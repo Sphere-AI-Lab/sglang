@@ -692,6 +692,9 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
+        from sglang.srt.oft.utils import assert_canonical_split_supported
+
+        assert_canonical_split_supported(type(self).__name__)
 
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
@@ -910,6 +913,10 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
+            w13_oft_r=getattr(layer, "w13_oft_r", None),
+            w1_oft_r=getattr(layer, "w1_oft_r", None),
+            w3_oft_r=getattr(layer, "w3_oft_r", None),
+            w2_oft_r=getattr(layer, "w2_oft_r", None),
         )
 
         return self.runner.run(dispatch_output, quant_info)
@@ -1493,6 +1500,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
+        from sglang.srt.oft.utils import assert_canonical_split_supported
+
+        assert_canonical_split_supported(type(self).__name__)
 
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:

@@ -99,6 +99,17 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
 
+        # Resolve OFT adapter
+        oft_path = self._resolve_oft_path(request.oft_path)
+        if oft_path:
+            first_adapter = (
+                oft_path
+                if isinstance(oft_path, str)
+                else next((a for a in oft_path if a), None)
+            )
+            if first_adapter:
+                self._validate_oft_enabled(first_adapter)
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             sampling_params=sampling_params,
@@ -108,6 +119,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_text_in_logprobs=True,
             stream=request.stream,
             lora_path=lora_path,
+            oft_path=oft_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,

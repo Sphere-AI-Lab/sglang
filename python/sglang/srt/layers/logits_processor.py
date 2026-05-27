@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -861,7 +862,26 @@ class LogitsProcessor(nn.Module):
             logits = lm_head(hidden_states)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
-            if self.use_fp32_lm_head:
+            if (
+                os.environ.get("SGLANG_DSV4_CANONICAL_LM_HEAD", "0") == "1"
+                and hidden_states.dim() == 2
+            ):
+                compute_dtype = (
+                    torch.float32 if self.use_fp32_lm_head else lm_head.weight.dtype
+                )
+                hs = hidden_states.to(compute_dtype)
+                weight_t = lm_head.weight.to(compute_dtype).T
+                if hs.shape[0] == 0:
+                    logits = hs.new_empty((0, lm_head.weight.shape[0]))
+                else:
+                    logits = torch.cat(
+                        [
+                            torch.matmul(row.unsqueeze(0), weight_t)
+                            for row in hs
+                        ],
+                        dim=0,
+                    )
+            elif self.use_fp32_lm_head:
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
                 )

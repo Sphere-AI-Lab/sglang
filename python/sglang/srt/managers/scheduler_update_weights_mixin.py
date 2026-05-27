@@ -25,6 +25,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    UpdateAdapterFromDistributedReqInput,
+    UpdateAdapterFromDistributedReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -84,6 +86,17 @@ class SchedulerUpdateWeightsMixin:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
 
+    def update_adapter_from_distributed(
+        self,
+        recv_req: UpdateAdapterFromDistributedReqInput,
+    ) -> Tuple[bool, str]:
+        """Update the PEFT adapter weights via NCCL broadcast."""
+        success, message = self.tp_worker.update_adapter_from_distributed(recv_req)
+        if not success:
+            logger.error(message)
+        # Adapters slot-swap without invalidating KV prefix cache; no flush_cache call needed.
+        return UpdateAdapterFromDistributedReqOutput(success, message)
+
     def update_weights_from_tensor(
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
@@ -138,9 +151,10 @@ class SchedulerUpdateWeightsMixin:
             self.flush_cache()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
-            self.stashed_model_static_state = _export_static_state(
-                self.tp_worker.model_runner.model
-            )
+            if not self.tp_worker.model_runner.server_args.enable_weights_cpu_backup:
+                self.stashed_model_static_state = _export_static_state(
+                    self.tp_worker.model_runner.model
+                )
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
@@ -168,11 +182,12 @@ class SchedulerUpdateWeightsMixin:
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
-            _import_static_state(
-                self.tp_worker.model_runner.model,
-                self.stashed_model_static_state,
-            )
-            del self.stashed_model_static_state
+            if hasattr(self, "stashed_model_static_state"):
+                _import_static_state(
+                    self.tp_worker.model_runner.model,
+                    self.stashed_model_static_state,
+                )
+                del self.stashed_model_static_state
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)

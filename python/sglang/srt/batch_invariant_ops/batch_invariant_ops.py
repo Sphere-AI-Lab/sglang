@@ -34,6 +34,9 @@ __all__ = [
     "is_batch_invariant_mode_enabled",
     "disable_batch_invariant_mode",
     "enable_batch_invariant_mode",
+    "matmul_fixed_order",
+    "rms_norm",
+    "rms_norm_batch_invariant",
 ]
 
 
@@ -303,6 +306,107 @@ def matmul_persistent(
         return out
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias)
+
+
+@triton.jit(launch_metadata=_matmul_launch_metadata)
+def matmul_kernel_fixed_order(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_SIZE_K):
+        k_idxs = k0 + offs_k
+        a = tl.load(
+            a_ptr + offs_m[:, None] * K + k_idxs[None, :],
+            mask=(offs_m[:, None] < M) & (k_idxs[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptr + k_idxs[:, None] * N + offs_n[None, :],
+            mask=(k_idxs[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        accumulator += tl.dot(a, b, input_precision="ieee")
+
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+        accumulator += bias
+
+    tl.store(
+        c_ptr + offs_m[:, None] * N + offs_n[None, :],
+        accumulator,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def matmul_fixed_order(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    block_k: int = 64,
+) -> torch.Tensor:
+    """Batch-invariant fp32 matmul with a fixed K-reduction order.
+
+    This is intended for DSV4 fp32 compressor projections where PyTorch GEMM is
+    fast but batch-shape dependent, and the generic persistent kernel is too
+    far from the official fp32 result.
+    """
+    assert a.dim() == 2 and b.dim() == 2, "matmul_fixed_order expects 2D tensors"
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.dtype == torch.float32 and b.dtype == torch.float32, (
+        "matmul_fixed_order currently supports fp32 inputs only"
+    )
+    assert a.is_contiguous() and b.is_contiguous(), "inputs must be contiguous"
+    assert bias is None or (bias.dim() == 1 and bias.dtype == torch.float32)
+
+    M, K = a.shape
+    _, N = b.shape
+    if block_m is None and block_n is None:
+        # Keep the faster small-row tile for stateful decode, and use a wider
+        # N tile for prefill where compressor GEMMs dominate. The c4
+        # compressor has N=1024 and benefits earlier than the c128 N=512 path.
+        use_small_row_tile = M < 1280 if N <= 512 else M <= 512
+        block_m, block_n = (128, 32) if use_small_row_tile else (64, 128)
+    else:
+        block_m = 128 if block_m is None else block_m
+        block_n = 32 if block_n is None else block_n
+    c = torch.empty((M, N), device=a.device, dtype=torch.float32)
+    grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+    matmul_kernel_fixed_order[grid](
+        a,
+        b,
+        c,
+        bias,
+        M,
+        K,
+        N,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=block_k,
+        HAS_BIAS=bias is not None,
+        num_stages=3,
+        num_warps=8,
+    )
+    return c
 
 
 @triton.jit

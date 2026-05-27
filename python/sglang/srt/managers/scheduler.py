@@ -73,6 +73,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.oft.oft_overlap_loader import OFTOverlapLoader
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -111,6 +112,10 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    LoadOFTAdapterFromTensorsReqInput,
+    LoadOFTAdapterFromTensorsReqOutput,
+    LoadOFTAdapterReqInput,
+    LoadOFTAdapterReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
@@ -129,6 +134,9 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UnloadOFTAdapterReqInput,
+    UnloadOFTAdapterReqOutput,
+    UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -177,7 +185,7 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache import DeepSeekV4RadixCache, RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -309,6 +317,9 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
+        self.enable_oft = server_args.enable_oft
+        self.enable_oft_overlap_loading = server_args.enable_oft_overlap_loading
+        self.max_ofts_per_batch = server_args.max_ofts_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -407,6 +418,12 @@ class Scheduler(
         if self.enable_lora_overlap_loading:
             self.lora_overlap_loader = LoRAOverlapLoader(
                 self.tp_worker.model_runner.lora_manager
+            )
+
+        # Init OFT overlap loader
+        if self.enable_oft_overlap_loading:
+            self.oft_overlap_loader = OFTOverlapLoader(
+                self.tp_worker.model_runner.oft_manager
             )
 
         # Init the grammar backend for constrained generation
@@ -723,8 +740,11 @@ class Scheduler(
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
                 )
+            elif self.model_config.is_deepseek_v4:
+                self.tree_cache = DeepSeekV4RadixCache(params)
             else:
                 self.tree_cache = RadixCache(params)
+        self.tree_cache.bind_model_worker(self.model_worker)
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -1061,6 +1081,10 @@ class Scheduler(
                     UpdateWeightsFromDistributedReqInput,
                     self.update_weights_from_distributed,
                 ),
+                (
+                    UpdateAdapterFromDistributedReqInput,
+                    self.update_adapter_from_distributed,
+                ),
                 (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
@@ -1080,6 +1104,12 @@ class Scheduler(
                     self.load_lora_adapter_from_tensors,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (LoadOFTAdapterReqInput, self.load_oft_adapter),
+                (
+                    LoadOFTAdapterFromTensorsReqInput,
+                    self.load_oft_adapter_from_tensors,
+                ),
+                (UnloadOFTAdapterReqInput, self.unload_oft_adapter),
                 (GetLoadReqInput, self.get_load),
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
@@ -1508,6 +1538,8 @@ class Scheduler(
                 token_ids_logprob=recv_req.token_ids_logprob,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
+                oft_id=recv_req.oft_id,
+                oft_version=recv_req.oft_version,
                 input_embeds=recv_req.input_embeds,
                 custom_logit_processor=recv_req.custom_logit_processor,
                 require_reasoning=recv_req.require_reasoning,
@@ -2049,6 +2081,9 @@ class Scheduler(
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
+        if self.enable_oft:
+            running_ofts = {req.oft_id for req in self.running_batch.reqs}
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and req.lora_id not in running_loras:
@@ -2064,6 +2099,20 @@ class Scheduler(
                     new_lora_set = {req.lora_id} | running_loras
                     if not self.tp_worker.model_runner.lora_manager.validate_lora_batch(
                         new_lora_set
+                    ):
+                        continue
+
+            if self.enable_oft and req.oft_id not in running_ofts:
+                if self.enable_oft_overlap_loading:
+                    res = self.oft_overlap_loader.try_overlap_load_oft(
+                        req.oft_id, running_ofts
+                    )
+                    if not res:
+                        continue
+                else:
+                    new_oft_set = {req.oft_id} | running_ofts
+                    if not self.tp_worker.model_runner.oft_manager.validate_oft_batch(
+                        new_oft_set
                     ):
                         continue
 
@@ -2101,6 +2150,9 @@ class Scheduler(
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
+
+            if self.enable_oft:
+                running_ofts.add(req.oft_id)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -2298,6 +2350,8 @@ class Scheduler(
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
+
+        self.tree_cache.prepare_for_forward_batch(batch)
 
         # Run forward
         if self.is_generation:
@@ -2893,6 +2947,30 @@ class Scheduler(
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
+        return result
+
+    def load_oft_adapter(
+        self, recv_req: LoadOFTAdapterReqInput
+    ) -> LoadOFTAdapterReqOutput:
+        """In-place loading a new OFT adapter from disk or huggingface."""
+
+        result = self.tp_worker.load_oft_adapter(recv_req)
+        return result
+
+    def load_oft_adapter_from_tensors(
+        self, recv_req: LoadOFTAdapterFromTensorsReqInput
+    ) -> LoadOFTAdapterFromTensorsReqOutput:
+        """In-place loading a new OFT adapter from serialized tensors."""
+
+        result = self.tp_worker.load_oft_adapter_from_tensors(recv_req)
+        return result
+
+    def unload_oft_adapter(
+        self, recv_req: UnloadOFTAdapterReqInput
+    ) -> UnloadOFTAdapterReqOutput:
+        """Unload the OFT adapter."""
+
+        result = self.tp_worker.unload_oft_adapter(recv_req)
         return result
 
     def init_weights_send_group_for_remote_instance(

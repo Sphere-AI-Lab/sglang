@@ -58,6 +58,7 @@ class LoRAMemoryPool:
         base_model: torch.nn.Module,
         eviction_policy: str,
         lora_added_tokens_size: int,
+        lora_modules: Optional[List[Dict[str, BaseLayerWithLoRA]]] = None,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -68,6 +69,7 @@ class LoRAMemoryPool:
         self.lora_added_tokens_size: int = lora_added_tokens_size
         self.max_lora_rank: int = max_lora_rank
         self.target_modules: Set[str] = target_modules
+        self.lora_modules: Optional[List[Dict[str, BaseLayerWithLoRA]]] = lora_modules
 
         # Initialize eviction policy
         self.eviction_policy = get_eviction_policy(eviction_policy)
@@ -130,16 +132,20 @@ class LoRAMemoryPool:
         base_model: torch.nn.Module,
         max_lora_dim: int,
         layer_idx: int,
+        module: Optional[BaseLayerWithLoRA] = None,
     ) -> Tuple[int]:
         """
         Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
-        input_dim, _ = get_hidden_dim(
-            module_name, self.base_hf_config, base_model, layer_idx
-        )
+        if module is not None:
+            input_dim = module.get_lora_a_input_dim()
+        else:
+            input_dim, _ = get_hidden_dim(
+                module_name, self.base_hf_config, base_model, layer_idx
+            )
+            if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+                input_dim = divide(input_dim, self.tp_size)
         c = get_stacked_multiply(module_name)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            input_dim = divide(input_dim, self.tp_size)
         return (
             self.max_loras_per_batch,
             max_lora_dim * c,
@@ -169,15 +175,19 @@ class LoRAMemoryPool:
         base_model: torch.nn.Module,
         max_lora_dim: int,
         layer_idx: int,
+        module: Optional[BaseLayerWithLoRA] = None,
     ) -> Tuple[int]:
         """
         Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
-        _, output_dim = get_hidden_dim(
-            module_name, self.base_hf_config, base_model, layer_idx
-        )
-        if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            output_dim = divide(output_dim, self.tp_size)
+        if module is not None:
+            output_dim = module.get_lora_b_output_dim()
+        else:
+            _, output_dim = get_hidden_dim(
+                module_name, self.base_hf_config, base_model, layer_idx
+            )
+            if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+                output_dim = divide(output_dim, self.tp_size)
         return (
             self.max_loras_per_batch,
             output_dim,
@@ -203,6 +213,17 @@ class LoRAMemoryPool:
 
     def init_buffers(self, base_model: torch.nn.Module):
         device = next(base_model.parameters()).device
+        module_lookup: Dict[Tuple[str, int], BaseLayerWithLoRA] = {}
+        if self.lora_modules is not None:
+            for layer_idx, layer_modules in enumerate(self.lora_modules):
+                for full_module_name, module in layer_modules.items():
+                    try:
+                        target_module = get_target_module_name(
+                            full_module_name, self.target_modules
+                        )
+                    except ValueError:
+                        continue
+                    module_lookup.setdefault((target_module, layer_idx), module)
 
         def init_buffer(
             buffer: Dict[str, List[torch.Tensor]],
@@ -218,6 +239,7 @@ class LoRAMemoryPool:
                             base_model,
                             self.max_lora_rank,
                             idx,
+                            module_lookup.get((module_name, idx)),
                         ),
                         dtype=self.dtype,
                         device=device,
@@ -435,11 +457,12 @@ class LoRAMemoryPool:
                         # Skip weight slicing if the weight is not present in the adapter
                         continue
 
+                    tp_rank = module.get_local_tp_rank()
                     temp_A_buffer[target_module] = module.slice_lora_a_weights(
-                        temp_A_buffer[target_module], self.tp_rank
+                        temp_A_buffer[target_module], tp_rank
                     )
                     temp_B_buffer[target_module] = module.slice_lora_b_weights(
-                        temp_B_buffer[target_module], self.tp_rank
+                        temp_B_buffer[target_module], tp_rank
                     )
 
             for name, weights in temp_A_buffer.items():

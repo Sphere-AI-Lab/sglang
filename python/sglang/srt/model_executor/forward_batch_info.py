@@ -308,6 +308,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For LoRA
     lora_ids: Optional[List[str]] = None
 
+    # For OFT
+    oft_ids: Optional[List[str]] = None
+
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
 
@@ -405,6 +408,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             lora_ids=batch.lora_ids,
+            oft_ids=batch.oft_ids,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
             token_to_kv_pool=model_runner.token_to_kv_pool,
@@ -522,6 +526,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        # Init OFT information
+        if model_runner.server_args.enable_oft:
+            if not model_runner.server_args.enable_oft_overlap_loading:
+                model_runner.oft_manager.fetch_new_ofts(set(ret.oft_ids))
+
+            model_runner.oft_manager.prepare_oft_batch(ret)
 
         return ret
 
@@ -832,6 +843,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
+        self.oft_ids.extend((bs - len(self.oft_ids)) * [None])
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()

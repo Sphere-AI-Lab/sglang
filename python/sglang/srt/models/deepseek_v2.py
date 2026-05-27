@@ -1260,6 +1260,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
         )
+        self.oft_mla_rotate_kv_cache = get_bool_env_var(
+            "SGLANG_OFT_MLA_ROTATE_KV_CACHE", "false"
+        )
         self.rocm_fused_decode_mla = get_bool_env_var(
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
         )
@@ -1489,6 +1492,37 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
         return qkv_latent
 
+    def _apply_kv_b_oft_to_absorbed_query(self, q_nope_out: torch.Tensor):
+        if self.oft_mla_rotate_kv_cache:
+            return q_nope_out
+        apply_input_rotation = getattr(self.kv_b_proj, "apply_input_rotation", None)
+        if apply_input_rotation is None:
+            return q_nope_out
+        return apply_input_rotation(
+            q_nope_out,
+            transpose=True,
+            n_groups=self.num_local_heads,
+        )
+
+    def _apply_kv_b_oft_to_absorbed_value(self, attn_output: torch.Tensor):
+        if self.oft_mla_rotate_kv_cache:
+            return attn_output
+        apply_input_rotation = getattr(self.kv_b_proj, "apply_input_rotation", None)
+        if apply_input_rotation is None:
+            return attn_output
+        return apply_input_rotation(
+            attn_output,
+            n_groups=self.num_local_heads,
+        )
+
+    def _apply_kv_b_oft_to_absorbed_kv_cache(self, k_nope: torch.Tensor):
+        if not self.oft_mla_rotate_kv_cache:
+            return k_nope
+        apply_input_rotation = getattr(self.kv_b_proj, "apply_input_rotation", None)
+        if apply_input_rotation is None:
+            return k_nope
+        return apply_input_rotation(k_nope)
+
     def _fuse_rope_for_trtllm_mla(self, forward_batch: ForwardBatch) -> bool:
         """
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
@@ -1606,6 +1640,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 if q_lora is None:
                     q_lora = q
 
+            k_nope = self._apply_kv_b_oft_to_absorbed_kv_cache(k_nope)
+
             # overlap q_b_proj and indexer during decode
             if (
                 self.alt_stream is not None
@@ -1645,7 +1681,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+            k_nope = self.kv_a_layernorm(k_nope)
+            k_nope = self._apply_kv_b_oft_to_absorbed_kv_cache(k_nope).unsqueeze(1)
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
@@ -1720,6 +1757,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
+        q_nope_out = self._apply_kv_b_oft_to_absorbed_query(q_nope_out)
 
         if (
             self.rotary_emb is not None
@@ -1823,6 +1861,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        attn_output = self._apply_kv_b_oft_to_absorbed_value(attn_output)
 
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
@@ -1983,9 +2022,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
-        q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
+        q_nope_out = q_nope_out.transpose(0, 1)
+        q_nope_out = self._apply_kv_b_oft_to_absorbed_query(q_nope_out)
+        q_input[..., : self.kv_lora_rank] = q_nope_out
         v_input = latent_cache[..., : self.kv_lora_rank]
-        v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
+        v_input = self.kv_a_layernorm(v_input.contiguous())
+        v_input = self._apply_kv_b_oft_to_absorbed_kv_cache(v_input).unsqueeze(1)
         k_input = latent_cache.unsqueeze(1)
         k_input[..., : self.kv_lora_rank] = v_input
 
@@ -2150,6 +2192,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
 
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        attn_output = self._apply_kv_b_oft_to_absorbed_value(attn_output)
 
         if _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm

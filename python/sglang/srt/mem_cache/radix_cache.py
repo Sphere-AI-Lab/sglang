@@ -111,6 +111,9 @@ class TreeNode:
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
         self.host_ref_counter = 0
+        # Optional model-owned prefix state. DeepSeek V4 uses this to restore
+        # stateful compressor/indexer buffers on radix hits.
+        self.dsv4_prefix_state = None
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
@@ -155,6 +158,169 @@ class TreeNode:
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
+
+
+class DeepSeekV4TreePrefixState:
+    def __init__(self, tree_cache: "RadixCache"):
+        self.tree_cache = tree_cache
+
+    @staticmethod
+    def model_from_worker(model_worker: Optional[Any]) -> Optional[Any]:
+        model_runner = getattr(model_worker, "model_runner", None)
+        model = getattr(model_runner, "model", None)
+        if model is None:
+            return None
+        if all(
+            hasattr(model, name)
+            for name in (
+                "export_prefix_state",
+                "reset_inference_state",
+                "restore_prefix_state",
+            )
+        ):
+            return model
+        return None
+
+    @staticmethod
+    def get_from_node(node: Optional[Any]) -> Optional[Any]:
+        return getattr(node, "dsv4_prefix_state", None)
+
+    def attach_to_node(
+        self, node: TreeNode, prefix_state: Optional[Any], prefix_len: int
+    ) -> None:
+        if prefix_state is None:
+            return
+
+        state_prefix_len = None
+        if isinstance(prefix_state, dict):
+            state_prefix_len = prefix_state.get("prefix_len")
+        else:
+            state_prefix_len = getattr(prefix_state, "prefix_len", None)
+
+        if state_prefix_len is not None and int(state_prefix_len) != int(prefix_len):
+            return
+
+        node.dsv4_prefix_state = prefix_state
+
+    def attach_by_key(
+        self,
+        token_ids: List[int],
+        extra_key: Optional[str],
+        prefix_state: Optional[Any],
+    ) -> None:
+        if prefix_state is None or self.tree_cache.disable:
+            return
+
+        keys = (
+            convert_to_bigram_key(token_ids)
+            if self.tree_cache.is_eagle
+            else token_ids
+        )
+        keys = self.tree_cache._page_align_keys(keys)
+        if len(keys) == 0:
+            return
+
+        radix_key = RadixKey(keys, extra_key, is_bigram=self.tree_cache.is_eagle)
+        match_result = self.tree_cache.match_prefix_allow_missing_dsv4_state(
+            MatchPrefixParams(key=radix_key)
+        )
+        if len(match_result.device_indices) != len(keys):
+            return
+
+        self.attach_to_node(match_result.last_device_node, prefix_state, len(keys))
+
+    def prepare_for_batch(self, model: Optional[Any], batch: Any) -> None:
+        if model is None:
+            return
+
+        forward_mode = getattr(batch, "forward_mode", None)
+        if forward_mode is not None and not forward_mode.is_extend():
+            return
+
+        req_pool_indices = getattr(batch, "req_pool_indices", None)
+        prefix_lens = getattr(batch, "prefix_lens", None)
+        reqs = getattr(batch, "reqs", None)
+        if req_pool_indices is None or prefix_lens is None or reqs is None:
+            return
+
+        req_indices = req_pool_indices.detach().cpu().tolist()
+        if isinstance(prefix_lens, torch.Tensor):
+            prefix_lens = prefix_lens.detach().cpu().tolist()
+
+        live_decode_req_ids = set()
+        if forward_mode is not None and forward_mode.is_mixed():
+            live_decode_req_ids = {
+                id(req) for req in getattr(batch, "decoding_reqs", None) or []
+            }
+        for req, req_idx, prefix_len in zip(
+            reqs, req_indices, prefix_lens, strict=True
+        ):
+            req_idx = int(req_idx)
+            prefix_len = int(prefix_len)
+            # Mixed batches append already-running decode requests, and
+            # chunked-prefill batches resume one unfinished request. Their
+            # DeepSeek V4 state is live in the model slot and must not be restored
+            # from a radix-node prefix snapshot.
+            live_chunk_len = int(getattr(req, "dsv4_live_prefix_state_len", 0) or 0)
+            if prefix_len > 0 and (
+                id(req) in live_decode_req_ids or live_chunk_len >= prefix_len
+            ):
+                continue
+
+            if prefix_len > 0:
+                prefix_state = self.get_from_node(getattr(req, "last_node", None))
+                if prefix_state is None:
+                    raise RuntimeError(
+                        "DeepSeek V4 prefix-hit extend requires a prefix state on the "
+                        f"radix node: rid={getattr(req, 'rid', None)!r}, "
+                        f"prefix_len={prefix_len}."
+                    )
+                model.restore_prefix_state(req_idx, prefix_state)
+            else:
+                model.reset_inference_state(req_idx)
+
+    def export_req(
+        self, model: Optional[Any], req: Any, prefix_len: int
+    ) -> Optional[Any]:
+        if model is None or getattr(req, "req_pool_idx", None) is None:
+            return None
+        return model.export_prefix_state(int(req.req_pool_idx), int(prefix_len))
+
+    @staticmethod
+    def token_ids_for_req(req: Any, prefix_len: int) -> List[int]:
+        token_ids = getattr(req, "fill_ids", [])
+        if len(token_ids) < prefix_len:
+            token_ids = getattr(req, "origin_input_ids", []) + getattr(
+                req, "output_ids", []
+            )
+        return list(token_ids[:prefix_len])
+
+    def commit_req(
+        self,
+        model: Optional[Any],
+        req: Any,
+        *,
+        prefix_len: Optional[int] = None,
+        prefix_state: Optional[Any] = None,
+    ) -> None:
+        if prefix_len is None:
+            prefix_len = len(getattr(req, "fill_ids", []))
+        if prefix_len <= 0:
+            return
+
+        if prefix_state is None:
+            prefix_state = self.export_req(model, req, prefix_len)
+        if prefix_state is None:
+            return
+
+        self.attach_by_key(
+            token_ids=self.token_ids_for_req(req, prefix_len),
+            extra_key=getattr(req, "extra_key", None),
+            prefix_state=prefix_state,
+        )
+
+
+DSV4TreePrefixState = DeepSeekV4TreePrefixState
 
 
 def _check_extra_key(key0: RadixKey, key1: RadixKey):
@@ -308,7 +474,7 @@ class RadixCache(BasePrefixCache):
 
     @classmethod
     def create_simulated(
-        self,
+        cls,
         disable: bool = False,
         mock_allocator: Optional[Any] = None,
         page_size: int = 1,
@@ -322,9 +488,20 @@ class RadixCache(BasePrefixCache):
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,
         )
-        return RadixCache(params)
+        return cls(params)
 
     ##### Public API #####
+
+    def _empty_match_result(self) -> MatchResult:
+        return MatchResult(
+            device_indices=torch.empty(
+                (0,),
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            last_device_node=self.root_node,
+            last_host_node=self.root_node,
+        )
 
     def reset(self):
         # Initialize root with minimum priority so any real priority overrides it
@@ -389,26 +566,15 @@ class RadixCache(BasePrefixCache):
         key = params.key
         key, _ = self.maybe_bigram_convert(key)
 
-        def empty_match_result():
-            return MatchResult(
-                device_indices=torch.empty(
-                    (0,),
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                last_device_node=self.root_node,
-                last_host_node=self.root_node,
-            )
-
         if self.disable or len(key) == 0:
-            return empty_match_result()
+            return self._empty_match_result()
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
         if len(key) == 0:
-            return empty_match_result()
+            return self._empty_match_result()
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
@@ -442,6 +608,9 @@ class RadixCache(BasePrefixCache):
             return key
         page_aligned_len = len(key) // self.page_size * self.page_size
         return key[:page_aligned_len]
+
+    def _match_prefix_for_cache_update(self, radix_key: RadixKey) -> MatchResult:
+        return self.match_prefix(MatchPrefixParams(key=radix_key))
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
@@ -522,7 +691,7 @@ class RadixCache(BasePrefixCache):
         )
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        match_result = self._match_prefix_for_cache_update(radix_key)
         new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
@@ -866,6 +1035,90 @@ class RadixCache(BasePrefixCache):
         events = self.kv_event_queue
         self.kv_event_queue = []
         return events
+
+
+class DeepSeekV4RadixCache(RadixCache):
+    """Radix cache variant that pairs KV prefix hits with DeepSeek V4 model state.
+
+    DeepSeek V4 owns extra per-request state beyond the normal KV pages
+    (compressor/indexer buffers). A prefix cache hit is only usable when the
+    matching radix node also carries that exported model state. Keep that rule
+    here so the generic RadixCache and scheduler paths stay unchanged.
+    """
+
+    def __init__(self, params: CacheInitParams):
+        super().__init__(params)
+        self.dsv4_prefix_state = DeepSeekV4TreePrefixState(self)
+        self._dsv4_model_worker = None
+
+    def bind_model_worker(self, model_worker: Any) -> None:
+        self._dsv4_model_worker = model_worker
+
+    def _dsv4_prefix_state_model(self) -> Optional[Any]:
+        return DeepSeekV4TreePrefixState.model_from_worker(self._dsv4_model_worker)
+
+    def prepare_for_forward_batch(self, batch: Any) -> None:
+        self.dsv4_prefix_state.prepare_for_batch(
+            self._dsv4_prefix_state_model(), batch
+        )
+
+    def match_prefix_allow_missing_dsv4_state(
+        self, params: MatchPrefixParams
+    ) -> MatchResult:
+        return super().match_prefix(params)
+
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        match_result = super().match_prefix(params)
+        if (
+            len(match_result.device_indices) > 0
+            and DeepSeekV4TreePrefixState.get_from_node(match_result.last_device_node)
+            is None
+        ):
+            return self._empty_match_result()
+        return match_result
+
+    def _match_prefix_for_cache_update(self, radix_key: RadixKey) -> MatchResult:
+        return self.match_prefix_allow_missing_dsv4_state(
+            MatchPrefixParams(key=radix_key)
+        )
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
+        should_insert = is_insert and not self.disable and not self.disable_finished_insert
+        prefix_len = int(getattr(req, "kv_committed_len", 0))
+        model = self._dsv4_prefix_state_model()
+        prefix_state = (
+            self.dsv4_prefix_state.export_req(model, req, prefix_len)
+            if should_insert and prefix_len > 0
+            else None
+        )
+
+        super().cache_finished_req(req, is_insert=is_insert)
+
+        if should_insert and prefix_len > 0:
+            self.dsv4_prefix_state.commit_req(
+                model, req, prefix_len=prefix_len, prefix_state=prefix_state
+            )
+
+    def cache_unfinished_req(self, req: Req, chunked=False):
+        prefix_len = int(getattr(req, "kv_committed_len", 0) or len(req.fill_ids))
+        model = self._dsv4_prefix_state_model()
+        prefix_state = self.dsv4_prefix_state.export_req(model, req, prefix_len)
+
+        super().cache_unfinished_req(req, chunked=chunked)
+
+        if chunked and prefix_len > 0:
+            req.dsv4_live_prefix_state_len = prefix_len
+        self.dsv4_prefix_state.commit_req(
+            model, req, prefix_len=prefix_len, prefix_state=prefix_state
+        )
+
+    def attach_dsv4_prefix_state(
+        self,
+        token_ids: List[int],
+        extra_key: Optional[str],
+        prefix_state: Optional[Any],
+    ) -> None:
+        self.dsv4_prefix_state.attach_by_key(token_ids, extra_key, prefix_state)
 
 
 if __name__ == "__main__":

@@ -134,6 +134,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             )
             self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
+    def bind_model_worker(self, model_worker: Any) -> None:
+        """Bind the model worker for cache implementations with model state."""
+        pass
+
+    def prepare_for_forward_batch(self, batch: Any) -> None:
+        """Prepare cache-owned model state before a forward batch."""
+        pass
+
     @abstractmethod
     def reset(self):
         pass

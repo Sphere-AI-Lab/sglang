@@ -19,6 +19,7 @@
 
 import logging
 import math
+import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -300,7 +301,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        if get_global_server_args().moe_router_force_fp32:
+            # Match Megatron Core's `--moe-router-dtype fp32`: gate matmul in
+            # fp32 so softmax/topk receive fp32 logits.
+            router_logits = torch.nn.functional.linear(
+                hidden_states.float(), self.gate.weight.float()
+            )
+        else:
+            router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
         if (
@@ -318,7 +326,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
+            if get_global_server_args().moe_router_force_fp32:
+                router_logits = torch.nn.functional.linear(
+                    hidden_states.float(), self.gate.weight.float()
+                )
+            else:
+                router_logits, _ = self.gate(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -340,7 +353,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):
             # router_logits: (num_tokens, n_experts)
-            state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
+            if get_global_server_args().moe_router_force_fp32:
+                state.router_logits = torch.nn.functional.linear(
+                    state.hidden_states_mlp_input.float(), self.gate.weight.float()
+                )
+            else:
+                state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
         else:
             state.router_logits = None
 
@@ -550,6 +568,10 @@ class Qwen3MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
+
+        _q_size = self.q_size
+        _kv_size = self.kv_size
+        _q, _k, _v = qkv.split([_q_size, _kv_size, _kv_size], dim=-1)
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
 
@@ -782,7 +804,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -889,6 +910,9 @@ class Qwen3MoeModel(Qwen2MoeModel):
 
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+    _lora_pattern_moe = re.compile(
+        r"^model\.layers\.(\d+)\.self_attn\.(?:qkv_proj|o_proj)$"
+    )
 
     # Mapping from fused module names to their component weight names.
     # Required for quantization configs (e.g., ModelOpt FP4) to correctly identify
@@ -897,6 +921,11 @@ class Qwen3MoeForCausalLM(nn.Module):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+
+    def get_oft_external_target_modules(self) -> set[str]:
+        # Routed expert OFT is owned by FusedMoE expert buffers, not the dense
+        # per-layer R_buffer used by attention and non-MoE MLP modules.
+        return {"gate_up_proj", "down_proj"}
 
     def __init__(
         self,
@@ -920,6 +949,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern_moe.match(module_name))
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens

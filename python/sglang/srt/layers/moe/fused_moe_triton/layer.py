@@ -5,6 +5,7 @@ from enum import Enum
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
@@ -90,6 +91,17 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
+
+
+def _use_oft_expert_parity_mode() -> bool:
+    if not get_bool_env_var("SGLANG_OFT_EXPERT_PARITY_MODE"):
+        return False
+    try:
+        from sglang.srt.oft.parity_dequant import is_parity_mode
+
+        return is_parity_mode()
+    except Exception:
+        return False
 
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
@@ -188,6 +200,7 @@ class FusedMoE(torch.nn.Module):
         prefix: str = "",
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
+        apply_router_weight_after_activation: Optional[bool] = None,
         use_presharded_weights: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
@@ -252,6 +265,18 @@ class FusedMoE(torch.nn.Module):
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size
 
+        # Resolve apply_router_weight_after_activation from server args if not set.
+        # The `moe_megatron_weighted_swiglu` server flag enables both the after-
+        # activation placement and the fp32-fused silu(g)*u*w chain downstream
+        # in fused_experts_impl.
+        if apply_router_weight_after_activation is None:
+            try:
+                apply_router_weight_after_activation = (
+                    get_global_server_args().moe_megatron_weighted_swiglu
+                )
+            except ValueError:
+                apply_router_weight_after_activation = False
+
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=self.num_local_experts,
@@ -263,6 +288,7 @@ class FusedMoE(torch.nn.Module):
             params_dtype=params_dtype,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            apply_router_weight_after_activation=apply_router_weight_after_activation,
             inplace=inplace,
             no_combine=no_combine,
             routed_scaling_factor=routed_scaling_factor,
@@ -303,6 +329,22 @@ class FusedMoE(torch.nn.Module):
             with_bias=with_bias,
         )
 
+        # Optional expert adapter attributes (set by LoRA/OFT manager)
+        self.w13_lora_a: Optional[torch.Tensor] = None  # (E, 2, rank, hidden)
+        self.w13_lora_b: Optional[torch.Tensor] = None  # (E, 2, inter/tp, rank)
+        self.w2_lora_a: Optional[torch.Tensor] = None   # (E, rank, inter/tp)
+        self.w2_lora_b: Optional[torch.Tensor] = None   # (E, hidden, rank)
+        self.lora_scaling: float = 0.0
+        self.w13_oft_r: Optional[torch.Tensor] = None   # legacy shared gate/up, (E, blocks, bs, bs)
+        self.w1_oft_r: Optional[torch.Tensor] = None    # gate, (E, blocks, bs, bs)
+        self.w3_oft_r: Optional[torch.Tensor] = None    # up,   (E, blocks, bs, bs)
+        self.w2_oft_r: Optional[torch.Tensor] = None    # down, (E, blocks, bs, bs)
+        # Kept only for the legacy parity helper below. The normal expert OFT
+        # path mirrors dense layers: rotate activations, then call the native
+        # quantized expert kernel.
+        self._parity_bf16_method = None
+        self._expert_parity_logged = False
+
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
 
@@ -321,6 +363,17 @@ class FusedMoE(torch.nn.Module):
 
         if self.quant_method is not None and hasattr(self.quant_method, "runner"):
             self.runner = self.quant_method.runner
+
+    @property
+    def has_adapters(self) -> bool:
+        return (
+            self.w13_lora_a is not None
+            or self.w2_lora_a is not None
+            or self.w13_oft_r is not None
+            or self.w1_oft_r is not None
+            or self.w3_oft_r is not None
+            or self.w2_oft_r is not None
+        )
 
     def _load_per_tensor_weight_scale(
         self,
@@ -1013,11 +1066,200 @@ class FusedMoE(torch.nn.Module):
         return final_hidden_states
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
-        # TODO: consider using symmetric memory
+        # Expert OFT follows dense OFT: the runner rotates activations before
+        # the native quantized grouped GEMM instead of dequantizing weights.
+        if (
+            _use_oft_expert_parity_mode()
+            and (self.w13_oft_r is not None or self.w2_oft_r is not None)
+        ):
+            return self._run_moe_parity(dispatch_output)
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
         )
+
+    def _run_moe_parity(self, dispatch_output: DispatchOutput) -> CombineInput:
+        """Dequant experts to bf16, temporarily swap into bf16 mode, apply."""
+        if dispatch_output.format.is_standard():
+            return self._run_moe_active_expert_parity(dispatch_output)
+
+        from sglang.srt.oft.parity_dequant import dequant_moe_experts_bf16
+
+        if self._parity_bf16_method is None:
+            self._parity_bf16_method = UnquantizedFusedMoEMethod(
+                use_triton_kernels=False,
+                use_flashinfer_trtllm_moe=False,
+            )
+            self._parity_bf16_method.create_moe_runner(
+                self, self.moe_runner_config
+            )
+
+        W13, W2 = dequant_moe_experts_bf16(
+            self, dispatch_output.hidden_states.dtype
+        )
+        if not self._expert_parity_logged:
+            logger.info(
+                "Using routed expert OFT parity path layer=%s w13=%s w2=%s dtype=%s",
+                self.layer_id,
+                tuple(W13.shape),
+                tuple(W2.shape),
+                W13.dtype,
+            )
+            self._expert_parity_logged = True
+        W13 = torch.nn.Parameter(W13.detach(), requires_grad=False)
+        W2 = torch.nn.Parameter(W2.detach(), requires_grad=False)
+
+        had_w13 = hasattr(self, "w13_weight")
+        had_w2 = hasattr(self, "w2_weight")
+        saved_w13 = getattr(self, "w13_weight", None)
+        saved_w2 = getattr(self, "w2_weight", None)
+        try:
+            self.w13_weight = W13
+            self.w2_weight = W2
+            return self._parity_bf16_method.apply(
+                layer=self, dispatch_output=dispatch_output
+            )
+        finally:
+            if had_w13:
+                self.w13_weight = saved_w13
+            else:
+                del self.w13_weight
+            if had_w2:
+                self.w2_weight = saved_w2
+            else:
+                del self.w2_weight
+
+    @staticmethod
+    def _apply_oft_blocks(x: torch.Tensor, oft_r: Optional[torch.Tensor]) -> torch.Tensor:
+        if oft_r is None:
+            return x
+        if oft_r.numel() == 0:
+            return x
+
+        original_dtype = x.dtype
+        block_size = oft_r.shape[-1]
+        rotated_dim = oft_r.shape[0] * block_size
+        x_prefix = x[..., :rotated_dim]
+        x_suffix = x[..., rotated_dim:]
+        if x_prefix.numel() == 0:
+            return x
+
+        x_blocks = x_prefix.reshape(-1, oft_r.shape[0], block_size)
+        if x_blocks.dtype != oft_r.dtype:
+            x_blocks = x_blocks.to(oft_r.dtype)
+        rotated = torch.einsum("mbk,bkc->mbc", x_blocks, oft_r).reshape_as(x_prefix)
+        if rotated.dtype != original_dtype:
+            rotated = rotated.to(original_dtype)
+        if x_suffix.numel() == 0:
+            return rotated
+        return torch.cat((rotated, x_suffix), dim=-1)
+
+    def _run_moe_active_expert_parity(self, dispatch_output: DispatchOutput) -> CombineInput:
+        """Reference routed-expert path for OFT parity diagnostics.
+
+        This dequantizes only experts that appear in the current routed batch,
+        then runs the same input-rotation + bf16 linear sequence as the dense
+        OFT parity path. It is slower than the native quantized grouped GEMM,
+        but avoids the all-expert BF16 materialization that OOMs debug6.
+        """
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.oft.parity_dequant import dequant_moe_expert_weight_to
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights = topk_output.topk_weights
+        topk_ids = topk_output.topk_ids
+        config = self.moe_runner_config
+
+        if config.gemm1_alpha is not None or config.gemm1_clamp_limit is not None:
+            raise NotImplementedError(
+                "Active expert OFT parity currently supports the Kimi/DeepSeek "
+                "SwiGLU path without gemm1 alpha/clamp variants."
+            )
+        if config.activation != "silu":
+            raise NotImplementedError(
+                f"Active expert OFT parity only supports silu, got {config.activation}."
+            )
+        if config.no_combine:
+            raise NotImplementedError("Active expert OFT parity does not support no_combine.")
+
+        active_ids = torch.unique(topk_ids[topk_ids >= 0]).detach().cpu().tolist()
+        out_features = self.hidden_size
+        out = x.new_zeros((x.shape[0], out_features))
+
+        if not self._expert_parity_logged:
+            logger.info(
+                "Using active routed expert OFT parity path layer=%s active_experts=%s "
+                "top_k=%s dtype=%s",
+                self.layer_id,
+                len(active_ids),
+                topk_ids.shape[1],
+                x.dtype,
+            )
+            self._expert_parity_logged = True
+
+        for expert_id in active_ids:
+            expert_id = int(expert_id)
+            route_mask = topk_ids == expert_id
+            token_idx, route_idx = route_mask.nonzero(as_tuple=True)
+            if token_idx.numel() == 0:
+                continue
+
+            x_e = x.index_select(0, token_idx)
+            weight_e = topk_weights[token_idx, route_idx].to(x.dtype)
+
+            if config.apply_router_weight_on_input:
+                x_e = x_e * weight_e.unsqueeze(-1)
+
+            w13 = dequant_moe_expert_weight_to(self, expert_id, "w13", x.dtype)
+            w13_bias = getattr(self, "w13_weight_bias", None)
+            if w13_bias is not None:
+                w13_bias = w13_bias[expert_id]
+            half = w13.shape[0] // 2
+
+            w1_oft_r = getattr(self, "w1_oft_r", None)
+            w3_oft_r = getattr(self, "w3_oft_r", None)
+            if w1_oft_r is not None and w3_oft_r is not None:
+                # Canonical OFT split: rotate input independently for gate / up.
+                x_gate = self._apply_oft_blocks(x_e, w1_oft_r[expert_id])
+                x_up = self._apply_oft_blocks(x_e, w3_oft_r[expert_id])
+                gate_bias = w13_bias[:half] if w13_bias is not None else None
+                up_bias = w13_bias[half:] if w13_bias is not None else None
+                gate = F.linear(x_gate, w13[:half], gate_bias)
+                up = F.linear(x_up, w13[half:], up_bias)
+            else:
+                if self.w13_oft_r is not None:
+                    x_e = self._apply_oft_blocks(x_e, self.w13_oft_r[expert_id])
+                gate_up = F.linear(x_e, w13, w13_bias)
+                gate, up = torch.chunk(gate_up, 2, dim=-1)
+
+            hidden = F.silu(gate) * up
+
+            if config.apply_router_weight_after_activation:
+                hidden = hidden * weight_e.unsqueeze(-1)
+
+            if self.w2_oft_r is not None:
+                hidden = self._apply_oft_blocks(hidden, self.w2_oft_r[expert_id])
+
+            w2 = dequant_moe_expert_weight_to(self, expert_id, "w2", x.dtype)
+            w2_bias = getattr(self, "w2_weight_bias", None)
+            if w2_bias is not None:
+                w2_bias = w2_bias[expert_id]
+            expert_out = F.linear(hidden, w2, w2_bias)
+
+            if (
+                not config.apply_router_weight_on_input
+                and not config.apply_router_weight_after_activation
+            ):
+                expert_out = expert_out * weight_e.unsqueeze(-1)
+
+            out.index_add_(0, token_idx, expert_out)
+
+        routed_scaling_factor = config.routed_scaling_factor
+        if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+            out = out * routed_scaling_factor
+
+        return StandardCombineInput(hidden_states=out)
 
     @classmethod
     def make_expert_params_mapping(

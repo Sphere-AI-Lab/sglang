@@ -206,6 +206,112 @@ def _load_deepseek_v32_model(
     )
 
 
+def _is_v4_native_config(model_path: Union[str, os.PathLike]) -> bool:
+    """Detect a DeepSeek V4 native checkpoint config.json.
+
+    V4's native config.json has every field the V4 model class reads
+    (`max_batch_size`, `max_seq_len`, `dim`, `compress_ratios`, ...) but
+    is missing the HF-side identity fields (`architectures`, `model_type`).
+    The V4-specific marker is `compress_ratios` — not present in any
+    HF-registered architecture.
+    """
+    try:
+        cfg_path = Path(model_path) / "config.json"
+        if not cfg_path.exists():
+            return False
+        with open(cfg_path, "r") as f:
+            cfg = json.load(f)
+    except Exception:
+        return False
+    return "compress_ratios" in cfg and "architectures" not in cfg
+
+
+def _load_deepseek_v4_native_model(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    """Patch a native V4 config.json into an HF-attribute config object.
+
+    We bypass `PretrainedConfig.from_pretrained` because:
+      1. Several native V4 field names (e.g. `dtype`, `head_dim`) collide
+         with HF-reserved attribute names that `from_pretrained` parses
+         or auto-derives, mangling V4's values (`dtype: "fp8"` crashes
+         `getattr(torch, dtype)`; `head_dim` gets overridden to a
+         derived default).
+      2. V4 isn't a registered HF model_type, so the AutoConfig path
+         falls through to a generic PretrainedConfig anyway — just an
+         attribute container.
+
+    Instead, instantiate a bare `PretrainedConfig` and set every native
+    field as an attribute. SGLang's loader only needs attribute access
+    on `architectures` (for ModelRegistry) plus whatever V4's `__init__`
+    reads.
+
+    `trust_remote_code` and `revision` kwargs accepted for signature
+    compatibility with the other `get_config` patchers; unused here.
+    """
+    del trust_remote_code, revision, kwargs  # signature-compat only
+
+    local_path = download_from_hf(model_path)
+    config_file = os.path.join(local_path, "config.json")
+    if not os.path.exists(config_file):
+        raise RuntimeError(f"Can't find config file in {local_path}.")
+
+    with open(config_file, "r") as f:
+        config_json = json.load(f)
+
+    config_json["architectures"] = ["DeepseekV4ForCausalLM"]
+    config_json["model_type"] = "deepseek_v4"
+
+    # V4's fp8/fp4 kernels hardcode bf16 output buffers; SGLang's
+    # ModelConfig.dtype derivation defaults to fp16 if `torch_dtype` is
+    # absent. Set bfloat16 explicitly. The native config's `dtype: "fp8"`
+    # would otherwise shadow this (SGLang's _get_and_verify_dtype reads
+    # `dtype` first, "fp8" doesn't map to a torch dtype, falls through
+    # to the float32 → fp16 default). Move the native value to a
+    # V4-prefixed name to preserve it without colliding with the HF-side
+    # parser.
+    if "dtype" in config_json:
+        config_json["v4_native_dtype"] = config_json.pop("dtype")
+    config_json["torch_dtype"] = "bfloat16"
+
+    # V4 native ckpts omit norm_eps (the config writer treats it as
+    # implicit). V4's __init__ + the test harness both set 1e-6 as the
+    # default; we mirror that here for parity.
+    config_json.setdefault("norm_eps", 1e-6)
+
+    # HF-standard alias fields. SGLang's ModelConfig.__init__ +
+    # _derive_model_shapes reads these via the standard names; V4's own
+    # __init__ continues to read its native names (`dim`, `n_heads`,
+    # `n_layers`, ...). Both sets coexist on the patched config.
+    config_json.setdefault("hidden_size", config_json["dim"])
+    config_json.setdefault("num_attention_heads", config_json["n_heads"])
+    config_json.setdefault("num_hidden_layers", config_json["n_layers"])
+    config_json.setdefault(
+        "num_key_value_heads", config_json["n_heads"]  # full attention, no GQA
+    )
+    config_json.setdefault(
+        "max_position_embeddings", config_json["max_seq_len"]
+    )
+    # V4 ckpt has its own YaRN scaling params; HF expects rope_scaling for
+    # the post-init rope plumbing. None is the right value (V4 reads its
+    # own fields and bypasses the standard rope path).
+    config_json.setdefault("rope_scaling", None)
+
+    config = PretrainedConfig()
+    # Bypass any HF property setters / defaults (e.g. `head_dim` in
+    # transformers 4.57+ is auto-derived from hidden_size/num_attention_heads
+    # via descriptor) by writing directly into __dict__.
+    config.__dict__.update(config_json)
+    # `torch_dtype` is a HF property that materialises strings into
+    # torch.dtype on access — but only when set via __setattr__, not
+    # __dict__.update. Re-assign it so the property converts.
+    config.torch_dtype = config_json["torch_dtype"]
+    return config
+
+
 # Temporary hack for Mistral Large
 def _load_mistral_large_3_for_causal_LM(
     model_path: str,
@@ -307,6 +413,14 @@ def get_config(
 
     if "mistral-large-3" in str(model).lower():
         config = _load_mistral_large_3_for_causal_LM(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    elif _is_v4_native_config(model):
+        # DSV4 native ckpts have no architectures / model_type; detect via
+        # the V4-specific `compress_ratios` field and route through the
+        # in-place patcher. AutoConfig is bypassed because V4 isn't a
+        # registered HF model_type.
+        config = _load_deepseek_v4_native_model(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
     else:

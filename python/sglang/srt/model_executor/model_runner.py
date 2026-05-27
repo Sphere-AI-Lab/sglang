@@ -111,6 +111,13 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.oft.oft_manager import OFTManager
+from sglang.srt.oft.oft_registry import OFTRef
+from sglang.srt.oft.streamed_weight_loader import (
+    FlattenedOFTTensorPayload,
+    load_streamed_oft_adapter,
+    normalize_oft_weight_payload,
+)
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -253,6 +260,18 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
         return model.thinker.model
     return model.model
+
+
+def compute_model_state_max_batch_size_override(
+    server_args: ServerArgs, model_config: ModelConfig, dp_size: int
+) -> Optional[int]:
+    if server_args.max_running_requests is None:
+        return None
+
+    if getattr(model_config, "is_deepseek_v4", False):
+        return max(1, server_args.max_running_requests)
+
+    return max(1, server_args.max_running_requests // dp_size)
 
 
 class RankZeroFilter(logging.Filter):
@@ -568,6 +587,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
+
+        # Init OFT
+        if server_args.enable_oft:
+            self.init_oft_manager()
 
         # Init Double Sparsity
         if server_args.enable_double_sparsity:
@@ -962,6 +985,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 t.start()
 
+        # Models that pre-allocate per-request state buffers at construction
+        # time (e.g. DSV4's per-layer Attention.kv_cache, Compressor.kv_state,
+        # Indexer.kv_cache) read these override attributes to size those
+        # buffers for the server's actual concurrency/context length. Non-V4
+        # models ignore the attributes.
+        max_batch_size_override = compute_model_state_max_batch_size_override(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            dp_size=self.dp_size,
+        )
+        if max_batch_size_override is not None:
+            self.model_config.hf_config.max_batch_size_override = max_batch_size_override
+        self.model_config.hf_config.max_seq_len_override = self.model_config.context_len
+
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
@@ -1337,6 +1374,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         shapes,
         group_name,
         load_format: Optional[str] = None,
+        *,
+        adapter_config: Optional[dict] = None,
+        adapter_name: Optional[str] = None,
+        adapter_id: Optional[str] = None,
     ):
         """
         Update specific parameter in the model weights online
@@ -1377,6 +1418,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             for handle in handles:
                 handle.wait()
 
+            if load_format == "oft_adapter":
+                return load_streamed_oft_adapter(
+                    self,
+                    weights,
+                    adapter_config,
+                    adapter_name,
+                    adapter_id,
+                )
+
             self.model.load_weights(weights)
             return True, "Succeeded to update parameter online."
 
@@ -1388,6 +1438,184 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             logger.error(error_msg)
             return False, error_msg
+
+    def update_adapter_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        weight_version,
+        load_format: str,
+        adapter_config: Optional[dict],
+        adapter_name: Optional[str],
+        adapter_id: Optional[str],
+        payload_metadata: Optional[dict],
+    ):
+        """NCCL recv into staging buffers, then dispatch on load_format.
+
+        Mirrors update_weights_from_distributed for PEFT adapter weights.
+        Dispatches to load_streamed_oft_adapter (OFT) or the LoRA tensor-loader
+        core (LoRA). The NCCL group is reused from init_weights_update_group;
+        no new group setup is required.
+        """
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        try:
+            # Recv tensors over NCCL (async broadcast then wait).
+            staging: list[tuple[str, torch.Tensor]] = []
+            handles = []
+            for name, dtype_str, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype_str
+                    if isinstance(dtype_str, torch.dtype)
+                    else getattr(torch, dtype_str)
+                )
+                buf = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.broadcast(
+                        buf,
+                        src=0,
+                        group=self._model_update_group[group_name],
+                        async_op=True,
+                    )
+                )
+                staging.append((name, buf))
+            for handle in handles:
+                handle.wait()
+
+            if load_format == "oft_adapter":
+                # If payload_metadata is present the sender transmitted a single
+                # flattened tensor (name "__flattened__") that must be unpacked
+                # back to per-weight tensors before calling the OFT loader.
+                if payload_metadata is not None:
+                    staging = self._reconstruct_oft_staging(staging, payload_metadata)
+                return load_streamed_oft_adapter(
+                    self,
+                    staging,
+                    adapter_config,
+                    adapter_name,
+                    adapter_id,
+                )
+
+            if load_format == "lora_adapter":
+                # "__distributed__" is a sentinel — the LoRA loader's tensor path doesn't
+                # read from disk; lora_path is required only to satisfy LoRARef's assertion.
+                # For double-buffer staged loads the tokenizer-side mixin rewrites
+                # adapter_name to the slot name (e.g. "{public}__orbit_slot_{0|1}")
+                # and supplies the corresponding adapter_id, so this branch loads
+                # into a brand-new slot and the lookup below finds no existing ref.
+                lora_ref_kwargs = {
+                    "lora_name": adapter_name,
+                    "lora_path": "__distributed__",
+                    # Explicit False; LoRARef.pinned defaults to None and
+                    # lora_manager.load_lora_adapter_from_tensors does
+                    # ``self.num_pinned_loras += int(lora_ref.pinned)``,
+                    # which raises "int() argument must be ... not 'NoneType'"
+                    # on the very first stage if pinned is left unset.
+                    "pinned": False,
+                }
+                if adapter_id is not None:
+                    lora_ref_kwargs["lora_id"] = adapter_id
+                lora_ref = LoRARef(**lora_ref_kwargs)
+                tensors = dict(staging)
+                config_dict = adapter_config or {}
+                # Unload any existing adapter with the same name before reloading.
+                # This mirrors the unload-then-load pattern used by IpcBackend.send_adapter
+                # (peft_transport/backends/ipc.py) and _ensure_streaming_oft_adapter_slot
+                # (sglang/srt/oft/streamed_weight_loader.py) so that repeated calls on the
+                # same adapter name do not raise "already loaded" from validate_new_adapter.
+                # In double-buffer mode this is a no-op because the staged slot name
+                # is always fresh (the previous occupant is retired by the tokenizer-side
+                # _wait_and_unload_retiring_adapter helper before re-staging the slot).
+                existing_ref = next(
+                    (
+                        ref
+                        for ref in self.lora_manager.lora_refs.values()
+                        if ref.lora_name == adapter_name
+                    ),
+                    None,
+                )
+                if existing_ref is not None:
+                    self.unload_lora_adapter(existing_ref)
+                # load_lora_adapter_from_tensors returns LoRAUpdateOutput;
+                # tp_worker.update_adapter_from_distributed unpacks (success,
+                # message) so the OFT and LoRA branches must match shape.
+                lora_result = self.load_lora_adapter_from_tensors(
+                    lora_ref,
+                    tensors,
+                    config_dict,
+                    None,  # added_tokens_config
+                )
+                return lora_result.success, lora_result.error_message or ""
+
+            raise ValueError(
+                f"update_adapter_from_distributed: unknown load_format={load_format!r}. "
+                "Expected 'oft_adapter' or 'lora_adapter'."
+            )
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to update adapter from distributed: {e}. "
+                f"adapter_name={adapter_name!r}, load_format={load_format!r}."
+            )
+            logger.exception(error_msg)
+            return False, error_msg
+
+    @staticmethod
+    def _reconstruct_oft_staging(
+        staging: list[tuple[str, torch.Tensor]],
+        payload_metadata: dict,
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Unpack a flattened NCCL OFT tensor back to per-weight tensors.
+
+        Wire format (canonical — orbit NcclBackend always pre-serializes via
+        _flatten_meta_to_json before calling update_adapter_from_distributed):
+          payload_metadata = {
+              "metadata": [
+                  {"name": str, "shape": [int, ...], "dtype": str,
+                   "start_idx": int, "end_idx": int, "numel": int},
+                  ...
+              ],
+              "extra": {"entries": [[name_str, unique_index_int], ...]},
+          }
+        All values are plain JSON primitives; torch.dtype / torch.Size are
+        never present on the wire.
+        """
+        assert len(staging) == 1 and staging[0][0] == "__flattened__", (
+            "OFT oft_adapter with payload_metadata expects exactly one "
+            f"'__flattened__' tensor, got names={[n for n,_ in staging]}"
+        )
+        flattened_tensor = staging[0][1]
+
+        raw_metadata = payload_metadata["metadata"]
+        entries = payload_metadata["extra"]["entries"]  # list[[str, int]]
+
+        # Rebuild FlattenedTensorMetadata from JSON-deserialized dicts.
+        # dtype is a plain string (e.g. "float32"), shape is a list of ints.
+        reconstructed_meta = [
+            FlattenedTensorMetadata(
+                name=m["name"],
+                shape=torch.Size(m["shape"]),
+                dtype=getattr(torch, m["dtype"]),
+                start_idx=m["start_idx"],
+                end_idx=m["end_idx"],
+                numel=m["numel"],
+            )
+            for m in raw_metadata
+        ]
+
+        bucket = FlattenedTensorBucket(
+            flattened_tensor=flattened_tensor,
+            metadata=reconstructed_meta,
+        )
+        unique_named_tensors = bucket.reconstruct_tensors()
+        unique_tensors = [t for _, t in unique_named_tensors]
+        # entries is list of [name, unique_index] (JSON arrays become lists).
+        return [(name, unique_tensors[int(idx)]) for name, idx in entries]
 
     def _update_bucketed_weights_from_distributed(
         self, names, dtypes, shapes, group_name
@@ -1422,8 +1650,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+        named_tensors: Union[
+            List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+            FlattenedOFTTensorPayload,
+        ],
         load_format: Optional[str] = None,
+        adapter_config: Optional[dict] = None,
+        adapter_name: Optional[str] = None,
+        adapter_id: Optional[str] = None,
     ):
         monkey_patch_torch_reductions()
         if load_format == "flattened_bucket":
@@ -1436,10 +1670,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.device_module = torch.get_device_module(self.device)
         infered_device = self.device_module.current_device()
 
+        if load_format == "oft_adapter":
+            named_tensors = normalize_oft_weight_payload(
+                named_tensors,
+                device=infered_device,
+            )
+            return load_streamed_oft_adapter(
+                self,
+                named_tensors,
+                adapter_config,
+                adapter_name,
+                adapter_id,
+            )
+
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
             for name, tensor in named_tensors
         ]
+
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
         elif load_format in self.server_args.custom_weight_loader:
@@ -1560,6 +1808,68 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return result
 
+    def init_oft_manager(self):
+        self.oft_manager = OFTManager(
+            base_model=self.model,
+            base_hf_config=self.model_config.hf_config,
+            max_ofts_per_batch=self.server_args.max_ofts_per_batch,
+            load_config=self.load_config,
+            dtype=self.dtype,
+            server_args=self.server_args,
+            oft_backend=self.server_args.oft_backend,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            max_oft_block_size=self.server_args.max_oft_block_size,
+            target_modules=self.server_args.oft_target_modules,
+            oft_paths=self.server_args.oft_paths,
+            memory_saver_adapter=self.memory_saver_adapter,
+            memory_saver_cpu_backup=self.server_args.enable_adapter_cpu_backup,
+        )
+
+    def load_oft_adapter(self, oft_ref: OFTRef):
+        """Load a new OFT adapter from disk or huggingface."""
+
+        logger.info(
+            f"OFT adapter loading starts: {oft_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        result = self.oft_manager.load_oft_adapter(oft_ref)
+
+        logger.info(
+            f"OFT adapter loading completes: {oft_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        return result
+
+    def load_oft_adapter_from_tensors(
+        self, oft_ref: OFTRef, tensors, config_dict, added_tokens_config=None
+    ):
+        logger.info(f"OFT adapter loading from tensors starts: {oft_ref}.")
+        result = self.oft_manager.load_oft_adapter_from_tensors(
+            oft_ref, tensors, config_dict, added_tokens_config
+        )
+        logger.info(f"OFT adapter loading from tensors completes: {oft_ref}.")
+        return result
+
+    def unload_oft_adapter(self, oft_ref: OFTRef):
+        """Unload an OFT adapter that was previously loaded during initialization or dynamic loading."""
+
+        logger.info(
+            f"OFT adapter unloading starts: {oft_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        result = self.oft_manager.unload_oft_adapter(oft_ref)
+
+        logger.info(
+            f"OFT adapter unloading completes: {oft_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        return result
+
     @property
     def qwen3_next_config(self):
         config = self.model_config.hf_config
@@ -1657,8 +1967,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "Disable piecewise CUDA graph because piecewise_cuda_graph does not support PP",
             )
             return False
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if get_moe_a2a_backend().is_deepep():
             # TODO(yuwei): fix the compilation errors for MOE A2A backend
+            if not self.model_config.is_deepseek_v4:
+                log_info_on_rank0(
+                    logger,
+                    "Disable piecewise CUDA graph due to existing compilation errors",
+                )
+                return False
+        if get_moe_a2a_backend().is_mooncake():
             log_info_on_rank0(
                 logger,
                 "Disable piecewise CUDA graph due to existing compilation errors",
@@ -1752,7 +2069,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.get_attention_backends()
         )
 
-        if self.decode_attention_backend_str != self.prefill_attention_backend_str:
+        if self.model_config.is_deepseek_v4:
+            from sglang.srt.layers.attention.deepseek_v4_attention_backend import (
+                DeepSeekV4AttentionBackend,
+            )
+
+            attn_backend = attn_backend_wrapper(
+                self,
+                DeepSeekV4AttentionBackend(
+                    model_runner=self,
+                    model_ref=self.model,
+                    max_batch_size=getattr(self.model, "max_batch_size", None),
+                ),
+            )
+            logger.info(
+                "Using DeepSeekV4AttentionBackend for DeepSeek-V4 model "
+                f"(requested attention_backend={self.server_args.attention_backend})."
+            )
+        elif self.decode_attention_backend_str != self.prefill_attention_backend_str:
             from sglang.srt.layers.attention.hybrid_attn_backend import (
                 HybridAttnBackend,
             )
@@ -2041,6 +2375,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             lora_ids = None
 
+        if self.server_args.enable_oft:
+            oft_ids = [None] * batch_size
+        else:
+            oft_ids = None
+
         forward_batch = ForwardBatch(
             forward_mode=capture_forward_mode,
             batch_size=batch_size,
@@ -2075,10 +2414,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
+            oft_ids=oft_ids,
         )
 
         if lora_ids is not None:
             self.lora_manager.prepare_lora_batch(forward_batch)
+
+        if oft_ids is not None:
+            self.oft_manager.prepare_oft_batch(forward_batch)
 
         self.attn_backend.init_forward_metadata(forward_batch)
 
@@ -2118,6 +2461,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_device_graphs(self):
         """Capture device graphs."""
+        old_graph_runner = getattr(self, "graph_runner", None)
+        if old_graph_runner is not None:
+            destroy = getattr(old_graph_runner, "destroy", None)
+            if callable(destroy):
+                destroy()
         self.graph_runner = None
         self.graph_mem_usage = 0
 
@@ -2185,6 +2533,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
                     self.attention_layers.append(layer.self_attn.attn_mqa)
+                elif self.model_config.is_deepseek_v4:
+                    self.attention_layers.append(layer.self_attn)
             # For hybrid model
             elif hasattr(layer, "attn"):
                 self.attention_layers.append(layer.attn)
@@ -2465,7 +2815,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+            return ModelRunnerOutput(
+                logits_output=ret,
+                can_run_graph=can_run_graph,
+            )
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
@@ -2513,7 +2866,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
 
-        return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+        return ModelRunnerOutput(
+            logits_output=ret,
+            can_run_graph=can_run_graph,
+        )
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
@@ -2669,6 +3025,11 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
     params_dict = dict(model.named_parameters())
     for name, tensor in named_tensors:
         default_weight_loader(params_dict[name], tensor)
+    refresh_cuda_graph_expert_weights = getattr(
+        model, "refresh_cuda_graph_expert_weights", None
+    )
+    if refresh_cuda_graph_expert_weights is not None:
+        refresh_cuda_graph_expert_weights()
 
 
 def _unwrap_tensor(tensor, tp_rank, device):

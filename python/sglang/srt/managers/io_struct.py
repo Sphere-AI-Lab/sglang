@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -221,6 +222,13 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
+    # The path to the OFT adaptors
+    oft_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # The uid of OFT adaptors, should be initialized by tokenizer manager
+    oft_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # Monotonic version of OFT weights, initialized by tokenizer manager.
+    oft_version: Optional[Union[List[Optional[int]], Optional[int]]] = None
+
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
@@ -403,6 +411,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
         self._expand_inputs(num)
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
+        self._normalize_oft_paths(num)
         self._normalize_image_data(num)
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
@@ -439,6 +448,16 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 self.lora_path = self.lora_path * self.parallel_sample_num
             else:
                 raise ValueError("lora_path should be a list or a string.")
+
+    def _normalize_oft_paths(self, num):
+        """Normalize OFT paths for batch processing."""
+        if self.oft_path is not None:
+            if isinstance(self.oft_path, str):
+                self.oft_path = [self.oft_path] * num
+            elif isinstance(self.oft_path, list):
+                self.oft_path = self.oft_path * self.parallel_sample_num
+            else:
+                raise ValueError("oft_path should be a list or a string.")
 
     def _normalize_image_data(self, num):
         """Normalize image data for batch processing."""
@@ -649,6 +668,13 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
+            oft_path=self.oft_path[i] if self.oft_path is not None else None,
+            oft_id=self.oft_id[i] if self.oft_id is not None else None,
+            oft_version=(
+                self.oft_version[i]
+                if isinstance(self.oft_version, list)
+                else self.oft_version
+            ),
             custom_logit_processor=(
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
@@ -728,6 +754,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
+
+    # OFT related
+    oft_id: Optional[str] = None  # None means just use the base model
+    oft_version: Optional[int] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -1336,12 +1366,73 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
+    # Optional: adapter config dict for adapter loading via distributed weight sync
+    adapter_config: Optional[Dict] = None
+    # Optional: adapter name for adapter loading via distributed weight sync
+    adapter_name: Optional[str] = None
+    # Optional: adapter ID assigned by tokenizer_manager for consistent registry mapping
+    adapter_id: Optional[str] = None
 
 
 @dataclass
 class UpdateWeightsFromDistributedReqOutput(BaseReq):
     success: bool
     message: str
+
+
+@dataclass
+class UpdateAdapterFromDistributedReqInput(BaseReq):
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    group_name: str
+    weight_version: str
+    load_format: str  # "lora_adapter" | "oft_adapter"
+    adapter_config: Dict
+    adapter_name: str
+    adapter_version: Optional[str] = None
+    double_buffer: bool = False
+    adapter_id: Optional[str] = None
+    payload_metadata: Optional[Dict] = None
+
+    def __post_init__(self):
+        if self.adapter_version is None:
+            self.adapter_version = self.weight_version
+        if str(self.adapter_version) != str(self.weight_version):
+            raise ValueError(
+                f"adapter_version and weight_version disagree: "
+                f"adapter_version={self.adapter_version} weight_version={self.weight_version}"
+            )
+
+
+@dataclass
+class UpdateAdapterFromDistributedReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class ActivateAdapterVersionReqInput(BaseReq):
+    adapter_name: str
+    adapter_version: str
+    weight_version: str
+    load_format: str
+
+    def __post_init__(self):
+        if str(self.adapter_version) != str(self.weight_version):
+            raise ValueError(
+                f"adapter_version and weight_version disagree: "
+                f"adapter_version={self.adapter_version} weight_version={self.weight_version}"
+            )
+
+
+@dataclass
+class ActivateAdapterVersionReqOutput(BaseReq):
+    success: bool
+    message: str
+    adapter_version: str
+    weight_version: str
+    active_adapter_version: str
 
 
 @dataclass
@@ -1361,6 +1452,12 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Optional: adapter config dict for OFT/LoRA adapter loading via load_format="oft_adapter"
+    adapter_config: Optional[Dict] = None
+    # Optional: adapter name for OFT/LoRA adapter loading
+    adapter_name: Optional[str] = None
+    # Optional: adapter ID assigned by tokenizer_manager for consistent registry mapping
+    adapter_id: Optional[str] = None
 
 
 @dataclass
@@ -1480,7 +1577,7 @@ class GetWeightsByNameReqOutput(BaseReq):
 @dataclass
 class ReleaseMemoryOccupationReqInput(BaseReq):
     # Optional tags to identify the memory region, which is primarily used for RL
-    # Currently we only support `weights` and `kv_cache`
+    # Supported tags include `weights`, `kv_cache`, `cuda_graph`, and `deepep_buffer`.
     tags: Optional[List[str]] = None
 
 
@@ -1492,7 +1589,7 @@ class ReleaseMemoryOccupationReqOutput(BaseReq):
 @dataclass
 class ResumeMemoryOccupationReqInput(BaseReq):
     # Optional tags to identify the memory region, which is primarily used for RL
-    # Currently we only support `weights` and `kv_cache`
+    # Supported tags include `weights`, `kv_cache`, `cuda_graph`, and `deepep_buffer`.
     tags: Optional[List[str]] = None
 
 
@@ -1780,6 +1877,70 @@ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
 ) = LoRAUpdateOutput
 
 
+@dataclass
+class LoadOFTAdapterReqInput(BaseReq):
+    # The name of the OFT module to newly loaded.
+    oft_name: str
+    # The path of loading.
+    oft_path: str
+    # Whether to pin the OFT adapter in memory.
+    pinned: bool = False
+    # The unique identifier for the OFT adapter, which automatically generated in the `TokenizerManager`.
+    oft_id: Optional[str] = None
+
+    def to_ref(self) -> OFTRef:
+        return OFTRef(
+            oft_id=self.oft_id,
+            oft_name=self.oft_name,
+            oft_path=self.oft_path,
+            pinned=self.pinned,
+        )
+
+
+@dataclass
+class UnloadOFTAdapterReqInput(BaseReq):
+    # The name of OFT module to unload.
+    oft_name: str
+    # The unique identifier for the OFT adapter, which automatically generated in the `TokenizerManager`.
+    oft_id: Optional[str] = None
+
+    def to_ref(self) -> OFTRef:
+        return OFTRef(
+            oft_id=self.oft_id,
+            oft_name=self.oft_name,
+        )
+
+
+@dataclass
+class LoadOFTAdapterFromTensorsReqInput(BaseReq):
+    oft_name: str
+    config_dict: Dict[str, Any]
+    serialized_tensors: str
+    pinned: bool = False
+    added_tokens_config: Optional[Dict[str, Any]] = None
+    oft_id: Optional[str] = None
+
+    def to_ref(self) -> OFTRef:
+        return OFTRef(
+            oft_id=self.oft_id,
+            oft_name=self.oft_name,
+            oft_path="__tensor__",
+            pinned=self.pinned,
+        )
+
+
+@dataclass
+class OFTUpdateOutput(BaseReq):
+    success: bool
+    error_message: Optional[str] = None
+    loaded_adapters: Optional[Dict[str, OFTRef]] = None
+
+
+LoadOFTAdapterReqOutput = UnloadOFTAdapterReqOutput = (
+    LoadOFTAdapterFromTensorsReqOutput
+) = OFTUpdateOutput
+
+
 class BlockReqType(Enum):
     BLOCK = 1
     UNBLOCK = 2
@@ -1888,7 +2049,7 @@ class GetLoadsReqInput(BaseReq):
     """Request for /v1/loads endpoint."""
 
     VALID_SECTIONS = frozenset(
-        {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
+        {"core", "memory", "spec", "lora", "oft", "disagg", "queues", "all"}
     )
 
     include: List[str] = field(default_factory=lambda: ["all"])

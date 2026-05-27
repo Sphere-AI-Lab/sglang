@@ -32,7 +32,7 @@ from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.lora.mem_pool import LoRAMemoryPool
+from sglang.srt.lora.mem_pool import EMPTY_SLOT, LoRAMemoryPool
 from sglang.srt.lora.utils import (
     LoRAType,
     get_normalized_target_modules,
@@ -45,6 +45,47 @@ from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _first_expert_lora_tensor(ew_dict, *names: str):
+    for ew in ew_dict.values():
+        for name in names:
+            tensor = ew.get(name)
+            if tensor is not None:
+                return tensor
+    return None
+
+
+def _expert_lora_buffer_desc(buffer: Optional[torch.Tensor]) -> str:
+    if buffer is None:
+        return "None"
+    return (
+        f"shape={tuple(buffer.shape)}, dtype={buffer.dtype}, "
+        f"device={buffer.device}, data_ptr={buffer.data_ptr()}"
+    )
+
+
+def _raise_expert_lora_buffer_mismatch(
+    *,
+    layer_id: int,
+    projection: str,
+    current_buffers: Dict[str, Optional[torch.Tensor]],
+    incoming_rank: int,
+) -> None:
+    message = (
+        "Expert LoRA update would replace CUDA-graph-captured buffers; "
+        "refusing to disable CUDA Graph silently. "
+        f"layer_id={layer_id}, projection={projection}, incoming_rank={incoming_rank}, "
+        "captured_buffers={"
+        + ", ".join(
+            f"{name}: {_expert_lora_buffer_desc(buffer)}"
+            for name, buffer in current_buffers.items()
+        )
+        + "}. This is unexpected when --lora-target-modules, "
+        "--max-lora-rank, TP/EP layout, and adapter rank are fixed."
+    )
+    logger.error(message)
+    raise RuntimeError(message)
 
 
 class LoRAManager:
@@ -203,6 +244,23 @@ class LoRAManager:
         ), f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
 
         try:
+            # Clear expert LoRA weights from FusedMoE layers
+            lora_adapter = self.loras.get(lora_ref.lora_id)
+            if lora_adapter is not None and any(
+                hasattr(layer, "expert_weights") and layer.expert_weights
+                for layer in lora_adapter.layers
+            ):
+                self._clear_expert_lora()
+
+            # Clean up memory pool mapping so that re-loading the same adapter
+            # actually copies new weights to the GPU buffer.
+            if hasattr(self, "memory_pool") and self.memory_pool is not None:
+                uid = lora_ref.lora_id
+                if uid in self.memory_pool.uid_to_buffer_id:
+                    buffer_id = self.memory_pool.uid_to_buffer_id.pop(uid)
+                    self.memory_pool.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
+                    self.memory_pool.eviction_policy.remove(uid)
+
             del self.configs[lora_ref.lora_id]
             del self.loras[lora_ref.lora_id]
             del self.lora_refs[lora_ref.lora_id]
@@ -353,6 +411,7 @@ class LoRAManager:
         self.init_lora_modules()
         self.init_memory_pool()
         self.update_lora_info()
+        self._init_zero_expert_lora_for_cuda_graph()
 
     def init_lora_adapters(self, lora_paths: Optional[List[LoRARef]] = None):
         # Configs of all active LoRA adapters, indexed by LoRA ID.
@@ -486,6 +545,13 @@ class LoRAManager:
 
         self.loras[lora_ref.lora_id] = lora_adapter
 
+        # Set expert LoRA weights on FusedMoE layers if present
+        if any(
+            hasattr(layer, "expert_weights") and layer.expert_weights
+            for layer in lora_adapter.layers
+        ):
+            self._set_expert_lora(lora_adapter, lora_adapter.scaling)
+
     def load_lora_weights_from_tensors(
         self, lora_ref: LoRARef, tensors: Dict[str, torch.Tensor]
     ):
@@ -501,6 +567,13 @@ class LoRAManager:
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
         self.loras[lora_ref.lora_id] = lora_adapter
+
+        # Set expert LoRA weights on FusedMoE layers if present
+        if any(
+            hasattr(layer, "expert_weights") and layer.expert_weights
+            for layer in lora_adapter.layers
+        ):
+            self._set_expert_lora(lora_adapter, lora_adapter.scaling)
 
     def load_lora_adapter_from_tensors(
         self,
@@ -547,6 +620,7 @@ class LoRAManager:
             max_lora_rank=self.max_lora_rank,
             target_modules=self.target_modules,
             base_model=self.base_model,
+            lora_modules=self.lora_modules,
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
         )
@@ -637,3 +711,271 @@ class LoRAManager:
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )
+
+    # ------------------------------------------------------------------ #
+    #  Expert LoRA helpers for FusedMoE layers
+    # ------------------------------------------------------------------ #
+
+    def _find_fused_moe_modules(self):
+        """Lazily find and cache all FusedMoE modules indexed by layer_id."""
+        if hasattr(self, "_moe_modules"):
+            return self._moe_modules
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        self._moe_modules = {}
+        for name, module in self.base_model.named_modules():
+            if isinstance(module, FusedMoE):
+                layer_id = get_layer_id(name)
+                if layer_id is not None:
+                    self._moe_modules[layer_id] = module
+        return self._moe_modules
+
+    def _init_zero_expert_lora_for_cuda_graph(self):
+        """Install zero expert LoRA buffers before CUDA graph capture.
+
+        CUDA graph replay can update tensor contents but not newly created
+        tensor objects or Python scalar kernel arguments. Preallocating zero
+        buffers makes the expert LoRA kernels part of graph capture. Adapter
+        scaling is folded into LoRA B when weights are copied into the buffers.
+        """
+        target_modules = getattr(self, "target_modules", set())
+        init_w13 = bool({"gate_up_proj", "gate_proj", "up_proj"} & target_modules)
+        init_w2 = "down_proj" in target_modules
+        self._expert_lora_graph_buffers_expected = init_w13 or init_w2
+        if not (init_w13 or init_w2):
+            return
+
+        rank = self.max_lora_rank
+        if rank <= 0:
+            return
+
+        initialized = False
+        for moe in self._find_fused_moe_modules().values():
+            device = moe.w13_weight.device
+            dtype = self.dtype
+            num_local = moe.num_local_experts
+            hidden = moe.hidden_size
+            inter_per_tp = moe.intermediate_size_per_partition
+
+            if init_w13:
+                if getattr(moe, "w13_lora_a", None) is None:
+                    moe.w13_lora_a = torch.zeros(
+                        num_local, 2, rank, hidden, device=device, dtype=dtype
+                    )
+                    initialized = True
+                if getattr(moe, "w13_lora_b", None) is None:
+                    moe.w13_lora_b = torch.zeros(
+                        num_local, 2, inter_per_tp, rank, device=device, dtype=dtype
+                    )
+                    initialized = True
+
+            if init_w2:
+                if getattr(moe, "w2_lora_a", None) is None:
+                    moe.w2_lora_a = torch.zeros(
+                        num_local, rank, inter_per_tp, device=device, dtype=dtype
+                    )
+                    initialized = True
+                if getattr(moe, "w2_lora_b", None) is None:
+                    moe.w2_lora_b = torch.zeros(
+                        num_local, hidden, rank, device=device, dtype=dtype
+                    )
+                    initialized = True
+
+            moe.lora_scaling = 1.0
+
+        if initialized:
+            logger.info(
+                "Initialized zero expert LoRA buffers for CUDA graph capture."
+            )
+
+    def _set_expert_lora(self, lora_adapter, scaling):
+        """Set expert LoRA tensors on FusedMoE layers from adapter expert_weights."""
+        moe_modules = self._find_fused_moe_modules()
+        if not moe_modules:
+            return
+
+        for layer_id, moe in moe_modules.items():
+            if layer_id >= len(lora_adapter.layers):
+                continue
+            ew_dict = lora_adapter.layers[layer_id].expert_weights
+            if not ew_dict:
+                continue
+
+            device = moe.w13_weight.device
+            dtype = self.dtype
+            num_local = moe.num_local_experts
+            tp_rank = moe.moe_tp_rank
+            tp_size = moe.moe_tp_size
+
+            rank_tensor = _first_expert_lora_tensor(
+                ew_dict,
+                "gate_proj.lora_A",
+                "up_proj.lora_A",
+                "down_proj.lora_A",
+            )
+            if rank_tensor is None:
+                continue
+            rank = rank_tensor.shape[0]
+
+            hidden = moe.hidden_size
+            inter_per_tp = moe.intermediate_size_per_partition
+
+            has_w13 = any(
+                any(
+                    ew.get(f"{proj}.lora_A") is not None
+                    and ew.get(f"{proj}.lora_B") is not None
+                    for proj in ("gate_proj", "up_proj")
+                )
+                for ew in ew_dict.values()
+            )
+            has_w2 = any(
+                ew.get("down_proj.lora_A") is not None
+                and ew.get("down_proj.lora_B") is not None
+                for ew in ew_dict.values()
+            )
+            graph_expected = getattr(self, "_expert_lora_graph_buffers_expected", False)
+
+            def _compatible_w13(a, b):
+                return (
+                    a is not None
+                    and b is not None
+                    and tuple(a.shape[:2]) == (num_local, 2)
+                    and a.shape[2] >= rank
+                    and a.shape[3] == hidden
+                    and tuple(b.shape[:3]) == (num_local, 2, inter_per_tp)
+                    and b.shape[3] >= rank
+                    and a.dtype == dtype
+                    and b.dtype == dtype
+                    and a.device == device
+                    and b.device == device
+                )
+
+            def _compatible_w2(a, b):
+                return (
+                    a is not None
+                    and b is not None
+                    and a.shape[0] == num_local
+                    and a.shape[1] >= rank
+                    and a.shape[2] == inter_per_tp
+                    and b.shape[0] == num_local
+                    and b.shape[1] == hidden
+                    and b.shape[2] >= rank
+                    and a.dtype == dtype
+                    and b.dtype == dtype
+                    and a.device == device
+                    and b.device == device
+                )
+
+            w13_a = getattr(moe, "w13_lora_a", None)
+            w13_b = getattr(moe, "w13_lora_b", None)
+            if has_w13:
+                if _compatible_w13(w13_a, w13_b):
+                    w13_a.zero_()
+                    w13_b.zero_()
+                elif graph_expected:
+                    _raise_expert_lora_buffer_mismatch(
+                        layer_id=layer_id,
+                        projection="w13",
+                        current_buffers={"w13_lora_a": w13_a, "w13_lora_b": w13_b},
+                        incoming_rank=rank,
+                    )
+                else:
+                    w13_a = torch.zeros(
+                        num_local, 2, rank, hidden, device=device, dtype=dtype
+                    )
+                    w13_b = torch.zeros(
+                        num_local, 2, inter_per_tp, rank, device=device, dtype=dtype
+                    )
+            elif w13_a is not None and w13_b is not None:
+                w13_a.zero_()
+                w13_b.zero_()
+
+            w2_a = getattr(moe, "w2_lora_a", None)
+            w2_b = getattr(moe, "w2_lora_b", None)
+            if has_w2:
+                if _compatible_w2(w2_a, w2_b):
+                    w2_a.zero_()
+                    w2_b.zero_()
+                elif graph_expected:
+                    _raise_expert_lora_buffer_mismatch(
+                        layer_id=layer_id,
+                        projection="w2",
+                        current_buffers={"w2_lora_a": w2_a, "w2_lora_b": w2_b},
+                        incoming_rank=rank,
+                    )
+                else:
+                    w2_a = torch.zeros(
+                        num_local, rank, inter_per_tp, device=device, dtype=dtype
+                    )
+                    w2_b = torch.zeros(
+                        num_local, hidden, rank, device=device, dtype=dtype
+                    )
+            elif w2_a is not None and w2_b is not None:
+                w2_a.zero_()
+                w2_b.zero_()
+
+            for global_id, ew in ew_dict.items():
+                local_id = moe._map_global_expert_id_to_local_expert_id(global_id)
+                if local_id < 0 or local_id >= num_local:
+                    continue
+
+                # w13: gate (sub_proj=0) and up (sub_proj=1)
+                for sub_idx, proj in enumerate(["gate_proj", "up_proj"]):
+                    A = ew.get(f"{proj}.lora_A")
+                    B = ew.get(f"{proj}.lora_B")
+                    if A is not None and B is not None and w13_a is not None:
+                        w13_a[local_id, sub_idx, :rank] = A.to(
+                            device=device, dtype=dtype
+                        )
+                        # TP-slice B on output dim
+                        B_full = B.to(device=device, dtype=dtype) * float(scaling)
+                        out_dim = B_full.shape[0]
+                        shard = out_dim // tp_size
+                        w13_b[local_id, sub_idx, :, :rank] = B_full[
+                            tp_rank * shard : (tp_rank + 1) * shard
+                        ]
+
+                # w2: down_proj
+                dA = ew.get("down_proj.lora_A")
+                dB = ew.get("down_proj.lora_B")
+                if dA is not None and dB is not None and w2_a is not None:
+                    # TP-slice A on input dim (down_proj input = intermediate)
+                    dA_full = dA.to(device=device, dtype=dtype)
+                    in_dim = dA_full.shape[1]
+                    shard = in_dim // tp_size
+                    w2_a[local_id, :rank] = dA_full[
+                        :, tp_rank * shard : (tp_rank + 1) * shard
+                    ]
+                    w2_b[local_id, :, :rank] = dB.to(
+                        device=device, dtype=dtype
+                    ) * float(scaling)
+
+            if w13_a is not None:
+                moe.w13_lora_a = w13_a
+                moe.w13_lora_b = w13_b
+            if w2_a is not None:
+                moe.w2_lora_a = w2_a
+                moe.w2_lora_b = w2_b
+            moe.lora_scaling = 1.0
+
+    def _clear_expert_lora(self):
+        """Clear expert LoRA tensors from all FusedMoE layers."""
+        graph_expected = getattr(self, "_expert_lora_graph_buffers_expected", False)
+        for moe in self._find_fused_moe_modules().values():
+            if graph_expected:
+                for name in (
+                    "w13_lora_a",
+                    "w13_lora_b",
+                    "w2_lora_a",
+                    "w2_lora_b",
+                ):
+                    tensor = getattr(moe, name, None)
+                    if tensor is not None:
+                        tensor.zero_()
+                moe.lora_scaling = 1.0
+            else:
+                moe.w13_lora_a = None
+                moe.w13_lora_b = None
+                moe.w2_lora_a = None
+                moe.w2_lora_b = None
+                moe.lora_scaling = 0.0

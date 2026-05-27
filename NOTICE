@@ -1,0 +1,9 @@
+SGLang -- Sphere AI Lab fork
+Copyright 2026 Sphere AI Lab
+
+This product is a fork of SGLang (https://github.com/sgl-project/sglang),
+Copyright 2023-2024 SGLang Team, licensed under the Apache License, Version 2.0.
+
+Sphere AI Lab modifications relative to the upstream base
+(sgl-project/sglang v0.5.9) are contained in the single release commit on top of
+that base and are likewise licensed under the Apache License, Version 2.0.

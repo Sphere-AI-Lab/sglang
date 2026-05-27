@@ -37,6 +37,54 @@ _is_xpu = is_xpu()
 _MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
 
+def _enable_fused_grouped_moe_oft_fc1() -> bool:
+    value = os.getenv("SGLANG_OFT_ENABLE_FUSED_GROUPED_MOE_FC1", "1")
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _select_fused_grouped_moe_oft_fc1_tiles(
+    num_tokens: int, default_block_m: int
+) -> dict:
+    if 2 <= num_tokens <= 16:
+        return {
+            "block_m": 8,
+            "block_n": 64,
+            "group_size_m": 1,
+            "num_warps": 2,
+        }
+    return {"block_m": default_block_m}
+
+
+def _make_config_expert_lora_compatible(config: dict, lora_inter_per_tp: int) -> dict:
+    block_n = config.get("BLOCK_SIZE_N")
+    if not block_n or lora_inter_per_tp % block_n == 0:
+        return config
+
+    for candidate in (64, 32, 16):
+        if candidate <= block_n and lora_inter_per_tp % candidate == 0:
+            compatible_config = dict(config)
+            compatible_config["BLOCK_SIZE_N"] = candidate
+            return compatible_config
+
+    return config
+
+
+@functools.lru_cache(maxsize=1)
+def _load_fused_split_w13_oft_grouped_moe():
+    # Hoisting this import out of the hot path: sglang.srt.oft.triton_ops/__init__
+    # pulls in other OFT kernels.
+    from sglang.srt.oft.triton_ops import fused_split_w13_oft_grouped_moe
+
+    return fused_split_w13_oft_grouped_moe
+
+
+@functools.lru_cache(maxsize=1)
+def _load_packed_bmm_split_w13_oft_grouped_moe():
+    from sglang.srt.oft.triton_ops import packed_bmm_split_w13_oft_grouped_moe
+
+    return packed_bmm_split_w13_oft_grouped_moe
+
+
 if _is_cuda or _is_hip:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
@@ -112,6 +160,23 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    # Expert LoRA
+    w13_lora_a: Optional[torch.Tensor] = None
+    w13_lora_b: Optional[torch.Tensor] = None
+    w2_lora_a: Optional[torch.Tensor] = None
+    w2_lora_b: Optional[torch.Tensor] = None
+    lora_scaling: float = 0.0
+    # Expert OFT
+    w13_oft_r: Optional[torch.Tensor] = None
+    w1_oft_r: Optional[torch.Tensor] = None
+    w3_oft_r: Optional[torch.Tensor] = None
+    w2_oft_r: Optional[torch.Tensor] = None
+
+
+# NOTE: zero-copy as_strided view into intermediate_cache1 was tried but does
+# not land — invoke_fused_moe_kernel's ``C = C.reshape(-1, 1, C.shape[-1])``
+# collapses the size-1 mid-dim stride to ``half``, so the two halves overlap.
+# Needs kernel-side explicit output row-stride to revisit.
 
 
 class TritonRunnerCore(MoeRunnerCore):
@@ -128,6 +193,7 @@ class TritonRunnerCore(MoeRunnerCore):
 
         # TODO: move these functions to the triton runner
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            _megatron_compiled_weighted_swiglu,
             _swiglu_gpt_oss_sigmoid_alpha,
             _swiglu_silu_clamp_mul,
             invoke_fused_moe_kernel,
@@ -166,8 +232,13 @@ class TritonRunnerCore(MoeRunnerCore):
         gemm1_limit = self.config.gemm1_clamp_limit
         routed_scaling_factor = self.config.routed_scaling_factor
         apply_router_weight_on_input = self.config.apply_router_weight_on_input
+        apply_router_weight_after_activation = self.config.apply_router_weight_after_activation
 
         assert self.config.is_gated, "Only gated MoEs are supported for Triton runner"
+        assert not (apply_router_weight_on_input and apply_router_weight_after_activation), (
+            "apply_router_weight_on_input and apply_router_weight_after_activation "
+            "cannot both be True — router weight would be applied twice"
+        )
 
         M = hidden_states.shape[0]
         E, N, _ = w13.shape
@@ -181,30 +252,136 @@ class TritonRunnerCore(MoeRunnerCore):
             dtype=hidden_states.dtype,
         )
 
-        invoke_fused_moe_kernel(
-            hidden_states,
-            w13,
-            b13,
-            intermediate_cache1,
-            a13_scale,
-            w13_scale,
-            w13_zp,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            apply_router_weight_on_input,
-            topk_ids.shape[1],
-            running_state["config"],
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-        )
+        split_w13_oft = quant_info.w1_oft_r is not None or quant_info.w3_oft_r is not None
+        if split_w13_oft and (
+            use_fp8_w8a8
+            or use_int8_w8a8
+            or use_int8_w8a16
+            or use_int4_w4a16
+            or per_channel_quant
+            or block_shape is not None
+        ):
+            raise RuntimeError(
+                "Split expert gate/up OFT is currently implemented for BF16/unquantized "
+                "FusedMoE only. Quantized split expert OFT needs a dedicated quantized "
+                "first-GEMM path."
+            )
+
+        if split_w13_oft:
+            if quant_info.w1_oft_r is None or quant_info.w3_oft_r is None:
+                raise RuntimeError(
+                    "Split expert gate/up OFT requires both w1_oft_r and w3_oft_r"
+                )
+            if quant_info.w13_oft_r is not None:
+                raise RuntimeError(
+                    "Split expert gate/up OFT cannot be active together with legacy w13_oft_r"
+                )
+
+            fast_split_w13_oft = (
+                _enable_fused_grouped_moe_oft_fc1()
+                and _is_cuda
+                and hidden_states.is_cuda
+                and b13 is None
+                and not apply_router_weight_on_input
+                and not use_fp8_w8a8
+                and not use_int8_w8a8
+                and not use_int8_w8a16
+                and not use_int4_w4a16
+                and not per_channel_quant
+                and block_shape is None
+                and hidden_states.dtype == torch.bfloat16
+                and w13.dtype == torch.bfloat16
+                and quant_info.w1_oft_r.dtype == torch.bfloat16
+                and quant_info.w3_oft_r.dtype == torch.bfloat16
+            )
+
+            if fast_split_w13_oft:
+                oft_fc1_tile_kwargs = running_state.get(
+                    "oft_fc1_tile_kwargs",
+                    {"block_m": running_state["config"]["BLOCK_SIZE_M"]},
+                )
+                intermediate_cache1 = _load_fused_split_w13_oft_grouped_moe()(
+                    hidden_states=hidden_states,
+                    w13=w13,
+                    w1_oft_r=quant_info.w1_oft_r,
+                    w3_oft_r=quant_info.w3_oft_r,
+                    topk_ids=topk_ids,
+                    sorted_token_ids=sorted_token_ids,
+                    expert_ids=expert_ids,
+                    num_tokens_post_padded=num_tokens_post_padded,
+                    **oft_fc1_tile_kwargs,
+                )
+            else:
+                half_cache_shape = (intermediate_cache1.shape[0], intermediate_cache1.shape[1], N // 2)
+                for half_slice, oft_r in (
+                    (slice(None, N // 2), quant_info.w1_oft_r),
+                    (slice(N // 2, None), quant_info.w3_oft_r),
+                ):
+                    half_cache = torch.empty(
+                        half_cache_shape,
+                        device=hidden_states.device,
+                        dtype=hidden_states.dtype,
+                    )
+                    invoke_fused_moe_kernel(
+                        hidden_states,
+                        w13[:, half_slice, :].contiguous(),
+                        None if b13 is None else b13[:, half_slice].contiguous(),
+                        half_cache,
+                        a13_scale,
+                        None if w13_scale is None else w13_scale[:, half_slice].contiguous(),
+                        w13_zp,
+                        topk_weights,
+                        topk_ids,
+                        sorted_token_ids,
+                        expert_ids,
+                        num_tokens_post_padded,
+                        apply_router_weight_on_input,
+                        topk_ids.shape[1],
+                        running_state["config"],
+                        compute_type=compute_type,
+                        use_fp8_w8a8=False,
+                        use_int8_w8a8=False,
+                        use_int8_w8a16=False,
+                        use_int4_w4a16=False,
+                        per_channel_quant=False,
+                        block_shape=None,
+                        lora_a=None,
+                        lora_b=None,
+                        lora_scaling=0.0,
+                        lora_inter_per_tp=N // 2,
+                        oft_r=oft_r,
+                    )
+                    intermediate_cache1[..., half_slice].copy_(half_cache)
+        else:
+            invoke_fused_moe_kernel(
+                hidden_states,
+                w13,
+                b13,
+                intermediate_cache1,
+                a13_scale,
+                w13_scale,
+                w13_zp,
+                topk_weights,
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                apply_router_weight_on_input,
+                topk_ids.shape[1],
+                running_state["config"],
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                per_channel_quant=per_channel_quant,
+                block_shape=block_shape,
+                lora_a=quant_info.w13_lora_a,
+                lora_b=quant_info.w13_lora_b,
+                lora_scaling=quant_info.lora_scaling,
+                lora_inter_per_tp=N // 2,  # gate/up boundary
+                oft_r=quant_info.w13_oft_r,
+            )
 
         intermediate_cache2 = torch.empty(
             (M * topk_ids.shape[1], N // 2),
@@ -212,8 +389,22 @@ class TritonRunnerCore(MoeRunnerCore):
             dtype=hidden_states.dtype,
         )
 
+        routed_weight_applied_after_activation = False
         if activation == "silu":
-            if gemm1_alpha is not None:
+            if (
+                apply_router_weight_after_activation
+                and gemm1_alpha is None
+                and gemm1_limit is None
+            ):
+                # Match Megatron Core's compiled weighted SwiGLU expression.
+                # The separate silu_and_mul + multiply route rounds before
+                # applying the routing weight and leaves a measurable parity gap.
+                intermediate_cache2 = _megatron_compiled_weighted_swiglu(
+                    intermediate_cache1.view(-1, N),
+                    topk_weights.reshape(-1).unsqueeze(-1),
+                )
+                routed_weight_applied_after_activation = True
+            elif gemm1_alpha is not None:
                 assert gemm1_limit is not None
                 intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
                     intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
@@ -239,6 +430,19 @@ class TritonRunnerCore(MoeRunnerCore):
                 )
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
+
+        # Apply routing weights after activation (matching Megatron Core's
+        # placement in mlp.py:325-328 and experts.py:320-322).
+        # This ensures bit-wise identical outputs between training (Megatron)
+        # and rollout (sglang) for RL infrastructure.
+        if (
+            apply_router_weight_after_activation
+            and not routed_weight_applied_after_activation
+        ):
+            original_dtype = intermediate_cache2.dtype
+            flat_weights = topk_weights.reshape(-1)
+            intermediate_cache2 = intermediate_cache2 * flat_weights.unsqueeze(-1)
+            intermediate_cache2 = intermediate_cache2.to(original_dtype)
 
         intermediate_cache3 = torch.empty(
             (M, topk_ids.shape[1], w2.shape[1]),
@@ -275,7 +479,7 @@ class TritonRunnerCore(MoeRunnerCore):
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            not apply_router_weight_on_input,
+            not apply_router_weight_on_input and not apply_router_weight_after_activation,
             1,
             running_state["config"],
             compute_type=compute_type,
@@ -285,6 +489,11 @@ class TritonRunnerCore(MoeRunnerCore):
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            lora_a=quant_info.w2_lora_a,
+            lora_b=quant_info.w2_lora_b,
+            lora_scaling=quant_info.lora_scaling,
+            lora_inter_per_tp=w2.shape[1],  # full output dim, no split
+            oft_r=quant_info.w2_oft_r,
         )
 
         if routed_scaling_factor is None:
@@ -398,8 +607,8 @@ def pre_permute_standard_to_triton(
     running_state: dict,
 ) -> TritonRunnerInput:
 
-    # NOTE: this is dead code as a fused func for standard format is registered.
-    # This is left here for testing and examples.
+    # Standard no-A2A usually takes the fused shortcut. Expert adapters bypass
+    # that shortcut because the legacy fused path does not accept adapter tensors.
 
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
         get_config_dtype_str,
@@ -450,6 +659,40 @@ def pre_permute_standard_to_triton(
     )
 
     config = get_config_func(num_tokens)
+    running_state.pop("oft_fc1_tile_kwargs", None)
+    split_w13_oft = quant_info.w1_oft_r is not None or quant_info.w3_oft_r is not None
+    if (
+        split_w13_oft
+        and _enable_fused_grouped_moe_oft_fc1()
+        and _is_cuda
+        and hidden_states.is_cuda
+        and quant_info.b13 is None
+        and not runner_config.apply_router_weight_on_input
+        and not quant_info.use_fp8_w8a8
+        and not quant_info.use_int8_w8a8
+        and not quant_info.use_int8_w8a16
+        and not quant_info.use_int4_w4a16
+        and not quant_info.per_channel_quant
+        and quant_info.block_shape is None
+        and hidden_states.dtype == torch.bfloat16
+        and quant_info.w13_weight.dtype == torch.bfloat16
+        and quant_info.w1_oft_r is not None
+        and quant_info.w3_oft_r is not None
+        and quant_info.w1_oft_r.dtype == torch.bfloat16
+        and quant_info.w3_oft_r.dtype == torch.bfloat16
+    ):
+        oft_fc1_tile_kwargs = _select_fused_grouped_moe_oft_fc1_tiles(
+            num_tokens, config["BLOCK_SIZE_M"]
+        )
+        if oft_fc1_tile_kwargs["block_m"] != config["BLOCK_SIZE_M"]:
+            config = dict(config)
+            config["BLOCK_SIZE_M"] = oft_fc1_tile_kwargs["block_m"]
+        running_state["oft_fc1_tile_kwargs"] = oft_fc1_tile_kwargs
+
+    if quant_info.w13_lora_a is not None and quant_info.w13_lora_a.dim() == 4:
+        config = _make_config_expert_lora_compatible(
+            config, quant_info.w13_weight.shape[1] // 2
+        )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_output.topk_ids, config["BLOCK_SIZE_M"], num_local_experts
@@ -475,8 +718,8 @@ def post_permute_triton_to_standard(
     running_state: dict,
 ) -> StandardCombineInput:
 
-    # NOTE: this is dead code as a fused func for standard format is registered.
-    # This is left here for testing and examples.
+    # Standard no-A2A usually takes the fused shortcut. Expert adapters bypass
+    # that shortcut because the legacy fused path does not accept adapter tensors.
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 

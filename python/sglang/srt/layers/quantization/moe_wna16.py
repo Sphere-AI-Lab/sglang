@@ -386,6 +386,10 @@ class MoeWNA16Method(FusedMoEMethodBase):
             w13_zp=layer.w13_qzeros if has_zp else None,
             w2_zp=layer.w2_qzeros if has_zp else None,
             block_shape=[0, layer.group_size],
+            w13_oft_r=getattr(layer, "w13_oft_r", None),
+            w1_oft_r=getattr(layer, "w1_oft_r", None),
+            w3_oft_r=getattr(layer, "w3_oft_r", None),
+            w2_oft_r=getattr(layer, "w2_oft_r", None),
         )
         return self.runner.run(dispatch_output, quant_info)
 

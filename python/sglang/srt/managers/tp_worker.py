@@ -29,8 +29,12 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    LoadOFTAdapterFromTensorsReqInput,
+    LoadOFTAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
+    UnloadOFTAdapterReqInput,
+    UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -149,6 +153,26 @@ class BaseTpWorker(ABC):
             recv_req.shapes,
             recv_req.group_name,
             recv_req.load_format,
+            adapter_config=recv_req.adapter_config,
+            adapter_name=recv_req.adapter_name,
+            adapter_id=recv_req.adapter_id,
+        )
+        return success, message
+
+    def update_adapter_from_distributed(
+        self, recv_req: UpdateAdapterFromDistributedReqInput
+    ):
+        success, message = self.model_runner.update_adapter_from_distributed(
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.group_name,
+            recv_req.weight_version,
+            recv_req.load_format,
+            recv_req.adapter_config,
+            recv_req.adapter_name,
+            recv_req.adapter_id,
+            recv_req.payload_metadata,
         )
         return success, message
 
@@ -160,6 +184,9 @@ class BaseTpWorker(ABC):
                 recv_req.serialized_named_tensors[self.tp_rank]
             ),
             load_format=recv_req.load_format,
+            adapter_config=recv_req.adapter_config,
+            adapter_name=recv_req.adapter_name,
+            adapter_id=recv_req.adapter_id,
         )
         return success, message
 
@@ -187,8 +214,30 @@ class BaseTpWorker(ABC):
     ):
         # The LoRA code handles TP sharding internally using slice_lora_a_weights
         # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
+        monkey_patch_torch_reductions()
         tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
         result = self.model_runner.load_lora_adapter_from_tensors(
+            recv_req.to_ref(),
+            tensors,
+            recv_req.config_dict,
+            recv_req.added_tokens_config,
+        )
+        return result
+
+    def load_oft_adapter(self, recv_req: LoadOFTAdapterReqInput):
+        result = self.model_runner.load_oft_adapter(recv_req.to_ref())
+        return result
+
+    def unload_oft_adapter(self, recv_req: UnloadOFTAdapterReqInput):
+        result = self.model_runner.unload_oft_adapter(recv_req.to_ref())
+        return result
+
+    def load_oft_adapter_from_tensors(
+        self, recv_req: LoadOFTAdapterFromTensorsReqInput
+    ):
+        monkey_patch_torch_reductions()
+        tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+        result = self.model_runner.load_oft_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
             recv_req.config_dict,

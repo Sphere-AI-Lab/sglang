@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import suppress
 from typing import (
     TYPE_CHECKING,
@@ -84,6 +85,52 @@ __all__ = ["CompressedTensorsLinearMethod"]
 
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Optional[Dict[str, QuantizationArgs]]]
+
+
+def _global_oft_requires_triton_moe() -> bool:
+    if os.getenv("SGLANG_FORCE_OFT_TRITON_MOE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
+    if os.getenv("SGLANG_OFT_MARLIN_MOE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return False
+
+    with suppress(Exception):
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        if not bool(getattr(server_args, "enable_oft", False)):
+            return False
+
+        target_modules = getattr(server_args, "oft_target_modules", None)
+        if target_modules is None:
+            # If target modules were inferred from preloaded adapters, keep the
+            # existing conservative backend choice.
+            return True
+
+        expert_oft_targets = {
+            "gate_up_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        }
+        if not (set(target_modules) & expert_oft_targets):
+            return False
+
+        # RL rollouts often start with an empty --oft-paths list and receive
+        # adapter weights through streamed updates after engine startup. The
+        # routed expert OFT buffers still exist in that mode, so choose the
+        # Triton MoE path up front instead of serving expert OFT through Marlin.
+        return True
+    return False
 
 
 class DeviceCapability(NamedTuple):
@@ -188,19 +235,41 @@ class CompressedTensorsConfig(QuantizationConfig):
             return CompressedTensorsFusedMoEMethod(self)
         return None
 
-    def _add_fused_moe_to_target_scheme_map(self):
+    def _add_fused_moe_to_target_scheme_map(
+        self, layer: Optional[torch.nn.Module] = None
+    ):
         """
         Helper function to update target_scheme_map
         since linear layers get fused into FusedMoE
         targeting 'Linear' needs to also match
         FusedMoE modules.
+
+        The runtime FusedMoE subclass varies with --moe-a2a-backend and
+        --moe-runner-backend (DeepEPMoE for deepep/mooncake, MoriEPMoE
+        for mori, NpuFuseEPMoE for ascend_fuseep, FlashInferFusedMoE /
+        FlashInferFP4MoE for the flashinfer trtllm runner). Registering
+        only "FusedMoE" leaves those subclasses unmatched because
+        find_matched_target checks `module.__class__.__name__` against
+        the target keys via substring contains, and e.g. "FusedMoE" is
+        not a substring of "DeepEPMoE". When a layer is supplied, walk
+        its MRO and register every nn.Module subclass name so the
+        substring match succeeds for the runtime class.
         """
-        if (
-            "Linear" not in self.target_scheme_map
-            or "FusedMoE" in self.target_scheme_map
-        ):
+        if "Linear" not in self.target_scheme_map:
             return
-        self.target_scheme_map["FusedMoE"] = self.target_scheme_map["Linear"]
+
+        candidates: List[str] = ["FusedMoE"]
+        if layer is not None:
+            candidates = [
+                cls.__name__
+                for cls in type(layer).__mro__
+                if cls is not torch.nn.Module and issubclass(cls, torch.nn.Module)
+            ]
+
+        linear_scheme = self.target_scheme_map["Linear"]
+        for name in candidates:
+            if name not in self.target_scheme_map:
+                self.target_scheme_map[name] = linear_scheme
 
     @property
     def weight_block_size(self) -> Optional[List[int]]:
@@ -644,8 +713,11 @@ class CompressedTensorsConfig(QuantizationConfig):
         """
 
         # FusedMoE was made by combining multiple Linears so need to
-        # make sure quantization config for Linear can target it
-        self._add_fused_moe_to_target_scheme_map()
+        # make sure quantization config for Linear can target it. Pass
+        # the layer so EP subclasses (DeepEPMoE/MoriEPMoE/NpuFuseEPMoE/
+        # FlashInferFusedMoE/...) are registered too — find_matched_target
+        # checks `module.__class__.__name__`, not isinstance.
+        self._add_fused_moe_to_target_scheme_map(layer)
         unfused_names = [
             layer_name + proj_name
             for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
@@ -679,6 +751,11 @@ class CompressedTensorsConfig(QuantizationConfig):
                     return CompressedTensorsMxInt4MoE(self)
                 elif _is_hip:
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
+                    return CompressedTensorsWNA16TritonMoE(self)
+                elif _global_oft_requires_triton_moe():
+                    logger.info_once(
+                        "Using CompressedTensorsWNA16TritonMoE because expert OFT is enabled"
+                    )
                     return CompressedTensorsWNA16TritonMoE(self)
                 else:
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")

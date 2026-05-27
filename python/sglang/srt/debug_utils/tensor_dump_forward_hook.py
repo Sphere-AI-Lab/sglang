@@ -114,7 +114,13 @@ class TensorDumper:
                 _, sub_count = self._add_hook_recursive(
                     module, cur_name, top_level_module_name, layers_module_name
                 )
-                if sub_count == 0 or top_level_model:
+                is_selected_layer = (
+                    name.isdigit()
+                    and prefix == layers_prefix
+                    and (self._dump_layers is None or int(name) in self._dump_layers)
+                )
+                layer_output_only = os.getenv("TENSOR_DUMP_LAYER_OUTPUT_ONLY", "0") == "1"
+                if (sub_count == 0 and not layer_output_only) or top_level_model or is_selected_layer:
                     # Avoid duplicated output hooks, e.g. self_attn may contain:
                     # self_attn.qkv_proj, self_attn.attn & self_attn.o_proj.
                     # Therefore, we do not need to add output hooks for self_attn,

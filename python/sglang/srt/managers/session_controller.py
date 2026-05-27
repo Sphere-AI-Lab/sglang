@@ -143,6 +143,8 @@ class Session:
             origin_input_ids_unpadded=input_ids_unpadded,
             sampling_params=req.sampling_params,
             lora_id=req.lora_id,
+            oft_id=req.oft_id,
+            oft_version=req.oft_version,
             session_id=self.session_id,
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,

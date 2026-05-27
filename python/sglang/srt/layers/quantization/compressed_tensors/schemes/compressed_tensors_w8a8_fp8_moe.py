@@ -217,6 +217,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
+        from sglang.srt.oft.utils import assert_canonical_split_supported
+
+        assert_canonical_split_supported(type(self).__name__)
+
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
         if self.static_input_scales:
@@ -367,6 +371,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.weight_block_size,
+                w13_oft_r=getattr(layer, "w13_oft_r", None),
+                w1_oft_r=getattr(layer, "w1_oft_r", None),
+                w3_oft_r=getattr(layer, "w3_oft_r", None),
+                w2_oft_r=getattr(layer, "w2_oft_r", None),
             )
             return self.runner.run(dispatch_output, quant_info)
         else:
@@ -380,5 +388,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 w2_scale=layer.w2_weight_scale,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
+                w13_oft_r=getattr(layer, "w13_oft_r", None),
+                w1_oft_r=getattr(layer, "w1_oft_r", None),
+                w3_oft_r=getattr(layer, "w3_oft_r", None),
+                w2_oft_r=getattr(layer, "w2_oft_r", None),
             )
             return self.runner.run(dispatch_output, quant_info)

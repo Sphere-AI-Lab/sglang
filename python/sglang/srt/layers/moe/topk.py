@@ -75,6 +75,32 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+
+def _capture_bypassed_topk_if_needed(
+    *,
+    layer_id: Optional[int],
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk_config: TopKConfig,
+    num_token_non_padded: Optional[torch.Tensor],
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
+):
+    capturer = get_global_experts_capturer()
+    if not capturer.is_enabled():
+        return
+
+    # FlashInfer TRT-LLM/MXFP4 MoE backends route internally from logits and
+    # bypass the normal select_experts() output. Replay still needs the routed
+    # expert IDs, so compute the same top-k side effect only when requested.
+    select_experts(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        topk_config=topk_config,
+        layer_id=layer_id,
+        num_token_non_padded=num_token_non_padded,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+    )
+
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
 
@@ -298,6 +324,14 @@ class TopK(MultiPlatformOp):
             )
             return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
         elif output_format == TopKOutputFormat.BYPASSED:
+            _capture_bypassed_topk_if_needed(
+                layer_id=self.layer_id,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_config=self.topk_config,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -846,9 +880,10 @@ def biased_grouped_topk_gpu(
         # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
+            gating_output = gating_output.to(dtype=torch.float32)
             return kimi_k2_moe_fused_gate(
-                gating_output.to(dtype=torch.float32),
-                correction_bias,
+                gating_output,
+                correction_bias.to(dtype=gating_output.dtype),
                 topk=topk,
                 renormalize=renormalize,
                 routed_scaling_factor=routed_scaling_factor,

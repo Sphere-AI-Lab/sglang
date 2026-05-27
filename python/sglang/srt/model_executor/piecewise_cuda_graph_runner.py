@@ -351,6 +351,7 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                oft_ids=None,
             )
 
         # Attention backend
@@ -461,6 +462,11 @@ class PiecewiseCudaGraphRunner:
         else:
             lora_ids = None
 
+        if self.model_runner.server_args.enable_oft:
+            oft_ids = [None] * bs
+        else:
+            oft_ids = None
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -502,11 +508,15 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                oft_ids=None,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+
+        if oft_ids is not None:
+            self.model_runner.oft_manager.prepare_oft_batch(forward_batch)
 
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
@@ -676,6 +686,7 @@ class PiecewiseCudaGraphRunner:
             num_token_non_padded=forward_batch.num_token_non_padded,
             global_forward_mode=forward_batch.global_forward_mode,
             lora_ids=forward_batch.lora_ids,
+            oft_ids=forward_batch.oft_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
             temp_scaled_logprobs=forward_batch.temp_scaled_logprobs,

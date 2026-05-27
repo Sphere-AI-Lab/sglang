@@ -672,6 +672,380 @@ def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
     return desc
 
 
+# ---------------------------------------------------------------------------
+# Standalone Triton kernel: block-diagonal OFT rotation
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _oft_block_rotate_kernel(
+    # Input: (M, K)
+    A_ptr,
+    stride_am,
+    stride_ak,
+    # Output: (M_expanded, K)  — one row per token-expert pair
+    A_rot_ptr,
+    stride_arm,
+    stride_ark,
+    # R matrices: (E, num_blocks, bs, bs)
+    R_ptr,
+    stride_re,
+    stride_rb,
+    stride_ri,
+    stride_rj,
+    # Token routing
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    num_valid_tokens,
+    # Dimensions
+    top_k: tl.constexpr,
+    K: tl.constexpr,
+    OFT_BLOCK_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    TILE_K: tl.constexpr,
+):
+    """Apply per-expert block-diagonal OFT rotation to input features.
+
+    Grid: (cdiv(EM, BLOCK_M), num_blocks)
+    - pid_m: block of sorted tokens (all same expert via moe_align_block_size)
+    - pid_blk: which OFT block (0 .. K // OFT_BLOCK_SIZE - 1)
+
+    For each program: loads BLOCK_M tokens' input at one OFT block position,
+    loads the expert's R matrix block, computes rotation via tl.dot, and
+    writes the rotated result to A_rot.
+    """
+    pid_m = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    # Bounds check
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_M >= num_tokens_post_padded:
+        return
+
+    # Load sorted token ids and expert for this block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    sorted_ids = tl.load(sorted_token_ids_ptr + offs_m)
+    sorted_ids = sorted_ids.to(tl.int64)
+    token_mask = sorted_ids < num_valid_tokens
+
+    expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+
+    # Original token ids (A is indexed by token, not token*top_k)
+    orig_ids = sorted_ids // top_k
+
+    # Base K offset for this OFT block
+    k_base = pid_blk * OFT_BLOCK_SIZE
+
+    # EP-dispatched non-local experts are encoded as -1. The base MoE GEMM
+    # filters those blocks, but the OFT pre-rotation runs before that filter,
+    # so skip here to avoid reading outside the R tensor.
+    if expert < 0:
+        return
+
+    # Tiled rotation: accumulate (BLOCK_M, OFT_BLOCK_SIZE) result
+    # by iterating over TILE_K chunks of the inner k dimension.
+    #
+    # OFT convention: rot_accum[t, c] = sum_k A[t, k_base+k] * R[k, c]
+    # i.e. A_rot[:, k_base:k_base+bs] = A[:, k_base:k_base+bs] @ R[expert, pid_blk]
+    # (NOT R^T — the dense OFT kernel `sgemm_oft_r.py` and `apply_block_diag_orth`
+    # both apply x @ R; matching that here keeps train/inference parity).
+
+    rot_accum = tl.zeros((BLOCK_M, OFT_BLOCK_SIZE), dtype=tl.float32)
+
+    for k_off in range(0, OFT_BLOCK_SIZE, TILE_K):
+        # Load A tile: (BLOCK_M, TILE_K) from A[orig_ids, k_base + k_off : ...]
+        k_tile_offs = (k_base + k_off + tl.arange(0, TILE_K)).to(tl.int64)
+        a_ptrs = A_ptr + orig_ids[:, None] * stride_am + k_tile_offs[None, :] * stride_ak
+        a_tile = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+
+        # Load R sub-block: R[expert, pid_blk, k_off:k_off+TILE_K, :]
+        # Shape: (TILE_K, OFT_BLOCK_SIZE) — rows = k inner axis, cols = c output axis.
+        r_row_offs = (k_off + tl.arange(0, TILE_K)).to(tl.int64)
+        r_col_offs = tl.arange(0, OFT_BLOCK_SIZE).to(tl.int64)
+        r_ptrs = (
+            R_ptr
+            + expert * stride_re
+            + pid_blk * stride_rb
+            + r_row_offs[:, None] * stride_ri
+            + r_col_offs[None, :] * stride_rj
+        )
+        r_sub = tl.load(r_ptrs)  # (TILE_K, OFT_BLOCK_SIZE)
+
+        # (BLOCK_M, TILE_K) @ (TILE_K, OFT_BLOCK_SIZE)  →  x @ R per block
+        # input_precision="ieee" is a no-op for bf16 operands (Triton 3.5.1
+        # only honors it for fp32×fp32) but kept defensive: if R is ever
+        # promoted to fp32, this enforces ieee not tf32, matching the Bridge
+        # train-side `sgemm_oft_r_single.py:71` annotation.
+        rot_accum += tl.dot(a_tile, r_sub, input_precision="ieee")
+
+    # Store rotated output: A_rot[sorted_ids, k_base : k_base + bs]
+    out_k_offs = (k_base + tl.arange(0, OFT_BLOCK_SIZE)).to(tl.int64)
+    out_ptrs = A_rot_ptr + sorted_ids[:, None] * stride_arm + out_k_offs[None, :] * stride_ark
+    tl.store(out_ptrs, rot_accum.to(A_rot_ptr.dtype.element_ty), mask=token_mask[:, None])
+
+
+def apply_oft_rotation_triton(
+    A: torch.Tensor,           # (M, K)
+    oft_r: torch.Tensor,       # (E, num_blocks, bs, bs)
+    topk_ids: torch.Tensor,    # (M, top_k)
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    block_m: int = 64,
+) -> torch.Tensor:
+    """Apply per-expert block-diagonal OFT rotation using a Triton kernel.
+
+    Returns A_rot of shape (M * top_k, K) where each row is rotated
+    by its assigned expert's block-diagonal R matrix.
+    """
+    M, K = A.shape
+    bs = oft_r.shape[2]
+    num_blocks = K // bs
+
+    # Output buffer: one row per token-expert pair
+    A_rot = torch.empty(M * top_k, K, device=A.device, dtype=A.dtype)
+
+    # TILE_K: chunk size for the inner dimension of the rotation matmul
+    tile_k = min(64, bs)
+
+    EM = sorted_token_ids.shape[0]
+    grid = (triton.cdiv(EM, block_m), num_blocks)
+
+    _oft_block_rotate_kernel[grid](
+        A, A.stride(0), A.stride(1),
+        A_rot, A_rot.stride(0), A_rot.stride(1),
+        oft_r, oft_r.stride(0), oft_r.stride(1), oft_r.stride(2), oft_r.stride(3),
+        sorted_token_ids, expert_ids, num_tokens_post_padded,
+        topk_ids.numel(),
+        top_k=top_k,
+        K=K,
+        OFT_BLOCK_SIZE=bs,
+        BLOCK_M=block_m,
+        TILE_K=tile_k,
+    )
+
+    return A_rot
+
+
+# ---------------------------------------------------------------------------
+# Standalone Triton kernels: LoRA delta  (two-pass: A-proj then B-proj+add)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _lora_a_proj_kernel(
+    # Input A: (M, K)
+    A_ptr, stride_am, stride_ak,
+    # Intermediate H: (M*top_k, num_sub, rank)
+    H_ptr, stride_hm, stride_hs, stride_hr,
+    # LoRA A weights: (E, [num_sub,] rank, K)
+    LA_ptr, stride_la_e, stride_la_s, stride_la_r, stride_la_k,
+    # Routing
+    sorted_token_ids_ptr, expert_ids_ptr, num_tokens_post_padded_ptr,
+    num_valid_tokens,
+    top_k: tl.constexpr,
+    K: tl.constexpr,
+    LORA_RANK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    TILE_K: tl.constexpr,
+):
+    """Pass 1: project input down to LoRA rank per expert.
+
+    Grid: (cdiv(EM, BLOCK_M), num_sub_projections)
+    Computes H[sorted_ids, sub_proj, :] = A[sorted_ids // top_k] @ lora_a[expert, sub_proj]^T
+    """
+    pid_m = tl.program_id(0)
+    pid_s = tl.program_id(1)  # sub-projection (0=gate, 1=up for w13; 0 for w2)
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_M >= num_tokens_post_padded:
+        return
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    sorted_ids = tl.load(sorted_token_ids_ptr + offs_m).to(tl.int64)
+    token_mask = sorted_ids < num_valid_tokens
+    expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if expert < 0:
+        return
+    orig_ids = sorted_ids // top_k
+
+    # Tile over K: h = A @ lora_a^T  ->  (BLOCK_M, LORA_RANK)
+    h = tl.zeros((BLOCK_M, LORA_RANK), dtype=tl.float32)
+    r_offs = tl.arange(0, LORA_RANK).to(tl.int64)
+
+    for k_off in range(0, K, TILE_K):
+        k_offs = (k_off + tl.arange(0, TILE_K)).to(tl.int64)
+
+        # Load A tile: (BLOCK_M, TILE_K)
+        a_ptrs = A_ptr + orig_ids[:, None] * stride_am + k_offs[None, :] * stride_ak
+        a_tile = tl.load(a_ptrs, mask=token_mask[:, None] & (k_offs[None, :] < K), other=0.0)
+
+        # Load lora_a tile: (TILE_K, LORA_RANK)
+        # lora_a layout: [expert, sub_proj, r, k]
+        la_ptrs = (
+            LA_ptr
+            + expert * stride_la_e
+            + pid_s * stride_la_s
+            + r_offs[None, :] * stride_la_r
+            + k_offs[:, None] * stride_la_k
+        )
+        la_tile = tl.load(la_ptrs, mask=k_offs[:, None] < K, other=0.0)  # (TILE_K, LORA_RANK)
+
+        # (BLOCK_M, TILE_K) @ (TILE_K, LORA_RANK)
+        h += tl.dot(a_tile, la_tile)
+
+    # Store H[sorted_ids, sub_proj, :]
+    h_ptrs = H_ptr + sorted_ids[:, None] * stride_hm + pid_s * stride_hs + r_offs[None, :] * stride_hr
+    tl.store(h_ptrs, h.to(H_ptr.dtype.element_ty), mask=token_mask[:, None])
+
+
+@triton.jit
+def _lora_b_proj_add_kernel(
+    # Intermediate H: (M*top_k, num_sub, rank)
+    H_ptr, stride_hm, stride_hs, stride_hr,
+    # LoRA B weights: (E, [num_sub,] N_per_sub, rank)
+    LB_ptr, stride_lb_e, stride_lb_s, stride_lb_n, stride_lb_r,
+    # Output C to add delta to
+    C_ptr, stride_cm, stride_cn,
+    lora_scaling,
+    topk_weights_ptr,
+    # Routing
+    sorted_token_ids_ptr, expert_ids_ptr, num_tokens_post_padded_ptr,
+    num_valid_tokens,
+    N,
+    lora_inter_per_tp,
+    LORA_RANK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+):
+    """Pass 2: project H up to output dim and add scaled delta to C.
+
+    Grid: (cdiv(EM, BLOCK_M), cdiv(N, BLOCK_N))
+    Computes C[sorted_ids, n_block] += scaling * H[sorted_ids, sub_proj] @ lora_b[expert, sub_proj, n_block]^T
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_M >= num_tokens_post_padded:
+        return
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    sorted_ids = tl.load(sorted_token_ids_ptr + offs_m).to(tl.int64)
+    token_mask = sorted_ids < num_valid_tokens
+    expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if expert < 0:
+        return
+
+    # Determine sub-projection from N position
+    first_n = pid_n * BLOCK_N
+    sub_proj = tl.where(first_n < lora_inter_per_tp, 0, 1).to(tl.int64)
+    local_n = first_n - sub_proj * lora_inter_per_tp
+
+    # Load H[sorted_ids, sub_proj, :rank]  ->  (BLOCK_M, LORA_RANK)
+    r_offs = tl.arange(0, LORA_RANK).to(tl.int64)
+    h_ptrs = H_ptr + sorted_ids[:, None] * stride_hm + sub_proj * stride_hs + r_offs[None, :] * stride_hr
+    h = tl.load(h_ptrs, mask=token_mask[:, None], other=0.0)
+
+    # Load lora_b tile: (BLOCK_N, LORA_RANK)
+    n_offs = (local_n + tl.arange(0, BLOCK_N)).to(tl.int64)
+    lb_ptrs = (
+        LB_ptr
+        + expert * stride_lb_e
+        + sub_proj * stride_lb_s
+        + n_offs[:, None] * stride_lb_n
+        + r_offs[None, :] * stride_lb_r
+    )
+    n_valid = n_offs < lora_inter_per_tp
+    lb_tile = tl.load(lb_ptrs, mask=n_valid[:, None], other=0.0)  # (BLOCK_N, LORA_RANK)
+
+    # Delta: (BLOCK_M, LORA_RANK) @ (LORA_RANK, BLOCK_N)
+    delta = tl.dot(h, tl.trans(lb_tile))
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + sorted_ids, mask=token_mask, other=0)
+        delta *= moe_weight[:, None]
+
+    # Add scaled delta to C
+    global_n_offs = (first_n + tl.arange(0, BLOCK_N)).to(tl.int64)
+    c_ptrs = C_ptr + sorted_ids[:, None] * stride_cm + global_n_offs[None, :] * stride_cn
+    n_mask = global_n_offs[None, :] < N
+    c = tl.load(c_ptrs, mask=token_mask[:, None] & n_mask, other=0.0).to(tl.float32)
+    c += lora_scaling * delta
+    tl.store(c_ptrs, c.to(C_ptr.dtype.element_ty), mask=token_mask[:, None] & n_mask)
+
+
+def apply_lora_delta_triton(
+    A: torch.Tensor,           # (M, K)
+    C: torch.Tensor,           # (M, top_k, N) — output to add delta to
+    lora_a: torch.Tensor,      # (E, 2, rank, K) or (E, rank, K)
+    lora_b: torch.Tensor,      # (E, 2, N_sub, rank) or (E, N, rank)
+    lora_scaling: float,
+    lora_inter_per_tp: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    topk_weights: Optional[torch.Tensor] = None,
+    mul_routed_weight: bool = False,
+    block_m: int = 64,
+) -> None:
+    """Apply per-expert LoRA delta to output C using two Triton kernel passes."""
+    if mul_routed_weight and topk_weights is None:
+        raise ValueError("topk_weights is required when mul_routed_weight is True")
+
+    M, K = A.shape
+    N = C.shape[-1]
+    rank = lora_a.shape[-2]
+    num_sub = 2 if lora_a.dim() == 4 else 1
+    num_valid = M * top_k
+
+    # Intermediate buffer: (M*top_k, num_sub, rank)
+    H = torch.empty(num_valid, num_sub, rank, device=A.device, dtype=A.dtype)
+
+    EM = sorted_token_ids.shape[0]
+    tile_k = min(64, K)
+
+    # Stride helpers for lora_a / lora_b (handle 3D vs 4D)
+    la_stride_e = lora_a.stride(0)
+    la_stride_s = lora_a.stride(1) if lora_a.dim() == 4 else 0
+    la_stride_r = lora_a.stride(-2)
+    la_stride_k = lora_a.stride(-1)
+    lb_stride_e = lora_b.stride(0)
+    lb_stride_s = lora_b.stride(1) if lora_b.dim() == 4 else 0
+    lb_stride_n = lora_b.stride(-2)
+    lb_stride_r = lora_b.stride(-1)
+
+    # Pass 1: A projection  ->  H
+    grid1 = (triton.cdiv(EM, block_m), num_sub)
+    _lora_a_proj_kernel[grid1](
+        A, A.stride(0), A.stride(1),
+        H, H.stride(0), H.stride(1), H.stride(2),
+        lora_a, la_stride_e, la_stride_s, la_stride_r, la_stride_k,
+        sorted_token_ids, expert_ids, num_tokens_post_padded,
+        num_valid,
+        top_k=top_k, K=K, LORA_RANK=rank,
+        BLOCK_M=block_m, TILE_K=tile_k,
+    )
+
+    # Pass 2: B projection + add to C
+    block_n = 64
+    grid2 = (triton.cdiv(EM, block_m), triton.cdiv(N, block_n))
+    _lora_b_proj_add_kernel[grid2](
+        H, H.stride(0), H.stride(1), H.stride(2),
+        lora_b, lb_stride_e, lb_stride_s, lb_stride_n, lb_stride_r,
+        C, C.stride(-2), C.stride(-1),
+        lora_scaling,
+        topk_weights if topk_weights is not None else C,
+        sorted_token_ids, expert_ids, num_tokens_post_padded,
+        num_valid, N, lora_inter_per_tp,
+        LORA_RANK=rank, BLOCK_M=block_m, BLOCK_N=block_n,
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+    )
+
+
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -700,6 +1074,11 @@ def invoke_fused_moe_kernel(
     b_use_tma: bool = False,
     c_sorted: bool = False,
     filter_expert: bool = True,
+    lora_a: Optional[torch.Tensor] = None,
+    lora_b: Optional[torch.Tensor] = None,
+    lora_scaling: float = 0.0,
+    lora_inter_per_tp: int = 0,
+    oft_r: Optional[torch.Tensor] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -710,6 +1089,41 @@ def invoke_fused_moe_kernel(
         swap_ab = False
 
     padded_size = 0
+
+    # OFT and LoRA are mutually exclusive per adapter load.
+    assert not (oft_r is not None and lora_a is not None), (
+        "OFT and LoRA cannot be active simultaneously on the same layer"
+    )
+
+    if oft_r is not None:
+        # Apply the expert-specific OFT rotation before activation
+        # quantization. FP8 activations cannot be used as tl.dot operands in
+        # the rotation kernel, and rotating before quantization matches the
+        # dense OFT path mathematically.
+        A = apply_oft_rotation_triton(
+            A,
+            oft_r,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            top_k,
+            block_m=config["BLOCK_SIZE_M"],
+        )
+
+        top_k = 1
+        C = C.reshape(-1, 1, C.shape[-1])
+        topk_weights = topk_weights.reshape(-1, 1)
+        topk_ids = topk_ids.reshape(-1, 1)
+
+        from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+            moe_align_block_size,
+        )
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, config["BLOCK_SIZE_M"], B.shape[0]
+        )
+
     if use_fp8_w8a8:
         assert B_scale is not None
         if block_shape is None:
@@ -880,6 +1294,28 @@ def invoke_fused_moe_kernel(
             swap_ab=swap_ab,
             **config,
         )
+
+        # --- Separate Triton kernel for LoRA delta ---
+        # Apply after the base kernel so the delta is added to the output.
+        # OFT and LoRA are mutually exclusive, so A/top_k/sorted_token_ids
+        # are unchanged when LoRA is active.
+        if lora_a is not None:
+            if lora_a.dim() == 4:
+                assert lora_inter_per_tp % config["BLOCK_SIZE_N"] == 0, (
+                    f"lora_inter_per_tp ({lora_inter_per_tp}) must be a multiple of "
+                    f"BLOCK_SIZE_N ({config['BLOCK_SIZE_N']})"
+                )
+            assert lora_a.shape[-2] % 16 == 0, (
+                f"LoRA rank must be a multiple of 16, got {lora_a.shape[-2]}"
+            )
+            apply_lora_delta_triton(
+                A, C, lora_a, lora_b, lora_scaling, lora_inter_per_tp,
+                sorted_token_ids, expert_ids, num_tokens_post_padded,
+                top_k,
+                topk_weights=topk_weights,
+                mul_routed_weight=mul_routed_weight,
+                block_m=config["BLOCK_SIZE_M"],
+            )
 
 
 @triton.jit

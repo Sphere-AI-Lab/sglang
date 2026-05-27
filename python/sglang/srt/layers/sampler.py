@@ -177,9 +177,9 @@ class Sampler(nn.Module):
                 logprobs,
                 top_logprobs_nums,
                 token_ids_logprobs,
-                sampling_info,
-                batch_next_token_ids,
-            )
+                    sampling_info,
+                    batch_next_token_ids,
+                )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
 

@@ -365,6 +365,8 @@ class Envs:
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
+    # Single-node ElasticBuffer: skip RDMA hybrid mode + reduce QP count.
+    SGLANG_DEEPEP_ALLOW_HYBRID_MODE = EnvBool(True)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
 
     # NSA Backend

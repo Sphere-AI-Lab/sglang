@@ -43,6 +43,27 @@ class BaseLayerWithLoRA(nn.Module):
     def set_lora_info(self, *args):
         pass
 
+    def get_local_tp_rank(self) -> int:
+        return getattr(self.base_layer, "tp_rank", 0)
+
+    def get_lora_a_input_dim(self) -> int:
+        if hasattr(self.base_layer, "input_size_per_partition"):
+            return self.base_layer.input_size_per_partition
+        if hasattr(self.base_layer, "input_size"):
+            return self.base_layer.input_size
+        raise NotImplementedError(
+            f"Cannot infer local LoRA A input dim for {type(self.base_layer).__name__}"
+        )
+
+    def get_lora_b_output_dim(self) -> int:
+        if hasattr(self.base_layer, "output_partition_sizes"):
+            return sum(self.base_layer.output_partition_sizes)
+        if hasattr(self.base_layer, "output_size"):
+            return self.base_layer.output_size
+        raise NotImplementedError(
+            f"Cannot infer local LoRA B output dim for {type(self.base_layer).__name__}"
+        )
+
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         pass
 
@@ -442,6 +463,9 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         # For computing number of launched blocks
         self.max_qkv_out_dim = max(q_proj_shard_size, kv_proj_shard_size)
 
+    def get_lora_b_output_dim(self) -> int:
+        return self.base_layer.q_proj_shard_size + 2 * self.base_layer.kv_proj_shard_size
+
     def set_lora_info(
         self,
         A_buffer_qkv: torch.Tensor,
@@ -480,7 +504,8 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         kv_start_idx = kv_proj_shard_size * kv_shard_id
         kv_end_idx = kv_start_idx + kv_proj_shard_size
 
-        q_size, k_size, _ = base_layer.output_sizes
+        q_size = base_layer.total_num_heads * base_layer.head_size
+        k_size = base_layer.total_num_kv_heads * base_layer.head_size
         B_q_shard = B[q_start_idx:q_end_idx, :]
         B_k_shard = B[q_size + kv_start_idx : q_size + kv_end_idx, :]
         B_v_shard = B[q_size + k_size + kv_start_idx : q_size + k_size + kv_end_idx, :]

@@ -35,11 +35,17 @@ class ExpertLocationDispatchInfo:
     @classmethod
     def init_new(cls, layer_id: int):
         ep_dispatch_algorithm = get_global_server_args().ep_dispatch_algorithm
-        expert_location_metadata = get_global_expert_location_metadata()
-        assert expert_location_metadata is not None
-
+        # The early return for "no EPLB algorithm configured" must run before
+        # asserting the metadata, otherwise non-EPLB DeepEP runs (where the
+        # global metadata is legitimately unset) crash here on the first
+        # forward pass. The remaining cls(...) construction below is the
+        # only branch that actually uses expert_location_metadata, so the
+        # assertion belongs there, not at the top.
         if ep_dispatch_algorithm is None:
             return None
+
+        expert_location_metadata = get_global_expert_location_metadata()
+        assert expert_location_metadata is not None
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,

@@ -351,6 +351,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        # Guard: adapters require TRITON backend (not TRITON_KERNELS)
+        if getattr(layer, "has_adapters", False):
+            assert not self.use_triton_kernels, (
+                "Expert adapters require TRITON backend (not TRITON_KERNELS). "
+                "Set moe_runner_backend='triton' or let the system auto-select."
+            )
+
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
@@ -424,6 +431,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     w2_weight=layer.w2_weight,
                     b13=getattr(layer, "w13_weight_bias", None),
                     b2=getattr(layer, "w2_weight_bias", None),
+                    w13_lora_a=getattr(layer, "w13_lora_a", None),
+                    w13_lora_b=getattr(layer, "w13_lora_b", None),
+                    w2_lora_a=getattr(layer, "w2_lora_a", None),
+                    w2_lora_b=getattr(layer, "w2_lora_b", None),
+                    lora_scaling=getattr(layer, "lora_scaling", 0.0),
+                    w13_oft_r=getattr(layer, "w13_oft_r", None),
+                    w1_oft_r=getattr(layer, "w1_oft_r", None),
+                    w3_oft_r=getattr(layer, "w3_oft_r", None),
+                    w2_oft_r=getattr(layer, "w2_oft_r", None),
                 )
                 return self.runner.run(dispatch_output, quant_info)
 
@@ -522,6 +538,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 w2_weight=layer.w2_weight,
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
+                w13_oft_r=getattr(layer, "w13_oft_r", None),
+                w1_oft_r=getattr(layer, "w1_oft_r", None),
+                w3_oft_r=getattr(layer, "w3_oft_r", None),
+                w2_oft_r=getattr(layer, "w2_oft_r", None),
             )
             return self.runner.run(dispatch_output, quant_info)
 

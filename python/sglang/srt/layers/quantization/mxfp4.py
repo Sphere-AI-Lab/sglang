@@ -889,6 +889,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
+                w13_oft_r=getattr(layer, "w13_oft_r", None),
+                w1_oft_r=getattr(layer, "w1_oft_r", None),
+                w3_oft_r=getattr(layer, "w3_oft_r", None),
+                w2_oft_r=getattr(layer, "w2_oft_r", None),
             )
         return self.runner.run(dispatch_output, quant_info)
 

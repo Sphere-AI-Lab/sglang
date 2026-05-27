@@ -70,6 +70,16 @@ class OpenAIServingBase(ABC):
         # Fall back to explicit lora_path
         return explicit_lora_path
 
+    def _resolve_oft_path(
+        self,
+        explicit_oft_path: Optional[Union[str, List[Optional[str]]]],
+    ) -> Optional[Union[str, List[Optional[str]]]]:
+        """Resolve OFT adapter path.
+
+        Returns adapter name or None. Supports both single values and lists (batches).
+        """
+        return explicit_oft_path
+
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:

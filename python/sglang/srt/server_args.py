@@ -31,10 +31,13 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
+    OFT_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    SUPPORTED_OFT_TARGET_MODULES,
     check_pkg_version_at_least,
     configure_ipv6,
     cpu_has_amx_support,
@@ -144,6 +147,7 @@ ATTENTION_BACKEND_CHOICES = [
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
+OFT_BACKEND_CHOICES = ["triton", "torch_native"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
 
@@ -445,6 +449,30 @@ class ServerArgs:
     lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
 
+    # OFT (Orthogonal Finetuning)
+    enable_oft: Optional[bool] = None
+    enable_oft_overlap_loading: Optional[bool] = None
+    max_oft_block_size: Optional[int] = None
+    oft_target_modules: Optional[Union[set[str], List[str]]] = None
+    oft_paths: Optional[
+        Union[dict[str, str], List[dict[str, str]], List[str], List[OFTRef]]
+    ] = None
+    max_loaded_ofts: Optional[int] = None
+    # Default 2 covers the typical single-active-adapter workload: slot 0 holds
+    # the auto-registered `None` placeholder (identity = base/reference model,
+    # used for KL against base in RL), slot 1 holds the active OFT adapter.
+    # This also enables the single-adapter fast-path kernel
+    # (`gemm_oft_r_fwd`) since `TritonOFTBackend.single_adapter_mode = (max_ofts_per_batch <= 2)`.
+    # Multi-tenant deployments serving more than one adapter concurrently
+    # should override with `--max-ofts-per-batch <N>`; for the segmented
+    # kernel to run, also pass `--max-ofts-per-batch >= 3`.
+    max_ofts_per_batch: int = 2
+    oft_eviction_policy: str = "lru"
+    oft_backend: str = "triton"
+    oft_dtype: Optional[str] = None
+    max_oft_chunk_size: Optional[int] = 16
+    oft_parity_mode: bool = False
+
     # Kernel backend
     attention_backend: Optional[str] = None
     decode_attention_backend: Optional[str] = None
@@ -617,6 +645,7 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
     enable_weights_cpu_backup: bool = False
+    enable_adapter_cpu_backup: bool = False
     enable_draft_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
@@ -630,6 +659,18 @@ class ServerArgs:
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
+    # Match Megatron Core's `weighted_bias_swiglu_impl`: place router-weight
+    # multiply after activation AND fuse silu(g)*u*w in fp32 before bf16 cast.
+    # Together these eliminate the extra bf16 rounding step that breaks
+    # bit-identity between training (Megatron) and rollout (sglang).
+    # Auto-enabled when enable_deterministic_inference is True.
+    moe_megatron_weighted_swiglu: bool = False
+    # Force MoE router gate computation in fp32 (matching Megatron Core's
+    # `--moe-router-dtype fp32`). When True, MoE blocks compute router logits
+    # by casting hidden_states and gate weight to fp32 before matmul, so
+    # softmax/topk receive fp32 logits. Required for bit-identical
+    # train-vs-rollout topk_weights when training uses fp32 router.
+    moe_router_force_fp32: bool = False
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
@@ -720,6 +761,9 @@ class ServerArgs:
 
         # Set missing default values.
         self._handle_missing_default_values()
+
+        # Enable DeepSeek V4 DeepEP runtime dependencies before memory sizing.
+        self._handle_deepseek_v4_deepep_defaults()
 
         # Handle device-specific backends.
         self._handle_hpu_backends()
@@ -1677,8 +1721,19 @@ class ServerArgs:
         is_h20_device = (
             device_name and "H20" in device_name and "H200" not in device_name
         )
+        # Opt-out: SGLANG_DISABLE_FLASHINFER_ALLREDUCE_FUSION=1 suppresses the
+        # auto-enable below. Useful when the fused kernel produces wrong outputs
+        # for a specific model+quant combo (e.g. Kimi-K2.5 + compressed-tensors
+        # W4A16 INT4 on H100 with --tp 8 / no DP attention silently produces
+        # accuracy=0; toggling this env var restores correctness). Doesn't touch
+        # the user-set value, only the auto-enable.
+        import os
+        _disable_flashinfer_allreduce_fusion = os.getenv(
+            "SGLANG_DISABLE_FLASHINFER_ALLREDUCE_FUSION", ""
+        ).lower() in {"1", "true", "yes", "on"}
         if (
             not self.enable_flashinfer_allreduce_fusion
+            and not _disable_flashinfer_allreduce_fusion
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
@@ -2174,11 +2229,33 @@ class ServerArgs:
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
 
+    def _is_deepseek_v4_model(self) -> bool:
+        return getattr(self.get_model_config(), "is_deepseek_v4", False)
+
+    def _handle_deepseek_v4_deepep_defaults(self):
+        if self.moe_a2a_backend != "deepep" or self.enable_symm_mem:
+            return
+
+        model_config = self.get_model_config()
+        if getattr(model_config, "is_deepseek_v4", False):
+            self.enable_symm_mem = True
+            logger.warning(
+                "Symmetric memory is enabled by default for DeepSeek V4 with DeepEP MoE "
+                "because DeepEP V2 ElasticBuffer requires an NCCL symmetric-memory communicator."
+            )
+
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
-                logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
-                self.disable_cuda_graph = True
+                if self._is_deepseek_v4_model():
+                    logger.warning(
+                        "Full CUDA graph remains enabled for DeepSeek V4 DeepEP normal mode."
+                    )
+                else:
+                    logger.warning(
+                        "Cuda graph is disabled because deepep_mode=`normal`"
+                    )
+                    self.disable_cuda_graph = True
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
@@ -2716,6 +2793,15 @@ class ServerArgs:
             os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
 
         if self.enable_deterministic_inference:
+            # Match Megatron Core's weighted-bias SwiGLU (fp32-fused chain +
+            # after-activation router-weight multiply) for deterministic MoE.
+            if not self.moe_megatron_weighted_swiglu:
+                self.moe_megatron_weighted_swiglu = True
+                logger.warning(
+                    "MoE Megatron weighted-SwiGLU mode auto-enabled for "
+                    "deterministic inference (matching Megatron Core)."
+                )
+
             # Check sampling backend
             self.sampling_backend = "pytorch"
             logger.warning(
@@ -3825,6 +3911,96 @@ class ServerArgs:
             help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
         )
 
+        # OFT (Orthogonal Finetuning)
+        parser.add_argument(
+            "--enable-oft",
+            default=ServerArgs.enable_oft,
+            action="store_true",
+            help="Enable OFT support for the model. This argument is automatically set to True if `--oft-paths` is provided for backward compatibility.",
+        )
+        parser.add_argument(
+            "--enable-oft-overlap-loading",
+            default=ServerArgs.enable_oft_overlap_loading,
+            action="store_true",
+            help="Enable asynchronous OFT weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your OFT workloads are bottlenecked by adapter weight loading, for example when frequently loading large OFT adapters.",
+        )
+        parser.add_argument(
+            "--max-oft-block-size",
+            default=ServerArgs.max_oft_block_size,
+            type=int,
+            help="The maximum block size of OFT adapters. If not specified, it will be automatically inferred from the adapters provided in --oft-paths.",
+        )
+        parser.add_argument(
+            "--oft-target-modules",
+            type=str,
+            choices=SUPPORTED_OFT_TARGET_MODULES + [OFT_TARGET_ALL_MODULES],
+            nargs="*",
+            default=None,
+            help="The union set of all target modules where OFT should be applied. If not specified, "
+            "it will be automatically inferred from the adapters provided in --oft-paths. If 'all' is specified, "
+            "all supported modules will be targeted.",
+        )
+        parser.add_argument(
+            "--oft-paths",
+            type=str,
+            nargs="*",
+            default=None,
+            action=OFTPathAction,
+            help='The list of OFT adapters to load. Each adapter must be specified in one of the following formats: <PATH> | <NAME>=<PATH> | JSON with schema {"oft_name":str,"oft_path":str,"pinned":bool}',
+        )
+        parser.add_argument(
+            "--max-ofts-per-batch",
+            type=int,
+            default=8,
+            help="Maximum number of OFT adapters for a running batch, include base-only request.",
+        )
+        parser.add_argument(
+            "--max-loaded-ofts",
+            type=int,
+            default=ServerArgs.max_loaded_ofts,
+            help="If specified, it limits the maximum number of OFT adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-ofts-per-batch`.",
+        )
+        parser.add_argument(
+            "--oft-eviction-policy",
+            type=str,
+            default=ServerArgs.oft_eviction_policy,
+            choices=["lru", "fifo"],
+            help="OFT adapter eviction policy when memory pool is full. 'lru': Least Recently Used (default, better cache efficiency). 'fifo': First-In-First-Out.",
+        )
+        parser.add_argument(
+            "--oft-backend",
+            type=str,
+            choices=OFT_BACKEND_CHOICES,
+            default=ServerArgs.oft_backend,
+            help="Choose the kernel backend for multi-OFT serving.",
+        )
+        parser.add_argument(
+            "--oft-dtype",
+            type=str,
+            choices=["auto", "model", "float32", "fp32", "bfloat16", "bf16", "float16", "fp16"],
+            default=ServerArgs.oft_dtype,
+            help="Dtype for precomputed OFT rotation buffers. Defaults to the model dtype.",
+        )
+        parser.add_argument(
+            "--oft-parity-mode",
+            action="store_true",
+            default=ServerArgs.oft_parity_mode,
+            help=(
+                "Dequantize FP8/INT4/NVFP4 base weights to the activation "
+                "dtype and run a bf16 F.linear on OFT-wrapped layers, matching "
+                "Megatron-Bridge's `_forward_{fp8,int4}` / NVFP4 training "
+                "graph. Hurts throughput on OFT layers; intended for RL "
+                "debugging / train-infer logprob parity."
+            ),
+        )
+        parser.add_argument(
+            "--max-oft-chunk-size",
+            type=int,
+            default=ServerArgs.max_oft_chunk_size,
+            choices=[16, 32, 64, 128],
+            help="Maximum chunk size for the OFT backend. Choosing a larger value might improve performance.",
+        )
+
         # Kernel backend
         parser.add_argument(
             "--attention-backend",
@@ -4690,6 +4866,11 @@ class ServerArgs:
             help="Save model weights (both main model and draft model, if any) to CPU memory during release_weights_occupation and resume_weights_occupation",
         )
         parser.add_argument(
+            "--enable-adapter-cpu-backup",
+            action="store_true",
+            help="Save PEFT adapter buffers to CPU memory during release_weights_occupation and resume_weights_occupation. Requires --enable-weights-cpu-backup.",
+        )
+        parser.add_argument(
             "--enable-draft-weights-cpu-backup",
             action="store_true",
             help="Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
@@ -4755,6 +4936,19 @@ class ServerArgs:
             "--enable-deterministic-inference",
             action="store_true",
             help="Enable deterministic inference mode with batch invariant ops.",
+        )
+        parser.add_argument(
+            "--moe-megatron-weighted-swiglu",
+            action="store_true",
+            help="Match Megatron Core's `weighted_bias_swiglu_impl`: place "
+            "router-weight multiply after activation and fuse silu(g)*u*w "
+            "in fp32 before bf16 cast. Bit-identical train-rollout MoE.",
+        )
+        parser.add_argument(
+            "--moe-router-force-fp32",
+            action="store_true",
+            help="Compute MoE router gate matmul in fp32 to match Megatron Core's "
+            "`--moe-router-dtype fp32`. Bit-identical train-rollout topk weights.",
         )
         parser.add_argument(
             "--rl-on-policy-target",
@@ -5146,21 +5340,28 @@ class ServerArgs:
 
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
+        if self.enable_adapter_cpu_backup and not self.enable_weights_cpu_backup:
+            raise ValueError(
+                "--enable-adapter-cpu-backup requires --enable-weights-cpu-backup"
+            )
 
         assert self.moe_dense_tp_size in {
             1,
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
 
-        # Check served model name to not have colon as it is reserved for LoRA adapter syntax
+        # Check served model name to not have colon as it is reserved for LoRA/OFT adapter syntax
         assert ":" not in self.served_model_name, (
             "served_model_name cannot contain a colon (':') character. "
-            "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
+            "The colon is reserved for the 'model:adapter' syntax used in LoRA/OFT adapter specification. "
             f"Invalid value: '{self.served_model_name}'"
         )
 
         # Check LoRA
         self.check_lora_server_args()
+
+        # Check OFT
+        self.check_oft_server_args()
 
         # torch 2.9.1 has compatibility issues with cuDNN 9.14 and below,
         # causing extremely slow nn.Conv3d performance.
@@ -5423,6 +5624,125 @@ class ServerArgs:
                     16 <= self.max_lora_chunk_size <= 128
                     and (self.max_lora_chunk_size & (self.max_lora_chunk_size - 1)) == 0
                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
+
+    def check_oft_server_args(self):
+        assert self.max_ofts_per_batch > 0, "max_ofts_per_batch must be positive"
+
+        # Enable OFT if any OFT paths are provided for backward compatibility.
+        if self.oft_paths:
+            if self.enable_oft is None:
+                self.enable_oft = True
+                logger.warning(
+                    "--enable-oft is set to True because --oft-paths is provided."
+                )
+            elif self.enable_oft is False:
+                logger.warning(
+                    "--enable-oft is set to False, any provided oft_paths will be ignored."
+                )
+
+        if self.enable_oft:
+            if self.enable_oft_overlap_loading is None:
+                self.enable_oft_overlap_loading = False
+
+            if self.enable_oft_overlap_loading:
+                # TODO: use some sort of buffer with eviction instead of enforcing a limit
+                max_loaded_ofts_limit = self.max_ofts_per_batch * 2
+                assert (
+                    self.max_loaded_ofts is not None
+                    and self.max_loaded_ofts <= max_loaded_ofts_limit
+                ), (
+                    "Enabling OFT overlap loading requires pinning OFT adapter weights in CPU memory, "
+                    f"so --max-loaded-ofts must be less than or equal to double --max-ofts-per-batch: {max_loaded_ofts_limit}"
+                )
+
+            # Validate compatibility with speculative decoding
+            if self.speculative_algorithm not in ["NGRAM", None]:
+                raise ValueError(
+                    "Currently OFT is only compatible with NGRAM speculative decoding."
+                )
+
+            # Parse oft_paths
+            if isinstance(self.oft_paths, list):
+                oft_paths = self.oft_paths
+                self.oft_paths = []
+                for oft_path in oft_paths:
+                    if isinstance(oft_path, str):
+                        if "=" in oft_path:
+                            name, path = oft_path.split("=", 1)
+                            oft_ref = OFTRef(
+                                oft_name=name, oft_path=path, pinned=False
+                            )
+                        else:
+                            oft_ref = OFTRef(
+                                oft_name=oft_path, oft_path=oft_path, pinned=False
+                            )
+                    elif isinstance(oft_path, dict):
+                        assert (
+                            "oft_name" in oft_path and "oft_path" in oft_path
+                        ), f"When providing OFT paths as a list of dict, each dict should contain 'oft_name' and 'oft_path' keys. Got: {oft_path}"
+                        oft_ref = OFTRef(
+                            oft_name=oft_path["oft_name"],
+                            oft_path=oft_path["oft_path"],
+                            pinned=oft_path.get("pinned", False),
+                        )
+                    else:
+                        raise ValueError(
+                            f"Invalid type for item in --oft-paths list: {type(oft_path)}. "
+                            "Expected a string or a dictionary."
+                        )
+                    self.oft_paths.append(oft_ref)
+            elif isinstance(self.oft_paths, dict):
+                self.oft_paths = [
+                    OFTRef(oft_name=k, oft_path=v, pinned=False)
+                    for k, v in self.oft_paths.items()
+                ]
+            elif self.oft_paths is None:
+                self.oft_paths = []
+            else:
+                raise ValueError(
+                    f"Invalid type for --oft-paths: {type(self.oft_paths)}. "
+                    "Expected a list or a dictionary."
+                )
+
+            # Expand target modules
+            if self.oft_target_modules:
+                self.oft_target_modules = set(self.oft_target_modules)
+                if "all" in self.oft_target_modules:
+                    assert (
+                        len(self.oft_target_modules) == 1
+                    ), "If 'all' is specified in --oft-target-modules, it should be the only module specified."
+                    self.oft_target_modules = set(SUPPORTED_OFT_TARGET_MODULES)
+
+                    # OFT currently only supports torch_native backend,
+                    # which does not support embedding / lm_head layers yet.
+                    logger.warning(
+                        "OFT backend does not yet support embedding or lm_head layers; "
+                        "dropping 'embed_tokens' and 'lm_head' from --oft-target-modules=all."
+                    )
+                    self.oft_target_modules.discard("embed_tokens")
+                    self.oft_target_modules.discard("lm_head")
+
+            # Ensure sufficient information is provided for OFT initialization.
+            assert self.oft_paths or (
+                self.max_oft_block_size and self.oft_target_modules
+            ), "When no initial --oft-paths is provided, you need to specify both --max-oft-block-size and --oft-target-modules for OFT initialization."
+
+            # Validate max_loaded_ofts
+            if self.max_loaded_ofts is not None:
+                assert self.max_loaded_ofts >= self.max_ofts_per_batch, (
+                    "max_loaded_ofts should be greater than or equal to max_ofts_per_batch. "
+                    f"max_loaded_ofts={self.max_loaded_ofts}, max_ofts_per_batch={self.max_ofts_per_batch}"
+                )
+                assert len(self.oft_paths) <= self.max_loaded_ofts, (
+                    "The number of OFT paths should not exceed max_loaded_ofts. "
+                    f"max_loaded_ofts={self.max_loaded_ofts}, oft_paths={len(self.oft_paths)}"
+                )
+
+            if self.max_oft_chunk_size is not None:
+                assert (
+                    16 <= self.max_oft_chunk_size <= 128
+                    and (self.max_oft_chunk_size & (self.max_oft_chunk_size - 1)) == 0
+                ), "--max-oft-chunk-size must be a power of 2 between 16 and 128."
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
@@ -5720,6 +6040,26 @@ class LoRAPathAction(argparse.Action):
                     lora_paths.append(lora_path)
 
         setattr(namespace, self.dest, lora_paths)
+
+
+class OFTPathAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        oft_paths = []
+        if values:
+            assert isinstance(values, list), "Expected a list of OFT paths."
+            for oft_path in values:
+                oft_path = oft_path.strip()
+                if oft_path.startswith("{") and oft_path.endswith("}"):
+                    obj = json.loads(oft_path)
+                    assert "oft_path" in obj and "oft_name" in obj, (
+                        f"{repr(oft_path)} looks like a JSON str, "
+                        "but it does not contain 'oft_name' and 'oft_path' keys."
+                    )
+                    oft_paths.append(obj)
+                else:
+                    oft_paths.append(oft_path)
+
+        setattr(namespace, self.dest, oft_paths)
 
 
 def print_deprecated_warning(message: str):

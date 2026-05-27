@@ -48,16 +48,23 @@ class _RoutedExpertsDeviceCache:
             dtype=torch.int32,
             device=device,
         )
+        self.capture_is_dp_local = None
         self._finalize_allocation_log()
 
     def get_buffer_size_bytes(self):
         assert hasattr(self, "buffer")
         return get_tensor_size_bytes(self.buffer)
 
-    def capture_fwd_routed_experts(self, layer_id: int, topk_ids: torch.Tensor):
+    def capture_fwd_routed_experts(
+        self, layer_id: int, topk_ids: torch.Tensor, dp_local: bool = False
+    ):
         assert layer_id is not None, "capturing routing experts but get layer_id None"
         batch, _ = topk_ids.shape
         self.buffer[:batch, layer_id, :] = topk_ids
+        if self.capture_is_dp_local is None:
+            self.capture_is_dp_local = dp_local
+        elif self.capture_is_dp_local != dp_local:
+            raise RuntimeError("Mixed routed-expert capture layouts in one forward pass.")
 
     def _finalize_allocation_log(self):
         """Common logging and memory usage computation for captured experts buffers."""
@@ -131,7 +138,10 @@ class RoutedExpertsCapturer(ABC):
     ):
         raise NotImplementedError
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor):
+    def capture(self, layer_id: int, topk_ids: torch.Tensor, dp_local: bool = False):
+        raise NotImplementedError
+
+    def is_enabled(self):
         raise NotImplementedError
 
     def get_routed_experts(
@@ -195,6 +205,9 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 local_end_pos = local_start_pos + local_num_tokens
             else:
                 local_end_pos = local_start_pos + local_num_tokens
+            if self.device_cache.capture_is_dp_local:
+                local_start_pos = 0
+                local_end_pos = local_num_tokens
         else:
             local_start_pos = 0
             local_end_pos = forward_batch.out_cache_loc.shape[0]
@@ -205,8 +218,11 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             local_start_pos:local_end_pos, :, : self.num_experts_per_tok
         ].cpu()
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor):
-        self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
+    def capture(self, layer_id: int, topk_ids: torch.Tensor, dp_local: bool = False):
+        self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids, dp_local)
+
+    def is_enabled(self):
+        return True
 
     def get_routed_experts(
         self,
@@ -245,8 +261,11 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     ):
         pass
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor):
+    def capture(self, layer_id: int, topk_ids: torch.Tensor, dp_local: bool = False):
         pass
+
+    def is_enabled(self):
+        return False
 
     def get_routed_experts(
         self,

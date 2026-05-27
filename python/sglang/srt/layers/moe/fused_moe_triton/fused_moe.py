@@ -38,6 +38,23 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 _is_hip = is_hip()
+
+
+# Bit-identical match to Megatron-Bridge `weighted_bias_swiglu_impl`
+# (megatron/core/fusions/fused_bias_swiglu.py:44, weighted_swiglu).
+# Same source body + same @torch.compile decorator → Inductor produces the
+# same fused kernel on both sides → bit-identical outputs (verified
+# max=0, mean=0 across bf16/fp32 weights and bf16/fp8-quant inputs).
+# Decoupling note: a verbatim eager all-fp32 chain produces max 9.8e-4
+# residual vs the compiled function. For exact RL train/rollout parity,
+# use this compiled function — not an approximation.
+@torch.compile
+def _megatron_compiled_weighted_swiglu(y: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    dtype = y.dtype
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    swiglu_out = F.silu(y_1) * y_2
+    res = swiglu_out * weights
+    return res.to(dtype)
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -88,6 +105,7 @@ def inplace_fused_experts(
     activation: str = "silu",
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
+    apply_router_weight_after_activation: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -134,6 +152,7 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
+        apply_router_weight_after_activation=apply_router_weight_after_activation,
     )
 
 
@@ -149,6 +168,7 @@ def outplace_fused_experts(
     activation: str = "silu",
     is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
+    apply_router_weight_after_activation: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -196,6 +216,7 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
+        apply_router_weight_after_activation=apply_router_weight_after_activation,
     )
 
 
@@ -238,6 +259,7 @@ def fused_experts(
             moe_runner_config.activation,
             moe_runner_config.is_gated,
             moe_runner_config.apply_router_weight_on_input,
+            moe_runner_config.apply_router_weight_after_activation,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -268,6 +290,7 @@ def fused_experts(
             moe_runner_config.activation,
             moe_runner_config.is_gated,
             moe_runner_config.apply_router_weight_on_input,
+            moe_runner_config.apply_router_weight_after_activation,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -347,6 +370,7 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    apply_router_weight_after_activation: bool = False,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -498,7 +522,23 @@ def fused_experts_impl(
         )
 
         # Activation function with multiplication
-        if activation == "silu" and is_gated:
+        if (
+            activation == "silu"
+            and is_gated
+            and apply_router_weight_after_activation
+            and gemm1_alpha is None
+            and gemm1_limit is None
+        ):
+            # Bit-identical to Megatron Core's `weighted_bias_swiglu_impl`:
+            # invoke a @torch.compile-decorated function with the same source
+            # body. Inductor then produces the same Triton kernel as Megatron's
+            # train-side jit_fuser (verified max=0 vs the compiled reference).
+            ic1_view = intermediate_cache1.view(-1, N)
+            flat_weights = curr_topk_weights.reshape(-1).unsqueeze(-1)
+            intermediate_cache2 = _megatron_compiled_weighted_swiglu(
+                ic1_view, flat_weights
+            )
+        elif activation == "silu" and is_gated:
             # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
             # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
             if gemm1_alpha is not None:
@@ -586,7 +626,8 @@ def fused_experts_impl(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            not apply_router_weight_on_input,
+            not apply_router_weight_on_input
+            and not apply_router_weight_after_activation,
             1,
             down_config or config,
             compute_type=compute_type,

@@ -112,6 +112,22 @@ class LoRARegistry:
 
         return lora_ref.lora_id
 
+    async def replace(self, lora_ref: LoRARef) -> Optional[str]:
+        """Atomically route future acquires for lora_ref.lora_name to a new LoRARef.
+
+        Returns the old LoRA ID if the public name was already active, or None.
+        The old counter is intentionally kept so in-flight requests can release
+        their reference. The caller is responsible for invoking
+        ``wait_for_unload(old_id)`` once in-flight requests drain, to free the
+        counter; otherwise the old id's counter leaks indefinitely.
+        """
+        async with self._registry_lock.writer_lock:
+            old_ref = self._registry.get(lora_ref.lora_name)
+            if old_ref is not None:
+                del self._registry[lora_ref.lora_name]
+            self._register_adapter(lora_ref)
+            return old_ref.lora_id if old_ref is not None else None
+
     async def acquire(self, lora_name: Union[str, List[str]]) -> Union[str, List[str]]:
         """
         Queries registry for LoRA IDs based on LoRA names and start tracking the usage of the corresponding LoRA adapters

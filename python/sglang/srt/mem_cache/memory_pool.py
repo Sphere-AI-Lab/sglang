@@ -694,6 +694,87 @@ class KVCache(abc.ABC):
         return self.custom_mem_pool
 
 
+class DeepSeekV4TokenToKVPool(KVCache):
+    """Logical token pool for DeepSeek V4.
+
+    DeepSeek V4's stateful attention path stores real HCA/CSA state in
+    model-owned buffers on each ``DeepSeekV4Attention`` layer. SGLang still
+    needs a token-to-slot allocator for scheduling and request bookkeeping,
+    but there are no generic K/V payload tensors to allocate here.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+        if enable_memory_saver:
+            logger.info(
+                "DeepSeek V4 token-to-KV pool is logical only; model-owned "
+                "HCA/CSA state follows the weights memory-saver region."
+            )
+        self._finalize_allocation_log(size)
+
+    @staticmethod
+    def _payload_error() -> NotImplementedError:
+        return NotImplementedError(
+            "DeepSeek V4 uses model-owned HCA/CSA state buffers; "
+            "DeepSeekV4TokenToKVPool is logical token-slot bookkeeping only."
+        )
+
+    def get_kv_size_bytes(self):
+        return 0
+
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        raise self._payload_error()
+
+    def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        raise self._payload_error()
+
+    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        raise self._payload_error()
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ) -> None:
+        raise self._payload_error()
+
+    def get_contiguous_buf_infos(self):
+        raise self._payload_error()
+
+    def get_cpu_copy(self, indices):
+        raise self._payload_error()
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        raise self._payload_error()
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        return
+
+
+DSV4TokenToKVPool = DeepSeekV4TokenToKVPool
+
+
 class MHATokenToKVPool(KVCache):
 
     def __init__(

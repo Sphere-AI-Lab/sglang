@@ -164,6 +164,10 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.oft.utils import assert_canonical_split_supported
+
+        assert_canonical_split_supported(type(self).__name__)
+
         # From packed to weight
         layer.w13_weight = torch.nn.Parameter(
             layer.w13_weight_packed.data, requires_grad=False

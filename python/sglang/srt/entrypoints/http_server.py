@@ -98,6 +98,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActivateAdapterVersionReqInput,
     AttachHiCacheStorageReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
@@ -112,6 +113,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    LoadOFTAdapterFromTensorsReqInput,
+    LoadOFTAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
@@ -123,7 +126,9 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UnloadOFTAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateAdapterFromDistributedReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -139,6 +144,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     write_data_for_multi_tokenizer,
 )
 from sglang.srt.managers.template_manager import TemplateManager
+from sglang.srt.managers.tokenizer_communicator_mixin import InactiveSlotBusyError
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -560,11 +566,11 @@ async def model_info():
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        "adapter_version": _global_state.tokenizer_manager.server_args.weight_version,
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
         # "hf_config": model_config.hf_config.to_dict(),
     }
     return result
@@ -1067,6 +1073,78 @@ async def update_weights_from_distributed(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
+@app.post("/update_adapter_from_distributed")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_adapter_from_distributed(
+    obj: UpdateAdapterFromDistributedReqInput, request: Request
+):
+    """Update PEFT adapter weights via NCCL broadcast (mirror of
+    /update_weights_from_distributed for adapters)."""
+    try:
+        success, message = (
+            await _global_state.tokenizer_manager.update_adapter_from_distributed(
+                obj, request
+            )
+        )
+    except InactiveSlotBusyError as e:
+        # Spec §9: surface a structured 200-OK so Orbit's NCCL backend can map
+        # this into a friendly retire-busy diagnostic instead of a generic 500.
+        content = {
+            "success": False,
+            "error": "inactive_slot_busy",
+            "message": str(e),
+            "in_flight_requests_on_retiring_slot": e.in_flight,
+            "adapter_version": obj.adapter_version,
+            "weight_version": obj.weight_version,
+            "staged_adapter_version": None,
+            "active_adapter_version": _global_state.tokenizer_manager.server_args.weight_version,
+        }
+        return ORJSONResponse(content, status_code=200)
+
+    active_version = _global_state.tokenizer_manager.server_args.weight_version
+    content = {
+        "success": success,
+        "message": message,
+        "adapter_version": obj.adapter_version,
+        "weight_version": obj.weight_version,
+        "staged_adapter_version": obj.adapter_version,
+        "active_adapter_version": active_version if obj.double_buffer else obj.adapter_version,
+    }
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/activate_adapter_version")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def activate_adapter_version(
+    obj: ActivateAdapterVersionReqInput, request: Request
+):
+    """Activate a previously staged double-buffered adapter version.
+
+    Atomically re-points the public adapter alias at the staged slot and
+    schedules retirement of the previous slot's id. Pairs with
+    /update_adapter_from_distributed when ``double_buffer=True``.
+    """
+    success, message = await _global_state.tokenizer_manager.activate_adapter_version(
+        obj, request
+    )
+    content = {
+        "success": success,
+        "message": message,
+        "adapter_version": obj.adapter_version,
+        "weight_version": obj.weight_version,
+        "active_adapter_version": (
+            obj.adapter_version
+            if success
+            else _global_state.tokenizer_manager.server_args.weight_version
+        ),
+    }
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
 @app.post("/update_weights_from_ipc")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Request):
@@ -1226,6 +1304,45 @@ async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
             result,
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
+
+@app.api_route("/load_oft_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def load_oft_adapter(obj: LoadOFTAdapterReqInput, request: Request):
+    """Load a new OFT adapter without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_oft_adapter(obj, request)
+
+    if result.success:
+        return ORJSONResponse(result, status_code=HTTPStatus.OK)
+    else:
+        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.api_route("/load_oft_adapter_from_tensors", methods=["POST"])
+async def load_oft_adapter_from_tensors(
+    obj: LoadOFTAdapterFromTensorsReqInput, request: Request
+):
+    """Load a new OFT adapter from tensors without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_oft_adapter_from_tensors(
+        obj, request
+    )
+
+    if result.success:
+        return ORJSONResponse(result, status_code=HTTPStatus.OK)
+    else:
+        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.api_route("/unload_oft_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def unload_oft_adapter(obj: UnloadOFTAdapterReqInput, request: Request):
+    """Unload an OFT adapter without re-launching the server."""
+    result = await _global_state.tokenizer_manager.unload_oft_adapter(obj, request)
+
+    if result.success:
+        return ORJSONResponse(result, status_code=HTTPStatus.OK)
+    else:
+        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])

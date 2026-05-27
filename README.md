@@ -21,6 +21,15 @@
 <a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
 </p>
 
+> **Fork notice -- Sphere AI Lab.** This repository is a fork of
+> [SGLang](https://github.com/sgl-project/sglang) at upstream **`v0.5.9`**,
+> maintained by [Sphere AI Lab](https://github.com/Sphere-AI-Lab). All Sphere AI
+> Lab changes are contained in the single release commit on top of the upstream
+> base (see `git log` and [`NOTICE`](./NOTICE)). This fork is pinned for use with
+> [Orbit](https://github.com/Sphere-AI-Lab/orbit) and is not an official SGLang
+> release; for upstream usage, documentation, and support, see the upstream
+> project.
+
 ## News
 - [2026/01] 🔥 SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
 - [2025/12] SGLang provides day-0 support for latest open models ([MiMo-V2-Flash](https://lmsys.org/blog/2025-12-16-mimo-v2-flash/), [Nemotron 3 Nano](https://lmsys.org/blog/2025-12-15-run-nvidia-nemotron-3-nano/), [Mistral Large 3](https://github.com/sgl-project/sglang/pull/14213), [LLaDA 2.0 Diffusion LLM](https://lmsys.org/blog/2025-12-19-diffusion-llm/), [MiniMax M2](https://lmsys.org/blog/2025-11-04-miminmax-m2/)).

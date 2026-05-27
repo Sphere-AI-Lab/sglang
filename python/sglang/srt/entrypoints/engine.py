@@ -50,6 +50,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    LoadOFTAdapterFromTensorsReqInput,
+    LoadOFTAdapterReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -57,6 +59,7 @@ from sglang.srt.managers.io_struct import (
     RpcReqInput,
     RpcReqOutput,
     UnloadLoRAAdapterReqInput,
+    UnloadOFTAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -225,6 +228,7 @@ class Engine(EngineBase):
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
+        oft_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
@@ -264,6 +268,7 @@ class Engine(EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            oft_path=oft_path,
             custom_logit_processor=custom_logit_processor,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
@@ -317,6 +322,7 @@ class Engine(EngineBase):
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
+        oft_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
@@ -358,6 +364,7 @@ class Engine(EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            oft_path=oft_path,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             stream=stream,
@@ -569,6 +576,10 @@ class Engine(EngineBase):
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
         load_format: Optional[str] = None,
+        *,
+        adapter_config: Optional[dict] = None,
+        adapter_name: Optional[str] = None,
+        adapter_id: Optional[str] = None,
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -578,6 +589,9 @@ class Engine(EngineBase):
             group_name=group_name,
             flush_cache=flush_cache,
             load_format=load_format,
+            adapter_config=adapter_config,
+            adapter_name=adapter_name,
+            adapter_id=adapter_id,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
@@ -684,6 +698,43 @@ class Engine(EngineBase):
 
         return self.loop.run_until_complete(
             self.tokenizer_manager.unload_lora_adapter(obj, None)
+        )
+
+    def load_oft_adapter_from_tensors(
+        self, oft_name: str, tensors: List[Tuple[str, torch.Tensor]], config_dict: Dict
+    ):
+        serialized_tensors = MultiprocessingSerializer.serialize(
+            tensors, output_str=True
+        )
+        oft_req = LoadOFTAdapterFromTensorsReqInput(
+            oft_name=oft_name,
+            config_dict=config_dict,
+            serialized_tensors=serialized_tensors,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_oft_adapter_from_tensors(oft_req, None)
+        )
+
+    def load_oft_adapter(self, oft_name: str, oft_path: str, pinned: bool = False):
+        """Load a new OFT adapter without re-launching the engine."""
+
+        obj = LoadOFTAdapterReqInput(
+            oft_name=oft_name,
+            oft_path=oft_path,
+            pinned=pinned,
+        )
+
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_oft_adapter(obj, None)
+        )
+
+    def unload_oft_adapter(self, oft_name: str):
+        """Unload an OFT adapter without re-launching the engine."""
+
+        obj = UnloadOFTAdapterReqInput(oft_name=oft_name)
+
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.unload_oft_adapter(obj, None)
         )
 
     def release_memory_occupation(self, tags: Optional[List[str]] = None):

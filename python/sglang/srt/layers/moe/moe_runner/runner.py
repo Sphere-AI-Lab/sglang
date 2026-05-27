@@ -74,7 +74,7 @@ class MoeRunner:
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo
     ) -> CombineInput:
 
-        if self.fused_func is not None:
+        if self.fused_func is not None and not self._has_expert_adapters(quant_info):
             return self.fused_func(dispatch_output, quant_info, self.config)
 
         assert self.runner_core is not None
@@ -105,6 +105,22 @@ class MoeRunner:
         )
 
         return combine_input
+
+    @staticmethod
+    def _has_expert_adapters(quant_info: MoeQuantInfo) -> bool:
+        return any(
+            getattr(quant_info, name, None) is not None
+            for name in (
+                "w13_lora_a",
+                "w13_lora_b",
+                "w2_lora_a",
+                "w2_lora_b",
+                "w13_oft_r",
+                "w1_oft_r",
+                "w3_oft_r",
+                "w2_oft_r",
+            )
+        )
 
     def set_overlap_args(
         self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict

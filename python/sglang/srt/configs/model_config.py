@@ -82,6 +82,17 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+def is_deepseek_v4_model(
+    model_architectures: Optional[List[str]], model_type: Optional[str] = None
+) -> bool:
+    model_architectures = model_architectures or []
+    return (
+        "DeepseekV4ForCausalLM" in model_architectures
+        or "DeepSeekV4ForCausalLM" in model_architectures
+        or str(model_type).lower() in {"deepseek_v4", "deepseek-v4"}
+    )
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -192,6 +203,10 @@ class ModelConfig:
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.is_local_attention_model = is_local_attention_model(
             self.hf_config.architectures
+        )
+        self.is_deepseek_v4 = is_deepseek_v4_model(
+            self.hf_config.architectures,
+            getattr(self.hf_config, "model_type", None),
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 

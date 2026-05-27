@@ -1132,6 +1132,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        from sglang.srt.oft.utils import assert_canonical_split_supported
+
+        assert_canonical_split_supported(type(self).__name__)
+
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
             return
@@ -1547,6 +1551,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.quant_config.weight_block_size,
+                w13_oft_r=getattr(layer, "w13_oft_r", None),
+                w1_oft_r=getattr(layer, "w1_oft_r", None),
+                w3_oft_r=getattr(layer, "w3_oft_r", None),
+                w2_oft_r=getattr(layer, "w2_oft_r", None),
             )
         else:
             raise NotImplementedError(

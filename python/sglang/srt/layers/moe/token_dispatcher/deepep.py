@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
@@ -23,11 +22,9 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     get_deepep_config,
     get_moe_runner_backend,
-    is_tbo_enabled,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
-    is_blackwell,
     is_hip,
     is_npu,
     load_json_config,
@@ -39,7 +36,7 @@ if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 try:
-    from deep_ep import Buffer, Config
+    from deep_ep import ElasticBuffer
 
     if not _is_npu:
         from sglang.srt.layers.quantization.fp8_kernel import (
@@ -135,10 +132,17 @@ class DeepEPDispatchMode(IntEnum):
 
 class DeepEPBuffer:
     _buffer = None
+    _cuda_graph_buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
     _num_experts: Optional[int] = None
+    _num_topk: Optional[int] = None
+    _use_fp8_dispatch: Optional[bool] = None
+
+    @classmethod
+    def mark_current_buffer_as_cuda_graph_owned(cls):
+        cls._cuda_graph_buffer = cls._buffer
 
     @classmethod
     def get_deepep_buffer(
@@ -149,95 +153,97 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
+        num_topk: int = -1,
+        use_fp8_dispatch: bool = False,
     ):
-        if cls._buffer is not None:
+        _ = param_bytes, deepep_mode
+        assert num_max_dispatch_tokens_per_rank != -1
+        assert num_experts != -1
+        assert num_topk != -1
+
+        allow_hybrid_mode = envs.SGLANG_DEEPEP_ALLOW_HYBRID_MODE.get()
+        required_bytes = ElasticBuffer.get_buffer_size_hint(
+            group,
+            num_max_dispatch_tokens_per_rank,
+            hidden_size,
+            num_topk=num_topk,
+            use_fp8_dispatch=use_fp8_dispatch,
+            allow_hybrid_mode=allow_hybrid_mode,
+        )
+        is_cuda_graph_capture = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if (
+            cls._buffer is not None
+            and cls._buffer.group == group
+            and cls._buffer.num_bytes >= required_bytes
+            and cls._hidden_size == hidden_size
+            and cls._num_experts == num_experts
+            and cls._num_topk == num_topk
+            and cls._use_fp8_dispatch == use_fp8_dispatch
+        ):
+            cls._num_max_dispatch_tokens_per_rank = max(
+                cls._num_max_dispatch_tokens_per_rank or 0,
+                num_max_dispatch_tokens_per_rank,
+            )
             return cls._buffer
+
+        old_buffer = cls._buffer
+        if old_buffer is not None and old_buffer is not cls._cuda_graph_buffer:
+            cls._destroy_buffer(old_buffer)
 
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
-
-        num_nvl_bytes, num_rdma_bytes = 0, 0
-        if deepep_mode.enable_normal():
-            hidden_bytes = hidden_size * param_bytes
-            for config in (
-                DeepEPConfig.get_instance().normal_dispatch_config
-                or Buffer.get_dispatch_config(group.size()),
-                DeepEPConfig.get_instance().normal_combine_config
-                or Buffer.get_combine_config(group.size()),
-            ):
-                num_nvl_bytes = max(
-                    config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
-                    num_nvl_bytes,
-                )
-                num_rdma_bytes = max(
-                    config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
-                    num_rdma_bytes,
-                )
-        if deepep_mode.enable_low_latency():
-            assert num_max_dispatch_tokens_per_rank != -1
-            assert num_experts != -1 and num_experts % group.size() == 0
-            num_rdma_bytes = max(
-                Buffer.get_low_latency_rdma_size_hint(
-                    num_max_dispatch_tokens_per_rank,
-                    hidden_size,
-                    group.size(),
-                    num_experts,
-                ),
-                num_rdma_bytes,
-            )
-
-        # We should calculate num_qps_per_rank consistently with DeepEP's test script logic:
-        if deepep_mode == DeepEPMode.NORMAL:
-            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
-            num_qps_per_rank = DeepEPConfig.get_instance().num_sms
-        elif deepep_mode == DeepEPMode.LOW_LATENCY:
-            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
-            num_qps_per_rank = num_experts // group.size()
-        elif deepep_mode == DeepEPMode.AUTO:
-            # low-latency and normal mode all need run
-            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
-            num_qps_per_rank = max(
-                DeepEPConfig.get_instance().num_sms, num_experts // group.size()
-            )
-        else:
-            raise NotImplementedError
-
-        if not _is_npu:
-            total_num_sms = torch.cuda.get_device_properties(
-                device="cuda"
-            ).multi_processor_count
-            if (
-                (deepep_mode != DeepEPMode.LOW_LATENCY)
-                and not is_tbo_enabled()
-                and (DeepEPConfig.get_instance().num_sms < total_num_sms // 2)
-            ):
-                logger.warning(
-                    f"Only use {DeepEPConfig.get_instance().num_sms} SMs for DeepEP communication. "
-                    f"This may result in highly suboptimal performance. "
-                    f"Consider using --deepep-config to change the behavior."
-                )
-
-        cls._buffer = Buffer(
+        cls._num_topk = num_topk
+        cls._use_fp8_dispatch = use_fp8_dispatch
+        cls._buffer = ElasticBuffer(
             group,
-            num_nvl_bytes,
-            num_rdma_bytes,
-            low_latency_mode=deepep_mode.enable_low_latency(),
-            num_qps_per_rank=num_qps_per_rank,
-            # TODO can be false when unneeded
-            allow_mnnvl=True,
+            num_bytes=required_bytes,
+            num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            hidden=hidden_size,
+            num_topk=num_topk,
+            use_fp8_dispatch=use_fp8_dispatch,
+            allow_hybrid_mode=allow_hybrid_mode,
+            num_allocated_qps=0 if allow_hybrid_mode else 17,
+            explicitly_destroy=True,
         )
+        if is_cuda_graph_capture:
+            cls._cuda_graph_buffer = cls._buffer
         return cls._buffer
 
     @classmethod
     def clean_buffer(cls):
-        if not cls._buffer.low_latency_mode:
+        buffers = []
+        for buffer in (cls._buffer, cls._cuda_graph_buffer):
+            if buffer is not None and not any(buffer is item for item in buffers):
+                buffers.append(buffer)
+
+        cls._buffer = None
+        cls._cuda_graph_buffer = None
+        cls._dispatch_mode = None
+        cls._hidden_size = None
+        cls._num_max_dispatch_tokens_per_rank = None
+        cls._num_experts = None
+        cls._num_topk = None
+        cls._use_fp8_dispatch = None
+
+        if not buffers:
             return
-        cls._buffer.clean_low_latency_buffer(
-            cls._num_max_dispatch_tokens_per_rank,
-            cls._hidden_size,
-            cls._num_experts,
-        )
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        for buffer in buffers:
+            cls._destroy_buffer(buffer)
+
+    @staticmethod
+    def _destroy_buffer(buffer):
+        for method_name in ("destroy", "close"):
+            method = getattr(buffer, method_name, None)
+            if callable(method):
+                method()
+                break
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
@@ -268,18 +274,14 @@ class DeepEPConfig(BaseDispatcherConfig):
             config_parsed = load_json_config(config_str)
             if torch.distributed.get_rank() == 0:
                 logger.info(f"Use DeepEP Config: {config_parsed}")
-            config_dispatch = config_parsed["normal_dispatch"]
-            config_combine = config_parsed["normal_combine"]
-
-            self.normal_dispatch_config = Config(**config_dispatch)
-            self.normal_combine_config = Config(**config_combine)
-
-            assert config_dispatch["num_sms"] == config_combine["num_sms"]
-            self.num_sms = config_dispatch["num_sms"]
+            self.num_sms = int(
+                config_parsed.get(
+                    "num_sms",
+                    config_parsed.get("normal_dispatch", {}).get("num_sms", 0),
+                )
+            )
         else:
-            self.normal_dispatch_config = None
-            self.normal_combine_config = None
-            self.num_sms = Buffer.num_sms
+            self.num_sms = 0
 
     @classmethod
     def get_instance(cls):
@@ -299,6 +301,7 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        force_bf16_dispatch: bool = False,
     ):
         if not use_deepep:
             raise ImportError(
@@ -314,15 +317,15 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
+        self.force_bf16_dispatch = force_bf16_dispatch
 
         self.params_bytes = 2
-        # A large value will lead to large memory occupation, thus users should change it accordingly
+        # Minimum DeepEP buffer capacity. DeepEP v2 also requires the runtime
+        # dispatch capacity to cover the actual max local token count across
+        # EP ranks, so _dispatch_core raises this value dynamically.
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
-        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
-        # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
-        assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.handle = None
 
@@ -352,7 +355,11 @@ class _DeepEPDispatcherImplBase:
     def combine_b(self, *args, **kwargs):
         raise NotImplementedError
 
-    def _get_buffer(self):
+    def _get_buffer(
+        self,
+        num_max_dispatch_tokens_per_rank: Optional[int] = None,
+        use_fp8_dispatch: bool = False,
+    ):
         raise NotImplementedError
 
     def set_quant_config(self, quant_config: dict) -> None:
@@ -367,6 +374,17 @@ class _DeepEPDispatcherImplBase:
     def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
+
+    def _get_num_max_tokens_per_rank(
+        self,
+        num_tokens: int,
+        device: torch.device,
+    ) -> int:
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            return max(self.num_max_dispatch_tokens_per_rank, num_tokens)
+        local = torch.tensor([num_tokens], device=device, dtype=torch.int32)
+        dist.all_reduce(local, op=dist.ReduceOp.MAX, group=self.group)
+        return max(self.num_max_dispatch_tokens_per_rank, int(local.item()))
 
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
@@ -388,6 +406,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and not get_moe_runner_backend().is_cutlass()
             and not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            and not self.force_bf16_dispatch
         ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
@@ -397,7 +416,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
-        previous_event = Buffer.capture() if self.async_finish else None
+        previous_event = ElasticBuffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_ids, topk_weights, previous_event):
@@ -430,19 +449,16 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         previous_event,
     ):
-        buffer = self._get_buffer()
-        (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-            is_token_in_rank,
-            previous_event,
-        ) = buffer.get_dispatch_layout(
-            topk_ids,
-            self.num_experts,
-            previous_event=previous_event,
-            async_finish=self.async_finish,
-            allocate_on_comm_stream=previous_event is not None,
+        use_fp8_dispatch = isinstance(x, tuple)
+        local_x = x[0] if use_fp8_dispatch else x
+        num_max_dispatch_tokens_per_rank = self._get_num_max_tokens_per_rank(
+            local_x.shape[0],
+            local_x.device,
+        )
+        is_cuda_graph_capture = torch.cuda.is_current_stream_capturing()
+        buffer = self._get_buffer(
+            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            use_fp8_dispatch=use_fp8_dispatch,
         )
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
@@ -452,29 +468,45 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             recv_x,
             recv_topk_ids,
             recv_topk_weights,
-            num_recv_tokens_per_expert,
             self.handle,
             event,
         ) = buffer.dispatch(
             x,
             topk_idx=topk_ids,
-            topk_weights=topk_weights,
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            is_token_in_rank=is_token_in_rank,
-            num_tokens_per_expert=num_tokens_per_expert,
+            topk_weights=topk_weights.float(),
+            num_experts=self.num_experts,
+            num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
             previous_event=previous_event,
-            async_finish=self.async_finish,
+            async_with_compute_stream=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
-            config=DeepEPConfig.get_instance().normal_dispatch_config,
+            num_sms=DeepEPConfig.get_instance().num_sms,
+            do_cpu_sync=not is_cuda_graph_capture,
         )
-        get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
-            num_recv_tokens_per_expert,
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            num_tokens_per_expert=num_tokens_per_expert,
-        )
+        if is_cuda_graph_capture:
+            num_valid_recv_tokens = self.handle.psum_num_recv_tokens_per_scaleup_rank[
+                -1
+            ]
+            row_ids = torch.arange(
+                recv_topk_ids.shape[0],
+                device=recv_topk_ids.device,
+                dtype=torch.int32,
+            )
+            valid_recv_mask = row_ids < num_valid_recv_tokens.to(torch.int32)
+            recv_topk_ids = recv_topk_ids.masked_fill(
+                ~valid_recv_mask[:, None], -1
+            )
+            recv_topk_weights = recv_topk_weights.masked_fill(
+                ~valid_recv_mask[:, None], 0.0
+            )
+        num_recv_tokens_per_expert = self.handle.num_recv_tokens_per_expert_list
+        if not is_cuda_graph_capture:
+            get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
+                num_recv_tokens_per_expert,
+                num_tokens_per_rank=None,
+                num_tokens_per_rdma_rank=None,
+                num_tokens_per_expert=None,
+            )
 
         return (
             recv_x,
@@ -496,7 +528,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         else:
             raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
 
-        previous_event = Buffer.capture() if self.async_finish else None
+        previous_event = ElasticBuffer.capture() if self.async_finish else None
         return output, previous_event
 
     def combine_b(self, output, previous_event):
@@ -507,216 +539,37 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return hidden_states
 
     def _combine_core(self, x: torch.Tensor, previous_event):
-        buffer = self._get_buffer()
+        buffer = self._get_buffer(
+            num_max_dispatch_tokens_per_rank=self.handle.num_max_tokens_per_rank,
+        )
         combined_x, _, event = buffer.combine(
             x,
             self.handle,
-            async_finish=self.async_finish,
+            async_with_compute_stream=self.async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
-            config=DeepEPConfig.get_instance().normal_combine_config,
+            num_sms=DeepEPConfig.get_instance().num_sms,
         )
         return combined_x, event
 
-    def _get_buffer(self):
+    def _get_buffer(
+        self,
+        num_max_dispatch_tokens_per_rank: Optional[int] = None,
+        use_fp8_dispatch: bool = False,
+    ):
         DeepEPBuffer.set_dispatch_mode_as_normal()
+        if num_max_dispatch_tokens_per_rank is None:
+            num_max_dispatch_tokens_per_rank = self.num_max_dispatch_tokens_per_rank
 
         return DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
             self.params_bytes,
             self.deepep_mode,
-            self.num_max_dispatch_tokens_per_rank,
+            num_max_dispatch_tokens_per_rank,
             self.num_experts,
-        )
-
-
-class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
-    def __init__(self, return_recv_hook: bool, **kwargs):
-        super().__init__(**kwargs)
-
-        """
-        num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
-        https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
-        """
-        self.return_recv_hook = return_recv_hook
-        self.device_module = torch.get_device_module()
-        self.quant_config = {}
-
-    def dispatch_a(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-    ):
-        buffer = self._get_buffer()
-        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
-        expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
-            + self.num_experts
-        ) // self.num_experts
-        hidden_states, masked_m, event, hook = self._dispatch_core(
-            hidden_states,
-            topk_ids,
-        )
-        return (
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            masked_m,
-            expected_m,
-            event,
-            hook,
-        )
-
-    def dispatch_b(
-        self,
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        masked_m,
-        expected_m,
-        event,
-        hook,
-    ):
-        hook() if self.return_recv_hook else event.current_stream_wait()
-
-        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            masked_m
-        )
-
-        if isinstance(hidden_states, tuple):
-            hidden_states, hidden_states_scale = hidden_states
-        else:
-            hidden_states_scale = None
-
-        deepep_output = DeepEPLLDispatchOutput(
-            hidden_states,
-            hidden_states_scale,
-            topk_ids,
-            topk_weights,
-            masked_m,
-            expected_m,
-        )
-        return deepep_output
-
-    def _dispatch_core(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ):
-        use_nvfp4 = use_fp8 = False
-        input_global_scale = self.quant_config.get("input_global_scale", None)
-        if input_global_scale is not None:
-            use_nvfp4 = True
-        elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
-            use_fp8 = True
-
-        buffer = self._get_buffer()
-        packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
-            buffer.low_latency_dispatch(
-                hidden_states,
-                topk_ids,
-                self.num_max_dispatch_tokens_per_rank,
-                self.num_experts,
-                use_fp8=use_fp8,
-                **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
-                **(
-                    dict(x_global_scale=input_global_scale)
-                    if input_global_scale is not None
-                    else dict()
-                ),
-                async_finish=not self.return_recv_hook,
-                return_recv_hook=self.return_recv_hook,
-                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-            )
-        )
-        return packed_recv_hidden, self.packed_recv_count, event, hook
-
-    def combine_a(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ):
-        hidden_states, event, hook = self._combine_core(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-        )
-        return hidden_states, event, hook
-
-    def combine_b(self, hidden_states, event, hook):
-        overlap_args = self.overlap_args
-        if overlap_args is not None:
-            overlap_args.stream.wait_stream(self.device_module.current_stream())
-
-        hook() if self.return_recv_hook else event.current_stream_wait()
-
-        if overlap_args is not None:
-            self.device_module.current_stream().wait_stream(overlap_args.stream)
-
-        return hidden_states
-
-    def _combine_core(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ):
-        buffer = self._get_buffer()
-        overlap_args = self.overlap_args
-        meta_overlap_args = self.meta_overlap_args
-
-        ctx = nullcontext()
-        if overlap_args is not None:
-            overlap_args.stream.wait_event(overlap_args.wait_event)
-            ctx = torch.cuda.stream(overlap_args.stream)
-
-            if is_blackwell():
-                overlap_args_dict = dict(
-                    overlap=overlap_args.overlap,
-                    src_signals=overlap_args.signal,
-                    src_signal_expect_value=overlap_args.threshold,
-                )
-            else:
-                overlap_args_dict = dict(
-                    overlap=overlap_args.overlap,
-                    packed_recv_count=self.packed_recv_count,
-                    comp_signal=overlap_args.signal,
-                    block_m=meta_overlap_args["block_m"],
-                    threshold=meta_overlap_args["threshold"],
-                    num_sms=overlap_args.num_sms,
-                )
-        else:
-            overlap_args_dict = {}
-
-        with ctx:
-            combined_hidden_states, event, hook = buffer.low_latency_combine(
-                x=hidden_states,
-                topk_idx=topk_ids,
-                topk_weights=topk_weights,
-                handle=self.handle,
-                async_finish=not self.return_recv_hook,
-                return_recv_hook=self.return_recv_hook,
-                **overlap_args_dict,
-            )
-
-        self.packed_recv_count = self.handle = None
-        return combined_hidden_states, event, hook
-
-    def _get_buffer(self):
-        DeepEPBuffer.set_dispatch_mode_as_low_latency()
-        return DeepEPBuffer.get_deepep_buffer(
-            self.group,
-            self.hidden_size,
-            self.params_bytes,
-            self.deepep_mode,
-            self.num_max_dispatch_tokens_per_rank,
-            self.num_experts,
+            self.router_topk,
+            use_fp8_dispatch=use_fp8_dispatch,
         )
 
 
@@ -741,6 +594,7 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        force_bf16_dispatch: bool = False,
     ):
         super().__init__()
 
@@ -755,18 +609,14 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            force_bf16_dispatch=force_bf16_dispatch,
         )
 
-        if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
-                return_recv_hook=return_recv_hook,
-                **common_kwargs,
-            )
-        if self.deepep_mode.enable_normal():
-            self._normal_dispatcher = _DeepEPDispatcherImplNormal(
-                async_finish=async_finish,
-                **common_kwargs,
-            )
+        self._normal_dispatcher = _DeepEPDispatcherImplNormal(
+            async_finish=async_finish,
+            **common_kwargs,
+        )
+        self._low_latency_dispatcher = None
 
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
@@ -830,10 +680,10 @@ class DeepEPDispatcher(BaseDispatcher):
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
-        if resolved_deepep_mode == DeepEPMode.NORMAL:
+        if resolved_deepep_mode in (DeepEPMode.NORMAL, DeepEPMode.LOW_LATENCY):
+            # DeepEP v2 exposes one ElasticBuffer dispatch/combine API. Keep the
+            # scheduler mode decision, but use the v2 normal-format path for both.
             return self._normal_dispatcher
-        elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
-            return self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
@@ -843,30 +693,19 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def set_quant_config(self, quant_config: dict):
         super().set_quant_config(quant_config)
-        if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher.set_quant_config(quant_config)
-        if self.deepep_mode.enable_normal():
-            self._normal_dispatcher.set_quant_config(quant_config)
+        self._normal_dispatcher.set_quant_config(quant_config)
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
     ):
         super().set_overlap_args(combine_overlap_args, meta_overlap_args)
-        if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher.set_overlap_args(
-                combine_overlap_args, meta_overlap_args
-            )
-        if self.deepep_mode.enable_normal():
-            self._normal_dispatcher.set_overlap_args(
-                combine_overlap_args, meta_overlap_args
-            )
+        self._normal_dispatcher.set_overlap_args(
+            combine_overlap_args, meta_overlap_args
+        )
 
     def clear_overlap_args(self):
         super().clear_overlap_args()
-        if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher.clear_overlap_args()
-        if self.deepep_mode.enable_normal():
-            self._normal_dispatcher.clear_overlap_args()
+        self._normal_dispatcher.clear_overlap_args()
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)

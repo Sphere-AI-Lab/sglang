@@ -29,7 +29,7 @@ import tqdm
 from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
@@ -102,10 +102,33 @@ def get_is_capture_mode():
 def model_capture_mode():
     global is_capture_mode
     is_capture_mode = True
+    try:
+        yield
+    finally:
+        is_capture_mode = False
 
-    yield
 
-    is_capture_mode = False
+def _prepare_model_cuda_graph_capture(model_runner: ModelRunner):
+    prepare_cuda_graph_capture = getattr(
+        model_runner.model, "prepare_cuda_graph_capture", None
+    )
+    if prepare_cuda_graph_capture is None:
+        return
+
+    memory_saver_adapter = getattr(model_runner, "memory_saver_adapter", None)
+    if memory_saver_adapter is None or not memory_saver_adapter.enabled:
+        prepare_cuda_graph_capture()
+        return
+
+    enable_cpu_backup = model_runner.server_args.enable_weights_cpu_backup or (
+        model_runner.is_draft_worker
+        and model_runner.server_args.enable_draft_weights_cpu_backup
+    )
+    with memory_saver_adapter.region(
+        GPU_MEMORY_TYPE_WEIGHTS,
+        enable_cpu_backup=enable_cpu_backup,
+    ):
+        prepare_cuda_graph_capture()
 
 
 @contextmanager
@@ -303,7 +326,6 @@ class CudaGraphRunner:
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
-
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
@@ -329,6 +351,14 @@ class CudaGraphRunner:
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_bs=self.num_tokens_per_bs,
             )
+
+        if self.model_runner.server_args.enable_oft:
+            self.model_runner.oft_manager.init_cuda_graph_batch_info(
+                max_bs_in_cuda_graph=self.max_bs,
+                num_tokens_per_bs=self.num_tokens_per_bs,
+            )
+
+        _prepare_model_cuda_graph_capture(self.model_runner)
 
         enable_mamba_track = (
             self.model_runner.server_args.enable_mamba_extra_buffer()
@@ -372,6 +402,23 @@ class CudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def destroy(self) -> None:
+        self.device_module.synchronize()
+        graphs = list(self.graphs.values())
+        for graph in graphs:
+            reset = getattr(graph, "reset", None)
+            if callable(reset):
+                reset()
+        self.graphs.clear()
+        self.output_buffers.clear()
+        del graphs
+        gc.collect()
+        self.device_module.synchronize()
+        empty_cache = getattr(self.device_module, "empty_cache", None)
+        if callable(empty_cache):
+            empty_cache()
+        DeepEPBuffer.clean_buffer()
 
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
@@ -473,6 +520,25 @@ class CudaGraphRunner:
         )
         logger.info(log_message)
 
+    def _is_deepep_normal_full_cuda_graph(self):
+        server_args = self.model_runner.server_args
+        moe_a2a_backend_arg = getattr(server_args, "moe_a2a_backend", None)
+        deepep_mode_arg = getattr(server_args, "deepep_mode", None)
+        moe_a2a_backend = (
+            getattr(moe_a2a_backend_arg, "value", None) or moe_a2a_backend_arg
+        )
+        deepep_mode = getattr(deepep_mode_arg, "value", None) or deepep_mode_arg
+
+        return (
+            moe_a2a_backend == "deepep"
+            and deepep_mode == "normal"
+            and not getattr(server_args, "disable_cuda_graph", False)
+        )
+
+    def _mark_deepep_buffer_as_cuda_graph_owned_for_capture(self):
+        if self._is_deepep_normal_full_cuda_graph():
+            DeepEPBuffer.mark_current_buffer_as_cuda_graph_owned()
+
     def capture(self) -> None:
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
@@ -542,7 +608,10 @@ class CudaGraphRunner:
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
         graph_fn = (
-            partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+            partial(
+                memory_saver_adapter.cuda_graph,
+                tag=GPU_MEMORY_TYPE_CUDA_GRAPH,
+            )
             if memory_saver_adapter.enabled
             else self.device_module.graph
         )
@@ -616,6 +685,11 @@ class CudaGraphRunner:
             global_dp_buffer_len = num_tokens
         else:
             global_dp_buffer_len = None
+        global_num_tokens_cpu = None
+        if self.require_mlp_tp_gather:
+            global_num_tokens_cpu = [num_tokens] * self.dp_size
+        elif self.require_attn_tp_gather:
+            global_num_tokens_cpu = [num_tokens]
 
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
@@ -629,6 +703,13 @@ class CudaGraphRunner:
             lora_ids = [None] * bs
         else:
             lora_ids = None
+
+        if self.model_runner.server_args.enable_oft:
+            # Same as LoRA: capture CUDA graph with empty OFT ids so the OFT kernels
+            # are included in the graph (they return immediately when OFT id is None).
+            oft_ids = [None] * bs
+        else:
+            oft_ids = None
 
         # mamba state tracking
         mamba_track_indices = (
@@ -668,6 +749,8 @@ class CudaGraphRunner:
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
+            original_global_num_tokens_cpu=global_num_tokens_cpu,
+            global_num_tokens_cpu=global_num_tokens_cpu,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
@@ -679,11 +762,15 @@ class CudaGraphRunner:
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            oft_ids=oft_ids,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+
+        if oft_ids is not None:
+            self.model_runner.oft_manager.prepare_oft_batch(forward_batch)
 
         # Attention backend
         attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -731,6 +818,8 @@ class CudaGraphRunner:
             self.model_runner.tp_group.barrier()
             run_once()
 
+        self._mark_deepep_buffer_as_cuda_graph_owned_for_capture()
+
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
@@ -771,7 +860,8 @@ class CudaGraphRunner:
         # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
         if self.capture_hidden_mode != required_capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
-            self.capture()
+            with model_capture_mode():
+                self.capture()
 
     def replay_prepare(
         self,
@@ -821,6 +911,16 @@ class CudaGraphRunner:
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
+
+        if self.model_runner.server_args.enable_oft and forward_batch.oft_ids is not None:
+            original_batch_size = forward_batch.batch_size
+            original_oft_ids = forward_batch.oft_ids
+            forward_batch.batch_size = bs
+            forward_batch.oft_ids = original_oft_ids + [None] * (bs - raw_bs)
+            self.model_runner.oft_manager.prepare_oft_batch(forward_batch)
+            forward_batch.batch_size = original_batch_size
+            forward_batch.oft_ids = original_oft_ids
+
         # Attention backend
         if self.enable_pdmux:
             stream_idx = get_current_stream_idx()

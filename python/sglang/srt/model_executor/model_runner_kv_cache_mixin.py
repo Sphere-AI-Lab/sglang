@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    DeepSeekV4TokenToKVPool,
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -339,7 +340,16 @@ class ModelRunnerKVCacheMixin:
     def init_memory_pool(self: ModelRunner, total_gpu_memory: int):
         max_num_reqs = self.server_args.max_running_requests
         max_total_tokens = self.server_args.max_total_tokens
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        is_dsv4_model = getattr(self.model_config, "is_deepseek_v4", False)
+        if is_dsv4_model:
+            if max_total_tokens is not None:
+                self.max_total_num_tokens = max_total_tokens
+            elif max_num_reqs is not None:
+                self.max_total_num_tokens = max_num_reqs * self.model_config.context_len
+            else:
+                self.max_total_num_tokens = 2048 * self.model_config.context_len
+        else:
+            self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -483,7 +493,18 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        if self.server_args.attention_backend == "ascend":
+        if is_dsv4_model:
+            self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+            )
+        elif self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,

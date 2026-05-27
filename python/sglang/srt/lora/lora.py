@@ -19,6 +19,7 @@
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
 import logging
+import re
 from typing import Dict, List
 
 import torch
@@ -34,6 +35,10 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
 
+_EXPERT_LORA_RE = re.compile(
+    r"mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.lora_(A|B)"
+)
+
 
 class LoRALayer(nn.Module):
     def __init__(self, config: LoRAConfig, base_hf_config: AutoConfig):
@@ -43,6 +48,8 @@ class LoRALayer(nn.Module):
 
         # lora weights in cpu. The weights are loaded from checkpoint.
         self.weights: Dict[str, torch.Tensor] = {}
+        # expert LoRA weights, keyed by expert_id
+        self.expert_weights: Dict[int, Dict[str, torch.Tensor]] = {}
 
 
 class LoRAAdapter(nn.Module):
@@ -109,7 +116,17 @@ class LoRAAdapter(nn.Module):
 
         layer_id = get_layer_id(name)
         if layer_id is not None:
-            self.layers[layer_id].weights[name] = loaded_weight.cpu()
+            m = _EXPERT_LORA_RE.search(name)
+            if m:
+                expert_id = int(m.group(1))
+                proj_name = m.group(2)   # gate_proj, up_proj, or down_proj
+                lora_type = m.group(3)   # A or B
+                ew = self.layers[layer_id].expert_weights
+                if expert_id not in ew:
+                    ew[expert_id] = {}
+                ew[expert_id][f"{proj_name}.lora_{lora_type}"] = loaded_weight.cpu()
+            else:
+                self.layers[layer_id].weights[name] = loaded_weight.cpu()
         elif "embed_tokens" in name or "lm_head" in name:
             # Check if this module is declared in target_modules before loading.
             # When normalized_target_modules is {"all"} (e.g. target_modules was
@@ -224,6 +241,10 @@ class LoRAAdapter(nn.Module):
         for layer in self.layers:
             for name, weight in layer.weights.items():
                 layer.weights[name] = weight.pin_memory()
+
+            for expert_id, expert_dict in layer.expert_weights.items():
+                for name, weight in expert_dict.items():
+                    expert_dict[name] = weight.pin_memory()
 
         for name, weight in self.embedding_layers.items():
             self.embedding_layers[name] = weight.pin_memory()

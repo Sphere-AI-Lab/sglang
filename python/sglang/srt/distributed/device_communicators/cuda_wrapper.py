@@ -7,6 +7,7 @@ convenient for use when we just need to call a few functions.
 
 import ctypes
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -45,19 +46,25 @@ def find_loaded_library(lib_name) -> Optional[str]:
     shared libraries loaded by the process. We can use this file to find the path of the
     a loaded library.
     """  # noqa
-    found = False
+    override = os.environ.get("SGLANG_CUDART_SO")
+    if lib_name == "libcudart" and override:
+        return override
+
+    candidates = []
     with open("/proc/self/maps") as f:
         for line in f:
             if lib_name in line:
-                found = True
-                break
-    if not found:
+                start = line.index("/")
+                path = line[start:].strip()
+                filename = path.split("/")[-1]
+                if "stub" not in filename:
+                    candidates.append(path)
+    if not candidates:
         # the library is not loaded in the current process
         return None
     # if lib_name is libcudart, we need to match a line with:
     # address /path/to/libcudart-hash.so.11.0
-    start = line.index("/")
-    path = line[start:].strip()
+    path = candidates[0]
     filename = path.split("/")[-1]
     assert filename.rpartition(".so")[0].startswith(
         lib_name

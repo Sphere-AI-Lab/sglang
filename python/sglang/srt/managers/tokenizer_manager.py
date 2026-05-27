@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.encode_receiver import MMReceiverHTTP
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.oft.oft_registry import OFTRef, OFTRegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -62,6 +63,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
+    LoadOFTAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     SessionParams,
@@ -123,6 +125,16 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class _StagedAdapterVersion:
+    load_format: str
+    public_name: str
+    slot_name: str
+    adapter_id: str
+    adapter_version: str
+    slot_index: int
 
 
 @dataclasses.dataclass
@@ -221,6 +233,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Init LoRA status
         self.init_lora()
+
+        # Versioned adapter double-buffer staging state.
+        # adapter_version_slots: maps public_name -> next slot index (0/1) to use
+        #   for ping-pong staging. Toggled by `_next_adapter_slot`.
+        # staged_adapter_versions: keyed by (public_name, adapter_version), tracks
+        #   the staged-but-not-yet-active LoRARef/OFTRef that activation will swap in.
+        # active_adapter_versions: maps public_name -> currently active adapter_version.
+        # retiring_adapter_ids: maps (public_name, slot_index) -> the old adapter_id
+        #   currently draining; activation re-staging blocks until it has unloaded.
+        self.adapter_version_slots: Dict[str, int] = {}
+        self.staged_adapter_versions: Dict[
+            tuple[str, str], _StagedAdapterVersion
+        ] = {}
+        self.active_adapter_versions: Dict[str, str] = {}
+        self.retiring_adapter_ids: Dict[tuple[str, int], str] = {}
+        self.adapter_retire_timeout_s = float(
+            os.environ.get("ORBIT_ADAPTER_RETIRE_TIMEOUT_S", "60")
+        )
+
+        # Init OFT status
+        self.init_oft()
 
         # Init PD disaggregation and encoder disaggregation
         self.init_disaggregation()
@@ -413,6 +446,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             for lora_ref in self.server_args.lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
+    def init_oft(self):
+        # OFT
+        self.oft_registry = OFTRegistry(self.server_args.oft_paths)
+        self.oft_update_lock = asyncio.Lock()
+        self.oft_ref_cache: Dict[str, OFTRef] = {}
+        if self.server_args.oft_paths is not None:
+            for oft_ref in self.server_args.oft_paths:
+                self.oft_ref_cache[oft_ref.oft_name] = oft_ref
+        self._logged_oft_base_only_request = False
+        if self.server_args.enable_oft:
+            logger.info(
+                "event=oft_tokenizer_registry_initialized enable_oft=%s "
+                "initial_oft_adapters=%s max_loaded_ofts=%s "
+                "max_ofts_per_batch=%s",
+                self.server_args.enable_oft,
+                sorted(self.oft_ref_cache.keys()),
+                self.server_args.max_loaded_ofts,
+                self.server_args.max_ofts_per_batch,
+            )
+
     def init_disaggregation(self):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(
@@ -512,6 +565,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         async with self.model_update_lock.reader_lock:
             await self._validate_and_resolve_lora(obj)
+
+            if self.server_args.enable_oft and obj.oft_path:
+                await self._resolve_oft_path(obj)
+            elif (
+                self.server_args.enable_oft
+                and not self._logged_oft_base_only_request
+            ):
+                logger.info(
+                    "event=oft_request_base_only enable_oft=True oft_path=None "
+                    "message='OFT server is enabled, but this request does "
+                    "not carry oft_path; using base/identity OFT slot.'"
+                )
+                self._logged_oft_base_only_request = True
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
@@ -934,6 +1000,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
                 lora_id=obj.lora_id,
+                oft_id=obj.oft_id,
+                oft_version=obj.oft_version,
                 input_embeds=input_embeds,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
@@ -1177,6 +1245,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         # Mark ongoing LoRA request as finished.
                         if self.server_args.enable_lora and state.obj.lora_path:
                             await self.lora_registry.release(state.obj.lora_id)
+                        # Mark ongoing OFT request as finished.
+                        if self.server_args.enable_oft and state.obj.oft_path:
+                            await self.oft_registry.release(state.obj.oft_id)
                         if not is_stream:
                             raise fastapi.HTTPException(
                                 status_code=finish_reason["status_code"],
@@ -1496,6 +1567,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
+                "adapter_version": self.server_args.weight_version,
                 "total_retractions": recv_obj.retraction_counts[i],
             }
 
@@ -1610,6 +1682,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 # Mark ongoing LoRA request as finished.
                 if self.server_args.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+                # Mark ongoing OFT request as finished.
+                if self.server_args.enable_oft and state.obj.oft_path:
+                    asyncio.create_task(self.oft_registry.release(state.obj.oft_id))
 
             state.out_list.append(out_dict)
             state.event.set()
@@ -2170,6 +2245,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             "id": recv_obj.rid,
             "finish_reason": finish_reason,
             "weight_version": self.server_args.weight_version,
+            "adapter_version": self.server_args.weight_version,
             "e2e_latency": state.finished_time - state.created_time,
         }
         is_stream = getattr(state.obj, "stream", False)
@@ -2281,6 +2357,65 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
         obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+
+    async def _resolve_oft_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
+        if isinstance(obj.oft_path, str):
+            unique_oft_paths = set([obj.oft_path])
+        else:
+            unique_oft_paths = set(obj.oft_path)
+
+        if (
+            self.server_args.max_loaded_ofts is not None
+            and len(unique_oft_paths) > self.server_args.max_loaded_ofts
+        ):
+            raise ValueError(
+                f"Received request with {len(unique_oft_paths)} unique OFTs requested "
+                f"but max loaded OFTs is {self.server_args.max_loaded_ofts}"
+            )
+
+        # Reload all existing OFT adapters that have been dynamically unloaded
+        unregistered_ofts = await self.oft_registry.get_unregistered_ofts(
+            unique_oft_paths
+        )
+        for oft_path in unregistered_ofts:
+            if oft_path is None:
+                continue
+
+            if oft_path not in self.oft_ref_cache:
+                raise ValueError(
+                    f"Got OFT adapter that has never been loaded: {oft_path}\n"
+                    f"All loaded adapters: {self.oft_ref_cache.keys()}."
+                )
+
+            logger.info(f"Reloading evicted adapter: {oft_path}")
+            new_oft_ref = self.oft_ref_cache[oft_path]
+            load_result = await self.load_oft_adapter(
+                LoadOFTAdapterReqInput(
+                    oft_name=new_oft_ref.oft_name,
+                    oft_path=new_oft_ref.oft_path,
+                    pinned=new_oft_ref.pinned,
+                )
+            )
+            if (
+                not load_result.success
+                and "already loaded" not in load_result.error_message
+            ):
+                raise ValueError(
+                    f"Failed to implicitly load OFT adapter {oft_path}: {load_result.error_message}"
+                )
+
+        # Look up the OFT ID from the registry and start tracking ongoing OFT requests.
+        obj.oft_id = await self.oft_registry.acquire(obj.oft_path)
+        obj.oft_version = await self.oft_registry.get_version_by_id(obj.oft_id)
+        requested_oft_paths = sorted(
+            str(oft_path) for oft_path in unique_oft_paths if oft_path is not None
+        )
+        logger.info(
+            "event=oft_request_adapter_active requested_oft_paths=%s "
+            "resolved_oft_id=%s",
+            requested_oft_paths,
+            obj.oft_id,
+        )
 
     def _trace_request_start(
         self,

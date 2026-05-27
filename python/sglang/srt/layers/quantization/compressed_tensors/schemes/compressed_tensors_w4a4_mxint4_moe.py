@@ -17,7 +17,12 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
-from sglang.srt.utils import is_flashinfer_available, next_power_of_2, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_flashinfer_available,
+    next_power_of_2,
+    set_weight_attrs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +268,17 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.oft.utils import assert_canonical_split_supported
+
+        assert_canonical_split_supported(type(self).__name__)
+
+        if get_bool_env_var("SGLANG_OFT_EXPERT_PARITY_MODE"):
+            logger.info(
+                "Skipping MxInt4 MoE serving-layout conversion for routed expert "
+                "OFT parity mode; bf16 parity forward dequantizes the checkpoint "
+                "packed layout directly."
+            )
+            return
 
         num_experts = layer.w13_weight_packed.shape[0]
         (

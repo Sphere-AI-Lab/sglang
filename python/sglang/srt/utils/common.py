@@ -3626,6 +3626,43 @@ SUPPORTED_LORA_TARGET_MODULES = [
 
 LORA_TARGET_ALL_MODULES = "all"
 
+# OFT-related constants and utilities
+# OFT (Orthogonal Finetuning) targets the same linear modules as LoRA,
+# but applies orthogonal transformations instead of low-rank decomposition.
+SUPPORTED_OFT_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "qkv_proj",
+    "q_a_proj",
+    "q_b_proj",
+    "kv_a_proj_with_mqa",
+    "kv_b_proj",
+    "gate_up_proj",
+    "embed_tokens",
+    "lm_head",
+    # DeepSeek V4 attention sublayer names. V4 uses native-quant
+    # DeepSeekV4Linear primitives that are NOT fused into qkv_proj/gate_up_proj,
+    # so each attention sublayer ships as its own OFT target. The
+    # corresponding wrap classes live in sglang/srt/oft/layers.py.
+    "wq_a",
+    "wq_b",
+    "wkv",
+    "wo_a",
+    "wo_b",
+    # DeepSeek V4 routed MoE expert names. These are handled outside the
+    # dense per-layer OFT memory pool by DeepSeek V4 MoE-owned expert buffers.
+    "w1",
+    "w2",
+    "w3",
+]
+
+OFT_TARGET_ALL_MODULES = "all"
+
 
 class ConcurrentCounter:
     """

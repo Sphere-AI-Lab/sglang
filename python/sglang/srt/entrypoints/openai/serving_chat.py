@@ -277,6 +277,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
+        # Resolve OFT adapter from model parameter or explicit oft_path
+        oft_path = self._resolve_oft_path(request.oft_path)
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
@@ -293,6 +295,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
             lora_path=lora_path,
+            oft_path=oft_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,

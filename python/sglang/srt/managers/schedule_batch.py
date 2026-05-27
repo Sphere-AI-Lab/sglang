@@ -525,6 +525,8 @@ class Req(ReqDllmMixin):
         stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_id: Optional[str] = None,
+        oft_id: Optional[str] = None,
+        oft_version: Optional[int] = None,
         input_embeds: Optional[List[List[float]]] = None,
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
@@ -603,9 +605,15 @@ class Req(ReqDllmMixin):
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
+        if oft_id is not None:
+            extra_key = (
+                extra_key or ""
+            ) + f"|oft:{oft_id}:v{0 if oft_version is None else oft_version}"
 
         self.extra_key = extra_key
         self.lora_id = lora_id
+        self.oft_id = oft_id
+        self.oft_version = oft_version
         self.routing_key = routing_key
 
         # Memory pool info
@@ -2210,6 +2218,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_lens_cpu=self.encoder_lens_cpu,
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_ids=[req.lora_id for req in self.reqs],
+            oft_ids=[req.oft_id for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
             token_type_ids=self.token_type_ids,
@@ -2380,6 +2389,9 @@ class ModelWorkerBatch:
 
     # For LoRA
     lora_ids: Optional[List[str]]
+
+    # For OFT
+    oft_ids: Optional[List[str]]
 
     # Sampling info
     sampling_info: SamplingBatchInfo

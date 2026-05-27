@@ -82,14 +82,7 @@ def _check_tensors(
         if torch.all(expect == actual):
             good_names.append(name)
         else:
-            abs_diff = (actual.float() - expect.float()).abs()
-            msg = (
-                f"name={name} "
-                f"max_abs_err={abs_diff.max()} "
-                f"mean_abs_err={abs_diff.mean()} "
-                f"{get_tensor_info(expect)=} "
-                f"{get_tensor_info(actual)=} "
-            )
+            msg = _mismatch_message(name, expect, actual, get_tensor_info)
             (error_messages if should_compare else info_messages).append(msg)
 
     logger.info(f"[check_tensors] equal tensors: {good_names}")
@@ -99,21 +92,64 @@ def _check_tensors(
         raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
 
 
+def _mismatch_message(name, expect, actual, get_tensor_info):
+    msg = f"name={name} "
+    try:
+        abs_diff = (actual.float() - expect.float()).abs()
+        msg += f"max_abs_err={abs_diff.max()} mean_abs_err={abs_diff.mean()} "
+    except RuntimeError as e:
+        try:
+            expect_bytes = expect.view(torch.uint8)
+            actual_bytes = actual.view(torch.uint8)
+            byte_mismatch = actual_bytes != expect_bytes
+            msg += (
+                "float_diff_unavailable="
+                f"{type(e).__name__}:{str(e).splitlines()[0]} "
+                f"byte_mismatch_count={byte_mismatch.sum()} "
+                f"byte_numel={byte_mismatch.numel()} "
+            )
+        except RuntimeError as byte_e:
+            msg += (
+                "float_and_byte_diff_unavailable="
+                f"{type(e).__name__}:{str(e).splitlines()[0]};"
+                f"{type(byte_e).__name__}:{str(byte_e).splitlines()[0]} "
+            )
+    msg += f"{get_tensor_info(expect)=} {get_tensor_info(actual)=} "
+    return msg
+
+
 def _random_like(t: torch.Tensor):
     device = t.device
     shape = t.shape
     dtype = t.dtype
 
-    if dtype.is_floating_point:
+    # DSV4: FP4/FP8 native-quant storage (and related exotic dtypes)
+    # cannot be written via copy_ from a float32 tensor — PyTorch lacks
+    # the cast. Randomise the underlying bytes directly via uint8 view
+    # so the post-update compare still detects a mismatched transfer.
+    # We fall back to this path for any dtype that isn't a "standard"
+    # float (bf16/fp16/fp32/fp64) / int / bool.
+    _STANDARD_FP = (torch.bfloat16, torch.float16, torch.float32, torch.float64)
+    if dtype in _STANDARD_FP:
         return torch.rand(shape, device=device, dtype=torch.float32).to(dtype)
 
     if dtype == torch.bool:
         return torch.rand(shape, device=device) > 0.5
 
-    info = torch.iinfo(dtype)
-    return torch.randint(
-        low=int(info.min), high=int(info.max), size=shape, device=device, dtype=dtype
-    )
+    try:
+        info = torch.iinfo(dtype)
+        return torch.randint(
+            low=int(info.min), high=int(info.max), size=shape, device=device, dtype=dtype
+        )
+    except TypeError:
+        # Exotic FP variant (FP4 e2m1, FP8 e4m3/e8m0, etc.) — randomise
+        # raw bytes via uint8 view; it preserves the storage layout and
+        # divergence detection without needing a float32 cast path.
+        rand_bytes = torch.randint(
+            low=0, high=256, size=t.view(torch.uint8).shape,
+            device=device, dtype=torch.uint8,
+        )
+        return rand_bytes.view(dtype)
 
 
 def _postprocess_tensors(

@@ -375,6 +375,10 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
+            w13_oft_r=getattr(layer, "w13_oft_r", None),
+            w1_oft_r=getattr(layer, "w1_oft_r", None),
+            w3_oft_r=getattr(layer, "w3_oft_r", None),
+            w2_oft_r=getattr(layer, "w2_oft_r", None),
         )
 
         return self.runner.run(dispatch_output, quant_info)

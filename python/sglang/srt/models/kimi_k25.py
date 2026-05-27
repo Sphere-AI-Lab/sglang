@@ -33,6 +33,12 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
+from sglang.srt.models.kimi_k25_oft_policy import (
+    KIMI_DENSE_FIRST_OFT_ALLOWED_SUFFIXES,
+    KIMI_DENSE_FIRST_OFT_UNSUPPORTED_FUSED_INPUT_SUFFIXES,
+    get_kimi_dense_first_unsupported_targets,
+    is_kimi_dense_first_oft_module,
+)
 from sglang.srt.models.kimi_vl_moonvit import MLP2
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
@@ -735,6 +741,25 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         return hidden_states
 
+    def should_apply_oft(self, module_name: str) -> bool:
+        return is_kimi_dense_first_oft_module(module_name)
+
+    def validate_oft_target_modules(self, target_modules: set[str]) -> None:
+        unsupported = get_kimi_dense_first_unsupported_targets(target_modules)
+        if unsupported:
+            fused_inputs = unsupported & KIMI_DENSE_FIRST_OFT_UNSUPPORTED_FUSED_INPUT_SUFFIXES
+            reason = ""
+            if fused_inputs:
+                reason = (
+                    " The first MLA q/kv projections are fused together in "
+                    "SGLang serving and do not yet have per-branch OFT support."
+                )
+            raise ValueError(
+                "Kimi dense-first OFT v1 only supports "
+                f"{sorted(KIMI_DENSE_FIRST_OFT_ALLOWED_SUFFIXES)}; got unsupported "
+                f"target modules {sorted(unsupported)}.{reason}"
+            )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
         mapper = getattr(self, "hf_to_sglang_mapper", None)
@@ -771,6 +796,30 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # Load language model weights
         if language_weights:
             self.language_model.load_weights(language_weights)
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        # EAGLE3 cuda-graph capture (cuda_graph_runner.py) and ModelRunner
+        # (model_runner.py) call this on the top-level model; delegate to the
+        # inner DeepseekV3ForCausalLM, which sets capture_aux_hidden_states and
+        # populates self.model.layers_to_capture.
+        if hasattr(self.language_model, "set_eagle3_layers_to_capture"):
+            self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        return self.language_model.set_embed_and_head(embed, head)
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        # The EPLB hook reads num_hidden_layers / n_routed_experts / n_group from a
+        # DeepSeek-V3-style config; for Kimi-K2.5 the multimodal wrapper carries those
+        # under text_config. Without this delegation, ModelConfigForExpertLocation
+        # returns None and the global expert_location_metadata stays unset, which
+        # triggers an AssertionError the first time DeepEP forward runs.
+        text_config = getattr(config, "text_config", config)
+        return DeepseekV3ForCausalLM.get_model_config_for_expert_location(text_config)
 
 
 EntryClass = [KimiK25ForConditionalGeneration]

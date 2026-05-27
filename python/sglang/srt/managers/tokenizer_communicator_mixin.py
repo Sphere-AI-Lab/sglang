@@ -23,6 +23,7 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    ActivateAdapterVersionReqInput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     CheckWeightsReqInput,
@@ -57,7 +58,12 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    LoadOFTAdapterFromTensorsReqInput,
+    LoadOFTAdapterFromTensorsReqOutput,
+    LoadOFTAdapterReqInput,
+    LoadOFTAdapterReqOutput,
     LoRAUpdateOutput,
+    OFTUpdateOutput,
     OpenSessionReqInput,
     ProfileReq,
     ProfileReqOutput,
@@ -74,6 +80,10 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UnloadOFTAdapterReqInput,
+    UnloadOFTAdapterReqOutput,
+    UpdateAdapterFromDistributedReqInput,
+    UpdateAdapterFromDistributedReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -81,6 +91,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
@@ -91,6 +102,29 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
+
+
+class InactiveSlotBusyError(Exception):
+    """Raised when a retiring adapter version cannot drain in time.
+
+    Surfaced as a structured 200-OK body by /update_adapter_from_distributed
+    so Orbit's NCCL backend can produce a friendly retire-busy error message
+    instead of a generic 500.
+    """
+
+    def __init__(
+        self,
+        public_name: str,
+        retiring_adapter_id: str,
+        in_flight: Optional[int],
+    ):
+        self.public_name = public_name
+        self.retiring_adapter_id = retiring_adapter_id
+        self.in_flight = in_flight
+        super().__init__(
+            f"inactive_slot_busy: public_name={public_name!r} "
+            f"retiring_adapter_id={retiring_adapter_id!r} in_flight={in_flight!r}"
+        )
 
 
 class _Communicator(Generic[T]):
@@ -175,6 +209,9 @@ class TokenizerCommunicatorMixin:
         self.update_weights_from_distributed_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.update_adapter_from_distributed_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.init_weights_send_group_for_remote_instance_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -229,6 +266,9 @@ class TokenizerCommunicatorMixin:
         self.update_lora_adapter_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.update_oft_adapter_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.get_load_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size, mode="watching"
         )
@@ -255,6 +295,10 @@ class TokenizerCommunicatorMixin:
                 (
                     UpdateWeightsFromDistributedReqOutput,
                     self.update_weights_from_distributed_communicator.handle_recv,
+                ),
+                (
+                    UpdateAdapterFromDistributedReqOutput,
+                    self.update_adapter_from_distributed_communicator.handle_recv,
                 ),
                 (
                     InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -327,6 +371,10 @@ class TokenizerCommunicatorMixin:
                 (
                     LoRAUpdateOutput,
                     self.update_lora_adapter_communicator.handle_recv,
+                ),
+                (
+                    OFTUpdateOutput,
+                    self.update_oft_adapter_communicator.handle_recv,
                 ),
                 (
                     GetLoadReqOutput,
@@ -505,6 +553,20 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
+        # For OFT adapter updates, register in tokenizer_manager BEFORE sending to
+        # scheduler, so the adapter_id flows to the model_runner for consistent mapping.
+        if obj.load_format == "oft_adapter" and obj.adapter_name is not None:
+            from sglang.srt.oft.oft_registry import OFTRef
+
+            adapter_name = obj.adapter_name
+            if adapter_name not in self.oft_ref_cache:
+                new_ref = OFTRef(
+                    oft_name=adapter_name, oft_path=adapter_name, pinned=False
+                )
+                await self.oft_registry.register(new_ref)
+                self.oft_ref_cache[adapter_name] = new_ref
+            obj.adapter_id = self.oft_ref_cache[adapter_name].oft_id
+
         # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -516,11 +578,343 @@ class TokenizerCommunicatorMixin:
             results = await self.update_weights_from_distributed_communicator(obj)
 
         success, message = _Communicator.merge_results(results)
+        if success and obj.load_format == "oft_adapter" and obj.adapter_id is not None:
+            updated_ref = await self.oft_registry.bump_version_by_id(obj.adapter_id)
+            self.oft_ref_cache[updated_ref.oft_name] = updated_ref
+            message += (
+                f" OFT adapter {updated_ref.oft_name} version updated to "
+                f"{updated_ref.oft_version}."
+            )
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
+
+    async def update_adapter_from_distributed(
+        self: TokenizerManager,
+        obj: UpdateAdapterFromDistributedReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update adapter from distributed"
+
+        public_name: Optional[str] = None
+        slot_index: Optional[int] = None
+        slot_name: Optional[str] = None
+
+        if obj.double_buffer and obj.adapter_name is not None:
+            # Double-buffer path: stage the new weights into a fresh slot whose name
+            # is `{public}__orbit_slot_{index}`. The slot index ping-pongs 0/1 across
+            # consecutive stages of the same public_name. The communicator (and
+            # downstream model_runner) sees obj.adapter_name = slot_name, so the
+            # new weights load into a brand-new adapter; activation later re-points
+            # the public alias at this slot via LoRARegistry.replace.
+            public_name = obj.adapter_name
+            slot_index = TokenizerCommunicatorMixin._next_adapter_slot(
+                self, public_name
+            )
+            slot_name = TokenizerCommunicatorMixin._adapter_slot_name(
+                self, public_name, slot_index
+            )
+
+            # If the same slot index still has a retiring adapter from the previous
+            # cycle, wait for in-flight requests to drain and unload it before
+            # reusing the slot (timeout-bounded so a leaked counter doesn't hang us).
+            retiring_id = self.retiring_adapter_ids.get((public_name, slot_index))
+            if retiring_id is not None:
+                try:
+                    await TokenizerCommunicatorMixin._wait_and_unload_retiring_adapter(
+                        self,
+                        obj.load_format,
+                        public_name,
+                        retiring_id,
+                        timeout_s=self.adapter_retire_timeout_s,
+                    )
+                except asyncio.TimeoutError as e:
+                    # Spec §9: surface a structured timeout instead of letting it
+                    # propagate as a bare 500. Orbit translates this to a clear
+                    # retire-busy diagnostic. The retiring entry stays so the next
+                    # stage can retry.
+                    in_flight = TokenizerCommunicatorMixin._best_effort_in_flight_count(
+                        self, obj.load_format, retiring_id
+                    )
+                    raise InactiveSlotBusyError(
+                        public_name, retiring_id, in_flight
+                    ) from e
+                del self.retiring_adapter_ids[(public_name, slot_index)]
+
+            if obj.load_format == "lora_adapter":
+                from sglang.srt.lora.lora_registry import LoRARef
+
+                slot_ref = LoRARef(
+                    lora_name=slot_name, lora_path=slot_name, pinned=False
+                )
+                obj.adapter_id = slot_ref.lora_id
+            elif obj.load_format == "oft_adapter":
+                from sglang.srt.oft.oft_registry import OFTRef
+
+                slot_ref = OFTRef(
+                    oft_name=slot_name, oft_path=slot_name, pinned=False
+                )
+                obj.adapter_id = slot_ref.oft_id
+            else:
+                raise ValueError(
+                    f"unknown adapter load_format={obj.load_format!r}"
+                )
+
+            obj.adapter_name = slot_name
+        else:
+            # Single-slot path (existing behavior). Mint a fresh ref for the public
+            # name and (for LoRA) replace any prior registration in place.
+            if obj.load_format == "oft_adapter" and obj.adapter_name is not None:
+                from sglang.srt.oft.oft_registry import OFTRef
+
+                adapter_name = obj.adapter_name
+                if adapter_name not in self.oft_ref_cache:
+                    new_ref = OFTRef(
+                        oft_name=adapter_name, oft_path=adapter_name, pinned=False
+                    )
+                    await self.oft_registry.register(new_ref)
+                    self.oft_ref_cache[adapter_name] = new_ref
+                obj.adapter_id = self.oft_ref_cache[adapter_name].oft_id
+
+            if obj.load_format == "lora_adapter" and obj.adapter_name is not None:
+                from sglang.srt.lora.lora_registry import LoRARef
+
+                adapter_name = obj.adapter_name
+                new_ref = LoRARef(
+                    lora_name=adapter_name,
+                    lora_path=adapter_name,
+                    pinned=False,
+                )
+                obj.adapter_id = new_ref.lora_id
+                if adapter_name in self.lora_ref_cache:
+                    old_id = await self.lora_registry.unregister(adapter_name)
+                    await self.lora_registry.wait_for_unload(old_id)
+                await self.lora_registry.register(new_ref)
+                self.lora_ref_cache[adapter_name] = new_ref
+
+        # Immediately update the adapter if the engine is in paused state
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
+        async with lock_context:
+            results = await self.update_adapter_from_distributed_communicator(obj)
+
+        success, message = _Communicator.merge_results(results)
+
+        if obj.double_buffer:
+            # Record the staged slot only after a successful load; activation will
+            # later look it up by (public_name, adapter_version).
+            if success and public_name is not None:
+                from sglang.srt.managers.tokenizer_manager import (
+                    _StagedAdapterVersion,
+                )
+
+                self.staged_adapter_versions[(public_name, obj.adapter_version)] = (
+                    _StagedAdapterVersion(
+                        load_format=obj.load_format,
+                        public_name=public_name,
+                        slot_name=slot_name,
+                        adapter_id=obj.adapter_id,
+                        adapter_version=obj.adapter_version,
+                        slot_index=slot_index,
+                    )
+                )
+        else:
+            if (
+                success
+                and obj.load_format == "oft_adapter"
+                and obj.adapter_id is not None
+            ):
+                updated_ref = await self.oft_registry.bump_version_by_id(obj.adapter_id)
+                self.oft_ref_cache[updated_ref.oft_name] = updated_ref
+                message += (
+                    f" OFT adapter {updated_ref.oft_name} version updated to "
+                    f"{updated_ref.oft_version}."
+                )
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
+
+    def _adapter_slot_name(self, public_name: str, slot_index: int) -> str:
+        """Slot-name format: ``{public}__orbit_slot_{index}``.
+
+        Activation flips the public alias between two slot names (index 0 and 1)
+        so that no in-flight request ever sees a half-loaded adapter.
+        """
+        return f"{public_name}__orbit_slot_{slot_index}"
+
+    def _next_adapter_slot(self, public_name: str) -> int:
+        """Return the next slot index (0/1) and toggle for the next call.
+
+        Ping-pongs deterministically: 0 -> 1 -> 0 -> 1 ...
+        """
+        next_slot = self.adapter_version_slots.get(public_name, 0)
+        self.adapter_version_slots[public_name] = 1 - next_slot
+        return next_slot
+
+    async def activate_adapter_version(
+        self: TokenizerManager,
+        obj: ActivateAdapterVersionReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Atomically swap the public adapter alias to a previously-staged slot.
+
+        Looks up the staged record by (adapter_name, adapter_version), calls the
+        registry's ``replace`` to re-route future acquires to the new slot's id,
+        records the old id under ``retiring_adapter_ids`` so the next stage at
+        the same slot drains and unloads it, and bumps the live weight_version.
+
+        The retire is intentionally deferred to the next stage at the same slot
+        (rather than fired here as a background task) to keep a single owner for
+        ``wait_for_unload(old_id)``. Two callers racing on that primitive corrupt
+        the registry's counter dict (one wins ``del self._counters[id]``, the
+        other asserts). With two-slot ping-pong, the retiring slot is naturally
+        reclaimed when the opposite slot stages back, so eager retirement saves
+        nothing — memory is already bounded at exactly 2 slots by design.
+        """
+        staged_key = (obj.adapter_name, obj.adapter_version)
+        staged = self.staged_adapter_versions.get(staged_key)
+        if staged is None:
+            return False, f"No staged adapter version for {staged_key}"
+
+        if obj.load_format == "lora_adapter":
+            from sglang.srt.lora.lora_registry import LoRARef
+
+            old_id = await self.lora_registry.replace(
+                LoRARef(
+                    lora_id=staged.adapter_id,
+                    lora_name=staged.public_name,
+                    lora_path=staged.slot_name,
+                    pinned=False,
+                )
+            )
+            self.lora_ref_cache[staged.public_name] = LoRARef(
+                lora_id=staged.adapter_id,
+                lora_name=staged.public_name,
+                lora_path=staged.slot_name,
+                pinned=False,
+            )
+        elif obj.load_format == "oft_adapter":
+            from sglang.srt.oft.oft_registry import OFTRef
+
+            old_id = await self.oft_registry.replace(
+                OFTRef(
+                    oft_id=staged.adapter_id,
+                    oft_name=staged.public_name,
+                    oft_path=staged.slot_name,
+                    pinned=False,
+                )
+            )
+            self.oft_ref_cache[staged.public_name] = OFTRef(
+                oft_id=staged.adapter_id,
+                oft_name=staged.public_name,
+                oft_path=staged.slot_name,
+                pinned=False,
+            )
+        else:
+            return False, f"unknown adapter load_format={obj.load_format!r}"
+
+        if old_id is not None:
+            # Track the retiring id under the slot where the OLD adapter
+            # physically lives. With two-slot ping-pong, the previous activate
+            # used slot ``1 - staged.slot_index``, so the retiring adapter is
+            # there. The next stage that ping-pongs back to that slot looks
+            # up this key and drains/unloads before reusing the slot.
+            #
+            # Using ``staged.slot_index`` here would be wrong: it's the slot
+            # the new adapter just took, not the slot whose contents need to
+            # drain. The lookup at the start of ``update_adapter_from_distributed``
+            # would then miss, the next stage would silently overwrite the
+            # still-loaded old slot, and the *following* stage's drain would
+            # try to unload an id that the model_runner already evicted —
+            # crashing the server in ``oft_manager.unload_oft_adapter``.
+            retiring_slot = 1 - staged.slot_index
+            self.retiring_adapter_ids[(staged.public_name, retiring_slot)] = (
+                old_id
+            )
+
+        self.active_adapter_versions[staged.public_name] = staged.adapter_version
+        self._update_weight_version_if_provided(obj.weight_version)
+        del self.staged_adapter_versions[staged_key]
+        return (
+            True,
+            f"Activated adapter_version={obj.adapter_version} for {obj.adapter_name}",
+        )
+
+    async def _wait_and_unload_retiring_adapter(
+        self: TokenizerManager,
+        load_format: str,
+        public_name: str,
+        adapter_id: str,
+        *,
+        timeout_s: float,
+    ) -> None:
+        """Wait for in-flight requests to release the retiring id, then unload.
+
+        ``LoRARegistry.replace`` deletes the alias but keeps the counter so that
+        in-flight requests can release their reference. After the counter hits
+        zero we send the streamed-unload-by-id to the model_runner so the slot
+        memory is freed; this is what allows the next stage at the same slot to
+        reuse it.
+        """
+        if load_format == "lora_adapter":
+            await asyncio.wait_for(
+                self.lora_registry.wait_for_unload(adapter_id), timeout=timeout_s
+            )
+            result = (
+                await self.update_lora_adapter_communicator(
+                    UnloadLoRAAdapterReqInput(
+                        lora_name=public_name, lora_id=adapter_id
+                    )
+                )
+            )[0]
+            if not result.success:
+                raise RuntimeError(result.error_message)
+        elif load_format == "oft_adapter":
+            await asyncio.wait_for(
+                self.oft_registry.wait_for_unload(adapter_id), timeout=timeout_s
+            )
+            result = (
+                await self.update_oft_adapter_communicator(
+                    UnloadOFTAdapterReqInput(oft_name=public_name, oft_id=adapter_id)
+                )
+            )[0]
+            if not result.success:
+                raise RuntimeError(result.error_message)
+        else:
+            raise ValueError(f"unknown adapter load_format={load_format!r}")
+
+    def _best_effort_in_flight_count(
+        self: TokenizerManager, load_format: str, adapter_id: str
+    ) -> Optional[int]:
+        """Read the in-flight refcount for a given adapter_id. Best-effort: returns
+        None if the registry's internal counter is not introspectable.
+
+        Used for ``inactive_slot_busy`` diagnostics; treat None as "unknown"
+        downstream.
+        """
+        try:
+            if load_format == "lora_adapter":
+                counter = self.lora_registry._counters.get(adapter_id)
+            elif load_format == "oft_adapter":
+                counter = self.oft_registry._counters.get(adapter_id)
+            else:
+                return None
+            if counter is None:
+                return None
+            return counter.value()
+        except Exception:
+            return None
 
     async def init_weights_send_group_for_remote_instance(
         self,
@@ -563,6 +957,19 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
+        # For OFT adapter updates, register in tokenizer_manager BEFORE sending to
+        # scheduler, so the adapter_id flows to the model_runner for consistent mapping.
+        if obj.load_format == "oft_adapter" and obj.adapter_name is not None:
+            from sglang.srt.oft.oft_registry import OFTRef
+
+            adapter_name = obj.adapter_name
+            if adapter_name not in self.oft_ref_cache:
+                new_ref = OFTRef(oft_name=adapter_name, oft_path=adapter_name, pinned=False)
+                await self.oft_registry.register(new_ref)
+                self.oft_ref_cache[adapter_name] = new_ref
+            # Pass the canonical adapter_id to the model_runner
+            obj.adapter_id = self.oft_ref_cache[adapter_name].oft_id
+
         # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -574,6 +981,13 @@ class TokenizerCommunicatorMixin:
             results = await self.update_weights_from_tensor_communicator(obj)
 
         success, message = _Communicator.merge_results(results)
+        if success and obj.load_format == "oft_adapter" and obj.adapter_id is not None:
+            updated_ref = await self.oft_registry.bump_version_by_id(obj.adapter_id)
+            self.oft_ref_cache[updated_ref.oft_name] = updated_ref
+            message += (
+                f" OFT adapter {updated_ref.oft_name} version updated to "
+                f"{updated_ref.oft_version}."
+            )
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -807,6 +1221,195 @@ class TokenizerCommunicatorMixin:
                 return await self._unload_lora_adapter_locked(obj)
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
+
+    async def _unload_oft_adapter_locked(
+        self: TokenizerManager,
+        obj: UnloadOFTAdapterReqInput,
+    ) -> UnloadOFTAdapterReqOutput:
+        assert (
+            self.oft_update_lock.locked()
+        ), "self.oft_update_lock must be locked in order for self._unload_oft_adapter_locked() to be called"
+
+        oft_id = await self.oft_registry.unregister(obj.oft_name)
+        obj.oft_id = oft_id
+
+        await self.oft_registry.wait_for_unload(oft_id)
+        result = (await self.update_oft_adapter_communicator(obj))[0]
+
+        return result
+
+    async def load_oft_adapter(
+        self: TokenizerManager,
+        obj: LoadOFTAdapterReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoadOFTAdapterReqOutput:
+        self.auto_create_handle_loop()
+
+        try:
+            if not self.server_args.enable_oft:
+                raise ValueError(
+                    "OFT is not enabled. Please set `--enable-oft` to enable OFT."
+                )
+
+            assert (
+                self.server_args.dp_size == 1
+            ), "dp_size must be 1 for dynamic OFT loading"
+            logger.info(
+                "Start load OFT adapter. OFT name=%s, path=%s",
+                obj.oft_name,
+                obj.oft_path,
+            )
+
+            async with self.oft_update_lock:
+                new_adapter = OFTRef(
+                    oft_name=obj.oft_name,
+                    oft_path=obj.oft_path,
+                    pinned=obj.pinned,
+                )
+
+                obj.oft_id = new_adapter.oft_id
+                result = (await self.update_oft_adapter_communicator(obj))[0]
+
+                if result.success:
+                    await self.oft_registry.register(new_adapter)
+                    self.oft_ref_cache[obj.oft_name] = new_adapter
+
+                if self.server_args.max_loaded_ofts is not None:
+                    while (
+                        self.oft_registry.num_registered_ofts
+                        > self.server_args.max_loaded_ofts
+                    ):
+                        lru_oft_name = await self.oft_registry.lru_oft_name(
+                            exclude_pinned=True
+                        )
+                        if lru_oft_name is None:
+                            raise ValueError(
+                                "Didn't find any OFT adapters when trying to evict LRU OFT adapter. "
+                                f"OFT registry is: {self.oft_registry._registry}"
+                            )
+
+                        logger.info(
+                            f"Unloading least recently used OFT adapter '{lru_oft_name}' "
+                            f"(current number of adapters: {self.oft_registry.num_registered_ofts}, "
+                            f"max allowed: {self.server_args.max_loaded_ofts})"
+                        )
+
+                        unload_result = await self._unload_oft_adapter_locked(
+                            UnloadOFTAdapterReqInput(oft_name=lru_oft_name)
+                        )
+                        if not unload_result.success:
+                            raise ValueError(
+                                f"Error while unloading LRU OFT adapter '{lru_oft_name}': "
+                                f"{unload_result.error_message}"
+                            )
+                        del result.loaded_adapters[lru_oft_name]
+
+                return result
+        except ValueError as e:
+            return LoadOFTAdapterReqOutput(
+                success=False,
+                error_message=str(e),
+            )
+
+    async def load_oft_adapter_from_tensors(
+        self: TokenizerManager,
+        obj: LoadOFTAdapterFromTensorsReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoadOFTAdapterFromTensorsReqOutput:
+        self.auto_create_handle_loop()
+
+        try:
+            if not self.server_args.enable_oft:
+                raise ValueError(
+                    "OFT is not enabled. Please set `--enable-oft` to enable OFT."
+                )
+
+            assert (
+                self.server_args.dp_size == 1
+            ), "dp_size must be 1 for dynamic OFT loading"
+            logger.info(
+                "Start load OFT adapter from tensors. OFT name=%s",
+                obj.oft_name,
+            )
+
+            async with self.oft_update_lock:
+                new_adapter = OFTRef(
+                    oft_name=obj.oft_name,
+                    oft_path="__tensor__",
+                    pinned=obj.pinned,
+                )
+                obj.oft_id = new_adapter.oft_id
+                result = (await self.update_oft_adapter_communicator(obj))[0]
+
+                if result.success:
+                    await self.oft_registry.register(new_adapter)
+                    self.oft_ref_cache[obj.oft_name] = new_adapter
+                if self.server_args.max_loaded_ofts is not None:
+                    while (
+                        self.oft_registry.num_registered_ofts
+                        > self.server_args.max_loaded_ofts
+                    ):
+                        lru_oft_name = await self.oft_registry.lru_oft_name(
+                            exclude_pinned=True
+                        )
+                        if lru_oft_name is None:
+                            raise ValueError(
+                                "Didn't find any OFT adapters when trying to evict LRU OFT adapter. "
+                                f"OFT registry is: {self.oft_registry._registry}"
+                            )
+
+                        logger.info(
+                            f"Unloading least recently used OFT adapter '{lru_oft_name}' "
+                            f"(current number of adapters: {self.oft_registry.num_registered_ofts}, "
+                            f"max allowed: {self.server_args.max_loaded_ofts})"
+                        )
+
+                        unload_result = await self._unload_oft_adapter_locked(
+                            UnloadOFTAdapterReqInput(oft_name=lru_oft_name)
+                        )
+                        if not unload_result.success:
+                            raise ValueError(
+                                f"Error while unloading LRU OFT adapter '{lru_oft_name}': "
+                                f"{unload_result.error_message}"
+                            )
+                        del result.loaded_adapters[lru_oft_name]
+
+                return result
+        except ValueError as e:
+            return LoadOFTAdapterFromTensorsReqOutput(
+                success=False,
+                error_message=str(e),
+            )
+
+    async def unload_oft_adapter(
+        self: TokenizerManager,
+        obj: UnloadOFTAdapterReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> UnloadOFTAdapterReqOutput:
+        self.auto_create_handle_loop()
+
+        try:
+            if not self.server_args.enable_oft:
+                raise ValueError(
+                    "OFT is not enabled. Please set `--enable-oft` to enable OFT."
+                )
+
+            assert (
+                obj.oft_name is not None
+            ), "oft_name must be provided to unload OFT adapter"
+
+            assert (
+                self.server_args.dp_size == 1
+            ), "dp_size must be 1 for dynamic OFT loading"
+            logger.info(
+                "Start unload OFT adapter. OFT name=%s",
+                obj.oft_name,
+            )
+
+            async with self.oft_update_lock:
+                return await self._unload_oft_adapter_locked(obj)
+        except ValueError as e:
+            return UnloadOFTAdapterReqOutput(success=False, error_message=str(e))
 
     async def get_weights_by_name(
         self: TokenizerManager,
