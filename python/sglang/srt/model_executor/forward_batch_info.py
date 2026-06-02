@@ -52,7 +52,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.true_on_policy import is_true_on_policy_enabled
+from sglang.srt.true_on_policy import get_rl_on_policy_target, is_true_on_policy_enabled
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -1105,7 +1105,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
                 # 3 * N
-                if mm_input is None or is_true_on_policy_enabled():
+                if (
+                    mm_input is None
+                    or get_rl_on_policy_target() is not None
+                    or is_true_on_policy_enabled()
+                ):
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
                         self.seq_lens_cpu[batch_idx] - 1,
@@ -1121,7 +1125,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     batch.extend_lens[batch_idx],
                     batch.prefix_lens[batch_idx],
                 )
-                if mm_input is None or is_true_on_policy_enabled():
+                if (
+                    mm_input is None
+                    or get_rl_on_policy_target() is not None
+                    or is_true_on_policy_enabled()
+                ):
                     # text only
                     mrope_positions = torch.tensor(
                         [
