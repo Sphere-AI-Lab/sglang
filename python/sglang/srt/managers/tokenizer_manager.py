@@ -87,7 +87,11 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    TensorTransportMode,
+    extend_mrope_positions_for_retracted_request,
+    wrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -273,6 +277,132 @@ class InputFormat(Enum):
     SINGLE_STRING = 1  # Regular single text like "Hello world"
     BATCH_STRINGS = 2  # Regular batch like ["Hello", "World"]
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
+
+
+def _append_scoring_suffix(
+    obj: Union[GenerateReqInput, EmbeddingReqInput],
+    input_ids: List[int],
+    mm_inputs: Any,
+    token_type_ids: Optional[List[int]],
+) -> List[int]:
+    """Append exact IDs after preprocessing for an opt-in prefill-scoring request."""
+    if not isinstance(obj, GenerateReqInput) or obj.scoring_suffix_ids is None:
+        return input_ids
+
+    suffix_ids = obj.scoring_suffix_ids
+    if not suffix_ids:
+        raise ValueError("scoring_suffix_ids must not be empty.")
+    if obj.input_embeds is not None:
+        raise ValueError("scoring_suffix_ids does not support input_embeds.")
+    if obj.return_logprob is not True:
+        raise ValueError("scoring_suffix_ids requires return_logprob=True.")
+    if obj.multi_item_delimiter_indices is not None:
+        raise ValueError(
+            "scoring_suffix_ids does not support multi_item_delimiter_indices; "
+            "multi-item scoring uses a different logprob boundary."
+        )
+    if (obj.sampling_params or {}).get("max_new_tokens") != 0:
+        raise ValueError(
+            "scoring_suffix_ids requires sampling_params.max_new_tokens=0."
+        )
+    if obj.logprob_start_len != -1:
+        raise ValueError(
+            "logprob_start_len must be omitted when scoring_suffix_ids is provided; "
+            "SGLang derives it from the processed prefix."
+        )
+    if token_type_ids is not None:
+        raise ValueError("scoring_suffix_ids does not support token_type_ids.")
+    if obj.contains_mm_input() and mm_inputs is None:
+        raise ValueError(
+            "Multimodal scoring_suffix_ids requires tokenizer-side multimodal "
+            "processing before the suffix can be appended."
+        )
+
+    prefix_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+    if not prefix_ids:
+        raise ValueError("scoring_suffix_ids requires a non-empty processed prefix.")
+
+    if mm_inputs is not None:
+        multimodal_token_fields = (
+            "im_token_id",
+            "im_start_id",
+            "im_end_id",
+            "slice_start_id",
+            "slice_end_id",
+            "video_token_id",
+            "audio_token_id",
+            "audio_start_id",
+            "audio_end_id",
+        )
+        multimodal_token_ids = {
+            int(token_id)
+            for field in multimodal_token_fields
+            if (token_id := getattr(mm_inputs, field, None)) is not None
+        }
+        invalid_suffix_ids = sorted(set(suffix_ids) & multimodal_token_ids)
+        if invalid_suffix_ids:
+            raise ValueError(
+                "scoring_suffix_ids must contain pure-text actions; found "
+                f"multimodal special token IDs {invalid_suffix_ids}. Images or other "
+                "media introduced inside the suffix require a separate processor pass."
+            )
+
+    combined_ids = prefix_ids + list(suffix_ids)
+
+    if mm_inputs is not None:
+        mm_inputs.input_ids = combined_ids
+
+        padded_input_ids = mm_inputs.padded_input_ids
+        if padded_input_ids is not None:
+            if len(padded_input_ids) != len(prefix_ids):
+                raise ValueError(
+                    "Multimodal padded_input_ids length does not match the processed "
+                    f"prefix: {len(padded_input_ids)} != {len(prefix_ids)}."
+                )
+            mm_inputs.padded_input_ids = list(padded_input_ids) + list(suffix_ids)
+
+        mrope_positions = mm_inputs.mrope_positions
+        if mrope_positions is not None:
+            if mrope_positions.shape[-1] != len(prefix_ids):
+                raise ValueError(
+                    "Multimodal mrope_positions length does not match the processed "
+                    f"prefix: {mrope_positions.shape[-1]} != {len(prefix_ids)}."
+                )
+            terminal_positions = mrope_positions[:, -1]
+            if terminal_positions.numel() == 0 or not torch.equal(
+                terminal_positions,
+                terminal_positions[0].expand_as(terminal_positions),
+            ):
+                raise ValueError(
+                    "scoring_suffix_ids requires the processed multimodal prefix to "
+                    "end in a text position with equal terminal mRoPE coordinates; "
+                    f"got {terminal_positions.tolist()}."
+                )
+            # Pure-text suffix positions extend linearly. Their length raises
+            # both max(position)+1 and sequence length equally, so the existing
+            # mrope_position_delta remains valid.
+            mm_inputs.mrope_positions = extend_mrope_positions_for_retracted_request(
+                mrope_positions, len(suffix_ids)
+            )
+
+        visible_frame_counts = getattr(mm_inputs, "visible_frame_counts", None)
+        if visible_frame_counts is not None:
+            if visible_frame_counts.ndim != 1 or len(visible_frame_counts) != len(
+                prefix_ids
+            ):
+                raise ValueError(
+                    "Multimodal visible_frame_counts length does not match the "
+                    f"processed prefix: {visible_frame_counts.shape} vs "
+                    f"{len(prefix_ids)} tokens."
+                )
+            mm_inputs.visible_frame_counts = torch.cat(
+                [
+                    visible_frame_counts,
+                    visible_frame_counts[-1:].expand(len(suffix_ids)),
+                ]
+            )
+
+    return combined_ids
 
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -988,6 +1118,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
+        input_ids = _append_scoring_suffix(obj, input_ids, mm_inputs, token_type_ids)
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
@@ -1004,7 +1135,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Validate input length
         if input_token_num >= self.context_len:
-            if self.allow_auto_truncate:
+            has_exact_scoring_suffix = (
+                isinstance(obj, GenerateReqInput) and obj.scoring_suffix_ids is not None
+            )
+            if self.allow_auto_truncate and not has_exact_scoring_suffix:
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens). "
@@ -1013,9 +1147,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 del input_ids[_max_req_len:]
                 input_token_num = len(input_ids)
             else:
+                exact_suffix_note = (
+                    " Exact scoring suffix requests cannot be auto-truncated."
+                    if has_exact_scoring_suffix
+                    else ""
+                )
                 raise ValueError(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens)."
+                    f"{exact_suffix_note}"
                 )
 
         # Validate total tokens (input + max_new_tokens)
@@ -1206,6 +1346,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
                 stream=obj.stream,
+                scoring_suffix_len=(
+                    len(obj.scoring_suffix_ids)
+                    if obj.scoring_suffix_ids is not None
+                    else None
+                ),
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
                 bootstrap_host=obj.bootstrap_host,
@@ -1319,13 +1464,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
-            self._validate_one_request(obj[i], input_ids_list[i])
             token_type_ids = (
                 token_type_ids_list[i] if token_type_ids_list is not None else None
             )
+            input_ids = _append_scoring_suffix(
+                req, input_ids_list[i], None, token_type_ids
+            )
+            self._validate_one_request(req, input_ids)
             tokenized_objs.append(
                 self._create_tokenized_object(
-                    req, req.text, input_ids_list[i], None, None, token_type_ids
+                    req, req.text, input_ids, None, None, token_type_ids
                 )
             )
         logger.debug(f"Completed batch processing for {batch_size} requests")

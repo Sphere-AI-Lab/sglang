@@ -167,6 +167,13 @@ class GenerateReqInput:
         Optional[Union[List[List[int]], List[int]]],
         PlainValidator(validate_optional_list_i64_1d_2d),
     ] = None
+    # Exact token IDs appended after text/multimodal preprocessing. This is an
+    # opt-in prefill-scoring contract: the scheduler derives logprob_start_len
+    # from the final processed sequence and never retokenizes these suffix IDs.
+    scoring_suffix_ids: Annotated[
+        Optional[Union[List[List[int]], List[int]]],
+        PlainValidator(validate_optional_list_i64_1d_2d),
+    ] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -423,9 +430,20 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+            if self.scoring_suffix_ids is not None:
+                self.scoring_suffix_ids = [self.scoring_suffix_ids]
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
+        if self.scoring_suffix_ids is not None and (
+            not isinstance(self.scoring_suffix_ids, list)
+            or not self.scoring_suffix_ids
+            or isinstance(self.scoring_suffix_ids[0], list)
+        ):
+            raise ValueError(
+                "scoring_suffix_ids should be a non-empty list of token IDs "
+                "for a single request."
+            )
         if self.sampling_params is None:
             self.sampling_params = {}
         if self.rid is None:
@@ -452,6 +470,7 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
+        self._normalize_scoring_suffix_ids()
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
@@ -481,6 +500,28 @@ class GenerateReqInput:
             if not isinstance(self.input_embeds, list):
                 raise ValueError("input_embeds should be a list for batch processing.")
             self.input_embeds = self.input_embeds * self.parallel_sample_num
+
+    def _normalize_scoring_suffix_ids(self):
+        """Normalize exact scoring suffixes without changing the main input shape."""
+        if self.scoring_suffix_ids is None:
+            return
+        if (
+            not isinstance(self.scoring_suffix_ids, list)
+            or not self.scoring_suffix_ids
+            or any(
+                not isinstance(suffix_ids, list) or not suffix_ids
+                for suffix_ids in self.scoring_suffix_ids
+            )
+        ):
+            raise ValueError(
+                "scoring_suffix_ids should contain one non-empty list of token IDs "
+                "per batch item."
+            )
+        if len(self.scoring_suffix_ids) != self.batch_size:
+            raise ValueError(
+                "The length of scoring_suffix_ids should be equal to the batch size."
+            )
+        self.scoring_suffix_ids = self.scoring_suffix_ids * self.parallel_sample_num
 
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
@@ -711,6 +752,11 @@ class GenerateReqInput:
             session_id=self.session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
+            scoring_suffix_ids=(
+                self.scoring_suffix_ids[i]
+                if self.scoring_suffix_ids is not None
+                else None
+            ),
             input_embeds=(
                 self.input_embeds[i] if self.input_embeds is not None else None
             ),
@@ -808,6 +854,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     stream: bool
     # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
     return_sampling_mask: bool = False
+
+    # Length of an exact scoring suffix appended by the tokenizer manager.
+    # The scheduler derives the absolute logprob boundary only after session
+    # composition and model-specific multimodal padding are complete.
+    scoring_suffix_len: Optional[int] = field(default=None, kw_only=True)
 
     # Whether to return hidden states
     return_hidden_states: bool = False

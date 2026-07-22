@@ -304,6 +304,60 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 _is_npu = is_npu()
 _is_hip = is_hip()
 
+_EXACT_SCORING_SUFFIX_STREAMING_SESSION_ERROR = (
+    "Exact scoring suffix is not supported for streaming sessions because "
+    "they do not preserve custom prompt-logprob boundaries."
+)
+
+
+def _resolve_exact_scoring_suffix_boundary(
+    req: Req, recv_req: TokenizedGenerateReqInput
+) -> Tuple[Optional[int], Optional[str]]:
+    """Validate an exact suffix against the final scheduler token sequence."""
+    suffix_len = recv_req.scoring_suffix_len
+    if suffix_len is None:
+        return None, None
+    if suffix_len <= 0:
+        return None, "scoring_suffix_len must be positive."
+    if recv_req.input_ids is None or suffix_len > len(recv_req.input_ids):
+        return None, (
+            "scoring_suffix_len exceeds the tokenizer-side input length: "
+            f"{suffix_len=} vs {len(recv_req.input_ids) if recv_req.input_ids else 0}."
+        )
+    if suffix_len >= len(req.origin_input_ids):
+        return None, (
+            "Exact scoring suffix requires a non-empty processed prefix: "
+            f"{suffix_len=} vs final input length {len(req.origin_input_ids)}."
+        )
+    if req.session is not None and req.session.streaming:
+        return None, _EXACT_SCORING_SUFFIX_STREAMING_SESSION_ERROR
+
+    expected_suffix = list(recv_req.input_ids[-suffix_len:])
+    actual_suffix = list(req.origin_input_ids[-suffix_len:])
+    if actual_suffix != expected_suffix:
+        mismatch_index = next(
+            index
+            for index, (expected, actual) in enumerate(
+                zip(expected_suffix, actual_suffix)
+            )
+            if expected != actual
+        )
+        return None, (
+            "Model-specific preprocessing did not preserve scoring_suffix_ids at "
+            f"the end of the final input: mismatch at suffix offset "
+            f"{mismatch_index}, expected token {expected_suffix[mismatch_index]}, "
+            f"got {actual_suffix[mismatch_index]} (suffix length {suffix_len})."
+        )
+
+    return len(req.origin_input_ids) - suffix_len - 1, None
+
+
+def _should_allow_auto_truncate(
+    allow_auto_truncate: bool, scoring_suffix_len: Optional[int]
+) -> bool:
+    """Never truncate a request that promises an exact suffix."""
+    return allow_auto_truncate and scoring_suffix_len is None
+
 
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
@@ -2185,6 +2239,22 @@ class Scheduler(
         ):
             # Session exists and is not closing: create request from session
             session = self.session_controller.get(session_id)
+            if recv_req.scoring_suffix_len is not None and session.streaming:
+                # Reject before Session.create_req() can mark the session inflight
+                # or share its multimodal state with the rejected request.
+                req = Req(
+                    recv_req.rid,
+                    recv_req.input_text,
+                    recv_req.input_ids,
+                    recv_req.sampling_params,
+                    vocab_size=self.model_config.vocab_size,
+                    http_worker_ipc=recv_req.http_worker_ipc,
+                )
+                req.tokenizer = self.tokenizer
+                req.set_finish_with_abort(_EXACT_SCORING_SUFFIX_STREAMING_SESSION_ERROR)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
             req = session.create_req(
                 recv_req,
                 self.tokenizer,
@@ -2310,6 +2380,15 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        exact_logprob_start_len, error_msg = _resolve_exact_scoring_suffix_boundary(
+            req, recv_req
+        )
+        if error_msg:
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
@@ -2317,9 +2396,19 @@ class Scheduler(
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
-            self.server_args.allow_auto_truncate,
+            _should_allow_auto_truncate(
+                self.server_args.allow_auto_truncate,
+                recv_req.scoring_suffix_len,
+            ),
         )
         if error_msg:
+            if recv_req.scoring_suffix_len is not None:
+                error_msg = (
+                    f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
+                    f"the maximum allowed length ({self.max_req_input_len} tokens). "
+                    "Exact scoring suffix requests cannot be auto-truncated; use a "
+                    "shorter input."
+                )
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
@@ -2328,7 +2417,9 @@ class Scheduler(
             # When return_logprob is False, logprob_start_len should be ignored
             recv_req.logprob_start_len = -1
 
-        if recv_req.logprob_start_len == -1:
+        if exact_logprob_start_len is not None:
+            req.logprob_start_len = exact_logprob_start_len
+        elif recv_req.logprob_start_len == -1:
             if recv_req.return_logprob and recv_req.token_ids_logprob is None:
                 # If logprob is required but neither token_ids_logprob nor logprob_start_len is
                 # set, return the logprobs for output tokens by default

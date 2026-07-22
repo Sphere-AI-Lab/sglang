@@ -34,6 +34,7 @@ class EngineBase(ABC):
         rid: Optional[Union[List[str], str]] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        scoring_suffix_ids: Optional[Union[List[List[int]], List[int]]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """Generate outputs based on given inputs."""
         pass
