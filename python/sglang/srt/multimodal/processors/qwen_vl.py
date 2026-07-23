@@ -683,12 +683,26 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         entry_time = time.perf_counter()
+        # Thread the caller's exact token ids into base_output: the
+        # SGLANG_MM_AVOID_RETOKENIZE path in process_and_combine_mm_data gates
+        # on base_output.input_ids, and without it an input_ids request is
+        # decoded to text and silently retokenized, drifting non-canonical
+        # sampled ids from prior turns. These ids may contain compact image
+        # placeholders or runs already expanded by the caller's HF processor.
+        request_input_ids = None
+        if (
+            isinstance(input_text, list)
+            and input_text
+            and isinstance(input_text[0], int)
+        ):
+            request_input_ids = list(input_text)
         base_output = await self.legacy_load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
+            input_ids=request_input_ids,
         )
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")

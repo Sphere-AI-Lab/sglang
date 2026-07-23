@@ -1290,32 +1290,56 @@ class BaseMultimodalProcessor(ABC):
     ) -> List[int]:
         """Rebuild final input_ids for a pre-tokenized (list[int]) prompt.
 
-        Keep the user's ORIGINAL tokens verbatim and expand the i-th image
-        placeholder into ``counts[i]`` copies of ``placeholder_token_id``. The HF
-        processor's re-tokenization is discarded, so non-media tokens cannot
-        drift.
+        Each contiguous placeholder run represents one image. Accept both the
+        compact form (one placeholder per image) and the form already expanded
+        by an HF processor (``counts[i]`` placeholders). Normalize either form
+        to exactly ``counts[i]`` placeholders while preserving every non-media
+        token verbatim.
 
         """
         if placeholder_token_id is None:
             raise ValueError("placeholder_token_id is not set for this processor")
 
-        num_placeholders = sum(
-            1 for token_id in original_ids if token_id == placeholder_token_id
-        )
-        if num_placeholders != len(counts):
+        rebuilt: List[int] = []
+        next_image_idx = 0
+        token_idx = 0
+        while token_idx < len(original_ids):
+            token_id = original_ids[token_idx]
+            if token_id != placeholder_token_id:
+                rebuilt.append(token_id)
+                token_idx += 1
+                continue
+
+            run_start = token_idx
+            while (
+                token_idx < len(original_ids)
+                and original_ids[token_idx] == placeholder_token_id
+            ):
+                token_idx += 1
+
+            if next_image_idx >= len(counts):
+                raise ValueError(
+                    "prompt has more image placeholder run(s) than provided images"
+                )
+
+            run_length = token_idx - run_start
+            expected_count = counts[next_image_idx]
+            if run_length not in (1, expected_count):
+                raise ValueError(
+                    f"image placeholder run {next_image_idx} has length "
+                    f"{run_length}; expected compact length 1 or expanded length "
+                    f"{expected_count}"
+                )
+
+            rebuilt.extend([placeholder_token_id] * expected_count)
+            next_image_idx += 1
+
+        if next_image_idx != len(counts):
             raise ValueError(
-                f"prompt has {num_placeholders} image placeholder token(s) but "
+                f"prompt has {next_image_idx} image placeholder run(s) but "
                 f"{len(counts)} image(s) were provided"
             )
 
-        rebuilt: List[int] = []
-        next_image_idx = 0
-        for token_id in original_ids:
-            if token_id == placeholder_token_id:
-                rebuilt.extend([placeholder_token_id] * counts[next_image_idx])
-                next_image_idx += 1
-            else:
-                rebuilt.append(token_id)
         return rebuilt
 
     def process_and_combine_mm_data(
