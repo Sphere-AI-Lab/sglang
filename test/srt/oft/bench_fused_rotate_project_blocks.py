@@ -34,20 +34,48 @@ SHAPES = [
 BATCHES = [1, 8, 64, 256, 1024]
 BLOCK_SIZES = [16, 32, 64, 128, 256, 512, 1024]
 
-# A kernel that was not changed should time within noise. 5% absorbs run-to-run
-# variance on an idle H100 without hiding a real slowdown.
-REGRESSION_TOLERANCE = 0.05
+# KNOWN, MEASURED, ACCEPTED: after the tiling change, `qwen25-7b-qkv M=1 BS=16`
+# is ~12% slower than baseline, reproducibly (12.6 / 12.2 / 12.3% over three
+# runs). It is the smallest and fastest configuration in the sweep, it takes the
+# untiled path unchanged, and no example launcher or campaign arm uses BS=16 --
+# every OFT RL example ships 32, 64 or 128, and E5's ladder is 28/32/64/256. It
+# is recorded here rather than hidden by widening the tolerance.
+#
+# A kernel that was not changed should time within noise. 10% is set from the
+# measured floor: with the timing method below, the unmodified kernel compared
+# against its own baseline stays inside this on every row. It was 5% with a
+# cruder timer, which flagged six false regressions -- see _time_ms.
+REGRESSION_TOLERANCE = 0.10
 
 
-def _time_ms(fn, warmup: int = 5, iters: int = 20) -> float:
+def _time_ms(fn, warmup: int = 20, iters: int = 100, repeats: int = 5) -> float:
+    """Fastest observed time per launch, over `repeats` independent batches.
+
+    Three deliberate choices, all forced by a measured failure: timing the
+    UNMODIFIED kernel against its own baseline with wall clock, 20 iterations
+    and a mean reported six "regressions", one of 84%. That noise floor is far
+    above any real difference this work would produce, so the gate was useless.
+
+      * CUDA events, not perf_counter -- removes host-side launch jitter.
+      * min over repeats, not mean -- the fastest batch is the one least
+        contaminated by interference; means chase whatever else touched the GPU.
+      * 100 iterations after 20 warmups -- these kernels run in ~0.1 ms, so a
+        20-iteration batch is dominated by the first launch after a gap.
+    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
-    start = time.perf_counter()
-    for _ in range(iters):
-        fn()
-    torch.cuda.synchronize()
-    return (time.perf_counter() - start) * 1000.0 / iters
+    best = float("inf")
+    for _ in range(repeats):
+        start_ev = torch.cuda.Event(enable_timing=True)
+        end_ev = torch.cuda.Event(enable_timing=True)
+        start_ev.record()
+        for _ in range(iters):
+            fn()
+        end_ev.record()
+        torch.cuda.synchronize()
+        best = min(best, start_ev.elapsed_time(end_ev) / iters)
+    return best
 
 
 def bench_block_sizes(shapes=SHAPES, block_sizes=BLOCK_SIZES, batches=BATCHES) -> list[dict]:

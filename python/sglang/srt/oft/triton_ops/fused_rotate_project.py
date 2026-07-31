@@ -43,6 +43,8 @@ def _fused_rotate_project_qkv_kernel(
     BLOCK_N: tl.constexpr,
     GROUP_N: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    TILED: tl.constexpr,
+    TILE_K: tl.constexpr,
 ):
     """One program covers (m_tile, slice_idx, n_tile-group-within-slice) for QKV."""
     pid_m = tl.program_id(0)
@@ -78,7 +80,7 @@ def _fused_rotate_project_qkv_kernel(
         pid_m, pid_slice, n_group_start, slice_offset, slice_width,
         slot_R_offset, bsv,
         M, K, sum_out, blocks_per_slice,
-        BS, BLOCK_M, BLOCK_N, GROUP_N, HAS_BIAS,
+        BS, BLOCK_M, BLOCK_N, GROUP_N, HAS_BIAS, TILED, TILE_K,
     )
 
 
@@ -99,6 +101,8 @@ def _fused_rotate_project_gate_up_kernel(
     BLOCK_N: tl.constexpr,
     GROUP_N: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    TILED: tl.constexpr,
+    TILE_K: tl.constexpr,
 ):
     """N=2 variant (gate/up)."""
     pid_m = tl.program_id(0)
@@ -129,7 +133,7 @@ def _fused_rotate_project_gate_up_kernel(
         pid_m, pid_slice, n_group_start, slice_offset, slice_width,
         slot_R_offset, bsv,
         M, K, sum_out, blocks_per_slice,
-        BS, BLOCK_M, BLOCK_N, GROUP_N, HAS_BIAS,
+        BS, BLOCK_M, BLOCK_N, GROUP_N, HAS_BIAS, TILED, TILE_K,
     )
 
 
@@ -220,6 +224,8 @@ def _fused_rotate_project_inner(
     BLOCK_N: tl.constexpr,
     GROUP_N: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    TILED: tl.constexpr,
+    TILE_K: tl.constexpr,
 ):
     m_start = pid_m * BLOCK_M
     offs_m = m_start + tl.arange(0, BLOCK_M)
@@ -257,7 +263,13 @@ def _fused_rotate_project_inner(
     rotation_block_start = pid_slice * blocks_per_slice
 
     bs_range = tl.arange(0, BS)
-    R_inner_offsets = bs_range[:, None] * BS + bs_range[None, :]
+    if TILED:
+        # NOT materialised when tiling: this is a BS x BS index tensor, so at
+        # BS=1024 it is a megabyte of int32 on its own -- the very thing the
+        # tiled path exists to avoid.
+        tile_range = tl.arange(0, TILE_K)
+    else:
+        R_inner_offsets = bs_range[:, None] * BS + bs_range[None, :]
 
     # bsv == 0 is the legacy identity-passthrough sentinel: the active OFT
     # slot's R buffer is uninitialized / not meaningful; behave as if R were
@@ -265,208 +277,422 @@ def _fused_rotate_project_inner(
     do_rotation = bsv != 0
 
     if do_rotation:
-        for block_idx in range(0, blocks_per_slice):
-            k_block_start = block_idx * BS
-            offs_k = k_block_start + bs_range
+        if TILED:
+            # Walk the rotation block in TILE_K-wide column tiles instead of
+            # staging all BS x BS of it. x_rot_j is a COMPLETE BS-reduction
+            # before it is cast, exactly as x_rot is in the untiled path below
+            # -- only the summation order inside that reduction differs, so the
+            # cast point and therefore the numerics are unchanged in kind.
+            #
+            # FLOPs are identical: the `i` loop covers the same BS reduction the
+            # single tl.dot did, and the `j` loop the same BS output columns.
+            # The added cost is re-reading x once per `j` tile, which is why
+            # TILED is a compile-time constant -- BS <= 128 must not pay it.
+            for block_idx in range(0, blocks_per_slice):
+                k_block_start = block_idx * BS
+                R_block_base = slot_R_offset + (rotation_block_start + block_idx) * BS * BS
+                for j in range(0, BS, TILE_K):
+                    offs_j = j + tile_range
+                    x_rot_j = tl.zeros((BLOCK_M, TILE_K), dtype=tl.float32)
+                    for i in range(0, BS, TILE_K):
+                        offs_i = i + tile_range
+                        x_i = tl.load(
+                            x_ptr + offs_m[:, None] * K + (k_block_start + offs_i)[None, :],
+                            mask=m_mask[:, None],
+                            other=0.0,
+                        )
+                        R_ij = tl.load(
+                            R_ptr + R_block_base + offs_i[:, None] * BS + offs_j[None, :]
+                        )
+                        x_rot_j += tl.dot(x_i, R_ij, out_dtype=tl.float32)
+                    x_for_proj_j = x_rot_j.to(tl.bfloat16)
+                    offs_kj = k_block_start + offs_j
 
-            x_block = tl.load(
-                x_ptr + offs_m[:, None] * K + offs_k[None, :],
-                mask=m_mask[:, None],
-                other=0.0,
-            )
-            R_block_base = slot_R_offset + (rotation_block_start + block_idx) * BS * BS
-            R_block = tl.load(R_ptr + R_block_base + R_inner_offsets)
-            x_rot = tl.dot(x_block, R_block, out_dtype=tl.float32)
-            x_for_proj = x_rot.to(tl.bfloat16)
+                    w_rows0 = slice_offset + offs_n0
+                    W_block0 = tl.load(
+                        W_ptr + w_rows0[:, None] * K + offs_kj[None, :],
+                        mask=n_mask0[:, None],
+                        other=0.0,
+                    )
+                    acc0 += tl.dot(
+                        x_for_proj_j, tl.trans(W_block0), out_dtype=tl.float32,
+                        allow_tf32=False,
+                    )
 
-            w_rows0 = slice_offset + offs_n0
-            W_block0 = tl.load(
-                W_ptr + w_rows0[:, None] * K + offs_k[None, :],
-                mask=n_mask0[:, None],
-                other=0.0,
-            )
-            acc0 += tl.dot(
-                x_for_proj, tl.trans(W_block0), out_dtype=tl.float32, allow_tf32=False
-            )
+                    if GROUP_N >= 2:
+                        w_rows1 = slice_offset + offs_n1
+                        W_block1 = tl.load(
+                            W_ptr + w_rows1[:, None] * K + offs_kj[None, :],
+                            mask=n_mask1[:, None],
+                            other=0.0,
+                        )
+                        acc1 += tl.dot(
+                            x_for_proj_j, tl.trans(W_block1), out_dtype=tl.float32,
+                            allow_tf32=False,
+                        )
+                    if GROUP_N >= 4:
+                        w_rows2 = slice_offset + offs_n2
+                        W_block2 = tl.load(
+                            W_ptr + w_rows2[:, None] * K + offs_kj[None, :],
+                            mask=n_mask2[:, None],
+                            other=0.0,
+                        )
+                        acc2 += tl.dot(
+                            x_for_proj_j, tl.trans(W_block2), out_dtype=tl.float32,
+                            allow_tf32=False,
+                        )
+                        w_rows3 = slice_offset + offs_n3
+                        W_block3 = tl.load(
+                            W_ptr + w_rows3[:, None] * K + offs_kj[None, :],
+                            mask=n_mask3[:, None],
+                            other=0.0,
+                        )
+                        acc3 += tl.dot(
+                            x_for_proj_j, tl.trans(W_block3), out_dtype=tl.float32,
+                            allow_tf32=False,
+                        )
+                    if GROUP_N >= 8:
+                        w_rows4 = slice_offset + offs_n4
+                        W_block4 = tl.load(
+                            W_ptr + w_rows4[:, None] * K + offs_kj[None, :],
+                            mask=n_mask4[:, None],
+                            other=0.0,
+                        )
+                        acc4 += tl.dot(
+                            x_for_proj_j, tl.trans(W_block4), out_dtype=tl.float32,
+                            allow_tf32=False,
+                        )
+                        w_rows5 = slice_offset + offs_n5
+                        W_block5 = tl.load(
+                            W_ptr + w_rows5[:, None] * K + offs_kj[None, :],
+                            mask=n_mask5[:, None],
+                            other=0.0,
+                        )
+                        acc5 += tl.dot(
+                            x_for_proj_j, tl.trans(W_block5), out_dtype=tl.float32,
+                            allow_tf32=False,
+                        )
+                        w_rows6 = slice_offset + offs_n6
+                        W_block6 = tl.load(
+                            W_ptr + w_rows6[:, None] * K + offs_kj[None, :],
+                            mask=n_mask6[:, None],
+                            other=0.0,
+                        )
+                        acc6 += tl.dot(
+                            x_for_proj_j, tl.trans(W_block6), out_dtype=tl.float32,
+                            allow_tf32=False,
+                        )
+                        w_rows7 = slice_offset + offs_n7
+                        W_block7 = tl.load(
+                            W_ptr + w_rows7[:, None] * K + offs_kj[None, :],
+                            mask=n_mask7[:, None],
+                            other=0.0,
+                        )
+                        acc7 += tl.dot(
+                            x_for_proj_j, tl.trans(W_block7), out_dtype=tl.float32,
+                            allow_tf32=False,
+                        )
+        else:
+            for block_idx in range(0, blocks_per_slice):
+                k_block_start = block_idx * BS
+                offs_k = k_block_start + bs_range
 
-            if GROUP_N >= 2:
-                w_rows1 = slice_offset + offs_n1
-                W_block1 = tl.load(
-                    W_ptr + w_rows1[:, None] * K + offs_k[None, :],
-                    mask=n_mask1[:, None],
+                x_block = tl.load(
+                    x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                    mask=m_mask[:, None],
                     other=0.0,
                 )
-                acc1 += tl.dot(
-                    x_for_proj,
-                    tl.trans(W_block1),
-                    out_dtype=tl.float32,
-                    allow_tf32=False,
+                R_block_base = slot_R_offset + (rotation_block_start + block_idx) * BS * BS
+                R_block = tl.load(R_ptr + R_block_base + R_inner_offsets)
+                x_rot = tl.dot(x_block, R_block, out_dtype=tl.float32)
+                x_for_proj = x_rot.to(tl.bfloat16)
+
+                w_rows0 = slice_offset + offs_n0
+                W_block0 = tl.load(
+                    W_ptr + w_rows0[:, None] * K + offs_k[None, :],
+                    mask=n_mask0[:, None],
+                    other=0.0,
+                )
+                acc0 += tl.dot(
+                    x_for_proj, tl.trans(W_block0), out_dtype=tl.float32, allow_tf32=False
                 )
 
-            if GROUP_N >= 4:
-                w_rows2 = slice_offset + offs_n2
-                w_rows3 = slice_offset + offs_n3
-                W_block2 = tl.load(
-                    W_ptr + w_rows2[:, None] * K + offs_k[None, :],
-                    mask=n_mask2[:, None],
-                    other=0.0,
-                )
-                W_block3 = tl.load(
-                    W_ptr + w_rows3[:, None] * K + offs_k[None, :],
-                    mask=n_mask3[:, None],
-                    other=0.0,
-                )
-                acc2 += tl.dot(
-                    x_for_proj,
-                    tl.trans(W_block2),
-                    out_dtype=tl.float32,
-                    allow_tf32=False,
-                )
-                acc3 += tl.dot(
-                    x_for_proj,
-                    tl.trans(W_block3),
-                    out_dtype=tl.float32,
-                    allow_tf32=False,
-                )
+                if GROUP_N >= 2:
+                    w_rows1 = slice_offset + offs_n1
+                    W_block1 = tl.load(
+                        W_ptr + w_rows1[:, None] * K + offs_k[None, :],
+                        mask=n_mask1[:, None],
+                        other=0.0,
+                    )
+                    acc1 += tl.dot(
+                        x_for_proj,
+                        tl.trans(W_block1),
+                        out_dtype=tl.float32,
+                        allow_tf32=False,
+                    )
 
-            if GROUP_N >= 8:
-                w_rows4 = slice_offset + offs_n4
-                w_rows5 = slice_offset + offs_n5
-                w_rows6 = slice_offset + offs_n6
-                w_rows7 = slice_offset + offs_n7
-                W_block4 = tl.load(
-                    W_ptr + w_rows4[:, None] * K + offs_k[None, :],
-                    mask=n_mask4[:, None],
-                    other=0.0,
-                )
-                W_block5 = tl.load(
-                    W_ptr + w_rows5[:, None] * K + offs_k[None, :],
-                    mask=n_mask5[:, None],
-                    other=0.0,
-                )
-                W_block6 = tl.load(
-                    W_ptr + w_rows6[:, None] * K + offs_k[None, :],
-                    mask=n_mask6[:, None],
-                    other=0.0,
-                )
-                W_block7 = tl.load(
-                    W_ptr + w_rows7[:, None] * K + offs_k[None, :],
-                    mask=n_mask7[:, None],
-                    other=0.0,
-                )
-                acc4 += tl.dot(
-                    x_for_proj,
-                    tl.trans(W_block4),
-                    out_dtype=tl.float32,
-                    allow_tf32=False,
-                )
-                acc5 += tl.dot(
-                    x_for_proj,
-                    tl.trans(W_block5),
-                    out_dtype=tl.float32,
-                    allow_tf32=False,
-                )
-                acc6 += tl.dot(
-                    x_for_proj,
-                    tl.trans(W_block6),
-                    out_dtype=tl.float32,
-                    allow_tf32=False,
-                )
-                acc7 += tl.dot(
-                    x_for_proj,
-                    tl.trans(W_block7),
-                    out_dtype=tl.float32,
-                    allow_tf32=False,
-                )
+                if GROUP_N >= 4:
+                    w_rows2 = slice_offset + offs_n2
+                    w_rows3 = slice_offset + offs_n3
+                    W_block2 = tl.load(
+                        W_ptr + w_rows2[:, None] * K + offs_k[None, :],
+                        mask=n_mask2[:, None],
+                        other=0.0,
+                    )
+                    W_block3 = tl.load(
+                        W_ptr + w_rows3[:, None] * K + offs_k[None, :],
+                        mask=n_mask3[:, None],
+                        other=0.0,
+                    )
+                    acc2 += tl.dot(
+                        x_for_proj,
+                        tl.trans(W_block2),
+                        out_dtype=tl.float32,
+                        allow_tf32=False,
+                    )
+                    acc3 += tl.dot(
+                        x_for_proj,
+                        tl.trans(W_block3),
+                        out_dtype=tl.float32,
+                        allow_tf32=False,
+                    )
+
+                if GROUP_N >= 8:
+                    w_rows4 = slice_offset + offs_n4
+                    w_rows5 = slice_offset + offs_n5
+                    w_rows6 = slice_offset + offs_n6
+                    w_rows7 = slice_offset + offs_n7
+                    W_block4 = tl.load(
+                        W_ptr + w_rows4[:, None] * K + offs_k[None, :],
+                        mask=n_mask4[:, None],
+                        other=0.0,
+                    )
+                    W_block5 = tl.load(
+                        W_ptr + w_rows5[:, None] * K + offs_k[None, :],
+                        mask=n_mask5[:, None],
+                        other=0.0,
+                    )
+                    W_block6 = tl.load(
+                        W_ptr + w_rows6[:, None] * K + offs_k[None, :],
+                        mask=n_mask6[:, None],
+                        other=0.0,
+                    )
+                    W_block7 = tl.load(
+                        W_ptr + w_rows7[:, None] * K + offs_k[None, :],
+                        mask=n_mask7[:, None],
+                        other=0.0,
+                    )
+                    acc4 += tl.dot(
+                        x_for_proj,
+                        tl.trans(W_block4),
+                        out_dtype=tl.float32,
+                        allow_tf32=False,
+                    )
+                    acc5 += tl.dot(
+                        x_for_proj,
+                        tl.trans(W_block5),
+                        out_dtype=tl.float32,
+                        allow_tf32=False,
+                    )
+                    acc6 += tl.dot(
+                        x_for_proj,
+                        tl.trans(W_block6),
+                        out_dtype=tl.float32,
+                        allow_tf32=False,
+                    )
+                    acc7 += tl.dot(
+                        x_for_proj,
+                        tl.trans(W_block7),
+                        out_dtype=tl.float32,
+                        allow_tf32=False,
+                    )
     else:
-        for block_idx in range(0, blocks_per_slice):
-            k_block_start = block_idx * BS
-            offs_k = k_block_start + bs_range
+        if TILED:
+            # The identity passthrough is reached at RUNTIME (bsv == 0), so
+            # Triton compiles it whichever branch the rotation takes -- and it
+            # stages BLOCK_M x BS and BLOCK_N x BS tiles of its own. Tiling the
+            # rotation alone left this one setting the footprint, which is why
+            # BS=512 still needed 393,216 B after that change. Plain matmul
+            # here, so tiling K is just an extra accumulation loop.
+            for block_idx in range(0, blocks_per_slice):
+                k_block_start = block_idx * BS
+                for j in range(0, BS, TILE_K):
+                    offs_k = k_block_start + j + tile_range
 
-            x_block = tl.load(
-                x_ptr + offs_m[:, None] * K + offs_k[None, :],
-                mask=m_mask[:, None],
-                other=0.0,
-            )
+                    x_block = tl.load(
+                        x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                        mask=m_mask[:, None],
+                        other=0.0,
+                    )
 
-            w_rows0 = slice_offset + offs_n0
-            W_block0 = tl.load(
-                W_ptr + w_rows0[:, None] * K + offs_k[None, :],
-                mask=n_mask0[:, None],
-                other=0.0,
-            )
-            acc0 += tl.dot(
-                x_block, tl.trans(W_block0), out_dtype=tl.float32, allow_tf32=False
-            )
+                    w_rows0 = slice_offset + offs_n0
+                    W_block0 = tl.load(
+                        W_ptr + w_rows0[:, None] * K + offs_k[None, :],
+                        mask=n_mask0[:, None],
+                        other=0.0,
+                    )
+                    acc0 += tl.dot(
+                        x_block, tl.trans(W_block0), out_dtype=tl.float32, allow_tf32=False
+                    )
 
-            if GROUP_N >= 2:
-                w_rows1 = slice_offset + offs_n1
-                W_block1 = tl.load(
-                    W_ptr + w_rows1[:, None] * K + offs_k[None, :],
-                    mask=n_mask1[:, None],
+                    if GROUP_N >= 2:
+                        w_rows1 = slice_offset + offs_n1
+                        W_block1 = tl.load(
+                            W_ptr + w_rows1[:, None] * K + offs_k[None, :],
+                            mask=n_mask1[:, None],
+                            other=0.0,
+                        )
+                        acc1 += tl.dot(
+                            x_block, tl.trans(W_block1), out_dtype=tl.float32, allow_tf32=False
+                        )
+
+                    if GROUP_N >= 4:
+                        w_rows2 = slice_offset + offs_n2
+                        w_rows3 = slice_offset + offs_n3
+                        W_block2 = tl.load(
+                            W_ptr + w_rows2[:, None] * K + offs_k[None, :],
+                            mask=n_mask2[:, None],
+                            other=0.0,
+                        )
+                        W_block3 = tl.load(
+                            W_ptr + w_rows3[:, None] * K + offs_k[None, :],
+                            mask=n_mask3[:, None],
+                            other=0.0,
+                        )
+                        acc2 += tl.dot(
+                            x_block, tl.trans(W_block2), out_dtype=tl.float32, allow_tf32=False
+                        )
+                        acc3 += tl.dot(
+                            x_block, tl.trans(W_block3), out_dtype=tl.float32, allow_tf32=False
+                        )
+
+                    if GROUP_N >= 8:
+                        w_rows4 = slice_offset + offs_n4
+                        w_rows5 = slice_offset + offs_n5
+                        w_rows6 = slice_offset + offs_n6
+                        w_rows7 = slice_offset + offs_n7
+                        W_block4 = tl.load(
+                            W_ptr + w_rows4[:, None] * K + offs_k[None, :],
+                            mask=n_mask4[:, None],
+                            other=0.0,
+                        )
+                        W_block5 = tl.load(
+                            W_ptr + w_rows5[:, None] * K + offs_k[None, :],
+                            mask=n_mask5[:, None],
+                            other=0.0,
+                        )
+                        W_block6 = tl.load(
+                            W_ptr + w_rows6[:, None] * K + offs_k[None, :],
+                            mask=n_mask6[:, None],
+                            other=0.0,
+                        )
+                        W_block7 = tl.load(
+                            W_ptr + w_rows7[:, None] * K + offs_k[None, :],
+                            mask=n_mask7[:, None],
+                            other=0.0,
+                        )
+                        acc4 += tl.dot(
+                            x_block, tl.trans(W_block4), out_dtype=tl.float32, allow_tf32=False
+                        )
+                        acc5 += tl.dot(
+                            x_block, tl.trans(W_block5), out_dtype=tl.float32, allow_tf32=False
+                        )
+                        acc6 += tl.dot(
+                            x_block, tl.trans(W_block6), out_dtype=tl.float32, allow_tf32=False
+                        )
+                        acc7 += tl.dot(
+                            x_block, tl.trans(W_block7), out_dtype=tl.float32, allow_tf32=False
+                        )
+
+        else:
+            for block_idx in range(0, blocks_per_slice):
+                k_block_start = block_idx * BS
+                offs_k = k_block_start + bs_range
+
+                x_block = tl.load(
+                    x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                    mask=m_mask[:, None],
                     other=0.0,
-                )
-                acc1 += tl.dot(
-                    x_block, tl.trans(W_block1), out_dtype=tl.float32, allow_tf32=False
                 )
 
-            if GROUP_N >= 4:
-                w_rows2 = slice_offset + offs_n2
-                w_rows3 = slice_offset + offs_n3
-                W_block2 = tl.load(
-                    W_ptr + w_rows2[:, None] * K + offs_k[None, :],
-                    mask=n_mask2[:, None],
+                w_rows0 = slice_offset + offs_n0
+                W_block0 = tl.load(
+                    W_ptr + w_rows0[:, None] * K + offs_k[None, :],
+                    mask=n_mask0[:, None],
                     other=0.0,
                 )
-                W_block3 = tl.load(
-                    W_ptr + w_rows3[:, None] * K + offs_k[None, :],
-                    mask=n_mask3[:, None],
-                    other=0.0,
-                )
-                acc2 += tl.dot(
-                    x_block, tl.trans(W_block2), out_dtype=tl.float32, allow_tf32=False
-                )
-                acc3 += tl.dot(
-                    x_block, tl.trans(W_block3), out_dtype=tl.float32, allow_tf32=False
+                acc0 += tl.dot(
+                    x_block, tl.trans(W_block0), out_dtype=tl.float32, allow_tf32=False
                 )
 
-            if GROUP_N >= 8:
-                w_rows4 = slice_offset + offs_n4
-                w_rows5 = slice_offset + offs_n5
-                w_rows6 = slice_offset + offs_n6
-                w_rows7 = slice_offset + offs_n7
-                W_block4 = tl.load(
-                    W_ptr + w_rows4[:, None] * K + offs_k[None, :],
-                    mask=n_mask4[:, None],
-                    other=0.0,
-                )
-                W_block5 = tl.load(
-                    W_ptr + w_rows5[:, None] * K + offs_k[None, :],
-                    mask=n_mask5[:, None],
-                    other=0.0,
-                )
-                W_block6 = tl.load(
-                    W_ptr + w_rows6[:, None] * K + offs_k[None, :],
-                    mask=n_mask6[:, None],
-                    other=0.0,
-                )
-                W_block7 = tl.load(
-                    W_ptr + w_rows7[:, None] * K + offs_k[None, :],
-                    mask=n_mask7[:, None],
-                    other=0.0,
-                )
-                acc4 += tl.dot(
-                    x_block, tl.trans(W_block4), out_dtype=tl.float32, allow_tf32=False
-                )
-                acc5 += tl.dot(
-                    x_block, tl.trans(W_block5), out_dtype=tl.float32, allow_tf32=False
-                )
-                acc6 += tl.dot(
-                    x_block, tl.trans(W_block6), out_dtype=tl.float32, allow_tf32=False
-                )
-                acc7 += tl.dot(
-                    x_block, tl.trans(W_block7), out_dtype=tl.float32, allow_tf32=False
-                )
+                if GROUP_N >= 2:
+                    w_rows1 = slice_offset + offs_n1
+                    W_block1 = tl.load(
+                        W_ptr + w_rows1[:, None] * K + offs_k[None, :],
+                        mask=n_mask1[:, None],
+                        other=0.0,
+                    )
+                    acc1 += tl.dot(
+                        x_block, tl.trans(W_block1), out_dtype=tl.float32, allow_tf32=False
+                    )
+
+                if GROUP_N >= 4:
+                    w_rows2 = slice_offset + offs_n2
+                    w_rows3 = slice_offset + offs_n3
+                    W_block2 = tl.load(
+                        W_ptr + w_rows2[:, None] * K + offs_k[None, :],
+                        mask=n_mask2[:, None],
+                        other=0.0,
+                    )
+                    W_block3 = tl.load(
+                        W_ptr + w_rows3[:, None] * K + offs_k[None, :],
+                        mask=n_mask3[:, None],
+                        other=0.0,
+                    )
+                    acc2 += tl.dot(
+                        x_block, tl.trans(W_block2), out_dtype=tl.float32, allow_tf32=False
+                    )
+                    acc3 += tl.dot(
+                        x_block, tl.trans(W_block3), out_dtype=tl.float32, allow_tf32=False
+                    )
+
+                if GROUP_N >= 8:
+                    w_rows4 = slice_offset + offs_n4
+                    w_rows5 = slice_offset + offs_n5
+                    w_rows6 = slice_offset + offs_n6
+                    w_rows7 = slice_offset + offs_n7
+                    W_block4 = tl.load(
+                        W_ptr + w_rows4[:, None] * K + offs_k[None, :],
+                        mask=n_mask4[:, None],
+                        other=0.0,
+                    )
+                    W_block5 = tl.load(
+                        W_ptr + w_rows5[:, None] * K + offs_k[None, :],
+                        mask=n_mask5[:, None],
+                        other=0.0,
+                    )
+                    W_block6 = tl.load(
+                        W_ptr + w_rows6[:, None] * K + offs_k[None, :],
+                        mask=n_mask6[:, None],
+                        other=0.0,
+                    )
+                    W_block7 = tl.load(
+                        W_ptr + w_rows7[:, None] * K + offs_k[None, :],
+                        mask=n_mask7[:, None],
+                        other=0.0,
+                    )
+                    acc4 += tl.dot(
+                        x_block, tl.trans(W_block4), out_dtype=tl.float32, allow_tf32=False
+                    )
+                    acc5 += tl.dot(
+                        x_block, tl.trans(W_block5), out_dtype=tl.float32, allow_tf32=False
+                    )
+                    acc6 += tl.dot(
+                        x_block, tl.trans(W_block6), out_dtype=tl.float32, allow_tf32=False
+                    )
+                    acc7 += tl.dot(
+                        x_block, tl.trans(W_block7), out_dtype=tl.float32, allow_tf32=False
+                    )
 
     if HAS_BIAS:
         bias_vals0 = tl.load(bias_ptr + slice_offset + offs_n0, mask=n_mask0, other=0.0)
@@ -549,6 +775,24 @@ def _fused_rotate_project_inner(
             acc7.to(tl.bfloat16),
             mask=m_mask[:, None] & n_mask7[None, :],
         )
+
+
+# Sub-tile width for the tiled rotation path, in elements.
+#
+# The untiled path stages the whole BS x BS rotation block in shared memory, so
+# its footprint is 6*BS*(BS+128) bytes and exceeds sm_90's 232,448 B per-block
+# limit above BS=128 (measured: 589,824 at 256; 1,966,080 at 512; 7,077,888 at
+# 1024). The tiled path walks that block in OFT_TILE_K x OFT_TILE_K sub-tiles,
+# so the footprint is O(OFT_TILE_K**2) and does not depend on BS at all.
+#
+# 64 rather than 32 or 128: tl.dot wants at least 16 per dimension, 64 keeps the
+# staged tiles well inside budget, and it matches the BLOCK_M/BLOCK_N the QKV
+# path already uses -- so the tiled loop reuses tile shapes that were tuned.
+OFT_TILE_K = 64
+
+# Largest block the untiled path fits in shared memory on sm_90. Above this the
+# tiled path is selected automatically.
+OFT_UNTILED_MAX_BS = 128
 
 
 def _pick_tiles(M: int, max_slice_width: int):
@@ -686,6 +930,7 @@ def fused_rotate_project_qkv(
     *,
     slot_idx_t: Optional[torch.Tensor] = None,
     bsv_t: Optional[torch.Tensor] = None,
+    force_tiled: bool = False,
 ) -> torch.Tensor:
     """Fused rotate-and-project for QKV (N=3, GQA Q!=K=V layout).
 
@@ -713,6 +958,12 @@ def fused_rotate_project_qkv(
     max_slice_width = max(S0, S1, S2)
     BLOCK_M, BLOCK_N, GROUP_N = _pick_qkv_tiles(M, max_slice_width, BS)
 
+    # Tiled only where the untiled path cannot launch, so every block size that
+    # works today compiles to exactly the code it does today. `force_tiled` is
+    # for the boundary test that proves the two paths agree at BS=128.
+    tiled = force_tiled or BS > OFT_UNTILED_MAX_BS
+    tile_k = min(OFT_TILE_K, BS)
+
     grid = (
         triton.cdiv(M, BLOCK_M),
         3,
@@ -728,6 +979,7 @@ def fused_rotate_project_qkv(
         BS=BS,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, GROUP_N=GROUP_N,
         HAS_BIAS=has_bias,
+        TILED=tiled, TILE_K=tile_k,
     )
     return out
 
@@ -779,6 +1031,9 @@ def fused_rotate_project_gate_up(
         BS=BS,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, GROUP_N=GROUP_N,
         HAS_BIAS=has_bias,
+        # Task 6 turns tiling on here. Until then gate-up keeps the untiled
+        # path unconditionally, so this change cannot alter its behaviour.
+        TILED=False, TILE_K=min(OFT_TILE_K, BS),
     )
     return out
 
