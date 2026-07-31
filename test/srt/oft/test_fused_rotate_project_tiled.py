@@ -125,3 +125,73 @@ def test_shared_memory_no_longer_scales_with_block_size():
     out = fused_rotate_project_qkv(x, R, W, OUT)  # must not raise
     torch.cuda.synchronize()
     assert out.shape == (8, sum(OUT))
+
+
+from sglang.srt.oft.triton_ops.fused_rotate_project import (  # noqa: E402
+    fused_rotate_gate_up_inputs,
+    fused_rotate_project_gate_up,
+)
+
+# Llama-3.1-8B FC1: hidden 4096 in, gate and up of 14336 each.
+FC1_K, FC1_OUT = 4096, [14336, 14336]
+
+
+def _fc1_inputs(M, BS, device="cuda", dtype=torch.bfloat16, seed=1):
+    g = torch.Generator(device=device).manual_seed(seed)
+    x = (torch.randn(M, FC1_K, device=device, dtype=dtype, generator=g) * 0.01).contiguous()
+    W = (torch.randn(sum(FC1_OUT), FC1_K, device=device, dtype=dtype, generator=g) * 0.02).contiguous()
+    blocks = 2 * (FC1_K // BS)
+    eye = torch.eye(BS, device=device, dtype=dtype)
+    noise = torch.randn(blocks, BS, BS, device=device, dtype=torch.float32, generator=g) * 0.02
+    R = (eye.float().unsqueeze(0) + (noise - noise.transpose(-1, -2))).to(dtype).contiguous()
+    return x, R, W
+
+
+@pytest.mark.parametrize("BS", [128, 256, 512, 1024])
+@pytest.mark.parametrize("M", [1, 64])
+def test_gate_up_projection_at_large_blocks(BS, M):
+    """gate_up shares the inner routine with QKV but picks different tiles --
+    GROUP_N up to 4 -- so its shared-memory budget is tighter and it needs its
+    own coverage."""
+    x, R, W = _fc1_inputs(M, BS)
+    out = fused_rotate_project_gate_up(x, R, W, FC1_OUT)
+    torch.cuda.synchronize()
+    err = (out.float() - _reference(x, R, W, FC1_OUT)).abs().max().item()
+    assert err <= TOL, f"BS={BS} M={M} max_abs={err:.2e}"
+
+
+@pytest.mark.parametrize("BS", [128, 256, 512, 1024])
+def test_gate_up_inputs_at_large_blocks(BS):
+    """No projection here -- it returns the two rotated inputs, so the reference
+    is the rotation alone, and it is a separate kernel from the two above."""
+    x, R, _ = _fc1_inputs(64, BS)
+    x_gate, x_up = fused_rotate_gate_up_inputs(x, R)
+    torch.cuda.synchronize()
+    blocks_per_slice = R.shape[0] // 2
+    for idx, got in enumerate((x_gate, x_up)):
+        expect = torch.empty_like(got, dtype=torch.float32)
+        for b in range(blocks_per_slice):
+            k0 = b * BS
+            expect[:, k0:k0 + BS] = (
+                x[:, k0:k0 + BS].float() @ R[idx * blocks_per_slice + b].float()
+            )
+        err = (got.float() - expect).abs().max().item()
+        assert err <= TOL, f"BS={BS} slice={idx} max_abs={err:.2e}"
+
+
+def test_the_tile_picker_respects_the_shared_memory_budget():
+    """GROUP_N >= 2 cannot afford a 128-wide tile: 245,760 B against 232,448.
+    The picker must reduce it rather than let the launch fail the way BS > 128
+    used to."""
+    from sglang.srt.oft.triton_ops.fused_rotate_project import (
+        OFT_SMEM_BUDGET,
+        _pick_tile_k,
+        _tiled_smem_bytes,
+    )
+
+    for BS in (128, 256, 512, 1024):
+        for block_m, block_n, group_n in ((64, 64, 1), (64, 64, 2), (16, 64, 4), (32, 64, 8)):
+            tk = _pick_tile_k(BS, block_m, block_n, group_n)
+            assert tk >= 16, (BS, group_n, tk)
+            assert BS % tk == 0, (BS, tk)
+            assert _tiled_smem_bytes(tk, block_m, block_n, group_n) <= OFT_SMEM_BUDGET

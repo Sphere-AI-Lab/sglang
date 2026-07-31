@@ -149,6 +149,8 @@ def _fused_rotate_gate_up_inputs_kernel(
     blocks_per_slice,
     BS: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    TILED: tl.constexpr,
+    TILE_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     block_idx = tl.program_id(1)
@@ -160,6 +162,58 @@ def _fused_rotate_gate_up_inputs_kernel(
     offs_m = m_start + tl.arange(0, BLOCK_M)
     m_mask = offs_m < M
 
+    slot = tl.load(slot_idx_ptr)
+    bsv = tl.load(bsv_ptr)
+
+    if TILED:
+        # This kernel is the worst of the three for shared memory: it holds TWO
+        # BS x BS rotations at once (gate and up), so its footprint is
+        # 3*2*(BLOCK_M*BS + 2*BS*BS) and it hits the limit sooner than the
+        # projection kernels do. Same remedy: walk both rotations in TILE_K
+        # sub-tiles. gate_j and up_j are complete BS-reductions before the cast,
+        # so the numerics match the untiled path in kind.
+        tile_range = tl.arange(0, TILE_K)
+        slot_R_offset_t = slot * 2 * blocks_per_slice * BS * BS
+        gate_R_base_t = slot_R_offset_t + block_idx * BS * BS
+        up_R_base_t = slot_R_offset_t + (blocks_per_slice + block_idx) * BS * BS
+        for j in range(0, BS, TILE_K):
+            offs_j = j + tile_range
+            offs_kj = block_idx * BS + offs_j
+            if bsv == 0:
+                # Identity passthrough, tiled: copy this slice of x through.
+                x_j = tl.load(
+                    x_ptr + offs_m[:, None] * K + offs_kj[None, :],
+                    mask=m_mask[:, None],
+                    other=0.0,
+                )
+                tl.store(out_gate_ptr + offs_m[:, None] * K + offs_kj[None, :],
+                         x_j, mask=m_mask[:, None])
+                tl.store(out_up_ptr + offs_m[:, None] * K + offs_kj[None, :],
+                         x_j, mask=m_mask[:, None])
+            else:
+                gate_j = tl.zeros((BLOCK_M, TILE_K), dtype=tl.float32)
+                up_j = tl.zeros((BLOCK_M, TILE_K), dtype=tl.float32)
+                for i in range(0, BS, TILE_K):
+                    offs_i = i + tile_range
+                    x_i = tl.load(
+                        x_ptr + offs_m[:, None] * K + (block_idx * BS + offs_i)[None, :],
+                        mask=m_mask[:, None],
+                        other=0.0,
+                    )
+                    R_gate_ij = tl.load(
+                        R_ptr + gate_R_base_t + offs_i[:, None] * BS + offs_j[None, :]
+                    )
+                    R_up_ij = tl.load(
+                        R_ptr + up_R_base_t + offs_i[:, None] * BS + offs_j[None, :]
+                    )
+                    gate_j += tl.dot(x_i, R_gate_ij, out_dtype=tl.float32)
+                    up_j += tl.dot(x_i, R_up_ij, out_dtype=tl.float32)
+                tl.store(out_gate_ptr + offs_m[:, None] * K + offs_kj[None, :],
+                         gate_j.to(tl.bfloat16), mask=m_mask[:, None])
+                tl.store(out_up_ptr + offs_m[:, None] * K + offs_kj[None, :],
+                         up_j.to(tl.bfloat16), mask=m_mask[:, None])
+        return
+
     bs_range = tl.arange(0, BS)
     offs_k = block_idx * BS + bs_range
     x_block = tl.load(
@@ -167,9 +221,6 @@ def _fused_rotate_gate_up_inputs_kernel(
         mask=m_mask[:, None],
         other=0.0,
     )
-
-    slot = tl.load(slot_idx_ptr)
-    bsv = tl.load(bsv_ptr)
 
     if bsv == 0:
         tl.store(
@@ -910,6 +961,8 @@ def fused_rotate_gate_up_inputs(
     *,
     slot_idx_t: Optional[torch.Tensor] = None,
     bsv_t: Optional[torch.Tensor] = None,
+    force_tiled: bool = False,
+    tile_k: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate FC1/gate-up input once and return ``(x_gate, x_up)`` tensors."""
     if R.dim() == 4:
@@ -941,6 +994,12 @@ def fused_rotate_gate_up_inputs(
     x_gate = torch.empty_like(x)
     x_up = torch.empty_like(x)
     BLOCK_M = 64
+    # Two rotations live at once here (gate and up), so the budget is solved
+    # with GROUP_N = 2 even though this kernel has no output groups -- that is
+    # exactly the shape of its footprint: BLOCK_M*TILE_K + 2*TILE_K*TILE_K.
+    tiled = force_tiled or BS > OFT_UNTILED_MAX_BS
+    tile_k_sel = _pick_tile_k(BS, BLOCK_M, BLOCK_M, 2,
+                              preferred=tile_k or OFT_TILE_K)
     grid = (triton.cdiv(M, BLOCK_M), blocks_per_slice)
 
     _fused_rotate_gate_up_inputs_kernel[grid](
@@ -955,6 +1014,8 @@ def fused_rotate_gate_up_inputs(
         blocks_per_slice,
         BS=BS,
         BLOCK_M=BLOCK_M,
+        TILED=tiled,
+        TILE_K=tile_k_sel,
     )
     return x_gate, x_up
 
@@ -1033,6 +1094,8 @@ def fused_rotate_project_gate_up(
     *,
     slot_idx_t: Optional[torch.Tensor] = None,
     bsv_t: Optional[torch.Tensor] = None,
+    force_tiled: bool = False,
+    tile_k: Optional[int] = None,
 ) -> torch.Tensor:
     """Fused rotate-and-project for fused gate/up (N=2, equal output dims)."""
     M, K, BS, blocks_per_slice = _validate_inputs(x, R, W, output_sizes, 2)
@@ -1056,6 +1119,13 @@ def fused_rotate_project_gate_up(
     max_slice_width = max(S0, S1)
     BLOCK_M, BLOCK_N, GROUP_N = _pick_tiles(M, max_slice_width)
 
+    # Same rule as QKV: tiled only where the untiled path cannot launch. The
+    # gate-up path reaches GROUP_N = 4, so _pick_tile_k will hand back a
+    # narrower sub-tile than QKV's 128 -- that is the budget, not a preference.
+    tiled = force_tiled or BS > OFT_UNTILED_MAX_BS
+    tile_k_sel = _pick_tile_k(BS, BLOCK_M, BLOCK_N, GROUP_N,
+                              preferred=tile_k or OFT_TILE_K)
+
     grid = (
         triton.cdiv(M, BLOCK_M),
         2,
@@ -1071,9 +1141,7 @@ def fused_rotate_project_gate_up(
         BS=BS,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, GROUP_N=GROUP_N,
         HAS_BIAS=has_bias,
-        # Task 6 turns tiling on here. Until then gate-up keeps the untiled
-        # path unconditionally, so this change cannot alter its behaviour.
-        TILED=False, TILE_K=_pick_tile_k(BS, BLOCK_M, BLOCK_N, GROUP_N),
+        TILED=tiled, TILE_K=tile_k_sel,
     )
     return out
 
