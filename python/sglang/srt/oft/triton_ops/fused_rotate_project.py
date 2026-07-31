@@ -897,9 +897,31 @@ def _pick_tiles(M: int, max_slice_width: int):
 
 
 def _pick_qkv_tiles(M: int, max_slice_width: int, block_size: int):
-    # GROUP_N=2 with BS=128 exceeds the B200 per-block shared memory limit
-    # under CUDA 13/Triton for Qwen2.5-style QKV shapes.
-    if block_size >= 128:
+    if block_size > OFT_UNTILED_MAX_BS:
+        # Tiled path. The footprint no longer scales with BS -- _pick_tile_k
+        # solves it -- so wider tiles are affordable here in a way they never
+        # were untiled, and they pay off as M grows. Measured on an H100,
+        # llama31-8b QKV, against the (64, 64, 1) this used to force:
+        #
+        #        BS=256   BS=512  BS=1024
+        #   M=64   same     same     same     <- (64,64,1) still best
+        #   M=256  -6.8%    -5.2%    -0.5%    <- (64,64,2)
+        #   M=1024 -32%     -27%     -22%     <- (128,128,1)
+        #
+        # The thresholds are where the measured winner changes, not round
+        # numbers: at M=64 a wider tile is 2x SLOWER (0.255 vs 0.121 at BS=256)
+        # because there are not enough rows to fill it.
+        if M >= 1024:
+            return 128, 128, 1
+        if M >= 256:
+            return 64, 64, 2
+        return 64, 64, 1
+    if block_size >= OFT_UNTILED_MAX_BS:
+        # Untiled at exactly BS=128: GROUP_N=2 needs 245,760 B against a
+        # 232,448 B budget, so this is forced and stays forced. Tiling it to
+        # afford (32, 64, 2) was measured at 0.4688 vs 0.4978 (M=1024) -- a 6%
+        # win for moving a working size onto a new code path, which is not a
+        # trade worth making.
         return 64, 64, 1
     return _pick_tiles(M, max_slice_width)
 
