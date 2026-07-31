@@ -1,0 +1,482 @@
+[
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1,
+    "BS": 16,
+    "ms": 0.16214530915021896,
+    "err": 0.00011957064270973206
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1,
+    "BS": 32,
+    "ms": 0.1330111175775528,
+    "err": 0.00011957064270973206
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1,
+    "BS": 64,
+    "ms": 0.10168924927711487,
+    "err": 0.00011957064270973206
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1,
+    "BS": 128,
+    "ms": 0.10273363441228867,
+    "err": 0.00011957064270973206
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1,
+    "BS": 256,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 589824, Hardware limit: 232448. Reduci"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1,
+    "BS": 512,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 1966080, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1,
+    "BS": 1024,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 7077888, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 8,
+    "BS": 16,
+    "ms": 0.1618141308426857,
+    "err": 0.00012207776308059692
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 8,
+    "BS": 32,
+    "ms": 0.12624096125364304,
+    "err": 0.00012207776308059692
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 8,
+    "BS": 64,
+    "ms": 0.1012653112411499,
+    "err": 0.00012207776308059692
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 8,
+    "BS": 128,
+    "ms": 0.07679015398025513,
+    "err": 0.00012207776308059692
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 8,
+    "BS": 256,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 589824, Hardware limit: 232448. Reduci"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 8,
+    "BS": 512,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 1966080, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 8,
+    "BS": 1024,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 7077888, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 64,
+    "BS": 16,
+    "ms": 0.1927873119711876,
+    "err": 0.0001951158046722412
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 64,
+    "BS": 32,
+    "ms": 0.15343856066465378,
+    "err": 0.0001951158046722412
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 64,
+    "BS": 64,
+    "ms": 0.11707022786140442,
+    "err": 0.0001951158046722412
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 64,
+    "BS": 128,
+    "ms": 0.09618401527404785,
+    "err": 0.0001951158046722412
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 64,
+    "BS": 256,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 589824, Hardware limit: 232448. Reduci"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 64,
+    "BS": 512,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 1966080, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 64,
+    "BS": 1024,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 7077888, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 256,
+    "BS": 16,
+    "ms": 0.30178166925907135,
+    "err": 0.00015716999769210815
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 256,
+    "BS": 32,
+    "ms": 0.19667614251375198,
+    "err": 0.00015716999769210815
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 256,
+    "BS": 64,
+    "ms": 0.15695355832576752,
+    "err": 0.00015716999769210815
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 256,
+    "BS": 128,
+    "ms": 0.15285462141036987,
+    "err": 0.00015716999769210815
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 256,
+    "BS": 256,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 589824, Hardware limit: 232448. Reduci"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 256,
+    "BS": 512,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 1966080, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 256,
+    "BS": 1024,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 7077888, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1024,
+    "BS": 16,
+    "ms": 0.46371929347515106,
+    "err": 0.0001222863793373108
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1024,
+    "BS": 32,
+    "ms": 0.28822794556617737,
+    "err": 0.0001222863793373108
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1024,
+    "BS": 64,
+    "ms": 0.2856781706213951,
+    "err": 0.0001222863793373108
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1024,
+    "BS": 128,
+    "ms": 0.5075545981526375,
+    "err": 0.0001222863793373108
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1024,
+    "BS": 256,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 589824, Hardware limit: 232448. Reduci"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1024,
+    "BS": 512,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 1966080, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "llama31-8b-qkv",
+    "M": 1024,
+    "BS": 1024,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 7077888, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 1,
+    "BS": 16,
+    "ms": 0.136672705411911,
+    "err": 0.00012153014540672302
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 1,
+    "BS": 32,
+    "ms": 0.1114552840590477,
+    "err": 0.00012153014540672302
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 1,
+    "BS": 64,
+    "ms": 0.09351037442684174,
+    "err": 0.00012153014540672302
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 1,
+    "BS": 128,
+    "ms": 0.09377989917993546,
+    "err": 0.00012153014540672302
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 1,
+    "BS": 256,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 589824, Hardware limit: 232448. Reduci"
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 1,
+    "BS": 512,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 1966080, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 8,
+    "BS": 16,
+    "ms": 0.13412851840257645,
+    "err": 0.0001218058168888092
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 8,
+    "BS": 32,
+    "ms": 0.11681485921144485,
+    "err": 0.0001218058168888092
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 8,
+    "BS": 64,
+    "ms": 0.09344629943370819,
+    "err": 0.0001218058168888092
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 8,
+    "BS": 128,
+    "ms": 0.09865015745162964,
+    "err": 0.0001218058168888092
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 8,
+    "BS": 256,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 589824, Hardware limit: 232448. Reduci"
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 8,
+    "BS": 512,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 1966080, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 64,
+    "BS": 16,
+    "ms": 0.1496369019150734,
+    "err": 0.0001221001148223877
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 64,
+    "BS": 32,
+    "ms": 0.1151474192738533,
+    "err": 0.0001221001148223877
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 64,
+    "BS": 64,
+    "ms": 0.08452218025922775,
+    "err": 0.0001221001148223877
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 64,
+    "BS": 128,
+    "ms": 0.06983913481235504,
+    "err": 0.0001221001148223877
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 64,
+    "BS": 256,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 589824, Hardware limit: 232448. Reduci"
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 64,
+    "BS": 512,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 1966080, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 256,
+    "BS": 16,
+    "ms": 0.24189352989196777,
+    "err": 0.00012210384011268616
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 256,
+    "BS": 32,
+    "ms": 0.16227010637521744,
+    "err": 0.00012210384011268616
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 256,
+    "BS": 64,
+    "ms": 0.13362355530261993,
+    "err": 0.00012210384011268616
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 256,
+    "BS": 128,
+    "ms": 0.13899412006139755,
+    "err": 0.00012210384011268616
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 256,
+    "BS": 256,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 589824, Hardware limit: 232448. Reduci"
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 256,
+    "BS": 512,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 1966080, Hardware limit: 232448. Reduc"
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 1024,
+    "BS": 16,
+    "ms": 0.3703339025378227,
+    "err": 0.00012223422527313232
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 1024,
+    "BS": 32,
+    "ms": 0.2264019101858139,
+    "err": 0.00012223422527313232
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 1024,
+    "BS": 64,
+    "ms": 0.246339850127697,
+    "err": 0.00012223422527313232
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 1024,
+    "BS": 128,
+    "ms": 0.3511320799589157,
+    "err": 0.00012223422527313232
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 1024,
+    "BS": 256,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 589824, Hardware limit: 232448. Reduci"
+  },
+  {
+    "shape": "qwen25-7b-qkv",
+    "M": 1024,
+    "BS": 512,
+    "ms": null,
+    "err": null,
+    "error": "OutOfResources: out of resource: shared memory, Required: 1966080, Hardware limit: 232448. Reduc"
+  }
+]
