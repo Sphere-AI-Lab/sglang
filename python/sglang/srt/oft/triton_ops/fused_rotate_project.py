@@ -788,11 +788,49 @@ def _fused_rotate_project_inner(
 # 64 rather than 32 or 128: tl.dot wants at least 16 per dimension, 64 keeps the
 # staged tiles well inside budget, and it matches the BLOCK_M/BLOCK_N the QKV
 # path already uses -- so the tiled loop reuses tile shapes that were tuned.
-OFT_TILE_K = 64
+# 128, measured. At 64 the tiled path cost 2.5x the untiled one at the SAME
+# FLOPs (BS=128, M=64: 0.179 ms against 0.072 ms) because it used only 32% of
+# the shared-memory budget, re-read x BS/TILE_K times and issued 64-cubed dots.
+# At 128 it matches the untiled path exactly (0.0724 vs 0.0735) and is 2.4x
+# faster at BS=1024 (0.206 vs 0.484). See _pick_tile_k: this is a preference,
+# not a guarantee -- it is reduced when GROUP_N would push it over budget.
+OFT_TILE_K = 128
+
+# Per-block shared memory on sm_90, in bytes. The kernel is compiled for the
+# device it runs on, but this bound is what the tile choice is solved against;
+# it is the number Triton reports as "Hardware limit" when a launch fails.
+OFT_SMEM_BUDGET = 232448
 
 # Largest block the untiled path fits in shared memory on sm_90. Above this the
 # tiled path is selected automatically.
 OFT_UNTILED_MAX_BS = 128
+
+
+def _tiled_smem_bytes(tile_k: int, block_m: int, block_n: int, group_n: int) -> int:
+    """Shared memory the tiled inner loop stages, in bytes.
+
+    Three tiles live at once -- x (BLOCK_M x TILE_K), the rotation sub-block
+    (TILE_K x TILE_K) and one W tile per output group (BLOCK_N x TILE_K) -- all
+    bf16, with Triton pipelining the loop three deep. Verified against the
+    untiled path's own footprint, 6*BS*(BS+128), which is this formula with
+    TILE_K = BS and GROUP_N = 1.
+    """
+    return 3 * 2 * (block_m * tile_k + tile_k * tile_k + group_n * block_n * tile_k)
+
+
+def _pick_tile_k(BS: int, block_m: int, block_n: int, group_n: int,
+                 preferred: int = OFT_TILE_K) -> int:
+    """Largest sub-tile at or below `preferred` that fits shared memory.
+
+    Halves until it fits rather than failing: GROUP_N is 1 for QKV at large BS
+    but 2 or 4 on the gate-up path, and at GROUP_N=2 a 128-wide tile needs
+    245,760 B -- over budget. Solving for it here means the caller never has to
+    know, and a launch cannot fail the way BS>128 used to.
+    """
+    tile_k = min(preferred, BS)
+    while tile_k > 16 and _tiled_smem_bytes(tile_k, block_m, block_n, group_n) > OFT_SMEM_BUDGET:
+        tile_k //= 2
+    return tile_k
 
 
 def _pick_tiles(M: int, max_slice_width: int):
@@ -931,6 +969,7 @@ def fused_rotate_project_qkv(
     slot_idx_t: Optional[torch.Tensor] = None,
     bsv_t: Optional[torch.Tensor] = None,
     force_tiled: bool = False,
+    tile_k: Optional[int] = None,
 ) -> torch.Tensor:
     """Fused rotate-and-project for QKV (N=3, GQA Q!=K=V layout).
 
@@ -962,7 +1001,8 @@ def fused_rotate_project_qkv(
     # works today compiles to exactly the code it does today. `force_tiled` is
     # for the boundary test that proves the two paths agree at BS=128.
     tiled = force_tiled or BS > OFT_UNTILED_MAX_BS
-    tile_k = min(OFT_TILE_K, BS)
+    tile_k = _pick_tile_k(BS, BLOCK_M, BLOCK_N, GROUP_N,
+                          preferred=tile_k or OFT_TILE_K)
 
     grid = (
         triton.cdiv(M, BLOCK_M),
@@ -1033,7 +1073,7 @@ def fused_rotate_project_gate_up(
         HAS_BIAS=has_bias,
         # Task 6 turns tiling on here. Until then gate-up keeps the untiled
         # path unconditionally, so this change cannot alter its behaviour.
-        TILED=False, TILE_K=min(OFT_TILE_K, BS),
+        TILED=False, TILE_K=_pick_tile_k(BS, BLOCK_M, BLOCK_N, GROUP_N),
     )
     return out
 

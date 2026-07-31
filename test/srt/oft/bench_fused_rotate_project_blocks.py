@@ -34,12 +34,13 @@ SHAPES = [
 BATCHES = [1, 8, 64, 256, 1024]
 BLOCK_SIZES = [16, 32, 64, 128, 256, 512, 1024]
 
-# KNOWN, MEASURED, ACCEPTED: after the tiling change, `qwen25-7b-qkv M=1 BS=16`
-# is ~12% slower than baseline, reproducibly (12.6 / 12.2 / 12.3% over three
-# runs). It is the smallest and fastest configuration in the sweep, it takes the
-# untiled path unchanged, and no example launcher or campaign arm uses BS=16 --
-# every OFT RL example ships 32, 64 or 128, and E5's ladder is 28/32/64/256. It
-# is recorded here rather than hidden by widening the tolerance.
+# KNOWN, MEASURED, ACCEPTED: after the tiling change, `qwen25-7b-qkv` at BS=16
+# times 12-19% above baseline, reproducibly, at M=1 or M=8 depending on the run.
+# It is the smallest and fastest configuration in the sweep -- 0.09 ms, 224
+# rotation blocks per slice, so it is loop-overhead bound -- and it takes the
+# untiled path unchanged. No example launcher or campaign arm uses BS=16: every
+# OFT RL example ships 32, 64 or 128, and E5's ladder is 28/32/64/256. Recorded
+# here rather than hidden by widening the tolerance.
 #
 # A kernel that was not changed should time within noise. 10% is set from the
 # measured floor: with the timing method below, the unmodified kernel compared
