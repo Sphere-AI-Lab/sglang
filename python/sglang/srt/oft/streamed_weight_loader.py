@@ -212,7 +212,28 @@ def _merge_expert_oft_chunks(
             dst_expert.update(expert_weights)
 
 
+# Live full-block tensors inside one _flush_oft_group_chunk call: the expanded
+# skew matrix, cayley_neumann's R accumulator, Q_squared, the rolling Q_power,
+# and the packed_r result. The chunk limit has to be measured against THIS,
+# not against the compact payload: compact storage is the upper triangle
+# (~half a full matrix), so accounting in compact bytes under-counted the
+# true scratch by ~10x. At the old accounting a "512 MB" chunk of b1024
+# compact weights expanded to ~4-5 GB of scratch -- and with the row-parallel
+# groups not chunked at all, one OFT adapter load transiently consumed 7-9 GB.
+# Colocated with a paused ~20 GB KV arena whose resume runs IMMEDIATELY after
+# the update, that put free memory at the resume threshold and the arena
+# came back up only by luck (measured: resume at 23.7 GB free succeeded on
+# one rollout and OOM'd on the next).
+_CAYLEY_LIVE_FULL_TENSORS = 5
+
+
 def _resolve_oft_batch_chunk_limit_bytes() -> int:
+    """Ceiling on the estimated per-chunk scratch, in bytes. 0 disables chunking.
+
+    SGLANG_OFT_BATCH_CHUNK_MB bounds the WORKING SET of one precompute_oft_r
+    call -- expanded skew-symmetric blocks and the Cayley intermediates -- as
+    estimated by _oft_working_set_bytes. It does not bound the compact payload.
+    """
     raw = os.getenv("SGLANG_OFT_BATCH_CHUNK_MB", "512").strip()
     try:
         value_mb = float(raw)
@@ -221,6 +242,17 @@ def _resolve_oft_batch_chunk_limit_bytes() -> int:
     if value_mb <= 0:
         return 0
     return int(value_mb * (1 << 20))
+
+
+def _oft_working_set_bytes(compact_weight: torch.Tensor, block_size: int) -> int:
+    """Scratch one compact tensor costs inside precompute_oft_r.
+
+    compact_weight is (num_blocks, n_elements); every full-block intermediate
+    is (num_blocks, block_size, block_size) in the same dtype.
+    """
+    num_blocks = compact_weight.shape[0]
+    full_block_bytes = block_size * block_size * compact_weight.element_size()
+    return num_blocks * full_block_bytes * _CAYLEY_LIVE_FULL_TENSORS
 
 
 def _flush_oft_group_chunk(
@@ -498,33 +530,53 @@ def load_streamed_oft_adapter(
         )
 
     batch_chunk_limit_bytes = _resolve_oft_batch_chunk_limit_bytes()
-    for group_key, group_items in non_row_groups.items():
-        target_device = group_key[0]
-        chunk_items = []
-        chunk_bytes = 0
+    # Row-parallel groups go through the SAME chunked flush as everything else.
+    # They used to be flushed whole, which made the limit meaningless exactly
+    # where it mattered most: fc2/down_proj is row-parallel and carries the
+    # most blocks of any module in the model, so the largest group was the one
+    # group the limiter never saw.
+    for group_key, group_items in list(non_row_groups.items()) + list(
+        row_parallel_groups.items()
+    ):
+        _flush_oft_group_in_chunks(
+            memory_pool,
+            buffer_id,
+            block_size,
+            group_key[0],
+            group_items,
+            batch_chunk_limit_bytes,
+        )
 
-        for item in group_items:
-            compact_weight = item[2]
-            compact_bytes = compact_weight.numel() * compact_weight.element_size()
-            if (
-                batch_chunk_limit_bytes > 0
-                and chunk_items
-                and chunk_bytes + compact_bytes > batch_chunk_limit_bytes
-            ):
-                _flush_oft_group_chunk(
-                    memory_pool,
-                    buffer_id,
-                    block_size,
-                    target_device,
-                    chunk_items,
-                )
-                chunk_items = []
-                chunk_bytes = 0
+    # Return the Cayley scratch to the driver, not just to this process's
+    # allocator cache. The very next thing the training loop does after an
+    # adapter update is resume the paused KV-cache arena, and torch_memory_saver
+    # re-creates it with raw cuMemCreate -- which the caching allocator's
+    # retained high-water mark can starve. empty_cache() releases only unused
+    # cached blocks, so nothing live is touched.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-            chunk_items.append(item)
-            chunk_bytes += compact_bytes
+    return True, "Success"
 
-        if chunk_items:
+
+def _flush_oft_group_in_chunks(
+    memory_pool,
+    buffer_id: int,
+    block_size: int,
+    target_device,
+    group_items,
+    batch_chunk_limit_bytes: int,
+) -> None:
+    """Flush one fused-target group in working-set-bounded chunks."""
+    chunk_items = []
+    chunk_bytes = 0
+    for item in group_items:
+        working_bytes = _oft_working_set_bytes(item[2], block_size)
+        if (
+            batch_chunk_limit_bytes > 0
+            and chunk_items
+            and chunk_bytes + working_bytes > batch_chunk_limit_bytes
+        ):
             _flush_oft_group_chunk(
                 memory_pool,
                 buffer_id,
@@ -532,14 +584,17 @@ def load_streamed_oft_adapter(
                 target_device,
                 chunk_items,
             )
+            chunk_items = []
+            chunk_bytes = 0
 
-    for group_key, group_items in row_parallel_groups.items():
+        chunk_items.append(item)
+        chunk_bytes += working_bytes
+
+    if chunk_items:
         _flush_oft_group_chunk(
             memory_pool,
             buffer_id,
             block_size,
-            group_key[0],
-            group_items,
+            target_device,
+            chunk_items,
         )
-
-    return True, "Success"
