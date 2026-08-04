@@ -232,6 +232,11 @@ class GenerateReqInput:
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
 
+    # The path to the OFT adaptors
+    adapter_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # The uid of OFT adaptors, should be initialized by tokenizer manager
+    adapter_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
+
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
@@ -454,6 +459,7 @@ class GenerateReqInput:
         self._expand_inputs(num)
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
+        self._normalize_adapter_paths(num)
         self._normalize_image_data(num)
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
@@ -491,6 +497,16 @@ class GenerateReqInput:
                 self.lora_path = self.lora_path * self.parallel_sample_num
             else:
                 raise ValueError("lora_path should be a list or a string.")
+
+    def _normalize_adapter_paths(self, num):
+        """Normalize adapter paths for batch processing."""
+        if self.adapter_path is not None:
+            if isinstance(self.adapter_path, str):
+                self.adapter_path = [self.adapter_path] * num
+            elif isinstance(self.adapter_path, list):
+                self.adapter_path = self.adapter_path * self.parallel_sample_num
+            else:
+                raise ValueError("adapter_path should be a list or a string.")
 
     def _normalize_image_data(self, num):
         """Normalize image data for batch processing."""
@@ -738,6 +754,8 @@ class GenerateReqInput:
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
+            adapter_path=self.adapter_path[i] if self.adapter_path is not None else None,
+            adapter_id=self.adapter_id[i] if self.adapter_id is not None else None,
             custom_logit_processor=(
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
@@ -824,6 +842,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
+
+    # OFT related
+    adapter_id: Optional[str] = None  # None means just use the base model
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -1585,6 +1606,65 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class UpdateAdapterFromDistributedReqInput(BaseReq, kw_only=True):
+    # Double-buffer PEFT (OFT/LoRA) weight-sync STAGE over NCCL. Mirrors
+    # UpdateWeightsFromDistributedReqInput; adds adapter metadata + the
+    # double_buffer flag. Versions arrive as STRINGS on the orbit wire
+    # (adapter_version == weight_version invariant); the model_runner boundary
+    # converts to int for the manager's int OFTRef.adapter_version/LoRARef.version.
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    # The group name
+    group_name: str = "weight_update_group"
+    weight_version: Optional[str] = None
+    adapter_version: Optional[str] = None
+    # "oft_adapter" | "lora_adapter"
+    load_format: Optional[str] = None
+    adapter_config: Optional[dict] = None
+    adapter_name: Optional[str] = None
+    # Stable per-adapter id set tokenizer-side by register_peft_ref (single-active
+    # OFT: id == adapter_name == "orbit_oft"). Threaded to the manager so the DB
+    # stage registers memory_pool.uid_to_buffer_id[adapter_id]=active_idx, which
+    # per-request /generate routing resolves against (LoRA ignores it).
+    adapter_id: Optional[str] = None
+    # flattened-bucket meta (orbit _flatten_meta_to_json); None on non-NCCL paths
+    payload_metadata: Optional[dict] = None
+    # True  -> STAGE only (lock-free, overlaps decode)
+    # False -> STAGE then ACTIVATE-in-place in the same call (caller idle, no drain)
+    double_buffer: bool = False
+
+
+class UpdateAdapterFromDistributedReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    staged_adapter_version: Optional[str] = None
+    adapter_version: Optional[str] = None
+    weight_version: Optional[str] = None
+    # set only when double_buffer=False (stage-then-activate-in-place)
+    active_adapter_version: Optional[str] = None
+
+
+class ActivateAdapterVersionReqInput(BaseReq, kw_only=True):
+    # Double-buffer PEFT weight-sync ACTIVATE (the drained atomic swap). The
+    # drain-to-empty lives tokenizer-side (model_update_lock.writer_lock);
+    # by the time this reaches the scheduler the running batch is drained, so
+    # the handler is a simple staging->active flip.
+    adapter_name: str
+    adapter_version: str
+    weight_version: Optional[str] = None
+    load_format: Optional[str] = None
+    # Symmetric with UpdateAdapterFromDistributedReqInput (set by register_peft_ref);
+    # carried for the activate-side version bump.
+    adapter_id: Optional[str] = None
+
+
+class ActivateAdapterVersionReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    active_adapter_version: Optional[str] = None
+
+
 class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     """Internal IPC request for updating model weights from serialized tensors."""
 
@@ -1606,6 +1686,11 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     disable_draft_model: Optional[bool] = None
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    # Optional: streamed adapter (peft LoRA/OFT) metadata for
+    # load_format in {"lora_adapter", "oft_adapter"}
+    adapter_config: Optional[dict] = None
+    adapter_name: Optional[str] = None
+    adapter_id: Optional[str] = None
 
 
 class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
@@ -2128,6 +2213,20 @@ def _check_all_req_types():
             raise ValueError(
                 f"{name} is a subclass of BaseReq but not follow the naming convention."
             )
+
+
+# Re-export the OFT request/output dataclasses (relocated to
+# sglang.srt.peft.io_types) so `from sglang.srt.managers.io_struct import
+# OFTUpdateOutput` / `LoadOFTAdapterReqInput` etc. keep working. io_types imports
+# BaseReq back from this module, so an eager `from ... import *` here is a genuine
+# cycle whenever io_types is imported first; PEP 562 `__getattr__` defers the
+# lookup until after this module has finished executing, breaking the cycle.
+def __getattr__(name):
+    from sglang.srt.peft import io_types
+
+    if name in io_types.__all__:
+        return getattr(io_types, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 _check_all_req_types()

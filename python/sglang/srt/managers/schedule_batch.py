@@ -728,6 +728,7 @@ class Req(ReqDllmMixin):
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
+        adapter_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
         token_type_ids: List[int] = None,
@@ -828,6 +829,7 @@ class Req(ReqDllmMixin):
 
         self.extra_key = extra_key
         self.lora_id = lora_id
+        self.adapter_id = adapter_id
         self.routing_key = routing_key
 
         # Memory pool info

@@ -110,6 +110,7 @@ from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
+from sglang.srt.peft import tokenizer_hooks as peft_tokenizer_hooks
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
@@ -317,6 +318,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init LoRA status
         self.init_lora()
 
+        # Init single-active PEFT registry (our LoRA/OFT)
+        self.init_peft()
+
         # Init PD disaggregation and encoder disaggregation
         self.init_disaggregation()
 
@@ -522,6 +526,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for lora_ref in self.server_args.lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
+    def init_peft(self):
+        # Single-active PEFT registry bootstrap (LoRA or OFT). Body lives in the
+        # peft.tokenizer_hooks façade to keep this file peft-free.
+        peft_tokenizer_hooks.init_tokenizer_peft(self)
+
     def init_disaggregation(self):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(
@@ -655,7 +664,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
             async with self.model_update_lock.reader_lock:
-                await self._validate_and_resolve_lora(obj)
+                # Single-active peft (enable_peft_lora XOR enable_oft) resolves the
+                # named adapter through the unified peft path; its request never goes
+                # through upstream _validate_and_resolve_lora (which requires
+                # enable_lora). Upstream multi-tenant LoRA keeps the old path.
+                if self.server_args.enable_peft:
+                    # peft adapter path only on GenerateReqInput (no embedding support).
+                    if isinstance(obj, GenerateReqInput):
+                        await peft_tokenizer_hooks.maybe_resolve_peft_path(self, obj)
+                else:
+                    await self._validate_and_resolve_lora(obj)
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
@@ -1199,6 +1217,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
+                adapter_id=obj.adapter_id,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,

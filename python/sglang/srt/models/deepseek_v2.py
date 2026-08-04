@@ -1620,6 +1620,13 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
+            # Expose the per-branch split (q_a | kv_a+rope) so single-active PEFT can
+            # un-fuse the q_a/kv_a LoRA deltas; ReplicatedLinear stores only the fused
+            # total. Order matches peft mem_pool DENSE_SUB_NAMES ("q_a", "kv_a").
+            self.fused_qkv_a_proj_with_mqa.output_sizes = [
+                self.q_lora_rank,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ]
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,

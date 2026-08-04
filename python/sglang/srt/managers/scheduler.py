@@ -82,6 +82,7 @@ from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActivateAdapterVersionReqInput,
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
@@ -140,6 +141,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1369,6 +1371,14 @@ class Scheduler(
                     self.weight_updater.update_weights_from_distributed,
                 ),
                 (
+                    UpdateAdapterFromDistributedReqInput,
+                    self.weight_updater.update_adapter_from_distributed,
+                ),
+                (
+                    ActivateAdapterVersionReqInput,
+                    self.weight_updater.activate_adapter_version,
+                ),
+                (
                     UpdateWeightsFromTensorReqInput,
                     self.weight_updater.update_weights_from_tensor,
                 ),
@@ -2105,6 +2115,7 @@ class Scheduler(
                 return_sampling_mask=recv_req.return_sampling_mask,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
+                adapter_id=recv_req.adapter_id,
                 session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,

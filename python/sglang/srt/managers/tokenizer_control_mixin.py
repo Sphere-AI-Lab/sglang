@@ -11,6 +11,8 @@ import fastapi
 
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
+    ActivateAdapterVersionReqInput,
+    ActivateAdapterVersionReqOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
@@ -66,6 +68,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateAdapterFromDistributedReqInput,
+    UpdateAdapterFromDistributedReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -94,6 +98,8 @@ _COMMUNICATOR_SPECS = [
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
+    ("update_adapter_from_distributed", UpdateAdapterFromDistributedReqOutput),
+    ("activate_adapter_version", ActivateAdapterVersionReqOutput),
     (
         "init_weights_send_group_for_remote_instance",
         InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -445,6 +451,86 @@ class TokenizerControlMixin:
 
         return success, message
 
+    async def update_adapter_from_distributed(
+        self: TokenizerManager,
+        obj: UpdateAdapterFromDistributedReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Double-buffer PEFT STAGE over NCCL.
+
+        double_buffer=True: LOCK-FREE stage into the reserved staging slot while
+        generation continues (overlaps decode); no writer_lock. double_buffer=
+        False: the synchronous distributed path stages then ACTIVATEs-in-place in
+        the scheduler in one round-trip, so we hold model_update_lock.writer_lock
+        (drain-to-idle, mirror update_weights_from_distributed) around it."""
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update adapter from distributed"
+
+        # PEFT register-before-dispatch (mirror update_weights_from_tensor's IPC
+        # path): mint/lookup the streamed adapter's ref in the active tokenizer
+        # registry and set obj.adapter_id, so a later /generate naming this
+        # adapter (OFT is multi-slot; orbit names "orbit_oft" to pick the adapter
+        # slot) resolves against tm.peft_ref_cache instead of 400ing "never been
+        # loaded". Threaded via obj.adapter_id to the manager, whose DB stage
+        # registers uid_to_buffer_id[adapter_id]=active_idx. Registration happens
+        # at STAGE: on the first sync no /generate names the adapter before the
+        # first activate (rollout-0 is base-only); later syncs no-op (name cached).
+        from sglang.srt.peft import tokenizer_hooks as peft_tokenizer_hooks
+
+        await peft_tokenizer_hooks.register_peft_ref(self, obj)
+
+        if obj.double_buffer:
+            results = await self.update_adapter_from_distributed_communicator(obj)
+        else:
+            # Hold is_pause_cond while updating to prevent unpause from racing.
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
+                if is_paused:
+                    results = await self.update_adapter_from_distributed_communicator(
+                        obj
+                    )
+            if not is_paused:
+                async with self.model_update_lock.writer_lock:
+                    results = await self.update_adapter_from_distributed_communicator(
+                        obj
+                    )
+
+        success, message = FanOutCommunicator.merge_results(results)
+        message += await peft_tokenizer_hooks.bump_peft_version(self, obj, success)
+        return success, message
+
+    async def activate_adapter_version(
+        self: TokenizerManager,
+        obj: ActivateAdapterVersionReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Double-buffer PEFT ACTIVATE (the drained atomic swap). The drain lives
+        HERE: model_update_lock.writer_lock waits for all in-flight generation
+        reader_locks to release (drain running_batch to empty) and blocks new
+        admission -- exactly what update_weights_from_disk/from_distributed use.
+        Only THEN is the activate control request sent to the scheduler (a simple
+        staging->active flip, since the batch is already drained); releasing the
+        lock on return resumes admission."""
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for activate adapter version"
+
+        # Hold is_pause_cond while updating to prevent unpause from racing.
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+            if is_paused:
+                results = await self.activate_adapter_version_communicator(obj)
+
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await self.activate_adapter_version_communicator(obj)
+
+        success, message = FanOutCommunicator.merge_results(results)
+        return success, message
+
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
         obj: InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -490,6 +576,16 @@ class TokenizerControlMixin:
             obj.serialized_named_tensors
         )
 
+        # PEFT register-before-dispatch: mint/lookup the streamed peft adapter's ref
+        # (LoRA or OFT -- single-active, routed by the active peft registry) and set
+        # obj.adapter_id, so a later generate request naming this adapter resolves
+        # against tm.peft_ref_cache. Triggered by obj.adapter_name; without it,
+        # streamed adapters loaded into the scheduler were never registered
+        # tokenizer-side -> generate 400s with "never been loaded".
+        from sglang.srt.peft import tokenizer_hooks as peft_tokenizer_hooks
+
+        await peft_tokenizer_hooks.register_peft_ref(self, obj)
+
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:
@@ -503,6 +599,7 @@ class TokenizerControlMixin:
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
+        message += await peft_tokenizer_hooks.bump_peft_version(self, obj, success)
 
         return success, message
 

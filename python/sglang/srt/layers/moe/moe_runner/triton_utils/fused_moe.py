@@ -459,6 +459,7 @@ def _fused_moe_kernel_sequence(
     gemm1_limit: Optional[float],
     filter_expert: bool,
     hooks: Optional[Any] = None,
+    invoke: Any = invoke_fused_moe_kernel,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
 ) -> torch.Tensor:
@@ -513,7 +514,7 @@ def _fused_moe_kernel_sequence(
         dtype=hidden_states.dtype,
     )
 
-    invoke_fused_moe_kernel(
+    invoke(
         hidden_states,
         w1,
         b1,
@@ -704,7 +705,7 @@ def _fused_moe_kernel_sequence(
         out_slice = out_hidden_states
         out_slice.zero_()
 
-    invoke_fused_moe_kernel(
+    invoke(
         intermediate_cache2,
         w2,
         b2,

@@ -19,6 +19,8 @@ from sglang.srt.constants import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    ActivateAdapterVersionReqInput,
+    ActivateAdapterVersionReqOutput,
     ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -32,6 +34,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    UpdateAdapterFromDistributedReqInput,
+    UpdateAdapterFromDistributedReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -107,6 +111,26 @@ class SchedulerWeightUpdaterManager:
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
 
+    def _flush_radix_after_adapter_activate(self, recv_req) -> None:
+        """Invalidate the radix cache after a double-buffer adapter activate
+        (OFT or our single-active peft-LoRA).
+
+        The DB stage/activate path is flush-free by design (lock-free stage +
+        drained atomic flip), so a prompt prefix cached before the swap would be
+        served with KV computed under the old adapter weights. Neither of our
+        single-active peft methods versions the radix key per request -- the OFT
+        extra_key versioning (maybe_extend_extra_key) was never wired on the
+        v0.5.14 base, and LoRA names no adapter per request -- so a full radix
+        flush is the correct invalidation. It mirrors the IPC sync path, which
+        already flushes via flush_cache=True. The batch is already drained
+        tokenizer-side (the writer_lock held around activate), so flush_cache
+        succeeds.
+        """
+        if recv_req.load_format not in ("oft_adapter", "lora_adapter"):
+            return
+        flushed = self.flush_cache(empty_cache=False)
+        assert flushed, "radix flush failed after peft double-buffer activate"
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
@@ -148,6 +172,67 @@ class SchedulerWeightUpdaterManager:
                 logger.error(message)
             return UpdateWeightsFromDistributedReqOutput(
                 success=success, message=message
+            )
+
+    def update_adapter_from_distributed(
+        self,
+        recv_req: UpdateAdapterFromDistributedReqInput,
+    ) -> UpdateAdapterFromDistributedReqOutput:
+        """Double-buffer STAGE (mirrors update_weights_from_distributed). STAGE
+        is lock-free (fills the reserved staging slot while generation runs). For
+        the synchronous distributed-but-NOT-double-buffer path (double_buffer=
+        False) the caller holds the writer_lock (engine idle), so we also
+        ACTIVATE-in-place in the same call and return active_adapter_version."""
+        with self._observe_weight_load("distributed_adapter"):
+            stage_success, message = self.tp_worker.update_adapter_from_distributed(
+                recv_req
+            )
+            success = stage_success
+            active_version = None
+            if stage_success and not recv_req.double_buffer:
+                act_success, act_message = self.tp_worker.activate_adapter_version(
+                    recv_req
+                )
+                success = act_success
+                if act_success:
+                    active_version = recv_req.adapter_version
+                    self._flush_radix_after_adapter_activate(recv_req)
+                else:
+                    message = act_message
+            if not success:
+                logger.error(message)
+            return UpdateAdapterFromDistributedReqOutput(
+                success=success,
+                message=message,
+                staged_adapter_version=(
+                    recv_req.adapter_version if stage_success else None
+                ),
+                adapter_version=recv_req.adapter_version,
+                weight_version=recv_req.weight_version,
+                active_adapter_version=active_version,
+            )
+
+    def activate_adapter_version(
+        self,
+        recv_req: ActivateAdapterVersionReqInput,
+    ) -> ActivateAdapterVersionReqOutput:
+        """Double-buffer ACTIVATE (the drained atomic swap). The drain-to-empty
+        happened tokenizer-side via model_update_lock.writer_lock, so by the time
+        this control request is processed the running batch is empty and this is
+        a simple staging->active flip + version bump. A missing staged version
+        surfaces as success=False (inactive_slot_busy) from the manager."""
+        with self._observe_weight_load("activate_adapter"):
+            success, message = self.tp_worker.activate_adapter_version(recv_req)
+            if success:
+                self._flush_radix_after_adapter_activate(recv_req)
+            else:
+                logger.error(message)
+            return ActivateAdapterVersionReqOutput(
+                success=success,
+                message=message,
+                active_adapter_version=(
+                    recv_req.adapter_version if success else None
+                ),
             )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

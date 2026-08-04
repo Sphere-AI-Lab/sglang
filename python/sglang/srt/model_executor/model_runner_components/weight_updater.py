@@ -11,6 +11,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.peft import integration as peft
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -273,10 +274,110 @@ class WeightUpdater:
             logger.error(error_msg)
             return False, error_msg
 
+    def stage_adapter(
+        self: WeightUpdater,
+        *,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        load_format: Optional[str] = None,
+        adapter_config: Optional[dict] = None,
+        adapter_name: Optional[str] = None,
+        adapter_id: Optional[str] = None,
+        adapter_version=None,
+        payload_metadata: Optional[dict] = None,
+        double_buffer: bool = True,
+    ):
+        """Double-buffer STAGE: NCCL-recv the (flattened) adapter payload into a
+        temp, then fill the STAGING slot via ``peft.stage_adapter``. Mirrors the
+        recv of ``update_weights_from_distributed`` (orbit broadcasts one
+        ``__flattened__`` tensor + ``payload_metadata``). Returns ``(bool, str)``
+        like the base-weight distributed path. Version arrives as a STRING and is
+        converted to int at this boundary (managers store int versions).
+
+        ``double_buffer`` is forwarded to ``peft.stage_adapter``, which rejects
+        it for OFT (see that function's docstring) -- the in-place-distributed
+        (``double_buffer=False``) OFT path is not implemented."""
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+        try:
+            tensors = []
+            handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.broadcast(
+                        weight,
+                        src=0,
+                        group=self._model_update_group[group_name],
+                        async_op=True,
+                    )
+                )
+                tensors.append((name, weight))
+            for handle in handles:
+                handle.wait()
+
+            result = peft.stage_adapter(
+                self.get_model_runner(),
+                load_format,
+                tensors,
+                adapter_config,
+                adapter_name,
+                # Single-active convention: the tokenizer-registered adapter_id
+                # (== adapter_name == "orbit_oft"); fall back to adapter_name when
+                # the tokenizer supplied none (mirrors
+                # _ensure_streaming_oft_adapter_slot's guard).
+                adapter_id=adapter_id if adapter_id is not None else adapter_name,
+                version=int(adapter_version),
+                payload_metadata=payload_metadata,
+                double_buffer=double_buffer,
+            )
+            if result is peft.NOT_HANDLED:
+                return (
+                    False,
+                    f"peft stage_adapter not handled for load_format={load_format}.",
+                )
+            return True, "Succeeded to stage adapter online."
+        except Exception as e:
+            error_msg = f"Failed to stage adapter online: {e}."
+            logger.error(error_msg)
+            return False, error_msg
+
+    def activate_adapter_version(self: WeightUpdater, *, adapter_name, adapter_version):
+        """Double-buffer ACTIVATE: copy STAGING->ACTIVE + bump version via
+        ``peft.activate_adapter``. Caller (tokenizer writer_lock) guarantees the
+        running batch is drained. Returns ``(bool, str)``; a missing staged
+        version raises ``inactive_slot_busy`` inside the manager -> ``(False, …)``.
+        """
+        try:
+            result = peft.activate_adapter(
+                self.get_model_runner(), adapter_name, int(adapter_version)
+            )
+            if result is peft.NOT_HANDLED:
+                return (
+                    False,
+                    f"peft activate_adapter not handled (peft_method="
+                    f"{self.get_model_runner().server_args.peft_method}).",
+                )
+            return True, "Succeeded to activate adapter version."
+        except Exception as e:
+            error_msg = f"Failed to activate adapter version: {e}."
+            logger.error(error_msg)
+            return False, error_msg
+
     def update_weights_from_tensor(
         self: WeightUpdater,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
+        adapter_config: Optional[dict] = None,
+        adapter_name: Optional[str] = None,
+        adapter_id: Optional[str] = None,
     ):
         monkey_patch_torch_reductions()
         if load_format == "flattened_bucket":
@@ -288,6 +389,21 @@ class WeightUpdater:
         # We need to get device after patch otherwise the device would be wrong
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
+
+        # Streamed peft adapter sync (load_format "oft_adapter" / "lora_adapter"):
+        # dispatch to the single-active peft managers; NOT_HANDLED falls through
+        # to the base-weight paths below.
+        result = peft.maybe_load_adapter_format(
+            self.get_model_runner(),
+            load_format,
+            named_tensors,
+            adapter_config,
+            adapter_name,
+            adapter_id,
+            device=infered_device,
+        )
+        if result is not peft.NOT_HANDLED:
+            return result
 
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))

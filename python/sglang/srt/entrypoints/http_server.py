@@ -112,6 +112,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActivateAdapterVersionReqInput,
     AttachHiCacheStorageReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
@@ -137,6 +138,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1343,6 +1345,55 @@ async def update_weights_from_distributed(
     if success:
         return ORJSONResponse(content, status_code=200)
     else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_adapter_from_distributed")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_adapter_from_distributed(
+    obj: UpdateAdapterFromDistributedReqInput, request: Request
+):
+    """Double-buffer PEFT (OFT/LoRA) STAGE over NCCL. double_buffer=True stages
+    only; double_buffer=False stages then activates-in-place (caller idle)."""
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.update_adapter_from_distributed(
+        obj, request
+    )
+
+    # Response schema orbit's nccl.py validators require (all string versions,
+    # echoed from the request; version fields only meaningful on success).
+    content = {"success": success, "message": message}
+    if success:
+        content["staged_adapter_version"] = obj.adapter_version
+        content["adapter_version"] = obj.adapter_version
+        content["weight_version"] = obj.weight_version
+        if not obj.double_buffer:
+            content["active_adapter_version"] = obj.adapter_version
+        return ORJSONResponse(content, status_code=200)
+    else:
+        content["error"] = message
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/activate_adapter_version")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def activate_adapter_version(
+    obj: ActivateAdapterVersionReqInput, request: Request
+):
+    """Double-buffer PEFT ACTIVATE (drained atomic swap). Drains in-flight
+    generation (tokenizer-side writer_lock) then flips staging->active."""
+    success, message = await _global_state.tokenizer_manager.activate_adapter_version(
+        obj, request
+    )
+
+    content = {"success": success, "message": message}
+    if success:
+        content["active_adapter_version"] = obj.adapter_version
+        return ORJSONResponse(content, status_code=200)
+    else:
+        content["error"] = message
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 

@@ -50,11 +50,12 @@ def linear_with_fused_a_gemm(
     *,
     backend: "FusedAGemmBackend | str" = FusedAGemmBackend.AUTO,
 ) -> torch.Tensor:
-    # LoRA reads weight.T directly, bypassing the adapter, so fall back when active.
+    # LoRA/OFT read weight.T directly, bypassing the adapter, so fall back when active.
     if (
         not isinstance(hidden_states, tuple)
         and 1 <= hidden_states.shape[0] <= 16
         and not getattr(layer, "set_lora", False)
+        and not getattr(layer, "set_oft", False)
     ):
         return dsv3_fused_a_gemm(hidden_states, layer.weight.T, backend=backend)
     return layer(hidden_states)[0]

@@ -82,6 +82,7 @@ class TritonRunnerCore(MoeRunnerCore):
         quant_info: TritonMoeQuantInfo,
         running_state: dict,
         hooks: Optional[Any] = None,
+        invoke: Optional[Any] = None,
     ) -> TritonRunnerOutput:
         if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
             from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
@@ -162,6 +163,8 @@ class TritonRunnerCore(MoeRunnerCore):
             gemm1_limit=self.config.gemm1_clamp_limit,
             filter_expert=filter_expert,
             hooks=hooks,
+            # omit when unset so the sequence keeps its own default invoker
+            **({} if invoke is None else {"invoke": invoke}),
             swiglu_limit=self.config.swiglu_limit,
         )
 

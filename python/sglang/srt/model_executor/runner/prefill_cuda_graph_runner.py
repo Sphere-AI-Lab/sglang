@@ -519,6 +519,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         fb, attn_backend = self.capture_prepare(num_tokens)
         attn_backend.init_forward_metadata(fb)
+        # peft (OFT or single-active LoRA): set the adapter batch_info before the
+        # compile/capture forward, mirroring decode_cuda_graph_runner and the
+        # normal forward (forward_batch_info.py). Self-guards on peft_method;
+        # without it FusedMoEWithLoRA._get_lora_info / the OFT triton backend read
+        # an unset batch_info during the tc-piecewise compile pass. fb carries
+        # dummy adapter_ids (base) from capture_prepare; load_batch re-preps OFT
+        # with the real ids at replay.
+        from sglang.srt.peft import integration as peft
+
+        peft.maybe_prepare_peft_batch(self.model_runner, fb)
         self._run_forward(fb, num_tokens)
 
     def run_dummy_multimodal_deepstack_forward(
@@ -785,6 +795,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_gpu = None
             global_num_tokens_for_logprob_gpu = None
 
+        # OFT: dummy adapter_ids so prepare_oft_batch binds the OFT batch_info
+        # during the compile/capture pass (mirrors decode_cuda_graph_runner's
+        # maybe_dummy_ids). [None]*bs when peft_method=="oft" (-> base slot at
+        # capture), else None. load_batch threads the real adapter_ids back in at
+        # replay, flipping the single-active idx base->active.
+        from sglang.srt.peft import integration as peft
+
+        adapter_dummy_ids = peft.maybe_dummy_ids(self.model_runner.server_args, bs)
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -845,6 +863,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                adapter_ids=adapter_dummy_ids,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
@@ -1036,6 +1055,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
+            adapter_ids=forward_batch.adapter_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
             temperature=forward_batch.temperature,
@@ -1097,6 +1117,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._prepare_forward_metadata_for_replay(
             forward_batch, static_forward_batch, static_num_tokens
         )
+
+        # Re-prep the peft adapter batch_info for replay with the REAL adapter_ids
+        # (capture used dummy base ids). Required for single-active OFT, whose
+        # captured single-adapter idx flips base->active here; a harmless idempotent
+        # re-prep for single-active LoRA (constant batch_info). Runs eagerly
+        # outside the compiled region, same as decode's replay re-prep.
+        from sglang.srt.peft import integration as peft
+
+        peft.maybe_prepare_peft_batch(self.model_runner, static_forward_batch)
 
         self._static_num_tokens = static_num_tokens
         return static_forward_batch

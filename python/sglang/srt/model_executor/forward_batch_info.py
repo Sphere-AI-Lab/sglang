@@ -51,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
+from sglang.srt.peft import integration as peft
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     is_cuda,
@@ -450,6 +451,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA
     lora_ids: Optional[List[str]] = None
+    # For OFT
+    adapter_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
@@ -733,6 +736,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
+            adapter_ids=[req.adapter_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
@@ -888,6 +892,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        # Init peft-lora (single-active) batch info. Distinct namespace/guard
+        # from the upstream enable_lora block above.
+        if model_runner.server_args.peft_method == "lora":
+            peft.maybe_prepare_lora_batch(model_runner, ret)
+
+        # Init OFT (single-active) batch info. Distinct namespace/guard from
+        # the upstream enable_lora block above.
+        if model_runner.server_args.peft_method == "oft":
+            peft.maybe_apply_forward(model_runner, ret)
 
         if (
             getattr(model_runner, "dcp_size", 1) > 1

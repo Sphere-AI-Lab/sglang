@@ -39,6 +39,10 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.peft.oft.kimi_k25_policy import (
+    get_kimi_dense_first_unsupported_targets,
+    is_kimi_dense_first_oft_module,
+)
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -902,6 +906,28 @@ class KimiK25ForConditionalGeneration(nn.Module):
     @property
     def expert_params_mapping(self):
         return getattr(self.language_model, "expert_params_mapping", [])
+
+    def should_apply_oft(self, module_name: str) -> bool:
+        """Kimi K2.5 dense-first OFT policy gate, consulted by
+        OFTManager.init_oft_modules (peft/oft/oft_manager.py) via
+        getattr(base_model, "should_apply_oft", None). ``base_model`` there is
+        this wrapper (model_runner.model), not the inner ``language_model``
+        (DeepseekV3ForCausalLM), so the hook lives here -- scoped to K2.5 only,
+        not the shared DeepseekV3ForCausalLM/DeepseekV2 class other DeepSeek
+        models also use.
+        """
+        return is_kimi_dense_first_oft_module(module_name)
+
+    def validate_oft_target_modules(self, target_modules: Iterable[str]) -> None:
+        """Consulted by validate_model_oft_target_modules (peft/oft/oft_manager.py)
+        to reject unsupported --oft-target-modules / adapter target_modules early.
+        """
+        unsupported = get_kimi_dense_first_unsupported_targets(target_modules)
+        if unsupported:
+            raise ValueError(
+                "Kimi K2.5 dense-first OFT does not support target modules: "
+                f"{sorted(unsupported)}"
+            )
 
     def mutate_weight_preload(self, name):
         return self.language_model.mutate_weight_preload(name)

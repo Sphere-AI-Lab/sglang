@@ -159,6 +159,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.peft import integration as peft
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -592,6 +593,7 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
+        self.maybe_init_peft_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
 
@@ -689,6 +691,25 @@ class ModelRunner:
     def maybe_init_lora_manager(self):
         if self.server_args.enable_lora:
             self.init_lora_manager()
+
+    def maybe_init_peft_manager(self):
+        # Init the peft adapter manager (OFT or LoRA) for the configured
+        # peft_method. No-op when peft_method is None.
+        peft.maybe_init_peft_manager(self, self.server_args)
+        if (
+            self.server_args.peft_method == "lora"
+            and not cuda_graph_fully_disabled()
+        ):
+            # Phase 1 of peft-lora CUDA graph init: pre-allocate the MoE cg
+            # buffers so decode CAPTURE uses the GPU moe-align path, not the CPU
+            # fallback in lora_moe_runners (`.cpu().tolist()` + `.to(device)`),
+            # which copies CPU->GPU and fails cuda-graph capture. Mirrors the
+            # enable_lora branch above; _init_lora_cuda_graph_moe_buffers only
+            # handles the upstream self.lora_manager, not peft_lora_manager.
+            self.peft_lora_manager.init_cuda_graph_moe_buffers(
+                max_bs=self.server_args.cuda_graph_config.decode.max_bs,
+                disable_cuda_graph=False,
+            )
 
     def maybe_enable_batch_invariant_mode(self):
         if self.server_args.enable_deterministic_inference:

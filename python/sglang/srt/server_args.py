@@ -58,6 +58,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     parse_cuda_graph_config_arg,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.peft.config import PEFTArgs, register_peft_args, validate_peft_args
 from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
@@ -409,7 +410,7 @@ def add_linear_attn_kernel_backend_choices(choices):
 
 
 @dataclasses.dataclass
-class ServerArgs:
+class ServerArgs(PEFTArgs):
     """Server-wide configuration for SGLang.
 
     Adding new arguments
@@ -3713,7 +3714,26 @@ class ServerArgs:
                 "MoE A2A backend",
                 lambda: _resolved_view(self).moe_a2a_backend != "none",
             ),
-            ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
+            (
+                "LoRA",
+                lambda: bool(self.lora_paths)
+                or self.enable_lora
+                # Fork's single-active peft/lora rides the SAME MoE-LoRA path
+                # (FusedMoEWithLoRA -> _prepare_fused_moe_run -> get_config_file_name
+                # -> get_device_name, a torch.* op returning str) that makes
+                # upstream LoRA torch.compile-incompatible, so peft_method=="lora"
+                # needs the same tc_piecewise disable as upstream --enable-lora.
+                or self.peft_method == "lora",
+            ),
+            (
+                "OFT",
+                # Same tc_piecewise incompatibility as LoRA: the OFT layer forward
+                # reads oft_backend.batch_info, which is only populated by the real
+                # prepare step, not the torch.compile dummy forward -- so the
+                # compile pass raises "AttributeError: 'TritonOFTBackend' object has
+                # no attribute 'batch_info'".
+                lambda: self.peft_method == "oft",
+            ),
             (
                 "multimodal model",
                 lambda: self.get_model_config().is_multimodal
@@ -7101,6 +7121,10 @@ class ServerArgs:
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
 
+        # PEFT (OFT / peft-lora) fields are bare-typed on PEFTArgs, so the
+        # auto-generator above skips them; register them manually here.
+        register_peft_args(parser)
+
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(
@@ -7621,6 +7645,9 @@ class ServerArgs:
 
         # Check LoRA
         self.check_lora_server_args()
+
+        # Check PEFT (OFT / peft-lora)
+        validate_peft_args(self)
 
         # Check speculative decoding
         if self.speculative_algorithm is not None:

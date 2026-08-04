@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -173,6 +174,34 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
+    def update_adapter_from_distributed(
+        self, recv_req: UpdateAdapterFromDistributedReqInput
+    ):
+        success, message = self.model_runner.weight_updater.stage_adapter(
+            names=recv_req.names,
+            dtypes=recv_req.dtypes,
+            shapes=recv_req.shapes,
+            group_name=recv_req.group_name,
+            load_format=recv_req.load_format,
+            adapter_config=recv_req.adapter_config,
+            adapter_name=recv_req.adapter_name,
+            adapter_id=recv_req.adapter_id,
+            adapter_version=recv_req.adapter_version,
+            payload_metadata=recv_req.payload_metadata,
+            double_buffer=recv_req.double_buffer,
+        )
+        return success, message
+
+    def activate_adapter_version(self, recv_req):
+        # recv_req is either ActivateAdapterVersionReqInput (drained swap) or
+        # UpdateAdapterFromDistributedReqInput (double_buffer=False in-place
+        # activate); both carry adapter_name + adapter_version.
+        success, message = self.model_runner.weight_updater.activate_adapter_version(
+            adapter_name=recv_req.adapter_name,
+            adapter_version=recv_req.adapter_version,
+        )
+        return success, message
+
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
 
         monkey_patch_torch_reductions()
@@ -181,6 +210,9 @@ class BaseTpWorker(ABC):
                 recv_req.serialized_named_tensors[self.ps.tp_rank]
             ),
             load_format=recv_req.load_format,
+            adapter_config=recv_req.adapter_config,
+            adapter_name=recv_req.adapter_name,
+            adapter_id=recv_req.adapter_id,
         )
         return success, message
 

@@ -339,6 +339,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 num_tokens_per_req=self.captured_req_width,
             )
 
+        # OFT: init the cuda-graph batch_info (analog of the LoRA init above).
+        # No-op unless enable_oft. Gives OFT's prepare_oft_batch a
+        # cuda_graph_batch_info to bind during capture/replay. Ph4 seam: the
+        # rebase wired the LoRA hooks into this runner but not the OFT ones,
+        # whose helpers already live in peft.integration.
+        from sglang.srt.peft import integration as peft
+
+        peft.maybe_init_cuda_graph_batch_info(
+            self.model_runner, self.max_bs, self.captured_req_width
+        )
+
         enable_mamba_track = (
             self.model_runner.server_args.enable_mamba_extra_buffer()
             and self.model_runner.spec_algorithm.is_none()
@@ -762,6 +773,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             lora_ids = None
 
+        # OFT: dummy adapter_ids so prepare_oft_batch runs during capture (mirrors the
+        # empty-lora_ids capture above). maybe_dummy_ids returns [None]*bs when
+        # enable_oft, else None; ForwardBatch carries adapter_ids so the capture block
+        # below can prep the OFT batch_info.
+        from sglang.srt.peft import integration as peft
+
+        adapter_ids = peft.maybe_dummy_ids(self.model_runner.server_args, bs)
+
         # mamba state tracking (registry-owned when enabled)
         mamba_track_indices = (
             _slot("mamba_track_indices")
@@ -807,6 +826,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            adapter_ids=adapter_ids,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
@@ -938,6 +958,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+
+            # peft-lora (single-active) sets batch_info on the MoE wrappers'
+            # backends; mirror the normal-forward wiring (forward_batch_info.py)
+            # so CUDA-graph CAPTURE preps it too. Self-guards on enable_peft_lora
+            # and, being single-active, does not depend on forward_batch.lora_ids.
+            # Without this, FusedMoEWithLoRA._get_lora_info reads an unset
+            # batch_info during capture.
+            from sglang.srt.peft import integration as peft
+
+            # Prep the peft (OFT or LoRA) batch_info during capture via the one
+            # unified seam. LoRA preps the single-active MoE-wrapper batch_info;
+            # OFT preps its batch_info when adapter_ids is set. Without this the
+            # FusedMoEWithLoRA wrapper / OFT triton backend read an unset
+            # batch_info during capture.
+            peft.maybe_prepare_peft_batch(self.model_runner, forward_batch)
 
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
@@ -1147,6 +1182,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+
+        # OFT: re-prep the OFT batch_info for the real replay batch (padded bs, the
+        # request's real adapter_ids -- capture used dummy base ids). No-op unless
+        # enable_oft. Mirrors v0.5.9 CudaGraphRunner.replay_prepare.
+        from sglang.srt.peft import integration as peft
+
+        peft.maybe_prepare_replay_batch(self.model_runner, forward_batch, bs, raw_bs)
 
         if (
             not is_ragged
