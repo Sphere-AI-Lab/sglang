@@ -1351,7 +1351,7 @@ async def update_weights_from_distributed(
 @app.post("/update_adapter_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_adapter_from_distributed(
-    obj: UpdateAdapterFromDistributedReqInput, request: Request
+    obj: Annotated[UpdateAdapterFromDistributedReqInput, Body()], request: Request
 ):
     """Double-buffer PEFT (OFT/LoRA) STAGE over NCCL. double_buffer=True stages
     only; double_buffer=False stages then activates-in-place (caller idle)."""
@@ -1380,7 +1380,7 @@ async def update_adapter_from_distributed(
 @app.post("/activate_adapter_version")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def activate_adapter_version(
-    obj: ActivateAdapterVersionReqInput, request: Request
+    obj: Annotated[ActivateAdapterVersionReqInput, Body()], request: Request
 ):
     """Double-buffer PEFT ACTIVATE (drained atomic swap). Drains in-flight
     generation (tokenizer-side writer_lock) then flips staging->active."""
