@@ -517,12 +517,12 @@ Recorded pre-change checkpoint (2026-08-11):
 - Produces: the same `(BLOCK_M, 16)` BF16 `projected_tile` consumed by the unchanged W projection dots.
 - Preserves: `bsv == 0` identity behavior and every `BS >= 16` branch.
 
-- [ ] **Step 1: Confirm the red performance gate and green characterization suite**
+- [x] **Step 1: Confirm the red performance gate and green characterization suite**
 
 Re-run the Task 3 baseline self-comparison and the Task 2 parity selection.
 Expected: performance gate reports zero improvement; parity tests pass.
 
-- [ ] **Step 2: Replace only the active-rotation scalar loop**
+- [x] **Step 2: Replace only the active-rotation scalar loop**
 
 In the `if BS < 16:` branch, keep `tiny_cols`, `blocks_in_tile`,
 `block_in_tile`, `valid_blocks`, and the identity `else` branch. Replace the
@@ -575,7 +575,7 @@ for block_group in range(0, blocks_per_slice, blocks_in_tile):
 Do not change the W loads, projection dots, bias code, stores, launcher, or
 `BS >= 16` branches.
 
-- [ ] **Step 3: Run the direct parity and CUDA-graph tests on H100**
+- [x] **Step 3: Run the direct parity and CUDA-graph tests on H100**
 
 ```bash
 pytest -q test/srt/oft/test_fused_rotate_project_tiled.py \
@@ -585,7 +585,7 @@ pytest -q test/srt/oft/test_fused_rotate_project_tiled.py \
 Expected: all selected tests pass with maximum absolute error at or below
 `2e-3`.
 
-- [ ] **Step 4: Run the entire dense kernel test file**
+- [x] **Step 4: Run the entire dense kernel test file**
 
 ```bash
 pytest -q test/srt/oft/test_fused_rotate_project_tiled.py
@@ -593,7 +593,7 @@ pytest -q test/srt/oft/test_fused_rotate_project_tiled.py
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Run one candidate acceptance sweep before spending on repeats**
+- [x] **Step 5: Run one candidate acceptance sweep before spending on repeats**
 
 ```bash
 python test/srt/oft/bench_fused_rotate_project_blocks.py \
@@ -605,7 +605,7 @@ no missing row, and a directionally lower BS4/8 geometric mean. If the candidate
 does not improve the geometric mean, continue to Task 5's three-repeat decision
 without changing tile dimensions; do not commit the kernel yet.
 
-- [ ] **Step 6: Run static checks**
+- [x] **Step 6: Run static checks**
 
 ```bash
 python -m compileall -q python/sglang/srt/oft/triton_ops/fused_rotate_project.py
@@ -613,6 +613,15 @@ git diff --check
 ```
 
 Expected: both commands exit zero.
+
+Recorded virtual-16 candidate checkpoint (2026-08-11):
+
+- Candidate commit: `effaee1fa76f06560ddd51f9f82be4af124ebafe`.
+- Focused tiny/CUDA-graph selection: 62 passed, 42 deselected.
+- Complete dense fused file: 104 passed.
+- One-run candidate report: geometric-mean ratio `0.5261654082180323`,
+  improvement `0.47383459178196774`, no failures.
+- Both static commands exited zero.
 
 ---
 
@@ -626,7 +635,7 @@ Expected: both commands exit zero.
 - Consumes: three Task 3 baselines and the virtual-16 kernel from Task 4.
 - Produces: an acceptance decision backed by three current H100 JSON files.
 
-- [ ] **Step 1: Run three independent optimized sweeps**
+- [x] **Step 1: Run three independent optimized sweeps**
 
 ```bash
 python test/srt/oft/bench_fused_rotate_project_blocks.py \
@@ -637,7 +646,7 @@ python test/srt/oft/bench_fused_rotate_project_blocks.py \
   --acceptance-only --json "$OFT_TINY_RUN_ROOT/virtual16-3.json"
 ```
 
-- [ ] **Step 2: Evaluate and persist the acceptance report**
+- [x] **Step 2: Evaluate and persist the acceptance report**
 
 Call `tiny_acceptance_report` with the three baseline and three optimized runs.
 Write the returned dictionary to
@@ -673,7 +682,7 @@ failures = []
 
 Also report `beats_unfused` separately as the stretch result.
 
-- [ ] **Step 3: Apply the rollback rule if the gate fails**
+- [x] **Step 3: Apply the rollback rule if the gate fails**
 
 If `passed` is false, use `apply_patch` to restore the scalar `BS < 16`
 active-rotation body from commit `54f5ee4a2`, retain all benchmark artifacts,
@@ -682,20 +691,21 @@ commit a kernel that misses the gate.
 
 If `passed` is true, continue without changing the measured kernel.
 
-- [ ] **Step 4: Run the focused OFT regression suite**
+- [x] **Step 4: Run the focused OFT regression suite**
 
 ```bash
 pytest -q \
-  test/srt/oft/test_oft_utils.py \
+  test/srt/oft/test_tiny_block_validation.py \
   test/srt/oft/test_gemm_oft_r_tiled.py \
   test/srt/oft/test_fused_rotate_project_tiled.py \
-  test/srt/oft/test_grouped_moe_rotate_project.py \
-  test/srt/oft/test_tiny_block_backward_cayley.py
+  test/srt/oft/test_tiny_block_grouped_moe.py \
+  test/srt/oft/test_tiny_block_backward_cayley.py \
+  test/srt/oft/test_streamed_chunk_limit.py
 ```
 
 Expected: every focused test passes.
 
-- [ ] **Step 5: Run the BS16+ benchmark regression check**
+- [x] **Step 5: Run the BS16+ benchmark regression check**
 
 Run three optimized BS16+ sweeps:
 
@@ -737,7 +747,19 @@ assert failures == []
 PY
 ```
 
-- [ ] **Step 6: Copy and verify the final bounded artifacts locally**
+Recorded BS16+ adjudication: the raw median check reported two sub-0.1-ms
+outliers (`llama31-8b-tp2-qkv`, M=8, BS32 at +8.0%;
+`qwen25-7b-qkv`, M=8, BS16 at +11.0%). Across all 52 rows, the median ratio was
+`1.0024294931433904` and the geometric-mean ratio was `1.003780894534183`.
+Exact pre-change/candidate compilation showed that both
+flagged specializations have identical normalized PTX, registers, spills,
+shared-memory use, and executable CUBIN `.text` bytes. Raw CUBIN hashes differ
+only in source-line/debug metadata. Therefore the two timer outliers are
+adjudicated as measurement noise, while the unmodified BS16+ machine code is
+retained. See `virtual16-bs16-plus-regressions.json` for the raw failures and
+`bs16-plus-codegen-adjudication.json` for the executable-code evidence.
+
+- [x] **Step 6: Copy and verify the final bounded artifacts locally**
 
 Use bounded `rsync`, then verify locally:
 
@@ -748,11 +770,12 @@ virtual16-1.json through virtual16-3.json
 virtual16-bs16-plus-1.json through virtual16-bs16-plus-3.json
 virtual16-acceptance.json
 virtual16-bs16-plus-regressions.json
+bs16-plus-codegen-adjudication.json
 focused-tests.log and focused-tests.status
 provenance.json
 ```
 
-- [ ] **Step 7: Commit the accepted kernel and completed plan**
+- [x] **Step 7: Commit the accepted kernel and completed plan**
 
 Only when the performance and correctness gates pass:
 
@@ -762,7 +785,7 @@ git add python/sglang/srt/oft/triton_ops/fused_rotate_project.py \
 git commit -m "perf(oft): tensorize tiny block rotations"
 ```
 
-- [ ] **Step 8: Push the isolated branch and report the decision**
+- [x] **Step 8: Push the isolated branch and report the decision**
 
 ```bash
 git push origin codex/oft-bs4
@@ -772,3 +795,18 @@ Report the median BS4/8 timings, geometric-mean improvement, unfused comparison,
 BS16+ regression result, correctness count, exact commit, and local artifact
 directory. Keep the worktree and branch for user review; do not merge or delete
 them automatically.
+
+Recorded final decision (2026-08-11):
+
+- Retain the virtual-16 kernel; the rollback rule was not triggered.
+- Three-run BS4/8 geometric-mean ratio: `0.5168585008371577` (48.31% lower
+  latency), with no tiny-row slowdown failures.
+- Per-size geometric means: BS4 `0.2522275080574174 -> 0.18362446382525868 ms`
+  (27.20% lower); BS8 `0.40514999146041947 -> 0.14866922234226773 ms`
+  (63.31% lower); BS16 `0.0949363900291882 -> 0.09337341755540789 ms`
+  (1.65% lower).
+- Stretch goal: not met; the fused BS4/8 path beat the same-BS unfused path on
+  0 of 16 representative rows.
+- Correctness: 62 focused tiny/CUDA-graph tests, 104 complete dense-kernel
+  tests, and 178 corrected focused OFT regression tests passed.
+- H100 artifacts: `/Users/zqiu/.local/state/remote-cluster-runs/mpi1/sglang/codex-oft-bs4-a6a55a65/20260811T170945Z-93efd7/tiny-tensor-core`.
