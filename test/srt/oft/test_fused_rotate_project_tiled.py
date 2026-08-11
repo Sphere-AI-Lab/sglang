@@ -34,17 +34,20 @@ TOL = 2e-3
 
 def _assert_bf16_parity(actual, expected):
     """Allow the absolute error floor or one final-output BF16 ULP."""
-    max_abs = (actual.float() - expected.float()).abs().max().item()
-    if max_abs <= TOL:
-        return
-
     assert actual.dtype == expected.dtype == torch.bfloat16
+    absolute = (actual.float() - expected.float()).abs()
     upward = torch.nextafter(expected, torch.full_like(expected, float("inf")))
     downward = torch.nextafter(expected, torch.full_like(expected, float("-inf")))
-    within_one_ulp = (
-        (actual == expected) | (actual == upward) | (actual == downward)
-    ).all()
-    assert within_one_ulp.item(), f"max_abs={max_abs:.2e} exceeds one BF16 ULP"
+    acceptable = (
+        (absolute <= TOL)
+        | (actual == expected)
+        | (actual == upward)
+        | (actual == downward)
+    )
+    assert acceptable.all().item(), (
+        f"max_abs={absolute.max().item():.2e} exceeds both the absolute floor "
+        "and one BF16 ULP"
+    )
 
 
 def _inputs(M, BS, device="cuda", dtype=torch.bfloat16, rotate=True, seed=0):
