@@ -25,6 +25,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.oft.utils import validate_oft_block_size
+
 
 @triton.jit
 def _fused_rotate_project_qkv_kernel(
@@ -172,42 +174,81 @@ def _fused_rotate_gate_up_inputs_kernel(
     slot_R_offset_t = slot * 2 * blocks_per_slice * BS * BS
     gate_R_base_t = slot_R_offset_t + block_idx * BS * BS
     up_R_base_t = slot_R_offset_t + (blocks_per_slice + block_idx) * BS * BS
-    for j in range(0, BS, TILE_K):
-        offs_j = j + tile_range
-        offs_kj = block_idx * BS + offs_j
-        if bsv == 0:
-            # Identity passthrough, tiled: copy this slice of x through.
-            x_j = tl.load(
-                x_ptr + offs_m[:, None] * K + offs_kj[None, :],
-                mask=m_mask[:, None],
-                other=0.0,
-            )
-            tl.store(out_gate_ptr + offs_m[:, None] * K + offs_kj[None, :],
-                     x_j, mask=m_mask[:, None])
-            tl.store(out_up_ptr + offs_m[:, None] * K + offs_kj[None, :],
-                     x_j, mask=m_mask[:, None])
-        else:
-            gate_j = tl.zeros((BLOCK_M, TILE_K), dtype=tl.float32)
-            up_j = tl.zeros((BLOCK_M, TILE_K), dtype=tl.float32)
-            for i in range(0, BS, TILE_K):
-                offs_i = i + tile_range
-                x_i = tl.load(
-                    x_ptr + offs_m[:, None] * K + (block_idx * BS + offs_i)[None, :],
+    if BS >= 16:
+        for j in range(0, BS, TILE_K):
+            offs_j = j + tile_range
+            offs_kj = block_idx * BS + offs_j
+            if bsv == 0:
+                # Identity passthrough, tiled: copy this slice of x through.
+                x_j = tl.load(
+                    x_ptr + offs_m[:, None] * K + offs_kj[None, :],
                     mask=m_mask[:, None],
                     other=0.0,
                 )
-                R_gate_ij = tl.load(
-                    R_ptr + gate_R_base_t + offs_i[:, None] * BS + offs_j[None, :]
+                tl.store(out_gate_ptr + offs_m[:, None] * K + offs_kj[None, :],
+                         x_j, mask=m_mask[:, None])
+                tl.store(out_up_ptr + offs_m[:, None] * K + offs_kj[None, :],
+                         x_j, mask=m_mask[:, None])
+            else:
+                gate_j = tl.zeros((BLOCK_M, TILE_K), dtype=tl.float32)
+                up_j = tl.zeros((BLOCK_M, TILE_K), dtype=tl.float32)
+                for i in range(0, BS, TILE_K):
+                    offs_i = i + tile_range
+                    x_i = tl.load(
+                        x_ptr + offs_m[:, None] * K + (block_idx * BS + offs_i)[None, :],
+                        mask=m_mask[:, None],
+                        other=0.0,
+                    )
+                    R_gate_ij = tl.load(
+                        R_ptr + gate_R_base_t + offs_i[:, None] * BS + offs_j[None, :]
+                    )
+                    R_up_ij = tl.load(
+                        R_ptr + up_R_base_t + offs_i[:, None] * BS + offs_j[None, :]
+                    )
+                    gate_j += tl.dot(x_i, R_gate_ij, out_dtype=tl.float32)
+                    up_j += tl.dot(x_i, R_up_ij, out_dtype=tl.float32)
+                tl.store(out_gate_ptr + offs_m[:, None] * K + offs_kj[None, :],
+                         gate_j.to(tl.bfloat16), mask=m_mask[:, None])
+                tl.store(out_up_ptr + offs_m[:, None] * K + offs_kj[None, :],
+                         up_j.to(tl.bfloat16), mask=m_mask[:, None])
+    else:
+        for j in range(BS):
+            out_col = block_idx * BS + j
+            if bsv == 0:
+                x_j = tl.load(
+                    x_ptr + offs_m * K + out_col,
+                    mask=m_mask,
+                    other=0.0,
                 )
-                R_up_ij = tl.load(
-                    R_ptr + up_R_base_t + offs_i[:, None] * BS + offs_j[None, :]
+                tl.store(out_gate_ptr + offs_m * K + out_col, x_j, mask=m_mask)
+                tl.store(out_up_ptr + offs_m * K + out_col, x_j, mask=m_mask)
+            else:
+                gate_j = tl.zeros((BLOCK_M,), dtype=tl.float32)
+                up_j = tl.zeros((BLOCK_M,), dtype=tl.float32)
+                for k in range(BS):
+                    x_k = tl.load(
+                        x_ptr + offs_m * K + block_idx * BS + k,
+                        mask=m_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    gate_r = tl.load(
+                        R_ptr + gate_R_base_t + k * BS + j
+                    ).to(tl.float32)
+                    up_r = tl.load(
+                        R_ptr + up_R_base_t + k * BS + j
+                    ).to(tl.float32)
+                    gate_j += x_k * gate_r
+                    up_j += x_k * up_r
+                tl.store(
+                    out_gate_ptr + offs_m * K + out_col,
+                    gate_j.to(tl.bfloat16),
+                    mask=m_mask,
                 )
-                gate_j += tl.dot(x_i, R_gate_ij, out_dtype=tl.float32)
-                up_j += tl.dot(x_i, R_up_ij, out_dtype=tl.float32)
-            tl.store(out_gate_ptr + offs_m[:, None] * K + offs_kj[None, :],
-                     gate_j.to(tl.bfloat16), mask=m_mask[:, None])
-            tl.store(out_up_ptr + offs_m[:, None] * K + offs_kj[None, :],
-                     up_j.to(tl.bfloat16), mask=m_mask[:, None])
+                tl.store(
+                    out_up_ptr + offs_m * K + out_col,
+                    up_j.to(tl.bfloat16),
+                    mask=m_mask,
+                )
 
 
 @triton.jit
@@ -274,7 +315,94 @@ def _fused_rotate_project_inner(
     # identity (skip the rotation matmul, project x directly).
     do_rotation = bsv != 0
 
-    if do_rotation:
+    if BS < 16:
+        # tl.dot rejects reduction dimensions below 16. Keep the useful
+        # BLOCK_M/BLOCK_N vectorization and unroll only the tiny rotation and
+        # projection reductions. The bf16 cast between them matches the dot
+        # path's numerical boundary.
+        for block_idx in range(0, blocks_per_slice):
+            k_block_start = block_idx * BS
+            R_block_base = (
+                slot_R_offset + (rotation_block_start + block_idx) * BS * BS
+            )
+            for j in range(BS):
+                if do_rotation:
+                    rotated_j = tl.zeros((BLOCK_M,), dtype=tl.float32)
+                    for k in range(BS):
+                        x_k = tl.load(
+                            x_ptr + offs_m * K + k_block_start + k,
+                            mask=m_mask,
+                            other=0.0,
+                        ).to(tl.float32)
+                        r_kj = tl.load(
+                            R_ptr + R_block_base + k * BS + j
+                        ).to(tl.float32)
+                        rotated_j += x_k * r_kj
+                    projected_j = rotated_j.to(tl.bfloat16)
+                else:
+                    # Runtime identity sentinel: do not read the inactive R
+                    # slot, because graph replay may switch bsv between calls.
+                    projected_j = tl.load(
+                        x_ptr + offs_m * K + k_block_start + j,
+                        mask=m_mask,
+                        other=0.0,
+                    )
+
+                projected_j_f32 = projected_j.to(tl.float32)
+                w0 = tl.load(
+                    W_ptr + (slice_offset + offs_n0) * K + k_block_start + j,
+                    mask=n_mask0,
+                    other=0.0,
+                ).to(tl.float32)
+                acc0 += projected_j_f32[:, None] * w0[None, :]
+
+                if GROUP_N >= 2:
+                    w1 = tl.load(
+                        W_ptr + (slice_offset + offs_n1) * K + k_block_start + j,
+                        mask=n_mask1,
+                        other=0.0,
+                    ).to(tl.float32)
+                    acc1 += projected_j_f32[:, None] * w1[None, :]
+                if GROUP_N >= 4:
+                    w2 = tl.load(
+                        W_ptr + (slice_offset + offs_n2) * K + k_block_start + j,
+                        mask=n_mask2,
+                        other=0.0,
+                    ).to(tl.float32)
+                    w3 = tl.load(
+                        W_ptr + (slice_offset + offs_n3) * K + k_block_start + j,
+                        mask=n_mask3,
+                        other=0.0,
+                    ).to(tl.float32)
+                    acc2 += projected_j_f32[:, None] * w2[None, :]
+                    acc3 += projected_j_f32[:, None] * w3[None, :]
+                if GROUP_N >= 8:
+                    w4 = tl.load(
+                        W_ptr + (slice_offset + offs_n4) * K + k_block_start + j,
+                        mask=n_mask4,
+                        other=0.0,
+                    ).to(tl.float32)
+                    w5 = tl.load(
+                        W_ptr + (slice_offset + offs_n5) * K + k_block_start + j,
+                        mask=n_mask5,
+                        other=0.0,
+                    ).to(tl.float32)
+                    w6 = tl.load(
+                        W_ptr + (slice_offset + offs_n6) * K + k_block_start + j,
+                        mask=n_mask6,
+                        other=0.0,
+                    ).to(tl.float32)
+                    w7 = tl.load(
+                        W_ptr + (slice_offset + offs_n7) * K + k_block_start + j,
+                        mask=n_mask7,
+                        other=0.0,
+                    ).to(tl.float32)
+                    acc4 += projected_j_f32[:, None] * w4[None, :]
+                    acc5 += projected_j_f32[:, None] * w5[None, :]
+                    acc6 += projected_j_f32[:, None] * w6[None, :]
+                    acc7 += projected_j_f32[:, None] * w7[None, :]
+
+    if BS >= 16 and do_rotation:
         # Walk the rotation block in TILE_K-wide column tiles instead of
         # staging all BS x BS of it. x_rot_j is a COMPLETE BS-reduction
         # before it is cast, exactly as x_rot is in the untiled path below
@@ -391,7 +519,7 @@ def _fused_rotate_project_inner(
                         x_for_proj_j, tl.trans(W_block7), out_dtype=tl.float32,
                         allow_tf32=False,
                     )
-    else:
+    elif BS >= 16:
         # The identity passthrough is reached at RUNTIME (bsv == 0), so
         # Triton compiles it whichever branch the rotation takes -- and it
         # stages BLOCK_M x BS and BLOCK_N x BS tiles of its own. Tiling the
@@ -695,7 +823,7 @@ def _validate_inputs(x, R, W, output_sizes, num_slices_expected):
     assert blocks_per_slice * BS == K, (
         f"blocks_per_slice={blocks_per_slice} * BS={BS} != K={K}"
     )
-    assert BS >= 16, f"Triton tl.dot requires BS >= 16; got BS={BS}"
+    validate_oft_block_size(BS)
     return M, K, BS, blocks_per_slice
 
 
@@ -753,7 +881,7 @@ def fused_rotate_gate_up_inputs(
     assert R.dtype == torch.bfloat16, f"R must be bf16, got {R.dtype}"
     assert x.is_contiguous(), "x must be contiguous"
     assert R.is_contiguous(), "R must be contiguous"
-    assert BS >= 16, f"Triton tl.dot requires BS >= 16; got BS={BS}"
+    validate_oft_block_size(BS)
 
     R, slot_idx_t, bsv_t = _ensure_4d_R_and_runtime_tensors(
         R, slot_idx_t, bsv_t, BS, x.device
