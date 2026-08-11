@@ -316,41 +316,45 @@ def _fused_rotate_project_inner(
     do_rotation = bsv != 0
 
     if BS < 16:
-        # Rotate BS4/8 blocks elementwise, but batch enough adjacent blocks to
-        # project a 16-column micro-tile with tl.dot. A scalar outer product
-        # here was correct but 20-54x slower than BS16 because it moved the
-        # full KxN projection off tensor cores. Only the tiny rotation remains
-        # scalar; the dominant projection follows the normal dot path.
+        # Batch adjacent BS4/8 blocks into a virtual 16x16 block-diagonal
+        # rotation. This makes both the rotation and the existing projection
+        # legal tensor-core dots without changing the packed R-buffer layout.
         tiny_cols = tl.arange(0, 16)
+        tiny_rows = tl.arange(0, 16)
         blocks_in_tile: tl.constexpr = 16 // BS
         block_in_tile = tiny_cols // BS
         col_in_block = tiny_cols - block_in_tile * BS
+        row_block = tiny_rows // BS
+        row_in_block = tiny_rows - row_block * BS
+        same_block = row_block[:, None] == block_in_tile[None, :]
         for block_group in range(0, blocks_per_slice, blocks_in_tile):
             block_ids = block_group + block_in_tile
             valid_blocks = block_ids < blocks_per_slice
             offs_k = block_group * BS + tiny_cols
 
             if do_rotation:
-                projected_tile_f32 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
-                for k in range(BS):
-                    x_k = tl.load(
-                        x_ptr
-                        + offs_m[:, None] * K
-                        + (block_ids * BS + k)[None, :],
-                        mask=m_mask[:, None] & valid_blocks[None, :],
-                        other=0.0,
-                    ).to(tl.float32)
-                    r_kj = tl.load(
-                        R_ptr
-                        + slot_R_offset
-                        + (rotation_block_start + block_ids) * BS * BS
-                        + k * BS
-                        + col_in_block,
-                        mask=valid_blocks,
-                        other=0.0,
-                    ).to(tl.float32)
-                    projected_tile_f32 += x_k * r_kj[None, :]
-                projected_tile = projected_tile_f32.to(tl.bfloat16)
+                x_tile = tl.load(
+                    x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                    mask=m_mask[:, None] & valid_blocks[None, :],
+                    other=0.0,
+                )
+                r_block_ids = block_group + row_block
+                valid_r_block = r_block_ids < blocks_per_slice
+                r_tile = tl.load(
+                    R_ptr
+                    + slot_R_offset
+                    + (rotation_block_start + r_block_ids[:, None]) * BS * BS
+                    + row_in_block[:, None] * BS
+                    + col_in_block[None, :],
+                    mask=same_block & valid_r_block[:, None],
+                    other=0.0,
+                )
+                projected_tile = tl.dot(
+                    x_tile,
+                    r_tile,
+                    input_precision="ieee",
+                    out_dtype=tl.float32,
+                ).to(tl.bfloat16)
             else:
                 # Runtime identity sentinel: do not read the inactive R slot.
                 projected_tile = tl.load(
