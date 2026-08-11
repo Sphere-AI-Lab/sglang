@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.oft.triton_ops.fused_rotate_project import (
     OFT_TILE_K,
     fused_rotate_project_qkv,
 )
+from sglang.srt.oft.triton_ops.gemm_oft_r import gemm_oft_r_fwd
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -65,6 +67,29 @@ def _reference(x, R, W, out_sizes):
     return torch.cat(outs, dim=1)
 
 
+def _unfused_projection(x, R4, W, output_sizes, bias, slot, bsv):
+    hidden = x.shape[-1]
+    rotated = gemm_oft_r_fwd(
+        x, R4, slot, bsv, num_slices=len(output_sizes)
+    )
+    rotated_slices = torch.split(rotated, hidden, dim=-1)
+    weight_slices = torch.split(W, output_sizes, dim=0)
+    bias_slices = (
+        [None] * len(output_sizes)
+        if bias is None
+        else torch.split(bias, output_sizes, dim=0)
+    )
+    return torch.cat(
+        [
+            F.linear(rotated_slice, weight_slice, bias_slice)
+            for rotated_slice, weight_slice, bias_slice in zip(
+                rotated_slices, weight_slices, bias_slices, strict=True
+            )
+        ],
+        dim=-1,
+    )
+
+
 @pytest.mark.parametrize("BS", [256, 512, 1024])
 @pytest.mark.parametrize("M", [1, 64, 256])
 def test_large_blocks_launch_and_are_correct(BS, M):
@@ -96,6 +121,28 @@ def test_tiny_qkv_blocks_are_correct(BS, M):
     torch.cuda.synchronize()
     err = (out.float() - _reference(x, R, W, OUT)).abs().max().item()
     assert err <= TOL, f"BS={BS} M={M} max_abs={err:.2e}"
+
+
+@pytest.mark.parametrize("BS", [4, 8])
+@pytest.mark.parametrize("M", [1, 8, 32, 64])
+@pytest.mark.parametrize("identity", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_tiny_qkv_matches_unfused(BS, M, identity, with_bias):
+    x, R, W = _inputs(M, BS)
+    R4 = R.unsqueeze(0)
+    slot = torch.zeros((), dtype=torch.int32, device=x.device)
+    bsv = torch.tensor(0 if identity else BS, dtype=torch.int32, device=x.device)
+    bias = (
+        torch.randn(sum(OUT), dtype=x.dtype, device=x.device)
+        if with_bias
+        else None
+    )
+    got = fused_rotate_project_qkv(
+        x, R4, W, OUT, bias=bias, slot_idx_t=slot, bsv_t=bsv
+    )
+    expect = _unfused_projection(x, R4, W, OUT, bias, slot, bsv)
+    torch.cuda.synchronize()
+    assert (got.float() - expect.float()).abs().max().item() <= TOL
 
 
 @pytest.mark.parametrize("BS", [4, 8, 128, 256, 1024])
@@ -233,6 +280,27 @@ def test_tiny_gate_up_projection(BS, M):
     torch.cuda.synchronize()
     err = (out.float() - _reference(x, R, W, FC1_OUT)).abs().max().item()
     assert err <= TOL, f"BS={BS} M={M} max_abs={err:.2e}"
+
+
+@pytest.mark.parametrize("BS", [4, 8])
+@pytest.mark.parametrize("identity", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_tiny_gate_up_matches_unfused(BS, identity, with_bias):
+    x, R, W = _fc1_inputs(8, BS)
+    R4 = R.unsqueeze(0)
+    slot = torch.zeros((), dtype=torch.int32, device=x.device)
+    bsv = torch.tensor(0 if identity else BS, dtype=torch.int32, device=x.device)
+    bias = (
+        torch.randn(sum(FC1_OUT), dtype=x.dtype, device=x.device)
+        if with_bias
+        else None
+    )
+    got = fused_rotate_project_gate_up(
+        x, R4, W, FC1_OUT, bias=bias, slot_idx_t=slot, bsv_t=bsv
+    )
+    expect = _unfused_projection(x, R4, W, FC1_OUT, bias, slot, bsv)
+    torch.cuda.synchronize()
+    assert (got.float() - expect.float()).abs().max().item() <= TOL
 
 
 @pytest.mark.parametrize("BS", [128, 256, 512, 1024])
