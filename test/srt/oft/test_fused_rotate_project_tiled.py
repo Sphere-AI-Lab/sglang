@@ -88,12 +88,37 @@ def test_small_blocks_still_correct(BS, M):
     assert err <= TOL, f"BS={BS} M={M} max_abs={err:.2e}"
 
 
-@pytest.mark.parametrize("BS", [128, 256, 1024])
+@pytest.mark.parametrize("BS", [4, 8])
+@pytest.mark.parametrize("M", [1, 8, 64])
+def test_tiny_qkv_blocks_are_correct(BS, M):
+    x, R, W = _inputs(M, BS)
+    out = fused_rotate_project_qkv(x, R, W, OUT)
+    torch.cuda.synchronize()
+    err = (out.float() - _reference(x, R, W, OUT)).abs().max().item()
+    assert err <= TOL, f"BS={BS} M={M} max_abs={err:.2e}"
+
+
+@pytest.mark.parametrize("BS", [4, 8, 128, 256, 1024])
 def test_identity_rotation_is_a_plain_projection(BS):
     """With R = I the kernel must reproduce x @ W.T. A failure here means the
     rotation matmul is wrong, independent of any reference implementation."""
     x, R, W = _inputs(64, BS, rotate=False)
     out = fused_rotate_project_qkv(x, R, W, OUT)
+    torch.cuda.synchronize()
+    err = (out.float() - (x.float() @ W.float().T)).abs().max().item()
+    assert err <= TOL, f"BS={BS} max_abs={err:.2e}"
+
+
+@pytest.mark.parametrize("BS", [4, 8])
+def test_tiny_qkv_runtime_identity_slot(BS):
+    """The runtime zero sentinel must bypass R for captured adapter slots."""
+    x, R, W = _inputs(32, BS, rotate=True)
+    R4 = torch.stack([R, R], dim=0).contiguous()
+    slot = torch.tensor(1, device="cuda", dtype=torch.int32)
+    bsv = torch.tensor(0, device="cuda", dtype=torch.int32)
+    out = fused_rotate_project_qkv(
+        x, R4, W, OUT, slot_idx_t=slot, bsv_t=bsv
+    )
     torch.cuda.synchronize()
     err = (out.float() - (x.float() @ W.float().T)).abs().max().item()
     assert err <= TOL, f"BS={BS} max_abs={err:.2e}"
@@ -114,7 +139,7 @@ def test_the_two_paths_agree_at_the_boundary():
 def test_the_tile_width_divides_every_supported_block():
     """OFT_TILE_K must divide each BS the kernel accepts, or the inner loop
     reads past the edge of the rotation block."""
-    for BS in (16, 32, 64, 128, 256, 512, 1024):
+    for BS in (4, 8, 16, 32, 64, 128, 256, 512, 1024):
         assert BS % min(OFT_TILE_K, BS) == 0, BS
 
 
@@ -160,6 +185,16 @@ def test_gate_up_projection_at_large_blocks(BS, M):
     assert err <= TOL, f"BS={BS} M={M} max_abs={err:.2e}"
 
 
+@pytest.mark.parametrize("BS", [4, 8])
+@pytest.mark.parametrize("M", [1, 8, 64])
+def test_tiny_gate_up_projection(BS, M):
+    x, R, W = _fc1_inputs(M, BS)
+    out = fused_rotate_project_gate_up(x, R, W, FC1_OUT)
+    torch.cuda.synchronize()
+    err = (out.float() - _reference(x, R, W, FC1_OUT)).abs().max().item()
+    assert err <= TOL, f"BS={BS} M={M} max_abs={err:.2e}"
+
+
 @pytest.mark.parametrize("BS", [128, 256, 512, 1024])
 def test_gate_up_inputs_at_large_blocks(BS):
     """No projection here -- it returns the two rotated inputs, so the reference
@@ -179,6 +214,25 @@ def test_gate_up_inputs_at_large_blocks(BS):
         assert err <= TOL, f"BS={BS} slice={idx} max_abs={err:.2e}"
 
 
+@pytest.mark.parametrize("BS", [4, 8])
+@pytest.mark.parametrize("M", [1, 8, 64])
+def test_tiny_gate_up_inputs(BS, M):
+    x, R, _ = _fc1_inputs(M, BS)
+    x_gate, x_up = fused_rotate_gate_up_inputs(x, R)
+    torch.cuda.synchronize()
+    blocks_per_slice = R.shape[0] // 2
+    for idx, got in enumerate((x_gate, x_up)):
+        expect = torch.empty_like(got, dtype=torch.float32)
+        for b in range(blocks_per_slice):
+            k0 = b * BS
+            expect[:, k0:k0 + BS] = (
+                x[:, k0:k0 + BS].float()
+                @ R[idx * blocks_per_slice + b].float()
+            )
+        err = (got.float() - expect).abs().max().item()
+        assert err <= TOL, f"BS={BS} M={M} slice={idx} max_abs={err:.2e}"
+
+
 def test_the_tile_picker_respects_the_shared_memory_budget():
     """GROUP_N >= 2 cannot afford a 128-wide tile: 245,760 B against 232,448.
     The picker must reduce it rather than let the launch fail the way BS > 128
@@ -189,9 +243,9 @@ def test_the_tile_picker_respects_the_shared_memory_budget():
         _tiled_smem_bytes,
     )
 
-    for BS in (128, 256, 512, 1024):
+    for BS in (4, 8, 128, 256, 512, 1024):
         for block_m, block_n, group_n in ((64, 64, 1), (64, 64, 2), (16, 64, 4), (32, 64, 8)):
             tk = _pick_tile_k(BS, block_m, block_n, group_n)
-            assert tk >= 16, (BS, group_n, tk)
+            assert tk >= min(16, BS), (BS, group_n, tk)
             assert BS % tk == 0, (BS, tk)
             assert _tiled_smem_bytes(tk, block_m, block_n, group_n) <= OFT_SMEM_BUDGET
