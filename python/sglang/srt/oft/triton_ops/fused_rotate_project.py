@@ -316,91 +316,145 @@ def _fused_rotate_project_inner(
     do_rotation = bsv != 0
 
     if BS < 16:
-        # tl.dot rejects reduction dimensions below 16. Keep the useful
-        # BLOCK_M/BLOCK_N vectorization and unroll only the tiny rotation and
-        # projection reductions. The bf16 cast between them matches the dot
-        # path's numerical boundary.
-        for block_idx in range(0, blocks_per_slice):
-            k_block_start = block_idx * BS
-            R_block_base = (
-                slot_R_offset + (rotation_block_start + block_idx) * BS * BS
-            )
-            for j in range(BS):
-                if do_rotation:
-                    rotated_j = tl.zeros((BLOCK_M,), dtype=tl.float32)
-                    for k in range(BS):
-                        x_k = tl.load(
-                            x_ptr + offs_m * K + k_block_start + k,
-                            mask=m_mask,
-                            other=0.0,
-                        ).to(tl.float32)
-                        r_kj = tl.load(
-                            R_ptr + R_block_base + k * BS + j
-                        ).to(tl.float32)
-                        rotated_j += x_k * r_kj
-                    projected_j = rotated_j.to(tl.bfloat16)
-                else:
-                    # Runtime identity sentinel: do not read the inactive R
-                    # slot, because graph replay may switch bsv between calls.
-                    projected_j = tl.load(
-                        x_ptr + offs_m * K + k_block_start + j,
-                        mask=m_mask,
-                        other=0.0,
-                    )
+        # Rotate BS4/8 blocks elementwise, but batch enough adjacent blocks to
+        # project a 16-column micro-tile with tl.dot. A scalar outer product
+        # here was correct but 20-54x slower than BS16 because it moved the
+        # full KxN projection off tensor cores. Only the tiny rotation remains
+        # scalar; the dominant projection follows the normal dot path.
+        tiny_cols = tl.arange(0, 16)
+        blocks_in_tile: tl.constexpr = 16 // BS
+        block_in_tile = tiny_cols // BS
+        col_in_block = tiny_cols - block_in_tile * BS
+        for block_group in range(0, blocks_per_slice, blocks_in_tile):
+            block_ids = block_group + block_in_tile
+            valid_blocks = block_ids < blocks_per_slice
+            offs_k = block_group * BS + tiny_cols
 
-                projected_j_f32 = projected_j.to(tl.float32)
-                w0 = tl.load(
-                    W_ptr + (slice_offset + offs_n0) * K + k_block_start + j,
-                    mask=n_mask0,
+            if do_rotation:
+                projected_tile_f32 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+                for k in range(BS):
+                    x_k = tl.load(
+                        x_ptr
+                        + offs_m[:, None] * K
+                        + (block_ids * BS + k)[None, :],
+                        mask=m_mask[:, None] & valid_blocks[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                    r_kj = tl.load(
+                        R_ptr
+                        + slot_R_offset
+                        + (rotation_block_start + block_ids) * BS * BS
+                        + k * BS
+                        + col_in_block,
+                        mask=valid_blocks,
+                        other=0.0,
+                    ).to(tl.float32)
+                    projected_tile_f32 += x_k * r_kj[None, :]
+                projected_tile = projected_tile_f32.to(tl.bfloat16)
+            else:
+                # Runtime identity sentinel: do not read the inactive R slot.
+                projected_tile = tl.load(
+                    x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                    mask=m_mask[:, None] & valid_blocks[None, :],
                     other=0.0,
-                ).to(tl.float32)
-                acc0 += projected_j_f32[:, None] * w0[None, :]
+                )
 
-                if GROUP_N >= 2:
-                    w1 = tl.load(
-                        W_ptr + (slice_offset + offs_n1) * K + k_block_start + j,
-                        mask=n_mask1,
-                        other=0.0,
-                    ).to(tl.float32)
-                    acc1 += projected_j_f32[:, None] * w1[None, :]
-                if GROUP_N >= 4:
-                    w2 = tl.load(
-                        W_ptr + (slice_offset + offs_n2) * K + k_block_start + j,
-                        mask=n_mask2,
-                        other=0.0,
-                    ).to(tl.float32)
-                    w3 = tl.load(
-                        W_ptr + (slice_offset + offs_n3) * K + k_block_start + j,
-                        mask=n_mask3,
-                        other=0.0,
-                    ).to(tl.float32)
-                    acc2 += projected_j_f32[:, None] * w2[None, :]
-                    acc3 += projected_j_f32[:, None] * w3[None, :]
-                if GROUP_N >= 8:
-                    w4 = tl.load(
-                        W_ptr + (slice_offset + offs_n4) * K + k_block_start + j,
-                        mask=n_mask4,
-                        other=0.0,
-                    ).to(tl.float32)
-                    w5 = tl.load(
-                        W_ptr + (slice_offset + offs_n5) * K + k_block_start + j,
-                        mask=n_mask5,
-                        other=0.0,
-                    ).to(tl.float32)
-                    w6 = tl.load(
-                        W_ptr + (slice_offset + offs_n6) * K + k_block_start + j,
-                        mask=n_mask6,
-                        other=0.0,
-                    ).to(tl.float32)
-                    w7 = tl.load(
-                        W_ptr + (slice_offset + offs_n7) * K + k_block_start + j,
-                        mask=n_mask7,
-                        other=0.0,
-                    ).to(tl.float32)
-                    acc4 += projected_j_f32[:, None] * w4[None, :]
-                    acc5 += projected_j_f32[:, None] * w5[None, :]
-                    acc6 += projected_j_f32[:, None] * w6[None, :]
-                    acc7 += projected_j_f32[:, None] * w7[None, :]
+            w0 = tl.load(
+                W_ptr
+                + (slice_offset + offs_n0)[:, None] * K
+                + offs_k[None, :],
+                mask=n_mask0[:, None] & valid_blocks[None, :],
+                other=0.0,
+            )
+            acc0 += tl.dot(
+                projected_tile,
+                tl.trans(w0),
+                out_dtype=tl.float32,
+                allow_tf32=False,
+            )
+
+            if GROUP_N >= 2:
+                w1 = tl.load(
+                    W_ptr
+                    + (slice_offset + offs_n1)[:, None] * K
+                    + offs_k[None, :],
+                    mask=n_mask1[:, None] & valid_blocks[None, :],
+                    other=0.0,
+                )
+                acc1 += tl.dot(
+                    projected_tile,
+                    tl.trans(w1),
+                    out_dtype=tl.float32,
+                    allow_tf32=False,
+                )
+            if GROUP_N >= 4:
+                w2 = tl.load(
+                    W_ptr
+                    + (slice_offset + offs_n2)[:, None] * K
+                    + offs_k[None, :],
+                    mask=n_mask2[:, None] & valid_blocks[None, :],
+                    other=0.0,
+                )
+                w3 = tl.load(
+                    W_ptr
+                    + (slice_offset + offs_n3)[:, None] * K
+                    + offs_k[None, :],
+                    mask=n_mask3[:, None] & valid_blocks[None, :],
+                    other=0.0,
+                )
+                acc2 += tl.dot(
+                    projected_tile, tl.trans(w2), out_dtype=tl.float32,
+                    allow_tf32=False,
+                )
+                acc3 += tl.dot(
+                    projected_tile, tl.trans(w3), out_dtype=tl.float32,
+                    allow_tf32=False,
+                )
+            if GROUP_N >= 8:
+                w4 = tl.load(
+                    W_ptr
+                    + (slice_offset + offs_n4)[:, None] * K
+                    + offs_k[None, :],
+                    mask=n_mask4[:, None] & valid_blocks[None, :],
+                    other=0.0,
+                )
+                w5 = tl.load(
+                    W_ptr
+                    + (slice_offset + offs_n5)[:, None] * K
+                    + offs_k[None, :],
+                    mask=n_mask5[:, None] & valid_blocks[None, :],
+                    other=0.0,
+                )
+                w6 = tl.load(
+                    W_ptr
+                    + (slice_offset + offs_n6)[:, None] * K
+                    + offs_k[None, :],
+                    mask=n_mask6[:, None] & valid_blocks[None, :],
+                    other=0.0,
+                )
+                w7 = tl.load(
+                    W_ptr
+                    + (slice_offset + offs_n7)[:, None] * K
+                    + offs_k[None, :],
+                    mask=n_mask7[:, None] & valid_blocks[None, :],
+                    other=0.0,
+                )
+                acc4 += tl.dot(
+                    projected_tile, tl.trans(w4), out_dtype=tl.float32,
+                    allow_tf32=False,
+                )
+                acc5 += tl.dot(
+                    projected_tile, tl.trans(w5), out_dtype=tl.float32,
+                    allow_tf32=False,
+                )
+                acc6 += tl.dot(
+                    projected_tile, tl.trans(w6), out_dtype=tl.float32,
+                    allow_tf32=False,
+                )
+                acc7 += tl.dot(
+                    projected_tile, tl.trans(w7), out_dtype=tl.float32,
+                    allow_tf32=False,
+                )
 
     if BS >= 16 and do_rotation:
         # Walk the rotation block in TILE_K-wide column tiles instead of
