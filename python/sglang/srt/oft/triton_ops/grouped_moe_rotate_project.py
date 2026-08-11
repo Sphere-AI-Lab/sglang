@@ -8,6 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.oft.utils import validate_oft_block_size
+
 
 @triton.jit
 def _split_w13_oft_grouped_moe_kernel(
@@ -65,35 +67,72 @@ def _split_w13_oft_grouped_moe_kernel(
     block_range = tl.arange(0, BLOCK_SIZE)
     r_offsets = block_range[:, None] * BLOCK_SIZE + block_range[None, :]
 
-    for block_idx in range(0, BLOCKS):
-        k_offsets = block_idx * BLOCK_SIZE + block_range
-        x = tl.load(
-            hidden_states_ptr + token_idx[:, None] * K + k_offsets[None, :],
-            mask=token_mask[:, None],
-            other=0.0,
-        )
+    if BLOCK_SIZE >= 16:
+        for block_idx in range(0, BLOCKS):
+            k_offsets = block_idx * BLOCK_SIZE + block_range
+            x = tl.load(
+                hidden_states_ptr + token_idx[:, None] * K + k_offsets[None, :],
+                mask=token_mask[:, None],
+                other=0.0,
+            )
 
-        r_base = expert * BLOCKS * BLOCK_SIZE * BLOCK_SIZE
-        if half_id == 0:
-            r = tl.load(w1_oft_r_ptr + r_base + block_idx * BLOCK_SIZE * BLOCK_SIZE + r_offsets)
-        else:
-            r = tl.load(w3_oft_r_ptr + r_base + block_idx * BLOCK_SIZE * BLOCK_SIZE + r_offsets)
+            r_base = expert * BLOCKS * BLOCK_SIZE * BLOCK_SIZE
+            if half_id == 0:
+                r = tl.load(w1_oft_r_ptr + r_base + block_idx * BLOCK_SIZE * BLOCK_SIZE + r_offsets)
+            else:
+                r = tl.load(w3_oft_r_ptr + r_base + block_idx * BLOCK_SIZE * BLOCK_SIZE + r_offsets)
 
-        x_rot = tl.dot(x, r, input_precision="ieee", out_dtype=tl.float32).to(tl.bfloat16)
-        w = tl.load(
-            w13_ptr
-            + expert * N * K
-            + (half_offset + offs_n[:, None]) * K
-            + k_offsets[None, :],
-            mask=n_mask[:, None],
-            other=0.0,
-        )
-        acc += tl.dot(
-            x_rot,
-            tl.trans(w),
-            out_dtype=tl.float32,
-            allow_tf32=False,
-        )
+            x_rot = tl.dot(x, r, input_precision="ieee", out_dtype=tl.float32).to(tl.bfloat16)
+            w = tl.load(
+                w13_ptr
+                + expert * N * K
+                + (half_offset + offs_n[:, None]) * K
+                + k_offsets[None, :],
+                mask=n_mask[:, None],
+                other=0.0,
+            )
+            acc += tl.dot(
+                x_rot,
+                tl.trans(w),
+                out_dtype=tl.float32,
+                allow_tf32=False,
+            )
+    else:
+        for block_idx in range(0, BLOCKS):
+            r_base = (
+                expert * BLOCKS * BLOCK_SIZE * BLOCK_SIZE
+                + block_idx * BLOCK_SIZE * BLOCK_SIZE
+            )
+            for j in range(BLOCK_SIZE):
+                x_rot_j = tl.zeros((BLOCK_M,), dtype=tl.float32)
+                for k in range(BLOCK_SIZE):
+                    x_k = tl.load(
+                        hidden_states_ptr
+                        + token_idx * K
+                        + block_idx * BLOCK_SIZE
+                        + k,
+                        mask=token_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    if half_id == 0:
+                        r_kj = tl.load(
+                            w1_oft_r_ptr + r_base + k * BLOCK_SIZE + j
+                        )
+                    else:
+                        r_kj = tl.load(
+                            w3_oft_r_ptr + r_base + k * BLOCK_SIZE + j
+                        )
+                    x_rot_j += x_k * r_kj.to(tl.float32)
+                w_j = tl.load(
+                    w13_ptr
+                    + expert * N * K
+                    + (half_offset + offs_n) * K
+                    + block_idx * BLOCK_SIZE
+                    + j,
+                    mask=n_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                acc += x_rot_j.to(tl.bfloat16).to(tl.float32)[:, None] * w_j[None, :]
 
     out_offsets = token_idx[:, None] * TOP_K * N + route_idx[:, None] * N
     out_offsets += half_offset + offs_n[None, :]
@@ -141,33 +180,63 @@ def _pack_split_oft_grouped_bmm_inputs_kernel(
     token_idx = token_routes // TOP_K
     rank_offsets = offs_m - tl.load(expert_offsets_ptr + expert).to(tl.int64)
 
-    block_range = tl.arange(0, BLOCK_SIZE)
-    k_offsets = block_idx * BLOCK_SIZE + block_range
-    x = tl.load(
-        hidden_states_ptr + token_idx[:, None] * K + k_offsets[None, :],
-        mask=token_mask[:, None],
-        other=0.0,
-    )
-
-    r_offsets = block_range[:, None] * BLOCK_SIZE + block_range[None, :]
     r_base = expert * BLOCKS * BLOCK_SIZE * BLOCK_SIZE + block_idx * BLOCK_SIZE * BLOCK_SIZE
-    if half_id == 0:
-        r = tl.load(w1_oft_r_ptr + r_base + r_offsets)
-    else:
-        r = tl.load(w3_oft_r_ptr + r_base + r_offsets)
-
-    x_rot = tl.dot(x, r, input_precision="ieee", out_dtype=tl.float32).to(tl.bfloat16)
-
     packed_batch = half_id * EXPERTS + expert
-    packed_offsets = (
-        (packed_batch * MAX_PADDED_TOKENS_PER_EXPERT + rank_offsets[:, None]) * K
-        + k_offsets[None, :]
-    )
-    tl.store(
-        packed_inputs_ptr + packed_offsets,
-        x_rot,
-        mask=token_mask[:, None],
-    )
+    if BLOCK_SIZE >= 16:
+        block_range = tl.arange(0, BLOCK_SIZE)
+        k_offsets = block_idx * BLOCK_SIZE + block_range
+        x = tl.load(
+            hidden_states_ptr + token_idx[:, None] * K + k_offsets[None, :],
+            mask=token_mask[:, None],
+            other=0.0,
+        )
+
+        r_offsets = block_range[:, None] * BLOCK_SIZE + block_range[None, :]
+        if half_id == 0:
+            r = tl.load(w1_oft_r_ptr + r_base + r_offsets)
+        else:
+            r = tl.load(w3_oft_r_ptr + r_base + r_offsets)
+
+        x_rot = tl.dot(x, r, input_precision="ieee", out_dtype=tl.float32).to(tl.bfloat16)
+        packed_offsets = (
+            (packed_batch * MAX_PADDED_TOKENS_PER_EXPERT + rank_offsets[:, None]) * K
+            + k_offsets[None, :]
+        )
+        tl.store(
+            packed_inputs_ptr + packed_offsets,
+            x_rot,
+            mask=token_mask[:, None],
+        )
+    else:
+        for j in range(BLOCK_SIZE):
+            x_rot_j = tl.zeros((BLOCK_M,), dtype=tl.float32)
+            for k in range(BLOCK_SIZE):
+                x_k = tl.load(
+                    hidden_states_ptr
+                    + token_idx * K
+                    + block_idx * BLOCK_SIZE
+                    + k,
+                    mask=token_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                if half_id == 0:
+                    r_kj = tl.load(
+                        w1_oft_r_ptr + r_base + k * BLOCK_SIZE + j
+                    ).to(tl.float32)
+                else:
+                    r_kj = tl.load(
+                        w3_oft_r_ptr + r_base + k * BLOCK_SIZE + j
+                    ).to(tl.float32)
+                x_rot_j += x_k * r_kj
+            packed_col = block_idx * BLOCK_SIZE + j
+            packed_offset = (
+                packed_batch * MAX_PADDED_TOKENS_PER_EXPERT + rank_offsets
+            ) * K + packed_col
+            tl.store(
+                packed_inputs_ptr + packed_offset,
+                x_rot_j.to(tl.bfloat16),
+                mask=token_mask,
+            )
 
 
 @triton.jit
@@ -340,6 +409,7 @@ def fused_split_w13_oft_grouped_moe(
         raise RuntimeError(f"OFT blocks must be square, got {tuple(w1_oft_r.shape[-2:])}")
 
     block_size = w1_oft_r.shape[-1]
+    validate_oft_block_size(block_size)
     blocks = w1_oft_r.shape[1]
     if blocks * block_size != hidden:
         raise RuntimeError(f"OFT blocks {blocks} * block_size {block_size} != hidden {hidden}")
@@ -500,6 +570,7 @@ def packed_bmm_split_w13_oft_grouped_moe(
             f"OFT expert count {w1_oft_r.shape[0]} != w13 expert count {experts}"
         )
     block_size = w1_oft_r.shape[-1]
+    validate_oft_block_size(block_size)
     blocks = w1_oft_r.shape[1]
     if blocks * block_size != hidden:
         raise RuntimeError(f"OFT blocks {blocks} * block_size {block_size} != hidden {hidden}")

@@ -753,31 +753,48 @@ def _oft_block_rotate_kernel(
 
     rot_accum = tl.zeros((BLOCK_M, OFT_BLOCK_SIZE), dtype=tl.float32)
 
-    for k_off in range(0, OFT_BLOCK_SIZE, TILE_K):
-        # Load A tile: (BLOCK_M, TILE_K) from A[orig_ids, k_base + k_off : ...]
-        k_tile_offs = (k_base + k_off + tl.arange(0, TILE_K)).to(tl.int64)
-        a_ptrs = A_ptr + orig_ids[:, None] * stride_am + k_tile_offs[None, :] * stride_ak
-        a_tile = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+    if OFT_BLOCK_SIZE >= 16:
+        for k_off in range(0, OFT_BLOCK_SIZE, TILE_K):
+            # Load A tile: (BLOCK_M, TILE_K) from A[orig_ids, k_base + k_off : ...]
+            k_tile_offs = (k_base + k_off + tl.arange(0, TILE_K)).to(tl.int64)
+            a_ptrs = A_ptr + orig_ids[:, None] * stride_am + k_tile_offs[None, :] * stride_ak
+            a_tile = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
 
-        # Load R sub-block: R[expert, pid_blk, k_off:k_off+TILE_K, :]
-        # Shape: (TILE_K, OFT_BLOCK_SIZE) — rows = k inner axis, cols = c output axis.
-        r_row_offs = (k_off + tl.arange(0, TILE_K)).to(tl.int64)
-        r_col_offs = tl.arange(0, OFT_BLOCK_SIZE).to(tl.int64)
-        r_ptrs = (
-            R_ptr
-            + expert * stride_re
-            + pid_blk * stride_rb
-            + r_row_offs[:, None] * stride_ri
-            + r_col_offs[None, :] * stride_rj
-        )
-        r_sub = tl.load(r_ptrs)  # (TILE_K, OFT_BLOCK_SIZE)
+            # Load R sub-block: R[expert, pid_blk, k_off:k_off+TILE_K, :]
+            # Shape: (TILE_K, OFT_BLOCK_SIZE) — rows = k inner axis, cols = c output axis.
+            r_row_offs = (k_off + tl.arange(0, TILE_K)).to(tl.int64)
+            r_col_offs = tl.arange(0, OFT_BLOCK_SIZE).to(tl.int64)
+            r_ptrs = (
+                R_ptr
+                + expert * stride_re
+                + pid_blk * stride_rb
+                + r_row_offs[:, None] * stride_ri
+                + r_col_offs[None, :] * stride_rj
+            )
+            r_sub = tl.load(r_ptrs)  # (TILE_K, OFT_BLOCK_SIZE)
 
-        # (BLOCK_M, TILE_K) @ (TILE_K, OFT_BLOCK_SIZE)  →  x @ R per block
-        # input_precision="ieee" is a no-op for bf16 operands (Triton 3.5.1
-        # only honors it for fp32×fp32) but kept defensive: if R is ever
-        # promoted to fp32, this enforces ieee not tf32, matching the Bridge
-        # train-side `sgemm_oft_r_single.py:71` annotation.
-        rot_accum += tl.dot(a_tile, r_sub, input_precision="ieee")
+            # (BLOCK_M, TILE_K) @ (TILE_K, OFT_BLOCK_SIZE)  →  x @ R per block
+            # input_precision="ieee" is a no-op for bf16 operands (Triton 3.5.1
+            # only honors it for fp32×fp32) but kept defensive: if R is ever
+            # promoted to fp32, this enforces ieee not tf32, matching the Bridge
+            # train-side `sgemm_oft_r_single.py:71` annotation.
+            rot_accum += tl.dot(a_tile, r_sub, input_precision="ieee")
+    else:
+        out_cols = tl.arange(0, OFT_BLOCK_SIZE).to(tl.int64)
+        for k in range(OFT_BLOCK_SIZE):
+            a_col = tl.load(
+                A_ptr + orig_ids * stride_am + (k_base + k) * stride_ak,
+                mask=token_mask,
+                other=0.0,
+            ).to(tl.float32)
+            r_row = tl.load(
+                R_ptr
+                + expert * stride_re
+                + pid_blk * stride_rb
+                + k * stride_ri
+                + out_cols * stride_rj
+            ).to(tl.float32)
+            rot_accum += a_col[:, None] * r_row[None, :]
 
     # Store rotated output: A_rot[sorted_ids, k_base : k_base + bs]
     out_k_offs = (k_base + tl.arange(0, OFT_BLOCK_SIZE)).to(tl.int64)
@@ -801,8 +818,23 @@ def apply_oft_rotation_triton(
     by its assigned expert's block-diagonal R matrix.
     """
     M, K = A.shape
-    bs = oft_r.shape[2]
+    if oft_r.dim() != 4:
+        raise ValueError(
+            f"oft_r must be 4D (experts, blocks, bs, bs), got {tuple(oft_r.shape)}"
+        )
+    bs = oft_r.shape[-1]
+    from sglang.srt.oft.utils import validate_oft_block_size
+
+    validate_oft_block_size(bs)
+    if tuple(oft_r.shape[-2:]) != (bs, bs):
+        raise ValueError(f"OFT blocks must be square, got {tuple(oft_r.shape[-2:])}")
+    if K % bs != 0:
+        raise ValueError(f"OFT hidden size {K} must be divisible by block size {bs}")
     num_blocks = K // bs
+    if oft_r.shape[1] != num_blocks:
+        raise ValueError(
+            f"oft_r has {oft_r.shape[1]} blocks, expected {num_blocks} for K={K}, BS={bs}"
+        )
 
     # Output buffer: one row per token-expert pair
     A_rot = torch.empty(M * top_k, K, device=A.device, dtype=A.dtype)
