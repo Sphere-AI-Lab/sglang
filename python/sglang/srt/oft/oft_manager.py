@@ -36,6 +36,7 @@ from sglang.srt.oft.mem_pool import EMPTY_SLOT, OFTMemoryPool
 from sglang.srt.oft.utils import (
     get_normalized_target_modules,
     get_target_module_name,
+    validate_oft_block_size,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
@@ -719,7 +720,7 @@ class OFTManager:
                 self.target_modules.update(adapter_target_modules)
 
         if max_oft_block_size is not None:
-            self.max_oft_block_size = max_oft_block_size
+            self.max_oft_block_size = validate_oft_block_size(max_oft_block_size)
         else:
             self.max_oft_block_size = max(
                 [x.block_size for x in self.configs.values()],
