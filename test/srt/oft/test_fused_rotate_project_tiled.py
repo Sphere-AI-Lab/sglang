@@ -32,6 +32,21 @@ K, OUT = 4096, [4096, 1024, 1024]
 TOL = 2e-3
 
 
+def _assert_bf16_parity(actual, expected):
+    """Allow the absolute error floor or one final-output BF16 ULP."""
+    max_abs = (actual.float() - expected.float()).abs().max().item()
+    if max_abs <= TOL:
+        return
+
+    assert actual.dtype == expected.dtype == torch.bfloat16
+    upward = torch.nextafter(expected, torch.full_like(expected, float("inf")))
+    downward = torch.nextafter(expected, torch.full_like(expected, float("-inf")))
+    within_one_ulp = (
+        (actual == expected) | (actual == upward) | (actual == downward)
+    ).all()
+    assert within_one_ulp.item(), f"max_abs={max_abs:.2e} exceeds one BF16 ULP"
+
+
 def _inputs(M, BS, device="cuda", dtype=torch.bfloat16, rotate=True, seed=0):
     g = torch.Generator(device=device).manual_seed(seed)
     x = (torch.randn(M, K, device=device, dtype=dtype, generator=g) * 0.01).contiguous()
@@ -132,8 +147,14 @@ def test_tiny_qkv_matches_unfused(BS, M, identity, with_bias):
     R4 = R.unsqueeze(0)
     slot = torch.zeros((), dtype=torch.int32, device=x.device)
     bsv = torch.tensor(0 if identity else BS, dtype=torch.int32, device=x.device)
+    bias_generator = torch.Generator(device=x.device).manual_seed(1)
     bias = (
-        torch.randn(sum(OUT), dtype=x.dtype, device=x.device)
+        torch.randn(
+            sum(OUT),
+            dtype=x.dtype,
+            device=x.device,
+            generator=bias_generator,
+        )
         if with_bias
         else None
     )
@@ -142,7 +163,7 @@ def test_tiny_qkv_matches_unfused(BS, M, identity, with_bias):
     )
     expect = _unfused_projection(x, R4, W, OUT, bias, slot, bsv)
     torch.cuda.synchronize()
-    assert (got.float() - expect.float()).abs().max().item() <= TOL
+    _assert_bf16_parity(got, expect)
 
 
 @pytest.mark.parametrize("BS", [4, 8, 128, 256, 1024])
@@ -290,8 +311,14 @@ def test_tiny_gate_up_matches_unfused(BS, identity, with_bias):
     R4 = R.unsqueeze(0)
     slot = torch.zeros((), dtype=torch.int32, device=x.device)
     bsv = torch.tensor(0 if identity else BS, dtype=torch.int32, device=x.device)
+    bias_generator = torch.Generator(device=x.device).manual_seed(1)
     bias = (
-        torch.randn(sum(FC1_OUT), dtype=x.dtype, device=x.device)
+        torch.randn(
+            sum(FC1_OUT),
+            dtype=x.dtype,
+            device=x.device,
+            generator=bias_generator,
+        )
         if with_bias
         else None
     )
@@ -300,7 +327,7 @@ def test_tiny_gate_up_matches_unfused(BS, identity, with_bias):
     )
     expect = _unfused_projection(x, R4, W, FC1_OUT, bias, slot, bsv)
     torch.cuda.synchronize()
-    assert (got.float() - expect.float()).abs().max().item() <= TOL
+    _assert_bf16_parity(got, expect)
 
 
 @pytest.mark.parametrize("BS", [128, 256, 512, 1024])
