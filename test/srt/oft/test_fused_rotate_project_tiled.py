@@ -124,6 +124,46 @@ def test_tiny_qkv_runtime_identity_slot(BS):
     assert err <= TOL, f"BS={BS} max_abs={err:.2e}"
 
 
+@pytest.mark.parametrize("BS", [4, 8])
+def test_tiny_qkv_cuda_graph_replays_identity_then_rotation(BS):
+    x, R, W = _inputs(8, BS, rotate=True)
+    R4 = torch.stack([R, R], dim=0).contiguous()
+    slot = torch.tensor(0, device="cuda", dtype=torch.int32)
+    bsv = torch.tensor(0, device="cuda", dtype=torch.int32)
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        fused_rotate_project_qkv(
+            x, R4, W, OUT, slot_idx_t=slot, bsv_t=bsv
+        )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_out = fused_rotate_project_qkv(
+            x, R4, W, OUT, slot_idx_t=slot, bsv_t=bsv
+        )
+    output_ptr = captured_out.data_ptr()
+
+    graph.replay()
+    torch.cuda.synchronize()
+    identity_error = (
+        captured_out.float() - (x.float() @ W.float().T)
+    ).abs().max().item()
+    assert identity_error <= TOL, f"BS={BS} identity max_abs={identity_error:.2e}"
+
+    slot.fill_(1)
+    bsv.fill_(BS)
+    graph.replay()
+    torch.cuda.synchronize()
+    rotation_error = (
+        captured_out.float() - _reference(x, R, W, OUT)
+    ).abs().max().item()
+    assert captured_out.data_ptr() == output_ptr
+    assert rotation_error <= TOL, f"BS={BS} rotation max_abs={rotation_error:.2e}"
+
+
 def test_the_two_paths_agree_at_the_boundary():
     """BS=128 is the largest untiled size. Forcing the tiled path at the same BS
     must give the same answer -- this is what proves the tiled path is a
