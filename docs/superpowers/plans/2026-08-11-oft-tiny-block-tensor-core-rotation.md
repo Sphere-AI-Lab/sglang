@@ -37,7 +37,7 @@
 - Produces: benchmark CLI flag `--acceptance-only`, selecting `M={1,8,32,64}`, `BS={4,8,16}`, and `mode=rotate`.
 - Produces: benchmark CLI flag `--bs16-plus`, selecting `M={1,8,32,64}`, `BS={16,32,64,128,256,512,1024}`, and `mode=rotate`.
 
-- [ ] **Step 1: Write failing unit tests for median aggregation and all three gates**
+- [x] **Step 1: Write failing unit tests for median aggregation and all three gates**
 
 Append tests equivalent to the following to `test_tiny_block_benchmark_report.py`:
 
@@ -102,7 +102,7 @@ def test_block_size_regressions_checks_every_row_at_or_above_floor():
 
 Add `import pytest` to the test module.
 
-- [ ] **Step 2: Run the report tests and verify the new interface is missing**
+- [x] **Step 2: Run the report tests and verify the new interface is missing**
 
 Run:
 
@@ -112,7 +112,7 @@ pytest -q test/srt/oft/test_tiny_block_benchmark_report.py
 
 Expected: FAIL with `AttributeError` for `median_rows` or `tiny_acceptance_report`.
 
-- [ ] **Step 3: Implement median aggregation and acceptance reporting**
+- [x] **Step 3: Implement median aggregation and acceptance reporting**
 
 Add these elements to `tiny_block_benchmark_report.py`:
 
@@ -213,7 +213,7 @@ def block_size_regressions(
     return failures
 ```
 
-- [ ] **Step 4: Add the focused benchmark switch**
+- [x] **Step 4: Add the focused benchmark switch**
 
 In `bench_fused_rotate_project_blocks.py`, add:
 
@@ -253,7 +253,7 @@ else:
 
 Keep the existing output and `--compare` behavior unchanged.
 
-- [ ] **Step 5: Run the report tests and static checks**
+- [x] **Step 5: Run the report tests and static checks**
 
 Run:
 
@@ -265,7 +265,7 @@ git diff --check
 
 Expected: all tests pass and both static checks exit zero.
 
-- [ ] **Step 6: Commit the benchmark gate**
+- [x] **Step 6: Commit the benchmark gate**
 
 ```bash
 git add test/srt/oft/tiny_block_benchmark_report.py \
@@ -285,7 +285,7 @@ git commit -m "bench(oft): gate tiny fused kernel speedup"
 - Consumes: `fused_rotate_project_qkv`, `fused_rotate_project_gate_up`, and production `gemm_oft_r_fwd`.
 - Produces: direct BS4/8 characterization tests covering active rotation, runtime identity, bias, QKV, and gate/up.
 
-- [ ] **Step 1: Add an unfused reference helper with identical BF16 boundaries**
+- [x] **Step 1: Add an unfused reference helper with identical BF16 boundaries**
 
 Add imports:
 
@@ -321,7 +321,7 @@ def _unfused_projection(x, R4, W, output_sizes, bias, slot, bsv):
     )
 ```
 
-- [ ] **Step 2: Add direct QKV and gate/up parity tests**
+- [x] **Step 2: Add direct QKV and gate/up parity tests**
 
 Add:
 
@@ -365,7 +365,7 @@ def test_tiny_gate_up_matches_unfused(BS, identity, with_bias):
     assert (got.float() - expect.float()).abs().max().item() <= TOL
 ```
 
-- [ ] **Step 3: Run the characterization tests on H100 before changing the kernel**
+- [x] **Step 3: Run the characterization tests on H100 before changing the kernel**
 
 Run inside an allocated H100 session:
 
@@ -378,7 +378,7 @@ Expected: all new tests pass on the current scalar implementation. These are
 characterization tests, so their initial green result locks behavior before the
 performance-only refactor rather than demonstrating a missing feature.
 
-- [ ] **Step 4: Run the complete focused dense test file**
+- [x] **Step 4: Run the complete focused dense test file**
 
 ```bash
 pytest -q test/srt/oft/test_fused_rotate_project_tiled.py
@@ -386,12 +386,19 @@ pytest -q test/srt/oft/test_fused_rotate_project_tiled.py
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit the numerical contract**
+- [x] **Step 5: Commit the numerical contract**
 
 ```bash
 git add test/srt/oft/test_fused_rotate_project_tiled.py
 git commit -m "test(oft): lock tiny fused and unfused parity"
 ```
+
+Characterization on H100 exposed that an unscaled BF16 bias makes a fixed
+`2e-3` output tolerance invalid at larger magnitudes: the scalar fused and
+unfused paths can land on adjacent BF16 values despite a no-bias maximum error
+of `2.44e-4`. The committed contract therefore applies the `2e-3` floor per
+element and otherwise permits only an adjacent BF16 value. With deterministic
+bias generation, all 40 direct parity cases and all 104 dense tests pass.
 
 ---
 
@@ -404,7 +411,7 @@ git commit -m "test(oft): lock tiny fused and unfused parity"
 - Consumes: the `--acceptance-only` benchmark from Task 1.
 - Produces: three immutable baseline JSON files from one H100 model and a performance gate that fails when the baseline is compared with itself.
 
-- [ ] **Step 1: Allocate one H100 using the cluster-control workflow**
+- [x] **Step 1: Allocate one H100 using the cluster-control workflow**
 
 Use `control-remote-condor` and `develop-on-remote-clusters`. Record login node,
 job ID, GPU model, approved bid, SGLang commit, PyTorch version, Triton version,
@@ -418,7 +425,7 @@ export OFT_TINY_RUN_ROOT="/home/zqiu/.local/state/remote-cluster-runs/mpi1/sglan
 mkdir -p "$OFT_TINY_RUN_ROOT"
 ```
 
-- [ ] **Step 2: Run three focused baseline sweeps**
+- [x] **Step 2: Run three focused baseline sweeps**
 
 From the exact remote task worktree commit, run:
 
@@ -445,7 +452,7 @@ python test/srt/oft/bench_fused_rotate_project_blocks.py \
 `OFT_TINY_RUN_ROOT` must remain under the durable cluster run store, not `/tmp`
 or the remote checkout.
 
-- [ ] **Step 3: Verify the current implementation fails the speedup gate**
+- [x] **Step 3: Verify the current implementation fails the speedup gate**
 
 Load the three JSON files as both baseline and current, call
 `tiny_acceptance_report`, and write the printed dictionary to
@@ -470,12 +477,12 @@ PY
 Expected: the assertion passes because comparing the implementation with itself
 produces zero improvement and the report contains the 30-percent gate failure.
 
-- [ ] **Step 4: Copy the bounded run directory to the local artifact store**
+- [x] **Step 4: Copy the bounded run directory to the local artifact store**
 
 Use the cluster skill's bounded `rsync` workflow. Verify all six JSON files,
 `baseline-gate.txt`, and `provenance.json` locally before continuing.
 
-- [ ] **Step 5: Record the artifact path in this plan and commit the checkpoint**
+- [x] **Step 5: Record the artifact path in this plan and commit the checkpoint**
 
 Append the exact remote and local artifact paths under Task 3, check its boxes,
 then run:
@@ -484,6 +491,18 @@ then run:
 git add docs/superpowers/plans/2026-08-11-oft-tiny-block-tensor-core-rotation.md
 git commit -m "docs(oft): record tiny rotation baseline"
 ```
+
+Recorded pre-change checkpoint (2026-08-11):
+
+- Remote artifacts: `/home/zqiu/.local/state/remote-cluster-runs/mpi1/sglang/codex-oft-bs4-a6a55a65/20260811T170945Z-93efd7/tiny-tensor-core`
+- Local snapshot: `/Users/zqiu/.local/state/remote-cluster-runs/mpi1/sglang/codex-oft-bs4-a6a55a65/20260811T170945Z-93efd7/tiny-tensor-core`
+- Allocation: job `17450886`, bid 50, H100 80GB HBM3 on `i103`
+- Source: `df2e07feca03bd7b4567a98ac5eda849ec8dbe75`, clean locally and remotely
+- Runtime: PyTorch 2.11.0+cu130, CUDA 13.0, Triton 3.6.0
+- Artifacts verified locally: three 24-row focused JSONs, three 52-row BS16+
+  JSONs, `baseline-gate.txt`, and `provenance.json`
+- Red gate: geometric-mean ratio `1.0`, improvement `0.0`, expected failure
+  because the required ratio is at most `0.7`
 
 ---
 
