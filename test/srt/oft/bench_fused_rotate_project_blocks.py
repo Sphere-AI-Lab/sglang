@@ -25,14 +25,17 @@ import torch
 
 from sglang.srt.oft.triton_ops.fused_rotate_project import fused_rotate_project_qkv
 
+from tiny_block_benchmark_report import relative_to_bs16
+
 # (name, K, output_sizes). Fused QKV under GQA: q, then k and v.
 SHAPES = [
-    ("llama31-8b-qkv", 4096, [4096, 1024, 1024]),
+    ("llama31-8b-tp2-qkv", 4096, [2048, 512, 512]),
     ("qwen25-7b-qkv", 3584, [3584, 512, 512]),
 ]
-# Decode (1, 8, 64), CUDA-graph capture (256), prefill (1024).
-BATCHES = [1, 8, 64, 256, 1024]
-BLOCK_SIZES = [16, 32, 64, 128, 256, 512, 1024]
+# Decode, CUDA-graph capture, and prefill sizes.
+BATCHES = [1, 8, 32, 64, 256, 1024]
+BLOCK_SIZES = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
+MODES = ["rotate", "identity"]
 
 # KNOWN, MEASURED, ACCEPTED: after the tiling change, `qwen25-7b-qkv` at BS=16
 # times 12-19% above baseline, reproducibly, at M=1 or M=8 depending on the run.
@@ -79,44 +82,100 @@ def _time_ms(fn, warmup: int = 20, iters: int = 100, repeats: int = 5) -> float:
     return best
 
 
-def bench_block_sizes(shapes=SHAPES, block_sizes=BLOCK_SIZES, batches=BATCHES) -> list[dict]:
-    """One row per (shape, M, BS). ``ms`` is None when the kernel cannot launch.
+def _reference_qkv(x, R, W, output_sizes, mode):
+    if mode == "identity":
+        rotated = [x.float()] * len(output_sizes)
+    else:
+        blocks_per_slice = x.shape[1] // R.shape[-1]
+        x_blocks = x.reshape(x.shape[0], blocks_per_slice, R.shape[-1]).float()
+        rotated = [
+            torch.einsum(
+                "mbk,bkc->mbc",
+                x_blocks,
+                R[0, slice_idx * blocks_per_slice : (slice_idx + 1) * blocks_per_slice].float(),
+            ).reshape_as(x.float())
+            for slice_idx in range(len(output_sizes))
+        ]
+    refs = []
+    output_offset = 0
+    for x_slice, output_size in zip(rotated, output_sizes, strict=True):
+        refs.append(x_slice @ W[output_offset : output_offset + output_size].float().T)
+        output_offset += output_size
+    return torch.cat(refs, dim=-1)
 
-    The rotation is identity, so ``err`` is measured against a plain projection
-    -- a reference that cannot itself drift. It is fp32 while the kernel casts
-    to bf16, so a correct kernel reports ~1e-4 rather than exactly zero.
-    """
+
+def bench_block_sizes(
+    shapes=SHAPES,
+    block_sizes=BLOCK_SIZES,
+    batches=BATCHES,
+    modes=MODES,
+) -> list[dict]:
+    """One row per (shape, mode, M, BS), including compile and steady-state time."""
     dev, dt = "cuda", torch.bfloat16
     rows: list[dict] = []
     for name, K, out_sizes in shapes:
         W = (torch.randn(sum(out_sizes), K, device=dev, dtype=dt) * 0.02).contiguous()
         for M in batches:
             x = (torch.randn(M, K, device=dev, dtype=dt) * 0.01).contiguous()
-            ref = (x.float() @ W.float().T)
             for BS in block_sizes:
                 if K % BS:
                     continue
                 blocks = 3 * (K // BS)
-                R = torch.eye(BS, device=dev, dtype=dt).expand(blocks, BS, BS).contiguous()
-                row = {"shape": name, "M": M, "BS": BS, "ms": None, "err": None}
-                try:
-                    out = fused_rotate_project_qkv(x, R, W, out_sizes)
-                    torch.cuda.synchronize()
-                    row["err"] = (out.float() - ref).abs().max().item()
-                    row["ms"] = _time_ms(lambda: fused_rotate_project_qkv(x, R, W, out_sizes))
-                except Exception as exc:  # noqa: BLE001 -- record whatever Triton raises
-                    row["error"] = f"{type(exc).__name__}: {str(exc).splitlines()[0][:80]}"
-                rows.append(row)
+                eye = torch.eye(BS, device=dev, dtype=dt)
+                R = eye.expand(1, blocks, BS, BS).clone()
+                R.add_(torch.randn_like(R) * 0.005)
+                slot_idx_t = torch.zeros((), dtype=torch.int32, device=dev)
+                bsv_t = torch.empty((), dtype=torch.int32, device=dev)
+                for mode in modes:
+                    bsv_t.fill_(BS if mode == "rotate" else 0)
+                    ref = _reference_qkv(x, R, W, out_sizes, mode)
+                    row = {
+                        "shape": name,
+                        "mode": mode,
+                        "M": M,
+                        "BS": BS,
+                        "compile_ms": None,
+                        "ms": None,
+                        "err": None,
+                    }
+                    try:
+                        start = time.perf_counter()
+                        out = fused_rotate_project_qkv(
+                            x,
+                            R,
+                            W,
+                            out_sizes,
+                            slot_idx_t=slot_idx_t,
+                            bsv_t=bsv_t,
+                        )
+                        torch.cuda.synchronize()
+                        row["compile_ms"] = (time.perf_counter() - start) * 1000.0
+                        row["err"] = (out.float() - ref).abs().max().item()
+                        row["ms"] = _time_ms(
+                            lambda: fused_rotate_project_qkv(
+                                x,
+                                R,
+                                W,
+                                out_sizes,
+                                slot_idx_t=slot_idx_t,
+                                bsv_t=bsv_t,
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- retain unsupported rows
+                        row["error"] = (
+                            f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}"
+                        )
+                    rows.append(row)
                 del R
                 torch.cuda.empty_cache()
-    return rows
+    return relative_to_bs16(rows)
 
 
 def compare(baseline_rows: list[dict], current_rows: list[dict],
             tolerance: float = REGRESSION_TOLERANCE) -> list[dict]:
     """Rows that got slower, or that stopped working."""
     def key(r):
-        return (r["shape"], r["M"], r["BS"])
+        return (r["shape"], r["mode"], r["M"], r["BS"])
 
     current = {key(r): r for r in current_rows}
     problems = []
@@ -141,11 +200,21 @@ def main() -> int:
     args = parser.parse_args()
 
     rows = bench_block_sizes()
-    print(f"{'shape':16} {'M':>5} {'BS':>5} {'ms':>9} {'max_err':>9}  note")
+    print(
+        f"{'shape':20} {'mode':>8} {'M':>5} {'BS':>5} "
+        f"{'compile_ms':>11} {'ms':>9} {'vs16':>7} {'max_err':>9}  note"
+    )
     for r in rows:
+        compile_ms = (
+            f"{r['compile_ms']:11.2f}" if r["compile_ms"] is not None else f"{'--':>11}"
+        )
         ms = f"{r['ms']:9.4f}" if r["ms"] is not None else f"{'--':>9}"
+        ratio = f"{r['vs_bs16']:7.3f}" if r["vs_bs16"] is not None else f"{'--':>7}"
         err = f"{r['err']:9.1e}" if r["err"] is not None else f"{'--':>9}"
-        print(f"{r['shape']:16} {r['M']:>5} {r['BS']:>5} {ms} {err}  {r.get('error', '')}")
+        print(
+            f"{r['shape']:20} {r['mode']:>8} {r['M']:>5} {r['BS']:>5} "
+            f"{compile_ms} {ms} {ratio} {err}  {r.get('error', '')}"
+        )
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
@@ -158,12 +227,16 @@ def main() -> int:
         problems = compare(baseline, rows)
         gained = [r for r in rows if r.get("ms") is not None
                   and not any(b["shape"] == r["shape"] and b["M"] == r["M"]
+                              and b.get("mode", "rotate") == r["mode"]
                               and b["BS"] == r["BS"] and b.get("ms") is not None
                               for b in baseline)]
         if problems:
             print("\nREGRESSIONS against the baseline:")
             for p in problems:
-                print(f"  {p['shape']} M={p['M']} BS={p['BS']}: {p['reason']}")
+                print(
+                    f"  {p['shape']} mode={p['mode']} M={p['M']} "
+                    f"BS={p['BS']}: {p['reason']}"
+                )
             return 1
         print(f"\nno regression at any block size the baseline could run "
               f"({len(gained)} row(s) newly runnable)")

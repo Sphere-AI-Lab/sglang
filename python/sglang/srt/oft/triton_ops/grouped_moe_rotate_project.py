@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
-import sys
+import argparse
+import json
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -659,7 +659,16 @@ def _bench_cuda(fn, *, warmup: int = 10, rep: int = 50) -> float:
     return start.elapsed_time(end) * 1000.0 / rep
 
 
-def _run_benchmark() -> int:
+def _measure_or_error(fn):
+    try:
+        out = fn()
+        torch.cuda.synchronize()
+        return out, _bench_cuda(fn), None
+    except Exception as exc:  # benchmark must retain unsupported baseline rows
+        return None, None, f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}"
+
+
+def _run_benchmark(json_path: Optional[str] = None) -> int:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for grouped_moe_rotate_project benchmark")
 
@@ -675,70 +684,42 @@ def _run_benchmark() -> int:
     half = 384
     experts = 128
     top_k = 8
-    block_size = 64
-    ms = [1, 2, 4, 8, 16, 32, 64, 256, 1024, 4096, 8192]
-    direct_variant_max_m = int(os.getenv("SGLANG_OFT_DIRECT_VARIANT_BENCH_MAX_M", "64"))
-    direct_variant_verbose = os.getenv(
-        "SGLANG_OFT_DIRECT_VARIANT_VERBOSE", "1"
-    ).strip().lower() not in {"0", "false", "no", "off"}
-    small_direct_variants = [
-        ("bm16_bn64_g8_w4", 16, 64, 8, 4),
-        ("bm16_bn64_g1_w4", 16, 64, 1, 4),
-        ("bm16_bn32_g1_w4", 16, 32, 1, 4),
-        ("bm8_bn64_g1_w4", 8, 64, 1, 4),
-        ("bm8_bn32_g1_w4", 8, 32, 1, 4),
-        ("bm8_bn64_g1_w2", 8, 64, 1, 2),
-        ("bm4_bn64_g1_w4", 4, 64, 1, 4),
-    ]
+    block_sizes = [4, 8, 16]
+    ms = [1, 8, 32, 64, 256, 1024]
+    rows: List[Dict[str, object]] = []
     failed = False
 
     header = (
-        f"{'M':>6} | {'direct default':>14} {'direct best':>12} {'best cfg':>17} "
-        f"{'packed_bmm':>11} {'legacy':>10} | "
-        f"{'best/default':>13} {'legacy/best':>12} {'legacy/packed':>14} | "
-        f"{'winner':>17} {'win x':>7} | {'err best':>9} {'err packed':>10}"
+        f"{'BS':>4} {'M':>6} {'variant':>12} {'us':>11} {'max_abs':>10}  note"
     )
     print("Grouped MoE OFT FC1 benchmark (lower us is better)")
-    print(
-        "direct tile variants run only for M <= "
-        f"{direct_variant_max_m} by default; set SGLANG_OFT_DIRECT_VARIANT_BENCH_MAX_M to override"
-    )
     print(header)
     print("-" * len(header))
-    for m in ms:
-        hidden_states, w13, w1_oft_r, w3_oft_r, topk_ids, topk_weights = (
-            _make_benchmark_inputs(
-                m=m,
-                hidden=hidden,
-                half=half,
-                experts=experts,
-                top_k=top_k,
-                block_size=block_size,
+    for block_size in block_sizes:
+        for m in ms:
+            hidden_states, w13, w1_oft_r, w3_oft_r, topk_ids, topk_weights = (
+                _make_benchmark_inputs(
+                    m=m,
+                    hidden=hidden,
+                    half=half,
+                    experts=experts,
+                    top_k=top_k,
+                    block_size=block_size,
+                )
             )
-        )
-        config = _benchmark_config(m, experts)
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], experts
-        )
-        expert_offsets, max_padded_tokens_per_expert, active_m_blocks = (
-            _make_grouped_bmm_expert_offsets(
-                expert_ids=expert_ids,
-                num_tokens_post_padded=num_tokens_post_padded,
-                experts=experts,
-                block_m=config["BLOCK_SIZE_M"],
+            config = _benchmark_config(m, experts)
+            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                topk_ids, config["BLOCK_SIZE_M"], experts
             )
-        )
-        w13_grouped_bmm_weight = _make_w13_grouped_bmm_weight(w13)
-
-        def make_direct_runner(
-            block_m: int,
-            block_n: int,
-            group_size_m: int,
-            num_warps: int,
-        ):
-            direct_sorted_ids, direct_expert_ids, direct_num_tokens_post_padded = (
-                moe_align_block_size(topk_ids, block_m, experts)
+            expert_offsets, max_padded_tokens_per_expert, active_m_blocks = (
+                _make_grouped_bmm_expert_offsets(
+                    expert_ids=expert_ids,
+                    num_tokens_post_padded=num_tokens_post_padded,
+                    experts=experts,
+                    block_m=config["BLOCK_SIZE_M"],
+                )
             )
+            w13_grouped_bmm_weight = _make_w13_grouped_bmm_weight(w13)
 
             def run_direct() -> torch.Tensor:
                 return fused_split_w13_oft_grouped_moe(
@@ -747,141 +728,108 @@ def _run_benchmark() -> int:
                     w1_oft_r=w1_oft_r,
                     w3_oft_r=w3_oft_r,
                     topk_ids=topk_ids,
-                    sorted_token_ids=direct_sorted_ids,
-                    expert_ids=direct_expert_ids,
-                    num_tokens_post_padded=direct_num_tokens_post_padded,
-                    block_m=block_m,
-                    block_n=block_n,
-                    group_size_m=group_size_m,
-                    num_warps=num_warps,
+                    sorted_token_ids=sorted_token_ids,
+                    expert_ids=expert_ids,
+                    num_tokens_post_padded=num_tokens_post_padded,
+                    block_m=config["BLOCK_SIZE_M"],
                 )
 
-            return run_direct
-
-        def run_new() -> torch.Tensor:
-            return fused_split_w13_oft_grouped_moe(
-                hidden_states=hidden_states,
-                w13=w13,
-                w1_oft_r=w1_oft_r,
-                w3_oft_r=w3_oft_r,
-                topk_ids=topk_ids,
-                sorted_token_ids=sorted_token_ids,
-                expert_ids=expert_ids,
-                num_tokens_post_padded=num_tokens_post_padded,
-                block_m=config["BLOCK_SIZE_M"],
-            )
-
-        def run_legacy() -> torch.Tensor:
-            legacy = torch.empty(m, top_k, half * 2, device="cuda", dtype=torch.bfloat16)
-            for half_slice, oft_r in (
-                (slice(None, half), w1_oft_r),
-                (slice(half, None), w3_oft_r),
-            ):
-                half_cache = torch.empty(m, top_k, half, device="cuda", dtype=torch.bfloat16)
-                invoke_fused_moe_kernel(
-                    hidden_states,
-                    w13[:, half_slice, :].contiguous(),
-                    None,
-                    half_cache,
-                    None,
-                    None,
-                    None,
-                    topk_weights,
-                    topk_ids,
-                    sorted_token_ids,
-                    expert_ids,
-                    num_tokens_post_padded,
-                    False,
-                    top_k,
-                    config,
-                    compute_type=tl.bfloat16,
-                    use_fp8_w8a8=False,
-                    use_int8_w8a8=False,
-                    use_int8_w8a16=False,
-                    use_int4_w4a16=False,
-                    per_channel_quant=False,
-                    block_shape=None,
-                    oft_r=oft_r,
+            def run_legacy() -> torch.Tensor:
+                legacy = torch.empty(
+                    m, top_k, half * 2, device="cuda", dtype=torch.bfloat16
                 )
-                legacy[..., half_slice].copy_(half_cache)
-            return legacy
+                for half_slice, oft_r in (
+                    (slice(None, half), w1_oft_r),
+                    (slice(half, None), w3_oft_r),
+                ):
+                    half_cache = torch.empty(
+                        m, top_k, half, device="cuda", dtype=torch.bfloat16
+                    )
+                    invoke_fused_moe_kernel(
+                        hidden_states,
+                        w13[:, half_slice, :].contiguous(),
+                        None,
+                        half_cache,
+                        None,
+                        None,
+                        None,
+                        topk_weights,
+                        topk_ids,
+                        sorted_token_ids,
+                        expert_ids,
+                        num_tokens_post_padded,
+                        False,
+                        top_k,
+                        config,
+                        compute_type=tl.bfloat16,
+                        use_fp8_w8a8=False,
+                        use_int8_w8a8=False,
+                        use_int8_w8a16=False,
+                        use_int4_w4a16=False,
+                        per_channel_quant=False,
+                        block_shape=None,
+                        oft_r=oft_r,
+                    )
+                    legacy[..., half_slice].copy_(half_cache)
+                return legacy
 
-        def run_packed_bmm() -> torch.Tensor:
-            return packed_bmm_split_w13_oft_grouped_moe(
-                hidden_states=hidden_states,
-                w13=w13,
-                w1_oft_r=w1_oft_r,
-                w3_oft_r=w3_oft_r,
-                topk_ids=topk_ids,
-                sorted_token_ids=sorted_token_ids,
-                expert_ids=expert_ids,
-                num_tokens_post_padded=num_tokens_post_padded,
-                block_m=config["BLOCK_SIZE_M"],
-                expert_offsets=expert_offsets,
-                max_padded_tokens_per_expert=max_padded_tokens_per_expert,
-                active_m_blocks=active_m_blocks,
-                w13_grouped_bmm_weight=w13_grouped_bmm_weight,
-            )
+            def run_packed_bmm() -> torch.Tensor:
+                return packed_bmm_split_w13_oft_grouped_moe(
+                    hidden_states=hidden_states,
+                    w13=w13,
+                    w1_oft_r=w1_oft_r,
+                    w3_oft_r=w3_oft_r,
+                    topk_ids=topk_ids,
+                    sorted_token_ids=sorted_token_ids,
+                    expert_ids=expert_ids,
+                    num_tokens_post_padded=num_tokens_post_padded,
+                    block_m=config["BLOCK_SIZE_M"],
+                    expert_offsets=expert_offsets,
+                    max_padded_tokens_per_expert=max_padded_tokens_per_expert,
+                    active_m_blocks=active_m_blocks,
+                    w13_grouped_bmm_weight=w13_grouped_bmm_weight,
+                )
 
-        legacy_out = run_legacy()
-        direct_variants = [("default", run_new)]
-        if m <= direct_variant_max_m:
-            direct_variants = [
-                (name, make_direct_runner(block_m, block_n, group_size_m, num_warps))
-                for name, block_m, block_n, group_size_m, num_warps in small_direct_variants
-            ]
-        direct_results = []
-        for name, run_direct in direct_variants:
-            out = run_direct()
-            torch.cuda.synchronize()
-            err = (out.float() - legacy_out.float()).abs().max().item()
-            us = _bench_cuda(run_direct)
-            direct_results.append((name, us, err))
+            measured = {
+                "legacy": _measure_or_error(run_legacy),
+                "direct": _measure_or_error(run_direct),
+                "packed_bmm": _measure_or_error(run_packed_bmm),
+            }
+            legacy_out = measured["legacy"][0]
+            for variant, (out, us, error) in measured.items():
+                max_abs = None
+                if out is not None and legacy_out is not None:
+                    max_abs = (out.float() - legacy_out.float()).abs().max().item()
+                row = {
+                    "BS": block_size,
+                    "M": m,
+                    "variant": variant,
+                    "us": us,
+                    "max_abs": max_abs,
+                    "error": error,
+                }
+                rows.append(row)
+                us_text = f"{us:11.2f}" if us is not None else f"{'--':>11}"
+                err_text = (
+                    f"{max_abs:10.5f}" if max_abs is not None else f"{'--':>10}"
+                )
+                print(
+                    f"{block_size:>4} {m:>6} {variant:>12} "
+                    f"{us_text} {err_text}  {error or ''}"
+                )
+                if error is None and max_abs is not None and max_abs > 3e-2:
+                    failed = True
 
-        packed_bmm_out = run_packed_bmm()
-        torch.cuda.synchronize()
-        packed_bmm_max_abs = (
-            packed_bmm_out.float() - legacy_out.float()
-        ).abs().max().item()
-        legacy_us = _bench_cuda(run_legacy)
-        packed_bmm_us = _bench_cuda(run_packed_bmm)
-        default_name, default_direct_us, default_err = direct_results[0]
-        best_direct_name, best_direct_us, best_direct_err = min(
-            direct_results, key=lambda item: item[1]
-        )
-        best_vs_default = (
-            default_direct_us / best_direct_us if best_direct_us > 0 else float("inf")
-        )
-        best_ratio = legacy_us / best_direct_us if best_direct_us > 0 else float("inf")
-        packed_ratio = legacy_us / packed_bmm_us if packed_bmm_us > 0 else float("inf")
-        candidates = {
-            f"direct:{best_direct_name}": best_direct_us,
-            "packed_bmm": packed_bmm_us,
-        }
-        ranked = sorted(candidates.items(), key=lambda item: item[1])
-        winner, winner_us = ranked[0]
-        winner_ratio = ranked[1][1] / winner_us if len(ranked) > 1 else float("inf")
-
-        print(
-            f"{m:>6} | {default_direct_us:>14.2f} {best_direct_us:>12.2f} "
-            f"{best_direct_name:>17} {packed_bmm_us:>11.2f} {legacy_us:>10.2f} | "
-            f"{best_vs_default:>12.3f}x {best_ratio:>11.3f}x {packed_ratio:>13.3f}x | "
-            f"{winner:>17} {winner_ratio:>6.3f}x | "
-            f"{best_direct_err:>9.5f} {packed_bmm_max_abs:>10.5f}"
-        )
-        if direct_variant_verbose and m <= direct_variant_max_m:
-            variant_summary = ", ".join(
-                f"{name}={us:.2f}us" for name, us, _ in direct_results
-            )
-            print(f"{'':>6}   direct variants: {variant_summary}")
-        if (
-            max(err for _, _, err in direct_results) > 3e-2
-            or packed_bmm_max_abs > 3e-2
-        ):
-            failed = True
+    if json_path:
+        with open(json_path, "w", encoding="utf-8") as fh:
+            json.dump(rows, fh, indent=2)
+        print(f"\nwrote {json_path}")
 
     return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    sys.exit(_run_benchmark())
+    parser = argparse.ArgumentParser(description="Benchmark grouped-MoE OFT paths")
+    parser.add_argument("--json", default=None, help="write complete rows to this file")
+    args = parser.parse_args()
+    raise SystemExit(_run_benchmark(args.json))
