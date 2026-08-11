@@ -234,9 +234,34 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", type=str, default=None, help="write rows here")
     parser.add_argument("--compare", type=str, default=None, help="baseline JSON to check against")
+    parser.add_argument(
+        "--acceptance-only",
+        action="store_true",
+        help="benchmark only rotate M=1/8/32/64 at BS4/8/16",
+    )
+    parser.add_argument(
+        "--bs16-plus",
+        action="store_true",
+        help="benchmark rotate M=1/8/32/64 at every supported BS >= 16",
+    )
     args = parser.parse_args()
 
-    rows = bench_block_sizes()
+    if args.acceptance_only and args.bs16_plus:
+        parser.error("--acceptance-only and --bs16-plus are mutually exclusive")
+    if args.acceptance_only:
+        rows = bench_block_sizes(
+            block_sizes=[4, 8, 16],
+            batches=[1, 8, 32, 64],
+            modes=["rotate"],
+        )
+    elif args.bs16_plus:
+        rows = bench_block_sizes(
+            block_sizes=[16, 32, 64, 128, 256, 512, 1024],
+            batches=[1, 8, 32, 64],
+            modes=["rotate"],
+        )
+    else:
+        rows = bench_block_sizes()
     print(
         f"{'shape':20} {'mode':>8} {'M':>5} {'BS':>5} "
         f"{'compile_ms':>11} {'ms':>9} {'vs16':>7} {'max_err':>9}  note"
