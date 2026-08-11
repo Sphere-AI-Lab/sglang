@@ -98,41 +98,54 @@ def _split_w13_oft_grouped_moe_kernel(
                 allow_tf32=False,
             )
     else:
-        for block_idx in range(0, BLOCKS):
+        tiny_cols = tl.arange(0, 16)
+        blocks_in_tile: tl.constexpr = 16 // BLOCK_SIZE
+        block_in_tile = tiny_cols // BLOCK_SIZE
+        col_in_block = tiny_cols - block_in_tile * BLOCK_SIZE
+        for block_group in range(0, BLOCKS, blocks_in_tile):
+            block_ids = block_group + block_in_tile
+            valid_blocks = block_ids < BLOCKS
+            x_rot = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
             r_base = (
                 expert * BLOCKS * BLOCK_SIZE * BLOCK_SIZE
-                + block_idx * BLOCK_SIZE * BLOCK_SIZE
+                + block_ids * BLOCK_SIZE * BLOCK_SIZE
             )
-            for j in range(BLOCK_SIZE):
-                x_rot_j = tl.zeros((BLOCK_M,), dtype=tl.float32)
-                for k in range(BLOCK_SIZE):
-                    x_k = tl.load(
-                        hidden_states_ptr
-                        + token_idx * K
-                        + block_idx * BLOCK_SIZE
-                        + k,
-                        mask=token_mask,
-                        other=0.0,
-                    ).to(tl.float32)
-                    if half_id == 0:
-                        r_kj = tl.load(
-                            w1_oft_r_ptr + r_base + k * BLOCK_SIZE + j
-                        )
-                    else:
-                        r_kj = tl.load(
-                            w3_oft_r_ptr + r_base + k * BLOCK_SIZE + j
-                        )
-                    x_rot_j += x_k * r_kj.to(tl.float32)
-                w_j = tl.load(
-                    w13_ptr
-                    + expert * N * K
-                    + (half_offset + offs_n) * K
-                    + block_idx * BLOCK_SIZE
-                    + j,
-                    mask=n_mask,
+            for k in range(BLOCK_SIZE):
+                x_k = tl.load(
+                    hidden_states_ptr
+                    + token_idx[:, None] * K
+                    + (block_ids * BLOCK_SIZE + k)[None, :],
+                    mask=token_mask[:, None] & valid_blocks[None, :],
                     other=0.0,
                 ).to(tl.float32)
-                acc += x_rot_j.to(tl.bfloat16).to(tl.float32)[:, None] * w_j[None, :]
+                if half_id == 0:
+                    r_kj = tl.load(
+                        w1_oft_r_ptr + r_base + k * BLOCK_SIZE + col_in_block,
+                        mask=valid_blocks,
+                        other=0.0,
+                    )
+                else:
+                    r_kj = tl.load(
+                        w3_oft_r_ptr + r_base + k * BLOCK_SIZE + col_in_block,
+                        mask=valid_blocks,
+                        other=0.0,
+                    )
+                x_rot += x_k * r_kj.to(tl.float32)[None, :]
+            k_offsets = block_group * BLOCK_SIZE + tiny_cols
+            w = tl.load(
+                w13_ptr
+                + expert * N * K
+                + (half_offset + offs_n[:, None]) * K
+                + k_offsets[None, :],
+                mask=n_mask[:, None] & valid_blocks[None, :],
+                other=0.0,
+            )
+            acc += tl.dot(
+                x_rot.to(tl.bfloat16),
+                tl.trans(w),
+                out_dtype=tl.float32,
+                allow_tf32=False,
+            )
 
     out_offsets = token_idx[:, None] * TOP_K * N + route_idx[:, None] * N
     out_offsets += half_offset + offs_n[None, :]
