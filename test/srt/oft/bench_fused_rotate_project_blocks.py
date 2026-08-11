@@ -22,7 +22,9 @@ import json
 import time
 
 import torch
+import torch.nn.functional as F
 
+from sglang.srt.oft.triton_ops.gemm_oft_r import gemm_oft_r_fwd
 from sglang.srt.oft.triton_ops.fused_rotate_project import fused_rotate_project_qkv
 
 from tiny_block_benchmark_report import relative_to_bs16
@@ -104,6 +106,25 @@ def _reference_qkv(x, R, W, output_sizes, mode):
     return torch.cat(refs, dim=-1)
 
 
+def _legacy_qkv(x, R, W, output_sizes, slot_idx_t, bsv_t):
+    """Production unfused path: rotate, project each slice, then concatenate."""
+    K = x.shape[-1]
+    rotated = gemm_oft_r_fwd(
+        x, R, slot_idx_t, bsv_t, num_slices=len(output_sizes)
+    )
+    input_slices = torch.split(rotated, K, dim=-1)
+    weight_slices = torch.split(W, output_sizes, dim=0)
+    return torch.cat(
+        [
+            F.linear(input_slice, weight_slice)
+            for input_slice, weight_slice in zip(
+                input_slices, weight_slices, strict=True
+            )
+        ],
+        dim=-1,
+    )
+
+
 def bench_block_sizes(
     shapes=SHAPES,
     block_sizes=BLOCK_SIZES,
@@ -137,6 +158,8 @@ def bench_block_sizes(
                         "compile_ms": None,
                         "ms": None,
                         "err": None,
+                        "legacy_ms": None,
+                        "fused_vs_legacy": None,
                     }
                     try:
                         start = time.perf_counter()
@@ -161,6 +184,20 @@ def bench_block_sizes(
                                 bsv_t=bsv_t,
                             )
                         )
+                        if BS <= 16:
+                            row["legacy_ms"] = _time_ms(
+                                lambda: _legacy_qkv(
+                                    x,
+                                    R,
+                                    W,
+                                    out_sizes,
+                                    slot_idx_t,
+                                    bsv_t,
+                                )
+                            )
+                            row["fused_vs_legacy"] = (
+                                row["ms"] / row["legacy_ms"]
+                            )
                     except Exception as exc:  # noqa: BLE001 -- retain unsupported rows
                         row["error"] = (
                             f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}"
