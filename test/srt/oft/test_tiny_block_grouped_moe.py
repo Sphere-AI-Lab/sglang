@@ -3,11 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
-    apply_oft_rotation_triton,
-)
-from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
+)
+from sglang.srt.peft.oft.triton_ops.block_rotate import (
+    apply_oft_rotation_triton,
 )
 from sglang.srt.peft.oft.triton_ops.grouped_moe_rotate_project import (
     fused_split_w13_oft_grouped_moe,
