@@ -24,6 +24,20 @@ _TRITON_MAX_BLOCK_SIZE_FP32 = 32
 _TRITON_MAX_BLOCK_SIZE_FP16 = 128
 
 
+def _torch_cayley_neumann_bwd(
+    grad_R: torch.Tensor, Q_skew: torch.Tensor
+) -> torch.Tensor:
+    """Differentiate the five-term Neumann polynomial with Torch matmuls."""
+    q_t = Q_skew.transpose(-1, -2)
+    g_prev = grad_R
+    acc = grad_R
+    for _ in range(3):
+        g_k = (2.0 * grad_R + g_prev @ q_t).to(grad_R.dtype)
+        g_prev = g_k
+        acc = (g_k + q_t @ acc).to(grad_R.dtype)
+    return acc
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Forward kernel
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,6 +146,8 @@ def cayley_neumann_fwd(Q_skew: torch.Tensor, num_terms: int = 5) -> torch.Tensor
     """Triton Cayley-Neumann forward (block_size must be <= _TRITON_MAX_BLOCK_SIZE)."""
     assert num_terms == NUM_TERMS, f"Only num_terms={NUM_TERMS} supported, got {num_terms}"
     num_blocks, block_size, _ = Q_skew.shape
+    if block_size < 16:
+        return _torch_cayley_neumann(Q_skew, num_terms)
     R = torch.empty_like(Q_skew)
     _cayley_fwd_kernel[(num_blocks,)](
         Q_skew, R,
@@ -149,6 +165,8 @@ def cayley_neumann_bwd(
     """Triton Cayley-Neumann backward (block_size must be <= _TRITON_MAX_BLOCK_SIZE)."""
     assert num_terms == NUM_TERMS, f"Only num_terms={NUM_TERMS} supported, got {num_terms}"
     num_blocks, block_size, _ = Q_skew.shape
+    if block_size < 16:
+        return _torch_cayley_neumann_bwd(grad_R, Q_skew)
     grad_Q = torch.empty_like(Q_skew)
     _cayley_bwd_kernel[(num_blocks,)](
         grad_R, Q_skew, grad_Q,
@@ -187,6 +205,8 @@ def cayley_neumann(Q_skew: torch.Tensor, num_terms: int = 5) -> torch.Tensor:
     Falls back to torch for larger blocks (register pressure makes triton slower).
     """
     block_size = Q_skew.shape[-1]
+    if block_size < 16:
+        return _torch_cayley_neumann(Q_skew, num_terms)
     max_bs = _TRITON_MAX_BLOCK_SIZE_FP32 if Q_skew.dtype == torch.float32 else _TRITON_MAX_BLOCK_SIZE_FP16
     if block_size > max_bs:
         return _torch_cayley_neumann(Q_skew, num_terms)

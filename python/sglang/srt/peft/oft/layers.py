@@ -221,6 +221,7 @@ def split_dense_merged_projection(
             )
             if (
                 len(output_sizes) == 3
+                and R.shape[-1] >= 16
                 and hasattr(oft_backend, "run_fused_rotate_project")
                 and _common_eligible
             ):

@@ -2,6 +2,12 @@ import torch
 import triton
 import triton.language as tl
 
+# Same shared-memory ceiling, same fix, as the un-segmented `gemm_oft_r`. The
+# picker is imported rather than copied so the two kernels cannot drift into
+# disagreeing about what fits -- they have identical staging shapes and differ
+# only in BLOCK_S (16 here, 64 there), which is already a parameter of it.
+from sglang.srt.peft.oft.triton_ops.gemm_oft_r import _pick_tiles
+
 
 @triton.jit
 def _sgemm_oft_r_kernel(
@@ -22,6 +28,8 @@ def _sgemm_oft_r_kernel(
     num_blocks: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    TILE_K: tl.constexpr,
+    TILE_N: tl.constexpr,
 ):
     """Unified Triton kernel for segmented block-diagonal OFT rotation.
 
@@ -45,9 +53,14 @@ def _sgemm_oft_r_kernel(
     slice_id = tl.program_id(1)
     seg_idx = tl.program_id(2)
 
+    num_col_tiles: tl.constexpr = BLOCK_SIZE // TILE_N
     num_token_tiles = tl.cdiv(max_seg_len, BLOCK_S)
-    block_idx = pid_0 // num_token_tiles
-    token_tile_idx = pid_0 % num_token_tiles
+    tiles_per_block = num_token_tiles * num_col_tiles
+
+    block_idx = pid_0 // tiles_per_block
+    rem = pid_0 % tiles_per_block
+    token_tile_idx = rem // num_col_tiles
+    col_tile_idx = rem % num_col_tiles
 
     if block_idx >= num_blocks:
         return
@@ -67,8 +80,11 @@ def _sgemm_oft_r_kernel(
     actual_s = token_offset + s_offsets
     s_mask = actual_s < seg_len
 
-    c_offsets = tl.arange(0, BLOCK_SIZE)
-    k_offsets = tl.arange(0, BLOCK_SIZE)
+    # Only this program's TILE_N columns of the rotation block. At
+    # TILE_N == BLOCK_SIZE there is one column tile and this is the original
+    # `arange(0, BLOCK_SIZE)`.
+    col_offset = col_tile_idx * TILE_N
+    c_offsets = col_offset + tl.arange(0, TILE_N)
 
     # Input: always read from the same x (all slices share the same input)
     x_base = x_ptr + seg_start * x_stride_0 + block_idx * BLOCK_SIZE
@@ -103,21 +119,27 @@ def _sgemm_oft_r_kernel(
     )
 
     if BLOCK_SIZE >= 16:
-        # Use tl.dot for efficient matmul when block_size >= 16
-        x_tile = tl.load(
-            x_base + actual_s[:, None] * x_stride_0 + k_offsets[None, :],
-            mask=s_mask[:, None],
-            other=0.0,
-        )
-        R_block = tl.load(
-            R_base
-            + k_offsets[:, None] * weights_stride_2
-            + c_offsets[None, :] * weights_stride_3,
-        )
-        out = tl.dot(x_tile.to(R_block.dtype), R_block, input_precision="ieee")
+        # Use tl.dot for efficient matmul when block_size >= 16, walking the
+        # contraction in TILE_K steps so shared memory stops scaling with
+        # BLOCK_SIZE. One iteration when TILE_K == BLOCK_SIZE.
+        acc = tl.zeros((BLOCK_S, TILE_N), dtype=tl.float32)
+        for k0 in range(0, BLOCK_SIZE, TILE_K):
+            k_offsets = k0 + tl.arange(0, TILE_K)
+            x_tile = tl.load(
+                x_base + actual_s[:, None] * x_stride_0 + k_offsets[None, :],
+                mask=s_mask[:, None],
+                other=0.0,
+            )
+            R_tile = tl.load(
+                R_base
+                + k_offsets[:, None] * weights_stride_2
+                + c_offsets[None, :] * weights_stride_3,
+            )
+            acc += tl.dot(x_tile.to(R_tile.dtype), R_tile, input_precision="ieee")
+        out = acc
     else:
         # Element-wise loop for small block sizes (block_size < 16)
-        acc = tl.zeros((BLOCK_S, BLOCK_SIZE), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_S, TILE_N), dtype=tl.float32)
         for k in range(BLOCK_SIZE):
             x_col = tl.load(
                 x_base + actual_s * x_stride_0 + k,
@@ -286,8 +308,14 @@ def sgemm_oft_r_fwd(
     BLOCK_S = 16
     BLOCK_SIZE = block_size
 
+    TILE_K, TILE_N = _pick_tiles(BLOCK_SIZE, BLOCK_S)
     num_token_tiles = triton.cdiv(batch_info.max_len, BLOCK_S)
-    grid = (num_blocks * num_token_tiles, num_slices, batch_info.num_segments)
+    num_col_tiles = BLOCK_SIZE // TILE_N
+    grid = (
+        num_blocks * num_token_tiles * num_col_tiles,
+        num_slices,
+        batch_info.num_segments,
+    )
 
     _sgemm_oft_r_kernel[grid](
         x,
@@ -307,6 +335,8 @@ def sgemm_oft_r_fwd(
         num_blocks=num_blocks,
         BLOCK_S=BLOCK_S,
         BLOCK_SIZE=BLOCK_SIZE,
+        TILE_K=TILE_K,
+        TILE_N=TILE_N,
     )
 
     return output

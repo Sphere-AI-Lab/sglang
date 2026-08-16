@@ -10,6 +10,18 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 _MISSING_CONFIG_ATTR = object()
 
 
+def validate_oft_block_size(block_size: int, *, allow_zero: bool = False) -> int:
+    if isinstance(block_size, bool) or not isinstance(block_size, int):
+        raise TypeError(f"OFT block size must be an integer, got {block_size!r}")
+    if allow_zero and block_size == 0:
+        return 0
+    if block_size < 4 or block_size & (block_size - 1):
+        raise ValueError(
+            f"OFT block size must be a power of two and at least 4; got {block_size}"
+        )
+    return block_size
+
+
 def get_hf_config_attr(config: AutoConfig, attr_name: str):
     value = getattr(config, attr_name, _MISSING_CONFIG_ATTR)
     if value is not _MISSING_CONFIG_ATTR:

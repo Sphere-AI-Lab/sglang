@@ -18,6 +18,8 @@ from typing import Dict, Optional
 
 from huggingface_hub import snapshot_download
 
+from sglang.srt.peft.oft.utils import validate_oft_block_size
+
 
 class OFTConfig:
     def __init__(
@@ -38,7 +40,7 @@ class OFTConfig:
         self.target_modules = self.hf_config["target_modules"]
         # OFT uses block_size instead of rank (r) as in LoRA.
         # block_size controls the size of the orthogonal blocks in the transformation.
-        self.block_size = self.hf_config["oft_block_size"]
+        self.block_size = validate_oft_block_size(self.hf_config["oft_block_size"])
         # OFT does not use a scaling factor like lora_alpha; instead it may use
         # a constraint coefficient (eps / coft) to control the deviation from identity.
         self.eps = self.hf_config.get("eps", 6e-5)
