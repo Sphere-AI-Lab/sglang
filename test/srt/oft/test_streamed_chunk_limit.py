@@ -40,6 +40,10 @@ class RecordingPool:
 
     def __init__(self):
         self.writes = []
+        # The v0.5.16 loader audits each dense write with the pool's TP rank
+        # (record_dense_write(..., tp_rank=memory_pool.tp_rank)); the real pool
+        # inherits it from peft/base/mem_pool.AdapterMemoryPool.
+        self.tp_rank = 0
 
     def _write_precomputed_oft_r(
         self, buffer_id, fused_target, layer_id, packed_r, block_size,
