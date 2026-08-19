@@ -826,6 +826,17 @@ class Req(ReqDllmMixin):
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
+        if adapter_id is not None:
+            # Radix keys MUST separate OFT-adapter requests from base requests:
+            # without this, a base request prefix-matches KV computed under the
+            # adapter and silently returns adapter output (measured: base greedy
+            # == adapter output on 14/16 prompts until keyed). The version is not
+            # plumbed to Req; v0 is correct because the double-buffer activate
+            # path already flushes the radix cache on weight changes. Lazy import:
+            # integration's module-level deps must not load from this module.
+            from sglang.srt.peft.integration import maybe_extend_extra_key
+
+            extra_key = maybe_extend_extra_key(extra_key, adapter_id, None)
 
         self.extra_key = extra_key
         self.lora_id = lora_id
