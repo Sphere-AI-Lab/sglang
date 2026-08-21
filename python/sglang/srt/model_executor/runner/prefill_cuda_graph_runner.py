@@ -913,6 +913,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         else:
             self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
+        # peft (OFT or single-active LoRA): bind the adapter batch_info before the
+        # captured forward, exactly as run_dummy_forward does for the tc-piecewise
+        # compile pass. Without it the breakable backend's capture reads an unset
+        # TritonOFTBackend.batch_info (AttributeError at the first OFT-wrapped
+        # projection). load_batch re-preps with the real adapter_ids at replay.
+        from sglang.srt.peft import integration as peft
+
+        peft.maybe_prepare_peft_batch(self.model_runner, forward_batch)
+
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
 
