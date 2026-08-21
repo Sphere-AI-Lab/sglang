@@ -519,9 +519,13 @@ class _GenerationStreamAccumulator:
         if self.return_hidden_states:
             if req.return_hidden_states:
                 # Mirror output_ids_through_stop: spec verify steps can overshoot finished_len.
+                # hs[0] is the prefill block (one entry holding every prompt position);
+                # entries 1.. are per-output-token. A prefill-only scoring request
+                # (max_new_tokens=0 -> finished_len=0) must still return the block,
+                # so never truncate below one entry.
                 hs = req.hidden_states
                 if req.finished_len is not None:
-                    hs = hs[: req.finished_len]
+                    hs = hs[: max(req.finished_len, 1)]
                 self.output_hidden_states.append(hs)
             else:
                 self.output_hidden_states.append(None)
