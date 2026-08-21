@@ -327,9 +327,12 @@ def _ensure_streaming_oft_adapter_slot(
         )
 
     existing_id = None
-    for adapter_id, ref in list(model_runner.oft_manager.refs.items()):
+    # NB: do not reuse `adapter_id` as the loop variable -- it is the id we are
+    # about to register under, and rebinding it here keyed the new OFTRef by
+    # whatever ref happened to be iterated last.
+    for ref_id, ref in list(model_runner.oft_manager.refs.items()):
         if ref.adapter_name == adapter_name:
-            existing_id = adapter_id
+            existing_id = ref_id
             break
     if existing_id is not None:
         old_ref = model_runner.oft_manager.refs[existing_id]
