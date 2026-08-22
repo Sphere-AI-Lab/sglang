@@ -114,6 +114,24 @@ async def bump_peft_version(tm, obj, success):
     return ""
 
 
+def _propagate_id_to_cached_sub_objs(obj, *, field, resolved):
+    """Push the resolved adapter id into sub-objects already memoized by
+    ``GenerateReqInput.__getitem__`` (``obj._sub_obj_cache``).
+
+    ``_init_req_state`` materializes ``obj[i]`` for every request in a batch
+    BEFORE this resolver runs, so an id set on ``obj`` alone never reaches the
+    cached copies -- ``_handle_batch_request`` then tokenizes those stale
+    copies and every batched request lands on the scheduler with a ``None`` id
+    (OFT: identity slot applied, output silently equals the base model; lora:
+    radix ``extra_key`` loses the adapter id). Mirrors the legacy propagation
+    in ``TokenizerManager._resolve_lora_path``.
+    """
+    for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
+        setattr(
+            sub_obj, field, resolved[i] if isinstance(resolved, list) else resolved
+        )
+
+
 async def resolve_peft_path(tm, obj):
     """Per-request peft adapter resolver: acquire the adapter id (+ version), and
     for OFT reload any dynamically-evicted adapter (single-active LoRA never
@@ -155,8 +173,10 @@ async def resolve_peft_path(tm, obj):
     if tm.peft_kind == "oft":
         obj.adapter_id = adapter_id
         obj.adapter_version = await tm.peft_registry.get_version_by_id(adapter_id)
+        _propagate_id_to_cached_sub_objs(obj, field="adapter_id", resolved=adapter_id)
     else:
         obj.lora_id = adapter_id
+        _propagate_id_to_cached_sub_objs(obj, field="lora_id", resolved=adapter_id)
 
 
 async def maybe_resolve_peft_path(tm, obj):
