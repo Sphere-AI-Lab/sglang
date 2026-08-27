@@ -36,10 +36,10 @@ class MoeRunner:
         self.config = config
         self.lora_enabled = lora_enabled
         self.peft_enabled = peft_enabled
-        # Live handle to the owning FusedMoE layer, stamped by the FusedMoEWithOFT
-        # wrapper (peft/oft/layers.py) on its own runner. Lets the peft MoE
-        # invoker (make_oft_invoke) read layer.w*_oft_r live, so the OFT buffers
-        # never ride TritonMoeQuantInfo.
+        # Set by FusedMoEWithOFT on its dedicated runner. The OFT invoker reads
+        # the owning layer's live buffers without placing them in quant_info.
+        # Expert OFT rotates before GEMM, so direct-dispatch cores receive this
+        # layer directly while Triton applies it through a replacement invoker.
         self._peft_layer = None
 
         self.fused_func = None
@@ -94,8 +94,7 @@ class MoeRunner:
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
-        # Skip fused func for any adapter method that requires the non-fused path
-        # (LoRA wrapper, or the fork's OFT wrapper via peft_enabled).
+        # Adapter-aware runners require the non-fused path.
         if not (lora_enabled or peft_enabled):
             a2a_backend_name = get_moe_a2a_backend().value
             runner_backend_name = runner_backend.value
@@ -158,10 +157,6 @@ class MoeRunner:
         # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore)
         # bypass the pre-permute step and do their own alignment internally.
         if hasattr(self.runner_core, "run_from_dispatch"):
-            # Expert OFT (MarlinOFTRunnerCore) is a pre-GEMM rotation, not a
-            # post-GEMM hook, so it takes the live peft layer instead of
-            # LoRA's built `hooks` -- mirrors the triton path's `_peft_layer`
-            # branch below.
             if self._peft_layer is not None:
                 return self.runner_core.run_from_dispatch(
                     dispatch_output,
@@ -192,13 +187,6 @@ class MoeRunner:
 
         hooks = _maybe_build_lora_hooks(runner_input)
 
-        # Expert OFT is a pre-GEMM multiplicative rotation, unlike LoRA's
-        # post-GEMM hooks, so it rides a peft-owned replacement for the kernel
-        # INVOKER rather than a branch inside the kernel sequence. The wrapper
-        # reads the layer's OFT buffers per call (streamed-sync visible under
-        # CUDA graph) and self-gates: no buffer => it delegates untouched. Only
-        # the Triton core takes an `invoke` (OFT is triton-only), so it is
-        # threaded conditionally to avoid touching the other runner cores.
         run_kwargs = {}
         if self._peft_layer is not None:
             from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (

@@ -432,13 +432,9 @@ class DeepseekMLAForwardMixin:
         if q_nope is None:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
-        # OFT: the absorbed path folds kv_b_proj into w_kc/w_vc built from the RAW
-        # weight and never calls kv_b_proj.forward, so a ColumnParallelLinearWithOFT
-        # wrapper's input rotation would be silently dropped (Megatron applies it on
-        # the materialized MLA -> K2.5 train/rollout divergence). Rotate the compressed
-        # KV latent once here; for the absorbed k and v this is exactly
-        # kv_b_proj(R @ kv_a_normed). Mirrors the kv_b LoRA correction below
-        # (peft/oft/deepseek_mla_correction.py). k_pe never enters kv_b -> untouched.
+        # The absorbed MLA path reads raw kv_b weights and bypasses the wrapped
+        # projection, so its OFT input rotation would otherwise be skipped.
+        # Rotate the compressed KV latent here; k_pe never enters kv_b_proj.
         if is_kv_b_oft_active(self):
             k_nope = apply_kv_b_oft_rotation(self, k_nope)
 

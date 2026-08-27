@@ -908,20 +908,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
         return getattr(self.language_model, "expert_params_mapping", [])
 
     def should_apply_oft(self, module_name: str) -> bool:
-        """Kimi K2.5 dense-first OFT policy gate, consulted by
-        OFTManager.init_oft_modules (peft/oft/oft_manager.py) via
-        getattr(base_model, "should_apply_oft", None). ``base_model`` there is
-        this wrapper (model_runner.model), not the inner ``language_model``
-        (DeepseekV3ForCausalLM), so the hook lives here -- scoped to K2.5 only,
-        not the shared DeepseekV3ForCausalLM/DeepseekV2 class other DeepSeek
-        models also use.
+        """Apply Kimi K2.5's dense-first OFT policy from the outer model wrapper.
+
+        OFTManager consults this wrapper rather than the inner language model.
         """
         return is_kimi_dense_first_oft_module(module_name)
 
     def validate_oft_target_modules(self, target_modules: Iterable[str]) -> None:
-        """Consulted by validate_model_oft_target_modules (peft/oft/oft_manager.py)
-        to reject unsupported --oft-target-modules / adapter target_modules early.
-        """
+        """Reject OFT targets unsupported by Kimi K2.5's dense-first policy."""
         unsupported = get_kimi_dense_first_unsupported_targets(target_modules)
         if unsupported:
             raise ValueError(
