@@ -232,10 +232,9 @@ class GenerateReqInput:
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
 
-    # The path to the OFT adaptors
-    adapter_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-    # The uid of OFT adaptors, should be initialized by tokenizer manager
-    adapter_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # The path and resolved identity of single-active OFT adapters.
+    adapter_path: Optional[Union[List[Optional[str]], str]] = None
+    adapter_id: Optional[Union[List[Optional[str]], str]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -499,7 +498,7 @@ class GenerateReqInput:
                 raise ValueError("lora_path should be a list or a string.")
 
     def _normalize_adapter_paths(self, num):
-        """Normalize adapter paths for batch processing."""
+        """Normalize single-active adapter paths for batch processing."""
         if self.adapter_path is not None:
             if isinstance(self.adapter_path, str):
                 self.adapter_path = [self.adapter_path] * num
@@ -843,7 +842,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
 
-    # OFT related
+    # Single-active OFT related
     adapter_id: Optional[str] = None  # None means just use the base model
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
