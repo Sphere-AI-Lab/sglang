@@ -1,4 +1,4 @@
-"""Sphere PEFT package: OFT (and, later, our own LoRA) adapters plus the thin
+"""Orbit PEFT package: OFT (and, later, our own LoRA) adapters plus the thin
 integration seams into upstream SGLang.
 
 Curated public API. Everything outside this package should import only from here.
