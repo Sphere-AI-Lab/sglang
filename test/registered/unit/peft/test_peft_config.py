@@ -1,0 +1,46 @@
+from types import SimpleNamespace
+
+import pytest
+
+
+def _args(peft_method, *, enable_lora=True):
+    return SimpleNamespace(
+        enable_lora=enable_lora,
+        peft_method=peft_method,
+        peft_paths=["/models/adapter"] if peft_method is not None else None,
+        peft_target_modules=None,
+        max_oft_block_size=None,
+        max_ofts_per_batch=2,
+        oft_backend="triton",
+        oft_dtype=None,
+        oft_type="canonical_oft",
+        max_oft_chunk_size=16,
+        peft_max_lora_rank=None,
+        peft_double_buffer=False,
+        speculative_algorithm=None,
+    )
+
+
+@pytest.mark.parametrize("peft_method", ["oft", "lora"])
+def test_native_lora_and_single_active_peft_are_mutually_exclusive(peft_method):
+    """Catch either PEFT method initializing alongside native LoRA."""
+    from sglang.srt.peft.config import validate_peft_args
+
+    with pytest.raises(
+        ValueError,
+        match=r"--enable-lora.*--peft-method.*mutually exclusive",
+    ):
+        validate_peft_args(_args(peft_method))
+
+
+@pytest.mark.parametrize(
+    ("enable_lora", "peft_method"),
+    [(True, None), (False, "oft"), (False, "lora")],
+)
+def test_native_lora_and_single_active_peft_validate_independently(
+    enable_lora, peft_method
+):
+    """Catch an over-broad guard that rejects either system on its own."""
+    from sglang.srt.peft.config import validate_peft_args
+
+    validate_peft_args(_args(peft_method, enable_lora=enable_lora))

@@ -205,6 +205,12 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
 
 def validate_peft_args(server_args) -> None:
     """Validate + normalize OFT server args in place (was check_oft_server_args)."""
+    if server_args.enable_lora and server_args.peft_method is not None:
+        raise ValueError(
+            "--enable-lora and --peft-method are mutually exclusive: native "
+            "multi-tenant LoRA and single-active PEFT cannot be initialized together."
+        )
+
     from sglang.srt.utils.common import SUPPORTED_OFT_TARGET_MODULES
 
     assert server_args.max_ofts_per_batch > 0, "max_ofts_per_batch must be positive"
