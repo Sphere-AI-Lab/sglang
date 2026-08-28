@@ -134,7 +134,7 @@ class MarlinOFTRunnerCore:
     ) -> StandardCombineInput:
         from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-        from sglang.srt.peft.oft.torch_ops.oft_ops import apply_block_diag_orth
+        from sglang.srt.oft.torch_ops.oft_ops import apply_block_diag_orth
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

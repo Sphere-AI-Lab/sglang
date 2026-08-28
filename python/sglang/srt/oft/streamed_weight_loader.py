@@ -7,7 +7,7 @@ from typing import Dict, List, Literal, Sequence, Tuple
 
 import torch
 
-from sglang.srt.peft.oft.oft_registry import OFTRef
+from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
@@ -143,7 +143,7 @@ def _partition_expert_oft_tensors(
     is also why MLA names are routed correctly without any MLA-specific code.
     """
     from sglang.srt.layers.utils import get_layer_id
-    from sglang.srt.peft.oft._streamed_audit import record_expert_partition
+    from sglang.srt.oft._streamed_audit import record_expert_partition
 
     fused_expert_layer_dict: Dict[int, Dict[int, Dict[str, torch.Tensor]]] = {}
     dsv4_expert_layer_dict: Dict[int, Dict[int, Dict[str, torch.Tensor]]] = {}
@@ -262,8 +262,8 @@ def _flush_oft_group_chunk(
     target_device,
     group_items,
 ) -> None:
-    from sglang.srt.peft.oft._streamed_audit import record_dense_write
-    from sglang.srt.peft.oft.torch_ops.oft_ops import precompute_oft_r
+    from sglang.srt.oft._streamed_audit import record_dense_write
+    from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
 
     normalized_items = []
     for item in group_items:
@@ -460,7 +460,7 @@ def load_streamed_oft_adapter(
     # buffer. Legacy shared-R names (single q_proj with bit-identical k/v)
     # pass through unchanged — they are handled by the duplicate-skip logic
     # downstream.
-    from sglang.srt.peft.oft.mem_pool import normalize_merged_oft_weights
+    from sglang.srt.oft.mem_pool import normalize_merged_oft_weights
 
     named_tensors_dict = dict(named_tensors)
     if len(named_tensors_dict) == len(named_tensors):

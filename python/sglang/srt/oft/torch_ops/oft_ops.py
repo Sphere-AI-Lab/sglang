@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 
 try:
-    from sglang.srt.peft.oft.triton_ops.cayley_neumann import cayley_neumann_fwd as _triton_cayley_fwd
+    from sglang.srt.oft.triton_ops.cayley_neumann import cayley_neumann_fwd as _triton_cayley_fwd
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False

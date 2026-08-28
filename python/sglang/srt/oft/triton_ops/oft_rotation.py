@@ -10,8 +10,8 @@ for both forward and backward passes:
 
 import torch
 
-from sglang.srt.peft.oft.triton_ops.sgemm_oft_r import sgemm_oft_r_fwd
-from sglang.srt.peft.oft.triton_ops.sgemm_oft_r_bwd import sgemm_oft_r_grad_R
+from sglang.srt.oft.triton_ops.sgemm_oft_r import sgemm_oft_r_fwd
+from sglang.srt.oft.triton_ops.sgemm_oft_r_bwd import sgemm_oft_r_grad_R
 
 
 class OFTRotationFunction(torch.autograd.Function):

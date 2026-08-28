@@ -1,7 +1,7 @@
 import logging
 from typing import Type
 
-from sglang.srt.peft.oft.backend.base_backend import BaseOFTBackend
+from sglang.srt.oft.backend.base_backend import BaseOFTBackend
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ def register_oft_backend(name):
 
 @register_oft_backend("triton")
 def create_triton_backend():
-    from sglang.srt.peft.oft.backend.triton_backend import TritonOFTBackend
+    from sglang.srt.oft.backend.triton_backend import TritonOFTBackend
 
     return TritonOFTBackend
 
@@ -33,7 +33,7 @@ def create_triton_csgmv_backend():
 
 @register_oft_backend("torch_native")
 def create_torch_native_backend():
-    from sglang.srt.peft.oft.backend.torch_backend import TorchNativeOFTBackend
+    from sglang.srt.oft.backend.torch_backend import TorchNativeOFTBackend
 
     return TorchNativeOFTBackend
 

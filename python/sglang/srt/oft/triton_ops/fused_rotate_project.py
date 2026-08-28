@@ -25,7 +25,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.peft.oft.utils import validate_oft_block_size
+from sglang.srt.oft.utils import validate_oft_block_size
 
 
 @triton.jit
@@ -1112,14 +1112,14 @@ if __name__ == "__main__":
     large-decode (256) and prefill (1024, 4096, 8192) so the per-regime perf gap is
     visible end-to-end.
 
-    Run: python python/sglang/srt/peft/oft/triton_ops/fused_rotate_project.py
+    Run: python python/sglang/srt/oft/triton_ops/fused_rotate_project.py
     """
     import time
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required to run this benchmark.")
 
-    from sglang.srt.peft.oft.triton_ops import gemm_oft_r_fwd
+    from sglang.srt.oft.triton_ops import gemm_oft_r_fwd
 
     def _production_legacy_path(x, R_4d, W, output_sizes, bias, slot_t, bsv_t):
         """Mirror SGLang's current OFT decode path: ``gemm_oft_r_fwd`` (Triton rotation,

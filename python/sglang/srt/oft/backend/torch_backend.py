@@ -1,8 +1,8 @@
 import torch
 
-from sglang.srt.peft.oft.backend.base_backend import BaseOFTBackend
-from sglang.srt.peft.oft.torch_ops.oft_ops import sgemm_oft_r_fwd
-from sglang.srt.peft.oft.utils import OFTBatchInfo, generate_sequence_lengths
+from sglang.srt.oft.backend.base_backend import BaseOFTBackend
+from sglang.srt.oft.torch_ops.oft_ops import sgemm_oft_r_fwd
+from sglang.srt.oft.utils import OFTBatchInfo, generate_sequence_lengths
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 

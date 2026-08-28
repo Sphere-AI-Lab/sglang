@@ -16,7 +16,7 @@
 from dataclasses import dataclass, fields, replace
 from typing import List, Optional, Union
 
-from sglang.srt.peft.base.registry import AdapterRef, AdapterRegistry
+from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
 
 @dataclass(frozen=True)

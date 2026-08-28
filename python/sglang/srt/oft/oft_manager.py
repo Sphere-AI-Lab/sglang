@@ -25,15 +25,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.peft.base.manager import AdapterManager
-from sglang.srt.peft.oft.backend.base_backend import BaseOFTBackend
-from sglang.srt.peft.oft.backend.oft_registry import get_backend_from_name
-from sglang.srt.peft.oft.layers import BaseLayerWithOFT, get_oft_layer
-from sglang.srt.peft.oft.oft import OFTAdapter
-from sglang.srt.peft.oft.oft_config import OFTConfig
-from sglang.srt.peft.oft.oft_registry import OFTRef
-from sglang.srt.peft.oft.mem_pool import EMPTY_SLOT, OFTMemoryPool
-from sglang.srt.peft.oft.utils import (
+from sglang.srt.oft.base.manager import AdapterManager
+from sglang.srt.oft.backend.base_backend import BaseOFTBackend
+from sglang.srt.oft.backend.oft_registry import get_backend_from_name
+from sglang.srt.oft.layers import BaseLayerWithOFT, get_oft_layer
+from sglang.srt.oft.oft import OFTAdapter
+from sglang.srt.oft.oft_config import OFTConfig
+from sglang.srt.oft.oft_registry import OFTRef
+from sglang.srt.oft.mem_pool import EMPTY_SLOT, OFTMemoryPool
+from sglang.srt.oft.utils import (
     get_normalized_target_modules,
     validate_oft_block_size,
 )
@@ -748,7 +748,7 @@ class OFTManager(AdapterManager):
         base_layer, unchanged. Invalidates the _find_fused_moe_modules cache so
         every later caller re-scans and sees through the wrapper to base_layer."""
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-        from sglang.srt.peft.oft.layers import FusedMoEWithOFT
+        from sglang.srt.oft.layers import FusedMoEWithOFT
         from sglang.srt.utils import replace_submodule
 
         # Only wrap FusedMoE when an expert projection is actually OFT-targeted
@@ -1011,7 +1011,7 @@ class OFTManager(AdapterManager):
         (input to down_proj); intermediate_size IS TP-sharded, so each
         TP rank takes its slice of the block-diagonal R.
         """
-        from sglang.srt.peft.oft.torch_ops.oft_ops import precompute_oft_r
+        from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
 
         if not ew_dict:
             return
@@ -1166,7 +1166,7 @@ class OFTManager(AdapterManager):
         If it does not, raise with diagnostics instead of silently replacing
         the graph-captured tensor and disabling CUDA Graph.
         """
-        from sglang.srt.peft.oft.torch_ops.oft_ops import precompute_oft_r
+        from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
 
         moe_modules = self._find_fused_moe_modules()
         if not moe_modules:
@@ -1398,11 +1398,11 @@ class OFTManager(AdapterManager):
         double-buffer phase's four fill locations; the embed/lm_head/
         added_tokens skip is a known gap, not a data-corrupting mishandling.
         """
-        from sglang.srt.peft.oft.mem_pool import normalize_merged_oft_weights
-        from sglang.srt.peft.oft.streamed_weight_loader import (
+        from sglang.srt.oft.mem_pool import normalize_merged_oft_weights
+        from sglang.srt.oft.streamed_weight_loader import (
             _partition_expert_oft_tensors,
         )
-        from sglang.srt.peft.oft.torch_ops.oft_ops import precompute_oft_r
+        from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
 
         memory_pool = self.memory_pool
         block_size = (
@@ -1503,7 +1503,7 @@ class OFTManager(AdapterManager):
         )
 
     def _make_streamed_ref(self, name, version, adapter_id=None, config=None):
-        from sglang.srt.peft.oft.oft_registry import OFTRef
+        from sglang.srt.oft.oft_registry import OFTRef
 
         # Single-active convention: the id IS the name when the tokenizer supplies
         # none (mirrors _ensure_streaming_oft_adapter_slot). OFTRef rejects a None

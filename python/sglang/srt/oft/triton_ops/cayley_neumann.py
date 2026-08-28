@@ -16,7 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.peft.oft.torch_ops.oft_ops import cayley_neumann as _torch_cayley_neumann
+from sglang.srt.oft.torch_ops.oft_ops import cayley_neumann as _torch_cayley_neumann
 
 NUM_TERMS = 5  # R = I + 2Q + 2Q² + 2Q³ + Q⁴
 # fp32 needs 2x registers per element, so lower threshold

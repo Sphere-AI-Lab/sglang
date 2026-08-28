@@ -18,7 +18,7 @@ from typing import Dict, Optional
 
 from huggingface_hub import snapshot_download
 
-from sglang.srt.peft.oft.utils import validate_oft_block_size
+from sglang.srt.oft.utils import validate_oft_block_size
 
 
 class OFTConfig:

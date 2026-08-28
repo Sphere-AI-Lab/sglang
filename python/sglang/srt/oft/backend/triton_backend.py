@@ -2,9 +2,9 @@ import os
 
 import torch
 
-from sglang.srt.peft.oft.backend.base_backend import BaseOFTBackend
-from sglang.srt.peft.oft.triton_ops import gemm_oft_r_fwd, sgemm_oft_r_fwd
-from sglang.srt.peft.oft.utils import OFTBatchInfo, generate_sequence_lengths
+from sglang.srt.oft.backend.base_backend import BaseOFTBackend
+from sglang.srt.oft.triton_ops import gemm_oft_r_fwd, sgemm_oft_r_fwd
+from sglang.srt.oft.utils import OFTBatchInfo, generate_sequence_lengths
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -145,7 +145,7 @@ class TritonOFTBackend(BaseOFTBackend):
                 "run_fused_gate_up_inputs: only single-adapter fast path is supported"
             )
 
-        from sglang.srt.peft.oft.triton_ops import fused_rotate_gate_up_inputs
+        from sglang.srt.oft.triton_ops import fused_rotate_gate_up_inputs
 
         if not x.is_contiguous():
             x = x.contiguous()
@@ -189,7 +189,7 @@ class TritonOFTBackend(BaseOFTBackend):
                 "run_fused_rotate_project: only QKV uses the fused fast path"
             )
 
-        from sglang.srt.peft.oft.triton_ops import (
+        from sglang.srt.oft.triton_ops import (
             fused_rotate_project_qkv,
         )
         if not x.is_contiguous():

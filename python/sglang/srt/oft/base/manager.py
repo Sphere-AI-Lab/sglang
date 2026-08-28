@@ -2,7 +2,7 @@ from contextlib import nullcontext
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.peft.oft.utils import get_target_module_name
+from sglang.srt.oft.utils import get_target_module_name
 from sglang.srt.utils import replace_submodule
 
 

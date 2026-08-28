@@ -24,8 +24,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.peft.oft.backend.base_backend import BaseOFTBackend
-from sglang.srt.peft.oft.utils import OFTBatchInfo
+from sglang.srt.oft.backend.base_backend import BaseOFTBackend
+from sglang.srt.oft.utils import OFTBatchInfo
 
 
 import atexit as _atexit
@@ -444,7 +444,7 @@ class VocabParallelEmbeddingWithOFT(BaseLayerWithOFT):
         """
         # return base_output
         raise NotImplementedError(
-            "Error in sglang/python/sglang/srt/peft/oft/layers.py - VocabParallelEmbeddingWithOFT \n"
+            "Error in sglang/python/sglang/srt/oft/layers.py - VocabParallelEmbeddingWithOFT \n"
             "Current SGLang codebase did not support tuned OFT with extra/added tokens. \n"
             "[TODO]: \n"
             "1. Refer to the LoRA extra token implementation for guidance \n"
@@ -481,7 +481,7 @@ class VocabParallelEmbeddingWithOFT(BaseLayerWithOFT):
     def slice_oft_r_weights(self, R: torch.Tensor, tp_rank: int):
         # For TP=1, no slicing needed
         # OFT R weights are not sliced for embedding (operates on full embedding dim)
-        # For TP>1, Need to modify code in: sglang/python/sglang/srt/peft/oft/mem_pool.py
+        # For TP>1, Need to modify code in: sglang/python/sglang/srt/oft/mem_pool.py
         # return R
         if tp_rank > 1:
             raise NotImplementedError(
@@ -553,7 +553,7 @@ class ParallelLMHeadWithOFT(BaseLayerWithOFT):
 
     def slice_oft_r_weights(self, R: torch.Tensor, tp_rank: int):
         # For TP=1, no slicing needed
-        # For TP>1, need to modify code in: sglang/python/sglang/srt/peft/oft/mem_pool.py
+        # For TP>1, need to modify code in: sglang/python/sglang/srt/oft/mem_pool.py
         # return R
         if tp_rank > 1:
             raise NotImplementedError(

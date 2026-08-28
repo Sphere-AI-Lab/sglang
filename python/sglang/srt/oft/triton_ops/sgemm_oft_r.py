@@ -6,7 +6,7 @@ import triton.language as tl
 # picker is imported rather than copied so the two kernels cannot drift into
 # disagreeing about what fits -- they have identical staging shapes and differ
 # only in BLOCK_S (16 here, 64 there), which is already a parameter of it.
-from sglang.srt.peft.oft.triton_ops.gemm_oft_r import _pick_tiles
+from sglang.srt.oft.triton_ops.gemm_oft_r import _pick_tiles
 
 
 @triton.jit

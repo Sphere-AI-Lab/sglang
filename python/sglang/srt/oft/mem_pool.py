@@ -6,12 +6,12 @@ import torch
 from sglang.srt.distributed import divide
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.utils import get_stacked_multiply as _lora_get_stacked_multiply
-from sglang.srt.peft.base.mem_pool import EMPTY_SLOT, AdapterMemPool, EmptySlot
-from sglang.srt.peft.oft.layers import BaseLayerWithOFT
-from sglang.srt.peft.oft.oft import OFTAdapter
-from sglang.srt.peft.oft.oft_config import OFTConfig
-from sglang.srt.peft.oft.oft_registry import OFTRef
-from sglang.srt.peft.oft.utils import (
+from sglang.srt.oft.base.mem_pool import EMPTY_SLOT, AdapterMemPool, EmptySlot
+from sglang.srt.oft.layers import BaseLayerWithOFT
+from sglang.srt.oft.oft import OFTAdapter
+from sglang.srt.oft.oft_config import OFTConfig
+from sglang.srt.oft.oft_registry import OFTRef
+from sglang.srt.oft.utils import (
     EMBEDDING_NAMES,
     ROW_PARALLELISM_LINEAR_OFT_NAMES,
     get_hidden_dim,
@@ -731,7 +731,7 @@ class OFTMemoryPool(AdapterMemPool):
                 compact_weight: (num_blocks_adapter, n_elements) CPU tensor, or None
                 block_size: adapter's block size
             """
-            from sglang.srt.peft.oft.torch_ops.oft_ops import precompute_oft_r
+            from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
 
             if compact_weight is None:
                 _fill_identity(buffer_view, block_size)
@@ -957,7 +957,7 @@ class OFTMemoryPool(AdapterMemPool):
         HF export duplicates that R into q/k/v (or gate/up), so only the
         primary sub-module writes; the duplicates are skipped.
         """
-        from sglang.srt.peft.oft.torch_ops.oft_ops import precompute_oft_r
+        from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
 
         # Handle embedding layers separately
         if "embed_tokens" in name or "lm_head" in name:
@@ -998,7 +998,7 @@ class OFTMemoryPool(AdapterMemPool):
         block_size: int,
     ):
         """Write an embedding OFT tensor directly into the GPU embedding R_buffer."""
-        from sglang.srt.peft.oft.torch_ops.oft_ops import precompute_oft_r
+        from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
 
         if "embed_tokens" in name and "embed_tokens" in self.embedding_R_buffer:
             buffer = self.embedding_R_buffer["embed_tokens"]

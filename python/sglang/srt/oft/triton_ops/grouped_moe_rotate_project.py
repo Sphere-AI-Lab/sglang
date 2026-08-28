@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.peft.oft.utils import validate_oft_block_size
+from sglang.srt.oft.utils import validate_oft_block_size
 
 
 @triton.jit
@@ -378,7 +378,7 @@ def fused_split_w13_oft_grouped_moe(
     """Return expert FC1 output shaped (M, top_k, 2 * half_intermediate).
 
     Gate rows use w1_oft_r, up rows use w3_oft_r. This helper is OFT-specific
-    and intentionally lives under sglang.srt.peft.oft.triton_ops, even though the
+    and intentionally lives under sglang.srt.oft.triton_ops, even though the
     call site is the MoE runner.
     """
     _validate_bf16("hidden_states", hidden_states)

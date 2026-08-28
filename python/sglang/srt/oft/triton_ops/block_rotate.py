@@ -149,7 +149,7 @@ def apply_oft_rotation_triton(
             f"oft_r must be 4D (experts, blocks, bs, bs), got {tuple(oft_r.shape)}"
         )
     bs = oft_r.shape[-1]
-    from sglang.srt.peft.oft.utils import validate_oft_block_size
+    from sglang.srt.oft.utils import validate_oft_block_size
 
     validate_oft_block_size(bs)
     if tuple(oft_r.shape[-2:]) != (bs, bs):

@@ -67,7 +67,7 @@ def _oft_prerotate(
     from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
         moe_align_block_size,
     )
-    from sglang.srt.peft.oft.triton_ops import apply_oft_rotation_triton
+    from sglang.srt.oft.triton_ops import apply_oft_rotation_triton
 
     A = apply_oft_rotation_triton(
         A,
@@ -304,7 +304,7 @@ def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
         # dequant pass, no new rotation-kernel numerics, no new golden-drift
         # risk on the already-validated bf16 rotation math.
         if A.dtype == torch.float8_e4m3fn:
-            from sglang.srt.peft.oft.triton_ops.parity_dequant_fp8 import (
+            from sglang.srt.oft.triton_ops.parity_dequant_fp8 import (
                 dequant_fp8_block_triton,
             )
 

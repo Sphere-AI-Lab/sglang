@@ -29,9 +29,9 @@ from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.peft.oft.backend.base_backend import BaseOFTBackend
-from sglang.srt.peft.oft.oft_config import OFTConfig
-from sglang.srt.peft.oft.utils import get_hf_config_attr
+from sglang.srt.oft.backend.base_backend import BaseOFTBackend
+from sglang.srt.oft.oft_config import OFTConfig
+from sglang.srt.oft.utils import get_hf_config_attr
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -123,7 +123,7 @@ class OFTAdapter(nn.Module):
         self._normalize_weights()
 
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
-        from sglang.srt.peft.oft.utils import get_normalized_target_modules
+        from sglang.srt.oft.utils import get_normalized_target_modules
 
         normalized_target_modules = get_normalized_target_modules(
             self.config.target_modules
