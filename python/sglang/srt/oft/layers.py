@@ -350,6 +350,20 @@ class BaseLayerWithOFT(nn.Module):
     def get_local_tp_rank(self) -> int:
         return getattr(self.base_layer, "tp_rank", 0)
 
+    @property
+    def oft_active(self) -> bool:
+        """Mirror of upstream ``lora/layers.py``'s ``lora_active`` (v0.5.18).
+
+        Deliberate deviation: upstream additionally requires
+        ``backend.batch_info is not None`` so DP-attention idle forwards fall
+        back to the base path. OFT does not serve DP-attention idle forwards,
+        and a ``set_oft`` layer running without a prepared batch is a bug we
+        want loud (see the OFT tc_piecewise gate in server_args), not a silent
+        base-path fallback. Revisit together with a ``reset_batch_state``
+        mirror if DP-idle support ever lands.
+        """
+        return self.set_oft
+
     def get_oft_input_dim(self) -> int:
         if hasattr(self.base_layer, "input_size_per_partition"):
             return self.base_layer.input_size_per_partition
@@ -473,7 +487,7 @@ class VocabParallelEmbeddingWithOFT(BaseLayerWithOFT):
             base_output = self.extra_token_embedding(input_, base_output)
 
         # Apply OFT if configured (rotate embedding output)
-        if self.set_oft:
+        if self.oft_active:
             base_output = self.apply_oft(base_output)
 
         return base_output
@@ -541,7 +555,7 @@ class ParallelLMHeadWithOFT(BaseLayerWithOFT):
     def forward(self, hidden_states: torch.Tensor):
         # OFT: rotate input FIRST, then apply base linear
         # (Unlike LoRA which computes base output first, then adds correction)
-        if self.set_oft:
+        if self.oft_active:
             hidden_states = self.apply_oft(hidden_states)
 
         # Apply base linear transformation on (possibly rotated) input
@@ -602,7 +616,7 @@ class ColumnParallelLinearWithOFT(BaseLayerWithOFT):
         the absorbed algebra moves the rotation to the query side, callers can
         request ``transpose=True`` to apply ``x @ R.T``.
         """
-        if not self.set_oft:
+        if not self.oft_active:
             return x
         if n_groups <= 0:
             raise ValueError(f"n_groups must be positive, got {n_groups}")
@@ -627,7 +641,7 @@ class ColumnParallelLinearWithOFT(BaseLayerWithOFT):
 
     def forward(self, input_: torch.Tensor):
         # OFT: rotate input FIRST, then apply base forward
-        if self.set_oft:
+        if self.oft_active:
             input_ = self.apply_oft(input_)
 
         # duplicate the logic in ColumnParallelLinear
@@ -699,7 +713,7 @@ class MergedColumnParallelLinearWithOFT(ColumnParallelLinearWithOFT):
         return R
 
     def forward(self, input_: torch.Tensor):
-        if not self.set_oft:
+        if not self.oft_active:
             return self.base_layer.forward(input_)
 
         if self.R_buffer.shape[-3] % 2 != 0:
@@ -751,7 +765,7 @@ class QKVParallelLinearWithOFT(ColumnParallelLinearWithOFT):
         return R
 
     def forward(self, input_: torch.Tensor):
-        if not self.set_oft:
+        if not self.oft_active:
             return self.base_layer.forward(input_)
 
         if self.R_buffer.shape[-3] % 3 != 0:
@@ -819,7 +833,7 @@ class RowParallelLinearWithOFT(BaseLayerWithOFT):
             input_parallel = splitted_input[tp_rank].contiguous()
 
         # OFT: rotate input FIRST, then apply base forward
-        if self.set_oft:
+        if self.oft_active:
             input_parallel = self.apply_oft(input_parallel)
 
         output_parallel = self.base_layer.quant_method.apply(
@@ -905,7 +919,7 @@ class ReplicatedLinearWithOFT(BaseLayerWithOFT):
     def forward(self, x: torch.Tensor):
         # Mirror ReplicatedLinear.forward: single un-sharded GEMM, no gather,
         # no tp_size divide (see ReplicatedLinearWithLoRA).
-        if not self.set_oft:
+        if not self.oft_active:
             return self.base_layer.forward(x)
 
         if self.R_buffer.shape[-3] % 2 != 0:
