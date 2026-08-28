@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
+from sglang.srt.arg_groups.arg_utils import NS, A
 from sglang.srt.peft.lora.lora_registry import LoRARef
 from sglang.srt.peft.oft.oft_registry import OFTRef
 
@@ -34,25 +35,28 @@ class PEFTArgs:
     # replaces the former enable_oft / enable_peft_lora boolean pair -- two bools
     # could encode illegal states (both set) that the single-active invariant
     # forbids; a 3-valued enum makes those unrepresentable.
-    peft_method: Optional[str] = None
+    peft_method: A[Optional[str], NS("lora")] = None
 
     # Shared single-active PEFT inputs (the active method is `peft_method`):
     #   peft_paths          adapter path map; normalized to OFTRef or LoRARef by
     #                       peft_method in validate_peft_args.
     #   peft_target_modules module allow-list; method-specific normalization
     #                       ("all"/embed/lm_head handling is OFT-only) in validate.
-    peft_paths: Optional[
-        Union[
-            dict[str, str],
-            List[dict[str, str]],
-            List[str],
-            List[OFTRef],
-            List["LoRARef"],
-        ]
+    peft_paths: A[
+        Optional[
+            Union[
+                dict[str, str],
+                List[dict[str, str]],
+                List[str],
+                List[OFTRef],
+                List["LoRARef"],
+            ]
+        ],
+        NS("lora"),
     ] = None
-    peft_target_modules: Optional[Union[set[str], List[str]]] = None
+    peft_target_modules: A[Optional[Union[set[str], List[str]]], NS("lora")] = None
 
-    max_oft_block_size: Optional[int] = None
+    max_oft_block_size: A[Optional[int], NS("lora")] = None
     # Default 2 covers the typical single-active-adapter workload: slot 0 holds
     # the auto-registered `None` placeholder (identity = base/reference model,
     # used for KL against base in RL), slot 1 holds the active OFT adapter.
@@ -61,28 +65,28 @@ class PEFTArgs:
     # Multi-tenant deployments serving more than one adapter concurrently
     # should override with `--max-ofts-per-batch <N>`; for the segmented
     # kernel to run, also pass `--max-ofts-per-batch >= 3`.
-    max_ofts_per_batch: int = 2
-    oft_backend: str = "triton"
-    oft_dtype: Optional[str] = None
+    max_ofts_per_batch: A[int, NS("lora")] = 2
+    oft_backend: A[str, NS("lora")] = "triton"
+    oft_dtype: A[Optional[str], NS("lora")] = None
     # Single global signal for split(canonical)-vs-fused OFT (attention qkv,
     # dense MLP gate_up, MoE expert gate_up all derive split-vs-fused from
     # this one flag; see sglang.srt.peft.oft.utils.detect_canonical_split_active
     # and oft/mem_pool.py's _declare_expert_groups). "canonical_oft" is orbit's
     # ONLY trained variant (Megatron-Bridge canonical_oft emits per-sub-
     # projection SPLIT rotations); "oft" is the legacy shared-R fused variant.
-    oft_type: str = "canonical_oft"
-    max_oft_chunk_size: Optional[int] = 16
+    oft_type: A[str, NS("lora")] = "canonical_oft"
+    max_oft_chunk_size: A[Optional[int], NS("lora")] = 16
 
     # peft-lora (single-active method under srt/peft/lora): the low-rank dim.
     # Distinct from OFT's max_oft_block_size -- different hyperparameter, kept
     # separate. Paths/target-modules are shared (peft_paths/peft_target_modules).
-    peft_max_lora_rank: Optional[int] = None
+    peft_max_lora_rank: A[Optional[int], NS("lora")] = None
 
     # Double-buffer weight-sync (async RL, NCCL transport). When set, adapter
     # memory pools reserve a staging slot and the stage/activate endpoints are
     # live. Orbit sets this alongside --adapter-double-buffer. Off => in-place
     # single-active sync (IPC/colocate), byte-identical to today.
-    peft_double_buffer: bool = False
+    peft_double_buffer: A[bool, NS("lora")] = False
 
     @property
     def enable_peft(self) -> bool:

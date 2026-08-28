@@ -285,6 +285,32 @@ def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
                 mul_routed_weight, top_k, config, **kw,
             )
 
+        # FP8 activations cannot be tl.dot operands in the rotation kernel (see
+        # _oft_prerotate's docstring). use_fp8_w8a8 alone is NOT the right check
+        # here -- that's the WEIGHT quantization scheme, and fp8-weight OFT-MoE
+        # with rotation on raw bf16 activations is validated and correct. The
+        # actual risk is A itself already being pre-quantized (e.g. the opt-in
+        # SGLANG_OPT_MOE_QUANT_ONCE a1_q path), which would otherwise silently
+        # rotate the wrong tensor or crash inside Triton.
+        #
+        # Fix: undo the pre-quantization for this one call. Dequant with the
+        # existing single-pass block-dequant kernel (built for OFT weight-parity
+        # checks in Megatron-Bridge import; same per-token-group math applies to
+        # activations), rotate in bf16 as usual, then hand back with
+        # A_scale=None so invoke_fused_moe_kernel's own quant branch
+        # (fused_moe_triton_kernels.py: `elif _is_cuda: ... =
+        # sglang_per_token_group_quant_fp8(A, block_k)`) re-quantizes it -- the
+        # exact path already used when SGLANG_OPT_MOE_QUANT_ONCE is off. One
+        # dequant pass, no new rotation-kernel numerics, no new golden-drift
+        # risk on the already-validated bf16 rotation math.
+        if A.dtype == torch.float8_e4m3fn:
+            from sglang.srt.peft.oft.triton_ops.parity_dequant_fp8 import (
+                dequant_fp8_block_triton,
+            )
+
+            A = dequant_fp8_block_triton(A, A_scale, out_dtype=C.dtype)
+            A_scale = None
+
         a, c, tw, ti, sti, ei, ntpp = _oft_prerotate(
             A,
             oft_r,
