@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 OFT_BACKEND_CHOICES = ["triton", "torch_native"]
 OFT_TYPE_CHOICES = ["oft", "canonical_oft"]
+OFT_IMPL_CHOICES = ["peft", "sibling"]
 
 
 @dataclass(kw_only=True)
@@ -67,6 +68,12 @@ class PEFTArgs:
     # kernel to run, also pass `--max-ofts-per-batch >= 3`.
     max_ofts_per_batch: A[int, NS("lora")] = 2
     oft_backend: A[str, NS("lora")] = "triton"
+    # Transitional (sibling restructure): which OFT implementation serves when
+    # peft_method == "oft". "peft" = srt/peft/oft (today's path); "sibling" =
+    # srt/oft, the srt/lora-shaped mirror. Worker-side only: the tokenizer-side
+    # registry/refs stay on srt/peft in BOTH modes. Equivalence testing flips
+    # this; the flag disappears at cutover.
+    oft_impl: A[str, NS("lora")] = "peft"
     oft_dtype: A[Optional[str], NS("lora")] = None
     # Single global signal for split(canonical)-vs-fused OFT (attention qkv,
     # dense MLP gate_up, MoE expert gate_up all derive split-vs-fused from
@@ -205,10 +212,21 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         help="Reserve a staging slot and enable the double-buffer stage/activate "
              "adapter endpoints (async-RL NCCL weight-sync).",
     )
-
+    parser.add_argument(
+        "--oft-impl",
+        type=str,
+        default="peft",
+        choices=OFT_IMPL_CHOICES,
+        help="Transitional: which OFT implementation serves for peft_method="
+        "'oft'. 'peft' = srt/peft/oft (default); 'sibling' = srt/oft.",
+    )
 
 def validate_peft_args(server_args) -> None:
     """Validate + normalize OFT server args in place (was check_oft_server_args)."""
+    if getattr(server_args, "oft_impl", "peft") not in OFT_IMPL_CHOICES:
+        raise ValueError(
+            f"Invalid --oft-impl {server_args.oft_impl!r}; choose from {OFT_IMPL_CHOICES}."
+        )
     if server_args.enable_lora and server_args.peft_method is not None:
         raise ValueError(
             "--enable-lora and --peft-method are mutually exclusive: native "
