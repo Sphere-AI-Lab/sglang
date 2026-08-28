@@ -250,10 +250,14 @@ def validate_peft_args(server_args) -> None:
                 "Currently OFT is only compatible with NGRAM speculative decoding."
             )
 
-        # Parse peft_paths -> List[OFTRef]
-        if isinstance(server_args.peft_paths, list):
-            adapter_paths = server_args.peft_paths
-            server_args.peft_paths = []
+        # Parse peft_paths -> List[OFTRef]. Normalize through locals -- not
+        # server_args.peft_paths directly -- because ServerArgs is read-only
+        # once __post_init__ reaches materialize_declarations() (well before
+        # this call), so writes must go through _late_resolution below.
+        peft_paths = server_args.peft_paths
+        if isinstance(peft_paths, list):
+            adapter_paths = peft_paths
+            peft_paths = []
             for adapter_path in adapter_paths:
                 if isinstance(adapter_path, str):
                     if "=" in adapter_path:
@@ -279,28 +283,29 @@ def validate_peft_args(server_args) -> None:
                         f"Invalid type for item in --peft-paths list: {type(adapter_path)}. "
                         "Expected a string or a dictionary."
                     )
-                server_args.peft_paths.append(oft_ref)
-        elif isinstance(server_args.peft_paths, dict):
-            server_args.peft_paths = [
+                peft_paths.append(oft_ref)
+        elif isinstance(peft_paths, dict):
+            peft_paths = [
                 OFTRef(adapter_name=k, adapter_path=v, pinned=False)
-                for k, v in server_args.peft_paths.items()
+                for k, v in peft_paths.items()
             ]
-        elif server_args.peft_paths is None:
-            server_args.peft_paths = []
+        elif peft_paths is None:
+            peft_paths = []
         else:
             raise ValueError(
-                f"Invalid type for --peft-paths: {type(server_args.peft_paths)}. "
+                f"Invalid type for --peft-paths: {type(peft_paths)}. "
                 "Expected a list or a dictionary."
             )
 
         # Expand target modules (OFT-specific "all"/embed/lm_head handling)
-        if server_args.peft_target_modules:
-            server_args.peft_target_modules = set(server_args.peft_target_modules)
-            if "all" in server_args.peft_target_modules:
+        peft_target_modules = server_args.peft_target_modules
+        if peft_target_modules:
+            peft_target_modules = set(peft_target_modules)
+            if "all" in peft_target_modules:
                 assert (
-                    len(server_args.peft_target_modules) == 1
+                    len(peft_target_modules) == 1
                 ), "If 'all' is specified in --peft-target-modules, it should be the only module specified."
-                server_args.peft_target_modules = set(SUPPORTED_OFT_TARGET_MODULES)
+                peft_target_modules = set(SUPPORTED_OFT_TARGET_MODULES)
 
                 # OFT currently only supports torch_native backend,
                 # which does not support embedding / lm_head layers yet.
@@ -308,12 +313,12 @@ def validate_peft_args(server_args) -> None:
                     "OFT backend does not yet support embedding or lm_head layers; "
                     "dropping 'embed_tokens' and 'lm_head' from --peft-target-modules=all."
                 )
-                server_args.peft_target_modules.discard("embed_tokens")
-                server_args.peft_target_modules.discard("lm_head")
+                peft_target_modules.discard("embed_tokens")
+                peft_target_modules.discard("lm_head")
 
         # Ensure sufficient information is provided for OFT initialization.
-        assert server_args.peft_paths or (
-            server_args.max_oft_block_size and server_args.peft_target_modules
+        assert peft_paths or (
+            server_args.max_oft_block_size and peft_target_modules
         ), "When no initial --peft-paths is provided, you need to specify both --max-oft-block-size and --peft-target-modules for OFT initialization."
 
         if server_args.max_oft_chunk_size is not None:
@@ -321,6 +326,12 @@ def validate_peft_args(server_args) -> None:
                 16 <= server_args.max_oft_chunk_size <= 128
                 and (server_args.max_oft_chunk_size & (server_args.max_oft_chunk_size - 1)) == 0
             ), "--max-oft-chunk-size must be a power of 2 between 16 and 128."
+
+        server_args._late_resolution(
+            "validate_peft_args",
+            peft_paths=peft_paths,
+            peft_target_modules=peft_target_modules,
+        )
 
     # ------------------------------------------------------------------ #
     #  peft-lora (single-active). Mirrors the OFT block above, simpler
@@ -330,9 +341,11 @@ def validate_peft_args(server_args) -> None:
         from sglang.srt.peft.lora.lora_registry import LoRARef
 
         # Parse peft_paths -> List[LoRARef] (mirror the OFT branch, LoRARef keys).
-        if isinstance(server_args.peft_paths, list):
-            adapter_paths = server_args.peft_paths
-            server_args.peft_paths = []
+        # Normalize through locals -- see the OFT branch's comment on why.
+        peft_paths = server_args.peft_paths
+        if isinstance(peft_paths, list):
+            adapter_paths = peft_paths
+            peft_paths = []
             for adapter_path in adapter_paths:
                 if isinstance(adapter_path, str):
                     if "=" in adapter_path:
@@ -360,26 +373,33 @@ def validate_peft_args(server_args) -> None:
                         f"Invalid type for item in --peft-paths list: {type(adapter_path)}. "
                         "Expected a string or a dictionary."
                     )
-                server_args.peft_paths.append(lora_ref)
-        elif isinstance(server_args.peft_paths, dict):
-            server_args.peft_paths = [
+                peft_paths.append(lora_ref)
+        elif isinstance(peft_paths, dict):
+            peft_paths = [
                 LoRARef(adapter_name=k, adapter_path=v, pinned=False)
-                for k, v in server_args.peft_paths.items()
+                for k, v in peft_paths.items()
             ]
-        elif server_args.peft_paths is None:
-            server_args.peft_paths = []
+        elif peft_paths is None:
+            peft_paths = []
         else:
             raise ValueError(
-                f"Invalid type for --peft-paths: {type(server_args.peft_paths)}. "
+                f"Invalid type for --peft-paths: {type(peft_paths)}. "
                 "Expected a list or a dictionary."
             )
 
         # Expand target modules (simple: just set(...) if provided; MVP skips
         # "all"/embed/lm_head handling).
-        if server_args.peft_target_modules:
-            server_args.peft_target_modules = set(server_args.peft_target_modules)
+        peft_target_modules = server_args.peft_target_modules
+        if peft_target_modules:
+            peft_target_modules = set(peft_target_modules)
 
         # Ensure sufficient info (mirror OFT's assert).
-        assert server_args.peft_paths or (
-            server_args.peft_max_lora_rank and server_args.peft_target_modules
+        assert peft_paths or (
+            server_args.peft_max_lora_rank and peft_target_modules
         ), "When no --peft-paths is provided, specify both --peft-max-lora-rank and --peft-target-modules."
+
+        server_args._late_resolution(
+            "validate_peft_args",
+            peft_paths=peft_paths,
+            peft_target_modules=peft_target_modules,
+        )

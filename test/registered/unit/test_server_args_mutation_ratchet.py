@@ -40,15 +40,11 @@ _MUTATION_PATTERNS = [
     ),
 ]
 
-# The resolution pipeline itself (mutation is its job), srt/peft (the fork's
-# own peft/OFT-args resolution seam -- validate_peft_args normalizes
-# peft_paths/peft_target_modules the same way arg_groups/ resolves everything
-# else), and multimodal_gen, whose ServerArgs is a different class outside
-# this contract.
+# The resolution pipeline itself (mutation is its job) and multimodal_gen,
+# whose ServerArgs is a different class outside this contract.
 _EXCLUDED = (
     "srt/server_args.py",
     "srt/arg_groups",
-    "srt/peft",
     "multimodal_gen",
 )
 

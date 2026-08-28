@@ -4,7 +4,7 @@ import pytest
 
 
 def _args(peft_method, *, enable_lora=True):
-    return SimpleNamespace(
+    ns = SimpleNamespace(
         enable_lora=enable_lora,
         peft_method=peft_method,
         peft_paths=["/models/adapter"] if peft_method is not None else None,
@@ -19,6 +19,11 @@ def _args(peft_method, *, enable_lora=True):
         peft_double_buffer=False,
         speculative_algorithm=None,
     )
+    # Stand-in for ServerArgs._late_resolution: validate_peft_args writes its
+    # normalized peft_paths/peft_target_modules through this (real ServerArgs
+    # is read-only by plain assignment once __post_init__ resolves it).
+    ns._late_resolution = lambda source, **fields: ns.__dict__.update(fields)
+    return ns
 
 
 @pytest.mark.parametrize("peft_method", ["oft", "lora"])
