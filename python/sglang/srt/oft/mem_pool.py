@@ -787,9 +787,8 @@ class OFTMemoryPool(AdapterMemPool):
                         module_name, self.target_modules
                     )
                     if temp_R_buffer[target_module] is not None:
-                        tp_rank = module.get_local_tp_rank()
                         temp_R_buffer[target_module] = module.slice_oft_r_weights(
-                            temp_R_buffer[target_module], tp_rank
+                            temp_R_buffer[target_module]
                         )
 
             for name, weights in temp_R_buffer.items():
@@ -916,8 +915,7 @@ class OFTMemoryPool(AdapterMemPool):
     ) -> torch.Tensor:
         if slice_module is None:
             return compact_weight
-        tp_rank = slice_module.get_local_tp_rank()
-        return slice_module.slice_oft_r_weights(compact_weight, tp_rank)
+        return slice_module.slice_oft_r_weights(compact_weight)
 
     def _write_precomputed_oft_r(
         self,

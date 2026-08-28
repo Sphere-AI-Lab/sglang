@@ -373,7 +373,7 @@ class BaseLayerWithOFT(nn.Module):
             f"Cannot infer local OFT input dim for {type(self.base_layer).__name__}"
         )
 
-    def slice_oft_r_weights(self, R: torch.Tensor, tp_rank: int):
+    def slice_oft_r_weights(self, R: torch.Tensor):
         pass
 
     def __getattr__(self, name: str):
@@ -492,7 +492,8 @@ class VocabParallelEmbeddingWithOFT(BaseLayerWithOFT):
 
         return base_output
 
-    def slice_oft_r_weights(self, R: torch.Tensor, tp_rank: int):
+    def slice_oft_r_weights(self, R: torch.Tensor):
+        tp_rank = self.get_local_tp_rank()
         # For TP=1, no slicing needed
         # OFT R weights are not sliced for embedding (operates on full embedding dim)
         # For TP>1, Need to modify code in: sglang/python/sglang/srt/oft/mem_pool.py
@@ -565,7 +566,8 @@ class ParallelLMHeadWithOFT(BaseLayerWithOFT):
 
         return base_output
 
-    def slice_oft_r_weights(self, R: torch.Tensor, tp_rank: int):
+    def slice_oft_r_weights(self, R: torch.Tensor):
+        tp_rank = self.get_local_tp_rank()
         # For TP=1, no slicing needed
         # For TP>1, need to modify code in: sglang/python/sglang/srt/oft/mem_pool.py
         # return R
@@ -681,7 +683,7 @@ class ColumnParallelLinearWithOFT(BaseLayerWithOFT):
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
 
-    def slice_oft_r_weights(self, R: torch.Tensor, tp_rank: int):
+    def slice_oft_r_weights(self, R: torch.Tensor):
         # OFT R operates on the input dimension for ColumnParallel (input rotation).
         # R is block-diagonal: shape (num_blocks, block_size, block_size) precomputed.
         # For ColumnParallel, input is replicated across TP ranks, so no slicing needed
@@ -709,7 +711,7 @@ class MergedColumnParallelLinearWithOFT(ColumnParallelLinearWithOFT):
     ) -> None:
         super().__init__(base_layer, oft_backend)
 
-    def slice_oft_r_weights(self, R: torch.Tensor, tp_rank: int):
+    def slice_oft_r_weights(self, R: torch.Tensor):
         return R
 
     def forward(self, input_: torch.Tensor):
@@ -761,7 +763,7 @@ class QKVParallelLinearWithOFT(ColumnParallelLinearWithOFT):
     ) -> None:
         super().__init__(base_layer, oft_backend)
 
-    def slice_oft_r_weights(self, R: torch.Tensor, tp_rank: int):
+    def slice_oft_r_weights(self, R: torch.Tensor):
         return R
 
     def forward(self, input_: torch.Tensor):
@@ -861,7 +863,8 @@ class RowParallelLinearWithOFT(BaseLayerWithOFT):
             output_bias = self.base_layer.bias
         return output, output_bias
 
-    def slice_oft_r_weights(self, R: torch.Tensor, tp_rank: int):
+    def slice_oft_r_weights(self, R: torch.Tensor):
+        tp_rank = self.get_local_tp_rank()
         # For RowParallel with input rotation, the input is split across TP ranks.
         # R operates on the input dimension, so it must be sliced for each rank's partition.
         # R is block-diagonal: shape (num_blocks, block_size, block_size) precomputed.
@@ -913,7 +916,7 @@ class ReplicatedLinearWithOFT(BaseLayerWithOFT):
         # Legacy shared-R: rotate the WHOLE input once before the fused GEMM.
         return self.oft_backend.run_oft_r_sgemm(x=x, weights=self.R_buffer)
 
-    def slice_oft_r_weights(self, R: torch.Tensor, tp_rank: int):
+    def slice_oft_r_weights(self, R: torch.Tensor):
         return R  # replicated: no sharding
 
     def forward(self, x: torch.Tensor):
