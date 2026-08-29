@@ -234,8 +234,9 @@ class OFTManager(AdapterManager):
         self.memory_saver_adapter = memory_saver_adapter
         self.memory_saver_cpu_backup = memory_saver_cpu_backup
 
-        # Single-active OFT uses a fixed small slot pool (base + adapter +
-        # double-buffer); eviction never fires, so the policy is not a knob.
+        # Every resident adapter fits the pool by construction (boot capacity
+        # check in init_state), so eviction never fires and the policy is not
+        # a knob until the B2 pool-overflow work.
         self.eviction_policy = "lru"
 
         # OFT backend for running orthogonal transform kernels
@@ -493,6 +494,23 @@ class OFTManager(AdapterManager):
         ), "When no initial --oft-paths is provided, you need to specify both --max-oft-block-size and --oft-target-modules for OFT initialization."
 
         self.init_oft_adapters(adapter_paths)
+
+        # B1 capacity model: every boot adapter stays resident (no eviction
+        # until the B2 pool-overflow work), so all of them must fit the slot
+        # pool next to the base slot (and the staging slot under
+        # double-buffer).
+        reserved_slots = 1 + int(self.peft_double_buffer)
+        if len(self.refs) > self.max_ofts_per_batch - reserved_slots:
+            raise ValueError(
+                f"{len(self.refs)} OFT adapters do not fit the slot pool: "
+                f"--max-ofts-per-batch={self.max_ofts_per_batch} minus "
+                f"{reserved_slots} reserved slot(s) (base model"
+                + (" + double-buffer staging" if self.peft_double_buffer else "")
+                + f") leaves room for "
+                f"{self.max_ofts_per_batch - reserved_slots}. Raise "
+                "--max-ofts-per-batch; adapter eviction is not supported yet."
+            )
+
         self.init_oft_shapes(
             max_oft_block_size=max_oft_block_size,
             target_modules=target_modules,
@@ -503,7 +521,17 @@ class OFTManager(AdapterManager):
         # LoRA. Runs after init_oft_modules (dense) and before anything that walks
         # the MoE modules, and invalidates the finder cache so later callers see
         # through the wrapper to base_layer.
-        self._install_moe_oft_wrappers()
+        n_expert_wrapped = self._install_moe_oft_wrappers()
+        # Expert OFT has no adapter slot dimension (kernels index by expert
+        # only), so more than one resident adapter is unrepresentable on the
+        # expert path. Dense targets are unaffected.
+        if n_expert_wrapped and len(self.refs) > 1:
+            raise ValueError(
+                f"Multi-adapter OFT serving is unsupported on MoE expert "
+                f"targets: {len(self.refs)} adapters are loaded but expert OFT "
+                "buffers are single-adapter. Serve one adapter, or remove "
+                "expert projections from --peft-target-modules."
+            )
         self.init_memory_pool()
         self.update_oft_info()
         self._init_identity_expert_oft_for_cuda_graph()
@@ -774,7 +802,7 @@ class OFTManager(AdapterManager):
         init_w13 = bool({"gate_up_proj", "gate_proj", "up_proj"} & self.target_modules)
         init_w2 = "down_proj" in self.target_modules
         if not (init_w13 or init_w2):
-            return
+            return 0
 
         # Snapshot names first: replace_submodule mutates the module tree.
         # `type(...) is FusedMoE` matches only RAW modules, never the wrapper.
@@ -791,6 +819,7 @@ class OFTManager(AdapterManager):
         if hasattr(self, "_moe_modules"):
             del self._moe_modules
         logger.info(f"Installed {len(moe_names)} FusedMoEWithOFT expert wrappers")
+        return len(moe_names)
 
     def init_oft_modules(self):
         # Look-up table that maps (layer_index, module_name) to the corresponding OFT module.
@@ -1426,6 +1455,16 @@ class OFTManager(AdapterManager):
                 f"but the server pool is allocated for --max-oft-block-size="
                 f"{memory_pool.max_oft_block_size}; smaller or mixed block "
                 f"sizes are unsupported."
+            )
+        other_adapters = sorted(
+            r.adapter_name for r in self.refs.values() if r.adapter_name != name
+        )
+        if other_adapters:
+            raise ValueError(
+                f"Streamed OFT update for '{name}' while other adapters are "
+                f"resident ({other_adapters}) is unsupported: the staged-update "
+                "path targets the single active slot. Hot-swap combined with "
+                "multi-tenant serving lands with the adapter_sync extension."
             )
 
         fused_expert_chunk, dsv4_expert_chunk, dense_named_tensors = (

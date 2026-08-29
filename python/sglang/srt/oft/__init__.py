@@ -27,8 +27,9 @@ these without a design decision:
     init_prefill_cuda_graph_batch_info,       OFT prefill CUDA-graph capture runs through the
     supports/can_use/prefill_cuda_graph_max_bs  peft integration facade + prepare_oft_batch,
                                               not a dedicated prefill batch-info protocol.
-    eviction_policy.py, lora_drainer.py,      single-active serving today; multi-tenant OFT
-    lora_overlap_loader.py                    (registry/eviction/drainer) is the Phase B backlog.
+    eviction_policy.py, lora_drainer.py,      B1 multi-tenancy keeps every boot adapter resident
+    lora_overlap_loader.py                    (capacity-capped in init_state), so pool-overflow
+                                              eviction/drainer/overlap-load stay out until B2.
     backend/lmhead_mixing.py                  OFT embed/lm_head handled in-layer.
     backend/{chunked,ascend}_backend.py,      upstream-specific backends/experiments with no
     marlin_lora_temp/, trtllm_lora_temp/      OFT counterpart planned.

@@ -325,6 +325,18 @@ def _ensure_streaming_oft_adapter_slot(
             f"server pool is allocated for --max-oft-block-size={max_block_size}; "
             f"smaller or mixed block sizes are unsupported."
         )
+    other_adapters = sorted(
+        r.adapter_name
+        for r in model_runner.oft_manager.refs.values()
+        if r.adapter_name != adapter_name
+    )
+    if other_adapters:
+        raise ValueError(
+            f"Streamed OFT sync for '{adapter_name}' while other adapters are "
+            f"resident ({other_adapters}) is unsupported: the streamed path "
+            "assumes the single-active slot convention. Hot-swap combined with "
+            "multi-tenant serving lands with the adapter_sync extension."
+        )
     if (
         hasattr(model_runner, "_oft_streaming_buffer_id")
         and model_runner._oft_streaming_name == adapter_name
