@@ -494,23 +494,6 @@ class OFTManager(AdapterManager):
         ), "When no initial --oft-paths is provided, you need to specify both --max-oft-block-size and --oft-target-modules for OFT initialization."
 
         self.init_oft_adapters(adapter_paths)
-
-        # B1 capacity model: every boot adapter stays resident (no eviction
-        # until the B2 pool-overflow work), so all of them must fit the slot
-        # pool next to the base slot (and the staging slot under
-        # double-buffer).
-        reserved_slots = 1 + int(self.peft_double_buffer)
-        if len(self.refs) > self.max_ofts_per_batch - reserved_slots:
-            raise ValueError(
-                f"{len(self.refs)} OFT adapters do not fit the slot pool: "
-                f"--max-ofts-per-batch={self.max_ofts_per_batch} minus "
-                f"{reserved_slots} reserved slot(s) (base model"
-                + (" + double-buffer staging" if self.peft_double_buffer else "")
-                + f") leaves room for "
-                f"{self.max_ofts_per_batch - reserved_slots}. Raise "
-                "--max-ofts-per-batch; adapter eviction is not supported yet."
-            )
-
         self.init_oft_shapes(
             max_oft_block_size=max_oft_block_size,
             target_modules=target_modules,
@@ -1572,7 +1555,12 @@ class OFTManager(AdapterManager):
             adapter_id=adapter_id,
             adapter_name=name,
             adapter_path=name,
-            pinned=False,
+            # Pinned: a streamed adapter has no CPU-side OFTAdapter to re-page
+            # from (the trainer pushed R straight into the slot), so evicting it
+            # is unrecoverable. Upstream LoRA needs no equivalent -- every one of
+            # its adapters is disk-backed. Pinning excludes the slot from
+            # _acquire_buffer_slot's eviction candidates.
+            pinned=True,
             adapter_version=version,
         )
         # Register per-request serving routing at the FIXED double-buffer

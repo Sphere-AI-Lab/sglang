@@ -288,6 +288,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.peft import integration as peft
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import get_context, publish
@@ -432,6 +433,9 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
+        # OFT adapters are admitted on the same schedule-time contract as LoRA
+        # above; the check itself lives behind the peft facade.
+        self.enable_oft = server_args.peft_method == "oft"
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
@@ -3288,6 +3292,13 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
+        if self.enable_oft:
+            running_ofts = {
+                req.adapter_id for req in running_batch.reqs if not req.finished()
+            }
+            # Account for adapters already loaded in the adder, such as chunked requests
+            running_ofts.update(req.adapter_id for req in adder.can_run_list)
+
         if self.enable_lora:
             running_loras = {
                 req.lora_id for req in running_batch.reqs if not req.finished()
@@ -3307,6 +3318,11 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                continue
+
+            if self.enable_oft and not peft.maybe_admit_request(
+                self, req, running_ofts
+            ):
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3344,6 +3360,9 @@ class Scheduler(
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
+
+            if self.enable_oft:
+                running_ofts.add(req.adapter_id)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:

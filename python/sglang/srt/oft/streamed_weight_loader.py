@@ -365,7 +365,9 @@ def _ensure_streaming_oft_adapter_slot(
         adapter_id=adapter_id,
         adapter_name=adapter_name,
         adapter_path=adapter_name,
-        pinned=False,
+        # Pinned: no CPU-side OFTAdapter exists for a streamed adapter, so an
+        # eviction could never be re-paged (see _make_streamed_ref).
+        pinned=True,
     )
     result = model_runner.oft_manager.register_streamed_adapter(
         oft_ref, buffer_id, adapter_config
