@@ -493,15 +493,18 @@ class VocabParallelEmbeddingWithOFT(BaseLayerWithOFT):
         return base_output
 
     def slice_oft_r_weights(self, R: torch.Tensor):
-        tp_rank = self.get_local_tp_rank()
+        # Guard by the SHARDING DEGREE (tp_size), not the rank: the old
+        # `tp_rank > 1` check never fired on TP=2 (ranks are 0/1), silently
+        # admitting unsupported vocab-sharded configs.
+        tp_size = getattr(self.base_layer, "tp_size", 1)
         # For TP=1, no slicing needed
         # OFT R weights are not sliced for embedding (operates on full embedding dim)
         # For TP>1, Need to modify code in: sglang/python/sglang/srt/oft/mem_pool.py
         # return R
-        if tp_rank > 1:
+        if tp_size > 1:
             raise NotImplementedError(
                 f"VocabParallelEmbeddingWithOFT does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
+                f"Got tp_size={tp_size}"
             )
 
 
@@ -567,14 +570,17 @@ class ParallelLMHeadWithOFT(BaseLayerWithOFT):
         return base_output
 
     def slice_oft_r_weights(self, R: torch.Tensor):
-        tp_rank = self.get_local_tp_rank()
+        # Guard by the SHARDING DEGREE (tp_size), not the rank: the old
+        # `tp_rank > 1` check never fired on TP=2 (ranks are 0/1), silently
+        # admitting unsupported vocab-sharded configs.
+        tp_size = getattr(self.base_layer, "tp_size", 1)
         # For TP=1, no slicing needed
         # For TP>1, need to modify code in: sglang/python/sglang/srt/oft/mem_pool.py
         # return R
-        if tp_rank > 1:
+        if tp_size > 1:
             raise NotImplementedError(
                 f"ParallelLMHeadWithOFT does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
+                f"Got tp_size={tp_size}"
             )
 
 
