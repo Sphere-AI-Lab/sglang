@@ -440,6 +440,14 @@ class OFTManager(AdapterManager):
         weight_indices = [0] * len(forward_batch.adapter_ids)
         oft_block_sizes = [0] * self.max_ofts_per_batch
         for i, uid in enumerate(forward_batch.adapter_ids):
+            # Mirrors upstream LoRAManager.prepare_lora_batch: a uid with no
+            # resident slot keeps weight_indices[i] = 0 rather than raising.
+            # Real requests are always resident (fetch_new_ofts runs first);
+            # the CUDA-graph replay path pads adapter_ids with None WITHOUT a
+            # fetch, so an evicted base slot lands here. Those padded rows are
+            # discarded, so slot 0's contents are immaterial for them.
+            if uid not in self.memory_pool.uid_to_buffer_id:
+                continue
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
             if uid is not None:
                 if uid in self.adapters:
