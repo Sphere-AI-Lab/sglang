@@ -689,7 +689,11 @@ class OFTMemoryPool(AdapterMemPool):
         for uid in cur_uids:
             self.eviction_policy.mark_used(uid)
 
-        for uid in cur_uids:
+        # Deterministic order: cur_uids is a set, and per-process hash
+        # randomization would otherwise let each TP rank map the same adapters
+        # to different slots -- silently wrong weights, no shape error.
+        # Mirrors upstream LoRAMemoryPool.prepare_lora_batch.
+        for uid in sorted(cur_uids, key=lambda uid: (uid is not None, uid or "")):
             if uid not in self.uid_to_buffer_id:
                 buffer_id = self._acquire_buffer_slot(cur_uids, oft_refs)
                 oft_adapter = oft_adapters.get(uid, None)
