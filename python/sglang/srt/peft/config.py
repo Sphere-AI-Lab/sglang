@@ -268,6 +268,32 @@ def validate_peft_args(server_args) -> None:
                 "Currently OFT is only compatible with NGRAM speculative decoding."
             )
 
+        # OFT is not prefill-CUDA-graph-safe: prepare_oft_batch routes
+        # EXTEND-mode prepares to the eager path (forward_mode.is_cuda_graph()
+        # is False for EXTEND), which builds a fresh batch_info and rebinds
+        # backend.batch_info instead of refreshing persistent buffers. Prefill
+        # graph capture therefore freezes device pointers to tensors that are
+        # freed (and reused) by the very next prepare call, and the first
+        # replay reads garbage seg_indptr/weight_indices in the segmented OFT
+        # kernels -> CUDA illegal memory access at the first prefill request.
+        # Decode CUDA graphs are unaffected (decode prepares take the in-place
+        # cuda_graph_batch_info path) and stay enabled. Lifting this requires
+        # mirroring upstream v0.5.18's prefill-graph protocol
+        # (init_prefill_cuda_graph_batch_info + can_use_prefill_cuda_graph +
+        # a can_run_graph gate); see the no-mirrors note in srt/oft/__init__.py.
+        if server_args.cuda_graph_config is not None:
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            if server_args.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                logger.warning(
+                    "peft_method=oft is incompatible with prefill CUDA graphs "
+                    "(captured OFT batch metadata goes stale before replay -> "
+                    "illegal memory access); disabling the prefill CUDA graph "
+                    "(was backend=%s). Decode CUDA graphs stay enabled.",
+                    server_args.cuda_graph_config.prefill.backend,
+                )
+                server_args.cuda_graph_config.prefill.backend = Backend.DISABLED
+
         # Parse peft_paths -> List[OFTRef]. Normalize through locals -- not
         # server_args.peft_paths directly -- because ServerArgs is read-only
         # once __post_init__ reaches materialize_declarations() (well before
