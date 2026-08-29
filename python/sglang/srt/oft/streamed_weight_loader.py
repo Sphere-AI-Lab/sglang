@@ -317,6 +317,14 @@ def _ensure_streaming_oft_adapter_slot(
     # None adapter_id, so default it here rather than crash the streamed path.
     if adapter_id is None:
         adapter_id = adapter_name
+    block_size = adapter_config.get("oft_block_size", 32)
+    max_block_size = model_runner.oft_manager.memory_pool.max_oft_block_size
+    if block_size != max_block_size:
+        raise ValueError(
+            f"OFT adapter '{adapter_name}' has block_size={block_size}, but the "
+            f"server pool is allocated for --max-oft-block-size={max_block_size}; "
+            f"smaller or mixed block sizes are unsupported."
+        )
     if (
         hasattr(model_runner, "_oft_streaming_buffer_id")
         and model_runner._oft_streaming_name == adapter_name
@@ -355,7 +363,6 @@ def _ensure_streaming_oft_adapter_slot(
             f"Failed to register OFT adapter: {result.error_message}"
         )
 
-    block_size = adapter_config.get("oft_block_size", 32)
     model_runner._oft_streaming_buffer_id = buffer_id
     model_runner._oft_streaming_name = adapter_name
     model_runner._oft_streaming_block_size = block_size

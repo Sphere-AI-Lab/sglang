@@ -323,7 +323,10 @@ class OFTMemoryPool(AdapterMemPool):
         """Check if the memory pool can support the given OFT adapter(s)."""
 
         def _can_support(config: OFTConfig) -> bool:
-            if config.block_size > self.max_oft_block_size:
+            # Equality, not <=: pool tiles have one (bs, bs) geometry, and a
+            # smaller-block adapter's R has the wrong shape for the tile
+            # (block size is geometry, unlike LoRA ranks, which pad).
+            if config.block_size != self.max_oft_block_size:
                 return False
             if config.oft_added_tokens_size > self.oft_added_tokens_size:
                 return False

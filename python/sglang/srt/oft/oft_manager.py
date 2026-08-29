@@ -625,6 +625,18 @@ class OFTManager(AdapterManager):
                 default=0,
             )
 
+        # One geometry per server: pool tiles are allocated once at
+        # (max_oft_block_size x max_oft_block_size) and every adapter's R must
+        # match them exactly -- block size is geometry, not a capacity to pad.
+        block_sizes = {x.block_size for x in self.configs.values()}
+        if block_sizes and block_sizes != {self.max_oft_block_size}:
+            raise ValueError(
+                f"All OFT adapters must use the server's max block size "
+                f"(--max-oft-block-size={self.max_oft_block_size}); got adapter "
+                f"block size(s) {sorted(block_sizes)}. Smaller or mixed block "
+                f"sizes are unsupported."
+            )
+
         # Auto-infer self.oft_added_tokens_size from loaded OFT configs
         if self.oft_added_tokens_size is None:
             inferred_extra_vocab_size = next(
@@ -1408,6 +1420,13 @@ class OFTManager(AdapterManager):
         block_size = (
             config.get("oft_block_size", 32) if config else self.max_oft_block_size
         )
+        if block_size != memory_pool.max_oft_block_size:
+            raise ValueError(
+                f"OFT staged update for '{name}' has block_size={block_size}, "
+                f"but the server pool is allocated for --max-oft-block-size="
+                f"{memory_pool.max_oft_block_size}; smaller or mixed block "
+                f"sizes are unsupported."
+            )
 
         fused_expert_chunk, dsv4_expert_chunk, dense_named_tensors = (
             _partition_expert_oft_tensors(
