@@ -88,6 +88,14 @@ def _init_oft_manager(model_runner: "ModelRunner", server_args: "ServerArgs") ->
     else:
         from sglang.srt.peft.oft.oft_manager import OFTManager
 
+    # Runtime witness for the A/B parity work: every boot names the stack that
+    # actually serves, so "which implementation ran" is in the log, not inferred.
+    logger.info(
+        "OFT implementation: %s (oft_impl=%s)",
+        OFTManager.__module__,
+        getattr(server_args, "oft_impl", "peft"),
+    )
+
     model_runner.oft_manager = OFTManager(
         base_model=model_runner.model,
         base_hf_config=model_runner.model_config.hf_config,
