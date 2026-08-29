@@ -58,15 +58,14 @@ class PEFTArgs:
     peft_target_modules: A[Optional[Union[set[str], List[str]]], NS("lora")] = None
 
     max_oft_block_size: A[Optional[int], NS("lora")] = None
-    # Default 2 covers the typical single-active-adapter workload: slot 0 holds
-    # the auto-registered `None` placeholder (identity = base/reference model,
-    # used for KL against base in RL), slot 1 holds the active OFT adapter.
-    # This also enables the single-adapter fast-path kernel
-    # (`gemm_oft_r_fwd`) since `TritonOFTBackend.single_adapter_mode = (max_ofts_per_batch <= 2)`.
-    # Multi-tenant deployments serving more than one adapter concurrently
-    # should override with `--max-ofts-per-batch <N>`; for the segmented
-    # kernel to run, also pass `--max-ofts-per-batch >= 3`.
-    max_ofts_per_batch: A[int, NS("lora")] = 2
+    # Default 8 matches the CLI default (argparse resolved to 8 all along) and
+    # upstream LoRA's max_loras_per_batch, so CLI and programmatic launches now
+    # select the same kernel path. Slot 0 holds the auto-registered `None`
+    # placeholder (identity = base/reference model, used for KL against base in
+    # RL); the rest hold adapters. Values <= 2 select the single-adapter
+    # fast-path kernels (`TritonOFTBackend.single_adapter_mode`); orbit's RL
+    # launcher pins the value explicitly (2..4) and ignores this default.
+    max_ofts_per_batch: A[int, NS("lora")] = 8
     oft_backend: A[str, NS("lora")] = "triton"
     # Which OFT implementation serves when peft_method == "oft". CUTOVER
     # 2026-08-29: default is "sibling" = srt/oft (the srt/lora-shaped mirror),
@@ -163,7 +162,7 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-ofts-per-batch",
         type=int,
-        default=8,
+        default=PEFTArgs.max_ofts_per_batch,
         help="Maximum number of OFT adapters for a running batch, include base-only request.",
     )
     parser.add_argument(
