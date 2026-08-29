@@ -85,7 +85,7 @@ class MoeRunner:
             elif peft_enabled:
                 from sglang.srt.server_args import get_global_server_args
 
-                if getattr(get_global_server_args(), "oft_impl", "peft") == "sibling":
+                if getattr(get_global_server_args(), "oft_impl", "sibling") == "sibling":
                     from sglang.srt.oft.oft_moe_runner_marlin import (
                         MarlinOFTRunnerCore,
                     )
@@ -230,7 +230,7 @@ class MoeRunner:
             )
             from sglang.srt.server_args import get_global_server_args
 
-            if getattr(get_global_server_args(), "oft_impl", "peft") == "sibling":
+            if getattr(get_global_server_args(), "oft_impl", "sibling") == "sibling":
                 from sglang.srt.oft.oft_moe_runners import make_oft_invoke
             else:
                 from sglang.srt.peft.oft.moe_invoke import make_oft_invoke

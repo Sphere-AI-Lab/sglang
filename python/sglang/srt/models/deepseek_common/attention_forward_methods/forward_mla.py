@@ -46,7 +46,7 @@ def _oft_mla():
     if _OFT_MLA is None:
         from sglang.srt.server_args import get_global_server_args
 
-        if getattr(get_global_server_args(), "oft_impl", "peft") == "sibling":
+        if getattr(get_global_server_args(), "oft_impl", "sibling") == "sibling":
             from sglang.srt.oft import deepseek_mla_correction as _m
         else:
             from sglang.srt.peft.oft import deepseek_mla_correction as _m

@@ -53,7 +53,7 @@ def _kimi_oft_policy():
     if _KIMI_OFT_POLICY is None:
         from sglang.srt.server_args import get_global_server_args
 
-        if getattr(get_global_server_args(), "oft_impl", "peft") == "sibling":
+        if getattr(get_global_server_args(), "oft_impl", "sibling") == "sibling":
             from sglang.srt.oft import kimi_k25_policy as _m
         else:
             from sglang.srt.peft.oft import kimi_k25_policy as _m

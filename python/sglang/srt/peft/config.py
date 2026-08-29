@@ -68,12 +68,13 @@ class PEFTArgs:
     # kernel to run, also pass `--max-ofts-per-batch >= 3`.
     max_ofts_per_batch: A[int, NS("lora")] = 2
     oft_backend: A[str, NS("lora")] = "triton"
-    # Transitional (sibling restructure): which OFT implementation serves when
-    # peft_method == "oft". "peft" = srt/peft/oft (today's path); "sibling" =
-    # srt/oft, the srt/lora-shaped mirror. Worker-side only: the tokenizer-side
-    # registry/refs stay on srt/peft in BOTH modes. Equivalence testing flips
-    # this; the flag disappears at cutover.
-    oft_impl: A[str, NS("lora")] = "peft"
+    # Which OFT implementation serves when peft_method == "oft". CUTOVER
+    # 2026-08-29: default is "sibling" = srt/oft (the srt/lora-shaped mirror),
+    # after the equivalence gate passed bitwise on the full parity matrix.
+    # "peft" = srt/peft/oft, kept intact as the rollback lever and frozen
+    # reference. Worker-side only: the tokenizer-side registry/refs stay on
+    # srt/peft in BOTH modes until the peft package is retired.
+    oft_impl: A[str, NS("lora")] = "sibling"
     oft_dtype: A[Optional[str], NS("lora")] = None
     # Single global signal for split(canonical)-vs-fused OFT (attention qkv,
     # dense MLP gate_up, MoE expert gate_up all derive split-vs-fused from
@@ -215,15 +216,16 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--oft-impl",
         type=str,
-        default="peft",
+        default="sibling",
         choices=OFT_IMPL_CHOICES,
-        help="Transitional: which OFT implementation serves for peft_method="
-        "'oft'. 'peft' = srt/peft/oft (default); 'sibling' = srt/oft.",
+        help="Which OFT implementation serves for peft_method='oft'. "
+        "'sibling' = srt/oft (default since the 2026-08-29 cutover); "
+        "'peft' = srt/peft/oft (rollback lever / frozen reference).",
     )
 
 def validate_peft_args(server_args) -> None:
     """Validate + normalize OFT server args in place (was check_oft_server_args)."""
-    if getattr(server_args, "oft_impl", "peft") not in OFT_IMPL_CHOICES:
+    if getattr(server_args, "oft_impl", "sibling") not in OFT_IMPL_CHOICES:
         raise ValueError(
             f"Invalid --oft-impl {server_args.oft_impl!r}; choose from {OFT_IMPL_CHOICES}."
         )
