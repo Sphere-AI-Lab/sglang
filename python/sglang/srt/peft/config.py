@@ -72,8 +72,9 @@ class PEFTArgs:
     # 2026-08-29: default is "sibling" = srt/oft (the srt/lora-shaped mirror),
     # after the equivalence gate passed bitwise on the full parity matrix.
     # "peft" = srt/peft/oft, kept intact as the rollback lever and frozen
-    # reference. Worker-side only: the tokenizer-side registry/refs stay on
-    # srt/peft in BOTH modes until the peft package is retired.
+    # reference. The tokenizer-side registry/ref classes follow this flag too
+    # (byte-identical twins; dispatched in validate_peft_args and
+    # peft/tokenizer_hooks.py).
     oft_impl: A[str, NS("lora")] = "sibling"
     oft_dtype: A[Optional[str], NS("lora")] = None
     # Single global signal for split(canonical)-vs-fused OFT (attention qkv,
@@ -296,6 +297,15 @@ def validate_peft_args(server_args) -> None:
                 )
                 server_args.cuda_graph_config.prefill.backend = Backend.DISABLED
 
+        # Refs must be the class family of the serving implementation: the
+        # sibling registry's ctor asserts its own OFTRef type (a byte-identical
+        # twin of the peft one), and both the tokenizer-side registry and the
+        # worker-side manager are built from these refs.
+        if server_args.oft_impl == "sibling":
+            from sglang.srt.oft.oft_registry import OFTRef as _ImplOFTRef
+        else:
+            _ImplOFTRef = OFTRef
+
         # Parse peft_paths -> List[OFTRef]. Normalize through locals -- not
         # server_args.peft_paths directly -- because ServerArgs is read-only
         # once __post_init__ reaches materialize_declarations() (well before
@@ -308,18 +318,18 @@ def validate_peft_args(server_args) -> None:
                 if isinstance(adapter_path, str):
                     if "=" in adapter_path:
                         name, path = adapter_path.split("=", 1)
-                        oft_ref = OFTRef(
+                        oft_ref = _ImplOFTRef(
                             adapter_name=name, adapter_path=path, pinned=False
                         )
                     else:
-                        oft_ref = OFTRef(
+                        oft_ref = _ImplOFTRef(
                             adapter_name=adapter_path, adapter_path=adapter_path, pinned=False
                         )
                 elif isinstance(adapter_path, dict):
                     assert (
                         "adapter_name" in adapter_path and "adapter_path" in adapter_path
                     ), f"When providing OFT paths as a list of dict, each dict should contain 'adapter_name' and 'adapter_path' keys. Got: {adapter_path}"
-                    oft_ref = OFTRef(
+                    oft_ref = _ImplOFTRef(
                         adapter_name=adapter_path["adapter_name"],
                         adapter_path=adapter_path["adapter_path"],
                         pinned=adapter_path.get("pinned", False),
@@ -332,7 +342,7 @@ def validate_peft_args(server_args) -> None:
                 peft_paths.append(oft_ref)
         elif isinstance(peft_paths, dict):
             peft_paths = [
-                OFTRef(adapter_name=k, adapter_path=v, pinned=False)
+                _ImplOFTRef(adapter_name=k, adapter_path=v, pinned=False)
                 for k, v in peft_paths.items()
             ]
         elif peft_paths is None:
