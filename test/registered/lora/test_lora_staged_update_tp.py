@@ -67,7 +67,9 @@ class TestStagedLoRAUpdateTP(CustomTestCase):
 
         tp1 = StagedLoRATestHarness(
             self,
-            base_gpu_id=3,
+            # The TP=2 server is already closed, so reuse its first GPU. This
+            # keeps the full trainer + TP=2 matrix within three visible GPUs.
+            base_gpu_id=1,
             tp_size=1,
             max_loras_per_batch=1,
         )
