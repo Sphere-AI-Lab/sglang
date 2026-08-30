@@ -11,6 +11,7 @@ import unittest
 import torch
 
 from sglang.srt.adapter_sync.mem_pool import AdapterMemPool
+from sglang.srt.adapter_sync.versioning import VersionedStaging
 
 
 class _Pool(AdapterMemPool):
@@ -90,6 +91,51 @@ class TestPerAdapterVersioning(unittest.TestCase):
         self.p.activate(3, uid=None)
         self.assertEqual(self.p.slot("W", "w", self.p.active_idx)[0].item(), 3.0)
         self.assertEqual(self.p._active_version, 3)  # compatibility shim
+
+
+class _ForeignLayoutPool(VersionedStaging):
+    """A pool whose weights are NOT in adapter_sync buffer groups.
+
+    Stands in for upstream's LoRAMemoryPool, which keeps A_buffer/B_buffer dicts
+    and cannot be reorganised (srt/lora is never edited). If the state machine
+    works here, it works there.
+    """
+
+    def __init__(self):
+        self.active_idx, self.staging_idx = 0, 2
+        self.A = [torch.zeros(4) for _ in range(3)]   # one tensor per slot
+        self.B = [torch.zeros(4) for _ in range(3)]
+        self.uid_to_buffer_id = {"A": 0, "B": 1}
+        self._init_versioning()
+
+    def get_buffer_id(self, uid):
+        return self.uid_to_buffer_id[uid]
+
+    def _fill_slot(self, slot_idx, named_tensors):
+        for name, t in named_tensors:
+            (self.A if name == "a" else self.B)[slot_idx].copy_(t)
+
+    def _copy_slot(self, src, dst):
+        self.A[dst].copy_(self.A[src])
+        self.B[dst].copy_(self.B[src])
+
+
+class TestStateMachineIsLayoutAgnostic(unittest.TestCase):
+    def test_works_over_a_foreign_buffer_layout(self):
+        p = _ForeignLayoutPool()
+        p.stage(5, [("a", torch.full((4,), 5.0)), ("b", torch.full((4,), 50.0))], uid="A")
+        p.activate(5, uid="A")
+        self.assertEqual(p.A[0][0].item(), 5.0)
+        self.assertEqual(p.B[0][0].item(), 50.0)
+        self.assertEqual(p.A[1][0].item(), 0.0)      # the other adapter untouched
+        self.assertEqual(p.active_version("A"), 5)
+
+    def test_mismatch_guard_holds_for_foreign_layouts_too(self):
+        p = _ForeignLayoutPool()
+        p.stage(5, [("a", torch.full((4,), 5.0))], uid="A")
+        with self.assertRaises(RuntimeError):
+            p.activate(5, uid="B")
+        self.assertEqual(p.A[1][0].item(), 0.0)
 
 
 if __name__ == "__main__":

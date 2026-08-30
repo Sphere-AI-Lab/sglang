@@ -16,6 +16,7 @@ from contextlib import nullcontext
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.adapter_sync.versioning import VersionedStaging
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ class EmptySlot:
 EMPTY_SLOT = EmptySlot()
 
 
-class AdapterMemPool:
+class AdapterMemPool(VersionedStaging):
     """Generic slot/eviction bookkeeping shared by adapter memory pools.
 
     Tracks which adapter UID occupies which buffer slot and how to evict a
@@ -68,14 +69,9 @@ class AdapterMemPool:
         self.uid_to_buffer_id = {}
         self.buffer_id_to_uid = [EMPTY_SLOT] * max_adapters_per_batch
         self._groups = {}
-        # Versioning is PER ADAPTER. A single staging slot is shared: the
-        # trainer republishes one adapter at a time, so serialising stages costs
-        # nothing and avoids a staging buffer per slot. ``_staged_uid`` records
-        # who currently owns that slot so an activate cannot promote weights
-        # into the wrong adapter.
-        self._active_versions = {}   # uid -> version currently live in its slot
-        self._staged_version = None
-        self._staged_uid = None
+        # Per-adapter staged/active versions live in VersionedStaging, which is
+        # layout-agnostic so upstream's LoRA pool can reuse it (WS2-3).
+        self._init_versioning()
         self.active_idx = 0
         self.staging_idx = 1
 
@@ -113,56 +109,11 @@ class AdapterMemPool:
     def staging_view(self, name, key):
         return self.slot(name, key, self.staging_idx)
 
-    def stage(self, version, named_tensors, uid=None):
-        """Fill the staging slot for ``uid`` (lock-free; generation keeps running).
-
-        ``uid=None`` is the single-active convention: the adapter lives in the
-        fixed ``active_idx`` slot. Passing a uid targets that adapter's own slot
-        at activate time, which is what lets several adapters sit at different
-        versions.
-        """
-        self._fill_slot(self.staging_idx, named_tensors)
-        self._staged_version = version
-        self._staged_uid = uid
-
-    def activate(self, version, uid=None):
-        """Promote the staged weights into the target adapter's slot.
-
-        Only the target slot is written. Every other adapter keeps serving its
-        own version untouched -- the property that made the old blanket copy
-        unusable once more than one adapter could be resident.
-        """
-        if self._staged_version != version:
-            raise RuntimeError(
-                f"inactive_slot_busy: staged={self._staged_version} requested={version}"
-            )
-        if self._staged_uid != uid:
-            raise RuntimeError(
-                f"staged_adapter_mismatch: staged={self._staged_uid} requested={uid}. "
-                "Refusing to promote one adapter's weights into another's slot."
-            )
-        target = self.active_idx if uid is None else self.get_buffer_id(uid)
+    def _copy_slot(self, src_idx, dst_idx):
+        """VersionedStaging primitive: promote a slot across every buffer group."""
         for name, keyed in self._groups.items():
             for key in keyed:
-                self.slot(name, key, target).copy_(
-                    self.slot(name, key, self.staging_idx)
-                )
-        self._active_versions[uid] = version
-        self._staged_version = None
-        self._staged_uid = None
-
-    def active_version(self, uid=None):
-        """The version currently live in ``uid``'s slot, or None if never activated."""
-        return self._active_versions.get(uid)
-
-    @property
-    def _active_version(self):
-        """Single-active compatibility shim: the version of the ``None`` adapter.
-
-        Kept so the existing single-active call sites read unchanged when
-        srt/oft migrates onto this core (WS2-4).
-        """
-        return self._active_versions.get(None)
+                self.slot(name, key, dst_idx).copy_(self.slot(name, key, src_idx))
 
     def _init_staging_from_active(self):
         """Boot-time hardening: seed each group's STAGING slot with its
