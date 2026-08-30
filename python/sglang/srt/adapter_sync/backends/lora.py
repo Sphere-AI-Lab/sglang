@@ -59,24 +59,42 @@ class StagedLoRAMemoryPool(VersionedStaging, LoRAMemoryPool):
         self.staging_idx = advertised
 
     def _slot_buffers(self):
-        """Every container whose leading dimension is the adapter slot."""
-        for d in (self.A_buffer, self.B_buffer):
-            for per_layer in d.values():
-                for t in per_layer:
-                    yield t
-        for d in (
-            self.embedding_A_buffer,
-            self.embedding_B_buffer,
-            self.lm_head_A_buffer,
-            self.lm_head_B_buffer,
-            self.new_embeddings_buffer,
+        """Every container whose leading dimension is the adapter slot.
+
+        Yields ``(label, tensor)`` so a failure can name the buffer rather than
+        surfacing as an anonymous tensor error.
+        """
+        for fam, d in (("A", self.A_buffer), ("B", self.B_buffer)):
+            for name, per_layer in d.items():
+                for layer, t in enumerate(per_layer):
+                    yield f"{fam}_buffer[{name}][layer {layer}]", t
+        for fam, d in (
+            ("embedding_A", self.embedding_A_buffer),
+            ("embedding_B", self.embedding_B_buffer),
+            ("lm_head_A", self.lm_head_A_buffer),
+            ("lm_head_B", self.lm_head_B_buffer),
+            ("new_embeddings", self.new_embeddings_buffer),
         ):
-            for t in d.values():
-                yield t
+            for name, t in d.items():
+                yield f"{fam}[{name}]", t
 
     # ---- VersionedStaging primitives --------------------------------------
     def _copy_slot(self, src_idx: int, dst_idx: int) -> None:
-        for t in self._slot_buffers():
+        for label, t in self._slot_buffers():
+            if t.shape[0] <= max(src_idx, dst_idx):
+                raise RuntimeError(
+                    f"slot_dim_too_small: {label} has shape {tuple(t.shape)}, so slot "
+                    f"{max(src_idx, dst_idx)} does not exist. Its leading dimension is "
+                    "not the adapter slot, or it was allocated before the staging "
+                    "slot was reserved."
+                )
+            if t[dst_idx].data_ptr() == t[src_idx].data_ptr():
+                raise RuntimeError(
+                    f"aliased_slots: {label} shape {tuple(t.shape)} strides "
+                    f"{tuple(t.stride())} -- slots {src_idx} and {dst_idx} share "
+                    "memory, so this buffer is broadcast/expanded across slots "
+                    "rather than being per-slot storage."
+                )
             t[dst_idx].copy_(t[src_idx])
 
     def _fill_slot(self, slot_idx, staged) -> None:

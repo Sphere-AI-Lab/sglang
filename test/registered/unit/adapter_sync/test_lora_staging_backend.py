@@ -115,5 +115,15 @@ class TestUidResolution(unittest.TestCase):
         self.assertEqual(self._mgr()._uid_for("policy", None), "policy")
 
 
+class TestSlotBufferLabels(unittest.TestCase):
+    def test_slot_buffers_yields_labels(self):
+        """Failures must name the buffer; an anonymous tensor error cost a whole
+        GPU round-trip to localise."""
+        p = _pool()
+        labels = [lbl for lbl, _ in p._slot_buffers()]
+        self.assertTrue(all(isinstance(l, str) for l in labels))
+        self.assertTrue(any("A_buffer[q_proj]" in l for l in labels), labels)
+
+
 if __name__ == "__main__":
     unittest.main()
