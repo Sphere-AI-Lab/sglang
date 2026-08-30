@@ -10,7 +10,10 @@ import unittest
 
 import torch
 
-from sglang.srt.adapter_sync.backends.lora import StagedLoRAMemoryPool
+from sglang.srt.adapter_sync.backends.lora import (
+    StagedLoRAManager,
+    StagedLoRAMemoryPool,
+)
 
 
 def _pool(n_slots=2, n_layers=2, rank=4, hidden=8):
@@ -88,6 +91,42 @@ class TestEndToEndStaging(unittest.TestCase):
         self.assertEqual(p.A_buffer["q_proj"][0][0][0, 0].item(), 0.0)   # adapterA untouched
         self.assertEqual(p.active_version("adapterB"), 11)
         self.assertIsNone(p.active_version("adapterA"))
+
+
+class TestNameResolution(unittest.TestCase):
+    """Checkpoint weight names -> (buffer, layer, A|B). A staged update and a
+    disk load must agree on where a tensor belongs, or the trainer silently
+    writes into the wrong buffer."""
+
+    def _mgr(self):
+        m = object.__new__(StagedLoRAManager)
+        m.memory_pool = _pool()
+        return m
+
+    def test_resolves_layer_and_ab_kind(self):
+        m = self._mgr()
+        rows = m._resolve_named_tensors([
+            ("base_model.model.model.layers.3.self_attn.q_proj.lora_A.weight", torch.ones(2, 8)),
+            ("base_model.model.model.layers.3.self_attn.q_proj.lora_B.weight", torch.ones(8, 2)),
+        ])
+        self.assertEqual([(r[0], r[1], r[2]) for r in rows],
+                         [("q_proj", 3, "A"), ("q_proj", 3, "B")])
+
+    def test_skips_names_with_no_layer_id(self):
+        """embed_tokens/lm_head staging is not supported; skip, do not misfile."""
+        m = self._mgr()
+        self.assertEqual(m._resolve_named_tensors(
+            [("base_model.model.model.embed_tokens.lora_A.weight", torch.ones(2, 8))]), [])
+
+    def test_skips_names_that_are_neither_A_nor_B(self):
+        m = self._mgr()
+        self.assertEqual(m._resolve_named_tensors(
+            [("base_model.model.model.layers.0.self_attn.q_proj.weight", torch.ones(2, 8))]), [])
+
+    def test_skips_modules_the_pool_has_no_buffer_for(self):
+        m = self._mgr()
+        self.assertEqual(m._resolve_named_tensors(
+            [("base_model.model.model.layers.0.mlp.down_proj.lora_A.weight", torch.ones(2, 8))]), [])
 
 
 if __name__ == "__main__":
