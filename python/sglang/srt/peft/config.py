@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 OFT_BACKEND_CHOICES = ["triton", "torch_native"]
 OFT_TYPE_CHOICES = ["oft", "canonical_oft"]
 OFT_IMPL_CHOICES = ["peft", "sibling"]
+LORA_IMPL_CHOICES = ["peft", "sibling"]
 
 
 @dataclass(kw_only=True)
@@ -75,6 +76,13 @@ class PEFTArgs:
     # (byte-identical twins; dispatched in validate_peft_args and
     # peft/tokenizer_hooks.py).
     oft_impl: A[str, NS("lora")] = "sibling"
+    # Which LoRA implementation serves when peft_method == "lora".
+    # "peft"    = srt/peft/lora, the frozen fork copy that carries the RL
+    #             features today. Default: this path is unchanged.
+    # "sibling" = upstream srt/lora + the adapter_sync staging extension, which
+    #             is what replaces the fork copy. Opt-in until its GPU gate
+    #             passes; upstream's own files are untouched either way.
+    lora_impl: A[str, NS("lora")] = "peft"
     oft_dtype: A[Optional[str], NS("lora")] = None
     # Single global signal for split(canonical)-vs-fused OFT (attention qkv,
     # dense MLP gate_up, MoE expert gate_up all derive split-vs-fused from
@@ -222,12 +230,25 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         "'sibling' = srt/oft (default since the 2026-08-29 cutover); "
         "'peft' = srt/peft/oft (rollback lever / frozen reference).",
     )
+    parser.add_argument(
+        "--lora-impl",
+        type=str,
+        default="peft",
+        choices=LORA_IMPL_CHOICES,
+        help="Which LoRA stack serves for peft_method='lora'. "
+        "'peft' = srt/peft/lora, the frozen fork copy (default); "
+        "'sibling' = upstream srt/lora + the adapter_sync staging extension.",
+    )
 
 def validate_peft_args(server_args) -> None:
     """Validate + normalize OFT server args in place (was check_oft_server_args)."""
     if getattr(server_args, "oft_impl", "sibling") not in OFT_IMPL_CHOICES:
         raise ValueError(
             f"Invalid --oft-impl {server_args.oft_impl!r}; choose from {OFT_IMPL_CHOICES}."
+        )
+    if getattr(server_args, "lora_impl", "peft") not in LORA_IMPL_CHOICES:
+        raise ValueError(
+            f"Invalid --lora-impl {server_args.lora_impl!r}; choose from {LORA_IMPL_CHOICES}."
         )
     if server_args.enable_lora and server_args.peft_method is not None:
         raise ValueError(

@@ -122,6 +122,32 @@ def _init_lora_manager(
     """
     # Lazy import: same vocab_parallel_embedding -> forward_batch_info cycle
     # reason as the OFT manager above.
+    if getattr(server_args, "lora_impl", "peft") == "sibling":
+        # Upstream srt/lora + the adapter_sync staging extension. Constructed
+        # separately rather than swapped for the class below: upstream's ctor
+        # takes server_args and has no peft_double_buffer (staging is always
+        # available there, on a slot allocated outside the advertised capacity).
+        from sglang.srt.adapter_sync.backends.lora import StagedLoRAManager
+
+        model_runner.peft_lora_manager = StagedLoRAManager(
+            base_model=model_runner.model,
+            base_hf_config=model_runner.model_config.hf_config,
+            max_loras_per_batch=1,  # single-active; the staging slot is extra
+            load_config=model_runner.load_config,
+            dtype=model_runner.dtype,
+            server_args=server_args,
+            tp_size=model_runner.ps.tp_size,
+            tp_rank=model_runner.ps.tp_rank,
+            max_lora_rank=server_args.peft_max_lora_rank,
+            target_modules=server_args.peft_target_modules,
+            lora_paths=server_args.peft_paths,
+        )
+        logger.info(
+            "LoRA implementation: %s (lora_impl=sibling)",
+            type(model_runner.peft_lora_manager).__module__,
+        )
+        return
+
     from sglang.srt.peft.lora.manager import LoRAManager
 
     model_runner.peft_lora_manager = LoRAManager(
@@ -138,6 +164,10 @@ def _init_lora_manager(
         memory_saver_adapter=model_runner.memory_saver_adapter,
         memory_saver_cpu_backup=server_args.enable_weights_cpu_backup,
         peft_double_buffer=server_args.peft_double_buffer,
+    )
+    logger.info(
+        "LoRA implementation: %s (lora_impl=peft)",
+        type(model_runner.peft_lora_manager).__module__,
     )
 
 
