@@ -203,3 +203,56 @@ class StagedLoRAManager(LoRAManager):
                 continue
             resolved.append((buffer_name, layer_id, kind, tensor))
         return resolved
+
+    # ---- compatibility with the fork's call sites --------------------------
+    #
+    # model_runner and the fork's streamed loader were written against
+    # srt/peft/lora's manager API, which upstream's manager does not share.
+    # Bridging here keeps those (upstream-tracked) files unedited.
+
+    def init_cuda_graph_moe_buffers(self, *args, **kwargs):
+        """Serve both calling conventions for MoE CUDA-graph buffer pre-alloc.
+
+        The fork calls ``(max_bs, disable_cuda_graph=...)`` and expects the
+        manager to walk the MoE layers itself. Upstream's method is per-layer,
+        ``(max_bs, max_loras, compute_dtype, moe_layer)``, normally driven by
+        upstream's own walker. Dispatch on which one arrived, so neither caller
+        has to change.
+        """
+        upstream_call = len(args) >= 4 or "moe_layer" in kwargs
+        if upstream_call:
+            return super().init_cuda_graph_moe_buffers(*args, **kwargs)
+
+        max_bs = kwargs.get("max_bs", args[0] if args else None)
+        if kwargs.get("disable_cuda_graph", False):
+            return
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+        max_loras = kwargs.get("max_loras", self.max_loras_per_batch)
+        for module in self.base_model.modules():
+            if isinstance(module, FusedMoEWithLoRA):
+                super().init_cuda_graph_moe_buffers(
+                    max_bs, max_loras, self.dtype, module
+                )
+                logger.info(
+                    "Pre-allocated shared MoE LoRA CUDA graph buffers "
+                    "(max_bs=%s, max_loras=%s)", max_bs, max_loras
+                )
+                break   # all MoE LoRA layers share one buffer set
+
+    def _unsupported_ipc(self, what):
+        raise NotImplementedError(
+            f"{what} belongs to the IPC/in-place streaming transport, which is not "
+            "ported to the staged upstream-LoRA backend. This backend implements the "
+            "NCCL double-buffer transport (stage_adapter/activate_adapter). Use "
+            "--lora-impl peft for the IPC path."
+        )
+
+    def _active_adapter(self):
+        self._unsupported_ipc("_active_adapter")
+
+    def apply_streamed_update(self, *args, **kwargs):
+        self._unsupported_ipc("apply_streamed_update")
+
+    def apply_streamed_expert_lora(self, *args, **kwargs):
+        self._unsupported_ipc("apply_streamed_expert_lora")
