@@ -1,9 +1,10 @@
 """Unit coverage for optional native staged-LoRA startup and routing."""
 
+import asyncio
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch, sentinel
+from unittest.mock import AsyncMock, MagicMock, Mock, patch, sentinel
 
 import torch
 
@@ -13,7 +14,13 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import ActivateAdapterVersionReqInput
+from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.managers.io_struct import (
+    ActivateAdapterVersionReqInput,
+    ActivateAdapterVersionReqOutput,
+    UpdateAdapterFromDistributedReqInput,
+    UpdateAdapterFromDistributedReqOutput,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.model_executor.model_runner_components import weight_updater
@@ -21,12 +28,14 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.aio_rwlock import RWLock
 
 # The CPU login environment exposes Megatron's Python package but not its CUDA
 # shared libraries. Isolate ModelRunner's optional debug integration while it
 # imports, then restore sys.modules for the rest of the test process.
 with patch.dict(sys.modules, {"megatron": None}):
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 
 def _weight_updater(runner):
@@ -53,6 +62,60 @@ def _stage_kwargs(**overrides):
     )
     values.update(overrides)
     return values
+
+
+def _stage_req(name="policy", version="4", *, double_buffer=True):
+    return UpdateAdapterFromDistributedReqInput(
+        names=[],
+        dtypes=[],
+        shapes=[],
+        load_format="lora_adapter",
+        adapter_name=name,
+        adapter_version=version,
+        double_buffer=double_buffer,
+    )
+
+
+def _activate_req(name="policy", version="4"):
+    return ActivateAdapterVersionReqInput(
+        adapter_name=name,
+        adapter_version=version,
+        load_format="lora_adapter",
+    )
+
+
+def _make_tm(*, tokenizer_worker_num=1):
+    tm = TokenizerManager.__new__(TokenizerManager)
+    tm.server_args = SimpleNamespace(
+        enable_lora_staging=True,
+        dp_size=1,
+        enable_dp_attention=False,
+        tokenizer_worker_num=tokenizer_worker_num,
+    )
+    tm.lora_registry = LoRARegistry()
+    tm.lora_ref_cache = {}
+    tm.lora_update_lock = asyncio.Lock()
+    tm.pending_lora_stage = None
+    tm.failed_lora_activations = {}
+    tm.model_update_lock = RWLock()
+    tm.is_pause_cond = asyncio.Condition()
+    tm.is_pause = False
+    tm.auto_create_handle_loop = Mock()
+    tm.update_adapter_from_distributed_communicator = AsyncMock(
+        return_value=[
+            UpdateAdapterFromDistributedReqOutput(success=True, message="staged")
+        ]
+    )
+    tm.activate_adapter_version_communicator = AsyncMock(
+        return_value=[
+            ActivateAdapterVersionReqOutput(
+                success=True,
+                message="activated",
+                active_adapter_version="4",
+            )
+        ]
+    )
+    return tm
 
 
 class TestStagingFlagAndSelection(unittest.TestCase):
@@ -204,6 +267,231 @@ class TestWeightUpdaterRouting(unittest.TestCase):
 
         self.assertEqual(result, (True, "Succeeded to activate adapter version."))
         fallback.assert_called_once_with(runner, "policy", 8)
+
+
+class TestTokenizerNativeStaging(unittest.TestCase):
+    def test_stage_reuses_id_without_publishing_version(self):
+        tm = _make_tm()
+        old = LoRARef(
+            lora_id="id-a",
+            lora_name="policy",
+            lora_path="__distributed__",
+            pinned=True,
+            version=3,
+        )
+        asyncio.run(tm.lora_registry.register(old))
+        req = _stage_req()
+
+        success, _ = asyncio.run(tm.update_adapter_from_distributed(req))
+
+        self.assertTrue(success)
+        self.assertEqual(req.adapter_id, "id-a")
+        self.assertEqual(tm.lora_registry.get_all_adapters()["policy"].version, 3)
+        self.assertEqual(tm.pending_lora_stage.version, 4)
+        self.assertTrue(tm.pending_lora_stage.pinned)
+
+    def test_first_stage_is_not_registered(self):
+        tm = _make_tm()
+        req = _stage_req()
+
+        success, _ = asyncio.run(tm.update_adapter_from_distributed(req))
+
+        self.assertTrue(success)
+        self.assertEqual(tm.lora_registry.get_all_adapters(), {})
+        self.assertEqual(tm.pending_lora_stage.lora_id, req.adapter_id)
+
+    def test_same_stage_retry_reuses_pending_ref(self):
+        tm = _make_tm()
+        first = _stage_req()
+        second = _stage_req()
+
+        asyncio.run(tm.update_adapter_from_distributed(first))
+        pending = tm.pending_lora_stage
+        asyncio.run(tm.update_adapter_from_distributed(second))
+
+        self.assertIs(tm.pending_lora_stage, pending)
+        self.assertEqual(second.adapter_id, first.adapter_id)
+
+    def test_conflicting_stage_reports_pending_identity(self):
+        tm = _make_tm()
+        asyncio.run(tm.update_adapter_from_distributed(_stage_req()))
+
+        with self.assertRaisesRegex(
+            ValueError, r"name=policy.*id=.*version=4"
+        ):
+            asyncio.run(
+                tm.update_adapter_from_distributed(
+                    _stage_req(name="other", version="5")
+                )
+            )
+
+        self.assertEqual(tm.pending_lora_stage.lora_name, "policy")
+
+    def test_concurrent_conflicting_stages_reserve_only_one_identity(self):
+        tm = _make_tm()
+        original = tm.lora_registry.register_or_reuse
+
+        async def slow_register_or_reuse(*args, **kwargs):
+            await asyncio.sleep(0)
+            return await original(*args, **kwargs)
+
+        async def run_concurrently():
+            with patch.object(
+                tm.lora_registry,
+                "register_or_reuse",
+                side_effect=slow_register_or_reuse,
+            ):
+                return await asyncio.gather(
+                    tm.update_adapter_from_distributed(_stage_req()),
+                    tm.update_adapter_from_distributed(
+                        _stage_req(name="other", version="5")
+                    ),
+                    return_exceptions=True,
+                )
+
+        results = asyncio.run(run_concurrently())
+
+        self.assertEqual(sum(isinstance(result, ValueError) for result in results), 1)
+        self.assertIn(tm.pending_lora_stage.lora_name, {"policy", "other"})
+
+    def test_activation_forwards_exact_id(self):
+        tm = _make_tm()
+        asyncio.run(tm.update_adapter_from_distributed(_stage_req()))
+        expected_id = tm.pending_lora_stage.lora_id
+        req = _activate_req()
+
+        success, _ = asyncio.run(tm.activate_adapter_version(req))
+
+        self.assertTrue(success)
+        self.assertEqual(req.adapter_id, expected_id)
+        forwarded = tm.activate_adapter_version_communicator.await_args.args[0]
+        self.assertEqual(forwarded.adapter_id, expected_id)
+
+    def test_successful_activation_refreshes_existing_ref(self):
+        tm = _make_tm()
+        old = LoRARef(
+            lora_id="id-a",
+            lora_name="policy",
+            lora_path="__distributed__",
+            pinned=True,
+            version=3,
+        )
+        asyncio.run(tm.lora_registry.register(old))
+        asyncio.run(tm.update_adapter_from_distributed(_stage_req()))
+
+        success, _ = asyncio.run(tm.activate_adapter_version(_activate_req()))
+
+        self.assertTrue(success)
+        active = tm.lora_registry.get_all_adapters()["policy"]
+        self.assertEqual((active.lora_id, active.version), ("id-a", 4))
+        self.assertTrue(active.pinned)
+        self.assertIsNone(tm.pending_lora_stage)
+
+    def test_successful_activation_registers_first_ref(self):
+        tm = _make_tm()
+        asyncio.run(tm.update_adapter_from_distributed(_stage_req()))
+        pending_id = tm.pending_lora_stage.lora_id
+
+        success, _ = asyncio.run(tm.activate_adapter_version(_activate_req()))
+
+        self.assertTrue(success)
+        active = tm.lora_registry.get_all_adapters()["policy"]
+        self.assertEqual((active.lora_id, active.version), (pending_id, 4))
+        self.assertIs(tm.lora_ref_cache["policy"], active)
+
+    def test_activation_failure_keeps_old_version_and_quarantines_name(self):
+        tm = _make_tm()
+        old = LoRARef(
+            lora_id="id-a",
+            lora_name="policy",
+            lora_path="__distributed__",
+            version=3,
+        )
+        asyncio.run(tm.lora_registry.register(old))
+        asyncio.run(tm.update_adapter_from_distributed(_stage_req()))
+        tm.activate_adapter_version_communicator = AsyncMock(
+            return_value=[
+                ActivateAdapterVersionReqOutput(
+                    success=True,
+                    message="ok",
+                    active_adapter_version="4",
+                ),
+                ActivateAdapterVersionReqOutput(
+                    success=False,
+                    message="rank 1 failed",
+                ),
+            ]
+        )
+
+        success, message = asyncio.run(
+            tm.activate_adapter_version(_activate_req())
+        )
+
+        self.assertFalse(success)
+        self.assertIn("restart required", message)
+        self.assertEqual(tm.lora_registry.get_all_adapters()["policy"].version, 3)
+        self.assertIn("policy", tm.failed_lora_activations)
+        with self.assertRaisesRegex(ValueError, "policy.*restart required"):
+            tm._assert_native_lora_available("policy")
+
+    def test_quarantine_does_not_block_base_or_other_adapter(self):
+        tm = _make_tm()
+        tm._quarantine_native_lora_activation("policy", "partial activation")
+
+        tm._assert_native_lora_available(None)
+        tm._assert_native_lora_available("unrelated")
+        tm._assert_native_lora_available([None, "unrelated"])
+        with self.assertRaisesRegex(ValueError, "policy.*restart required"):
+            tm._assert_native_lora_available([None, "policy"])
+
+    def test_multi_tokenizer_native_stage_is_rejected(self):
+        tm = _make_tm(tokenizer_worker_num=2)
+
+        with self.assertRaisesRegex(ValueError, "tokenizer_worker_num == 1"):
+            asyncio.run(tm.update_adapter_from_distributed(_stage_req()))
+
+        tm.update_adapter_from_distributed_communicator.assert_not_awaited()
+
+    def test_synchronous_stage_publishes_only_matching_active_version(self):
+        tm = _make_tm()
+        req = _stage_req(double_buffer=False)
+        tm.update_adapter_from_distributed_communicator = AsyncMock(
+            return_value=[
+                UpdateAdapterFromDistributedReqOutput(
+                    success=True,
+                    message="staged and activated",
+                    staged_adapter_version="4",
+                    active_adapter_version="4",
+                )
+            ]
+        )
+
+        success, _ = asyncio.run(tm.update_adapter_from_distributed(req))
+
+        self.assertTrue(success)
+        self.assertEqual(tm.lora_registry.get_all_adapters()["policy"].version, 4)
+        self.assertIsNone(tm.pending_lora_stage)
+
+    def test_version_disagreement_is_quarantined(self):
+        tm = _make_tm()
+        asyncio.run(tm.update_adapter_from_distributed(_stage_req()))
+        tm.activate_adapter_version_communicator = AsyncMock(
+            return_value=[
+                ActivateAdapterVersionReqOutput(
+                    success=True,
+                    message="wrong version",
+                    active_adapter_version="5",
+                )
+            ]
+        )
+
+        success, message = asyncio.run(
+            tm.activate_adapter_version(_activate_req())
+        )
+
+        self.assertFalse(success)
+        self.assertIn("restart required", message)
+        self.assertIn("policy", tm.failed_lora_activations)
 
 
 if __name__ == "__main__":

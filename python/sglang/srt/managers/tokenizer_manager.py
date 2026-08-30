@@ -662,6 +662,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # serves as the source of truth for available adapters and maps user-friendly LoRA names
         # to internally used unique LoRA IDs.
         self.lora_registry = LoRARegistry(get_lora().lora_paths)
+        self.pending_lora_stage: Optional[LoRARef] = None
+        self.failed_lora_activations: Dict[str, str] = {}
         # Lock to serialize LoRA update operations.
         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
         # LoRA updates and inference to overlap.
@@ -3442,6 +3444,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         await self._resolve_lora_path(obj)
 
     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
+        self._assert_native_lora_available(obj.lora_path)
         if isinstance(obj.lora_path, str):
             unique_lora_paths = set([obj.lora_path])
         else:

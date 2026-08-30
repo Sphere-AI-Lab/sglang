@@ -526,6 +526,144 @@ class TokenizerControlMixin:
 
         return success, message
 
+    def _is_native_lora_stage(self, obj) -> bool:
+        return (
+            self.server_args.enable_lora_staging
+            and obj.load_format == "lora_adapter"
+        )
+
+    def _assert_native_lora_available(self, lora_path) -> None:
+        names = [lora_path] if isinstance(lora_path, str) else (lora_path or [])
+        for name in names:
+            if name in self.failed_lora_activations:
+                raise ValueError(
+                    f"LoRA adapter '{name}' is unavailable after a partial "
+                    "activation failure; restart required"
+                )
+
+    def _quarantine_native_lora_activation(
+        self, name: str, message: str
+    ) -> None:
+        self.failed_lora_activations[name] = message
+
+    async def _reserve_native_lora_stage(self, obj) -> LoRARef:
+        # Reservation must be atomic across concurrent stage requests. The
+        # communicator serializes dispatch, but reservation happens before it.
+        async with self.lora_update_lock:
+            return await self._reserve_native_lora_stage_locked(obj)
+
+    async def _reserve_native_lora_stage_locked(self, obj) -> LoRARef:
+        if obj.load_format != "lora_adapter" or not obj.adapter_name:
+            raise ValueError(
+                "native LoRA staging requires load_format=lora_adapter "
+                "and adapter_name"
+            )
+        try:
+            version = int(obj.adapter_version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "native LoRA staging requires an integer adapter_version"
+            ) from exc
+        if self.server_args.tokenizer_worker_num > 1:
+            raise ValueError("native LoRA staging requires tokenizer_worker_num == 1")
+        if obj.adapter_name in self.failed_lora_activations:
+            raise ValueError(
+                f"LoRA adapter '{obj.adapter_name}' is quarantined; restart required"
+            )
+
+        pending = self.pending_lora_stage
+        if pending is not None:
+            if pending.lora_name == obj.adapter_name and pending.version == version:
+                obj.adapter_id = pending.lora_id
+                return pending
+            raise ValueError(
+                "staging slot already reserved for "
+                f"name={pending.lora_name} id={pending.lora_id} "
+                f"version={pending.version}"
+            )
+
+        candidate, _ = await self.lora_registry.register_or_reuse(
+            LoRARef(
+                lora_name=obj.adapter_name,
+                lora_path="__distributed__",
+                pinned=False,
+                reloadable=False,
+                version=version,
+            ),
+            upsert=True,
+            preserve_pinned=True,
+        )
+        self.pending_lora_stage = candidate
+        obj.adapter_id = candidate.lora_id
+        return candidate
+
+    def _prepare_native_lora_activation(self, obj) -> LoRARef:
+        try:
+            version = int(obj.adapter_version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "native LoRA activation requires an integer adapter_version"
+            ) from exc
+
+        pending = self.pending_lora_stage
+        if pending is None or (
+            pending.lora_name,
+            pending.version,
+        ) != (obj.adapter_name, version):
+            if pending is None:
+                detail = "no native LoRA stage is pending"
+            else:
+                detail = (
+                    f"pending name={pending.lora_name} id={pending.lora_id} "
+                    f"version={pending.version}"
+                )
+            raise ValueError(
+                f"Cannot activate name={obj.adapter_name} version={version}; {detail}"
+            )
+        self._assert_native_lora_available(obj.adapter_name)
+        obj.adapter_id = pending.lora_id
+        return pending
+
+    async def _publish_native_lora_activation(self) -> None:
+        pending = self.pending_lora_stage
+        if pending is None:
+            raise RuntimeError("No native LoRA stage is pending for publication")
+        registered = self.lora_registry.get_all_adapters().get(pending.lora_name)
+        if registered is None:
+            await self.lora_registry.register(pending)
+        else:
+            await self.lora_registry.refresh(pending)
+        self.lora_ref_cache[pending.lora_name] = pending
+        self.failed_lora_activations.pop(pending.lora_name, None)
+        self.pending_lora_stage = None
+
+    async def _finish_native_lora_activation(self, obj, results):
+        pending = self.pending_lora_stage
+        if pending is None:
+            raise RuntimeError("No native LoRA stage is pending during activation")
+        success, message = FanOutCommunicator.merge_results(results)
+        expected_version = int(obj.adapter_version)
+
+        def version_matches(result) -> bool:
+            try:
+                return int(result.active_adapter_version) == expected_version
+            except (TypeError, ValueError):
+                return False
+
+        versions_match = bool(results) and all(version_matches(r) for r in results)
+        if success and versions_match:
+            await self._publish_native_lora_activation()
+            return True, message
+
+        active_versions = [getattr(r, "active_adapter_version", None) for r in results]
+        failure = (
+            "Native LoRA activation consistency failure for "
+            f"adapter '{pending.lora_name}' version={pending.version}: "
+            f"{message}; worker active versions={active_versions}; restart required"
+        )
+        self._quarantine_native_lora_activation(pending.lora_name, failure)
+        return False, failure
+
     async def update_adapter_from_distributed(
         self: TokenizerManager,
         obj: UpdateAdapterFromDistributedReqInput,
@@ -543,21 +681,20 @@ class TokenizerControlMixin:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update adapter from distributed"
 
-        # PEFT register-before-dispatch (mirror update_weights_from_tensor's IPC
-        # path): mint/lookup the streamed adapter's ref in the active tokenizer
-        # registry and set obj.adapter_id, so a later /generate naming this
-        # adapter (OFT is multi-slot; orbit names "orbit_oft" to pick the adapter
-        # slot) resolves against tm.peft_ref_cache instead of 400ing "never been
-        # loaded". Threaded via obj.adapter_id to the manager, whose DB stage
-        # registers uid_to_buffer_id[adapter_id]=active_idx. Registration happens
-        # at STAGE: on the first sync no /generate names the adapter before the
-        # first activate (rollout-0 is base-only); later syncs no-op (name cached).
         from sglang.srt.peft import tokenizer_hooks as peft_tokenizer_hooks
 
-        await peft_tokenizer_hooks.register_peft_ref(self, obj)
+        is_native_lora = self._is_native_lora_stage(obj)
+        if is_native_lora:
+            await self._reserve_native_lora_stage(obj)
+        else:
+            # The existing PEFT path remains register-before-dispatch.
+            await peft_tokenizer_hooks.register_peft_ref(self, obj)
 
         if obj.double_buffer:
             results = await self.update_adapter_from_distributed_communicator(obj)
+            success, message = FanOutCommunicator.merge_results(results)
+            if is_native_lora:
+                return success, message
         else:
             # Hold is_pause_cond while updating to prevent unpause from racing.
             async with self.is_pause_cond:
@@ -566,13 +703,23 @@ class TokenizerControlMixin:
                     results = await self.update_adapter_from_distributed_communicator(
                         obj
                     )
+                    if is_native_lora:
+                        native_result = await self._finish_native_lora_activation(
+                            obj, results
+                        )
             if not is_paused:
                 async with self.model_update_lock.writer_lock:
                     results = await self.update_adapter_from_distributed_communicator(
                         obj
                     )
+                    if is_native_lora:
+                        native_result = await self._finish_native_lora_activation(
+                            obj, results
+                        )
+            if is_native_lora:
+                return native_result
+            success, message = FanOutCommunicator.merge_results(results)
 
-        success, message = FanOutCommunicator.merge_results(results)
         message += await peft_tokenizer_hooks.bump_peft_version(self, obj, success)
         return success, message
 
@@ -593,15 +740,30 @@ class TokenizerControlMixin:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for activate adapter version"
 
+        is_native_lora = self.server_args.enable_lora_staging
+        if is_native_lora:
+            self._prepare_native_lora_activation(obj)
+
         # Hold is_pause_cond while updating to prevent unpause from racing.
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:
                 results = await self.activate_adapter_version_communicator(obj)
+                if is_native_lora:
+                    native_result = await self._finish_native_lora_activation(
+                        obj, results
+                    )
 
         if not is_paused:
             async with self.model_update_lock.writer_lock:
                 results = await self.activate_adapter_version_communicator(obj)
+                if is_native_lora:
+                    native_result = await self._finish_native_lora_activation(
+                        obj, results
+                    )
+
+        if is_native_lora:
+            return native_result
 
         success, message = FanOutCommunicator.merge_results(results)
         return success, message
