@@ -823,6 +823,7 @@ class Req(ReqDllmMixin):
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
         adapter_id: Optional[str] = None,
+        adapter_version: Optional[int] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
         token_type_ids: List[int] = None,
@@ -933,18 +934,24 @@ class Req(ReqDllmMixin):
             # Radix keys MUST separate OFT-adapter requests from base requests:
             # without this, a base request prefix-matches KV computed under the
             # adapter and silently returns adapter output (measured: base greedy
-            # == adapter output on 14/16 prompts until keyed). The version is not
-            # plumbed to Req; v0 is correct because the double-buffer activate
-            # path already flushes the radix cache on weight changes. Lazy import:
-            # integration's module-level deps must not load from this module.
+            # == adapter output on 14/16 prompts until keyed).
+            #
+            # The key also carries the adapter WEIGHT VERSION: under RL the same
+            # adapter id is re-pushed with new weights every step, so id alone
+            # would let a prefix cached under version k be reused under k+1.
+            # Lazy import: integration's module-level deps must not load from
+            # this module.
             from sglang.srt.peft.integration import maybe_extend_extra_key
 
-            extra_key = maybe_extend_extra_key(extra_key, adapter_id, None)
+            extra_key = maybe_extend_extra_key(
+                extra_key, adapter_id, adapter_version
+            )
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
         self.lora_id = lora_id
         self.adapter_id = adapter_id
+        self.adapter_version = adapter_version
         self.routing_key = routing_key
 
         # Memory pool info

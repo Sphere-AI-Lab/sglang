@@ -23,10 +23,15 @@ def _peft_kind(tm):
     return tm.server_args.peft_method
 
 
-def _mint_ref(kind, name):
-    """Build the kind's AdapterRef for ``name`` (path == name for streamed adapters)."""
-    if kind == "oft":
-        from sglang.srt.peft.oft.oft_registry import OFTRef
+def _mint_ref(tm, name):
+    """Build the active kind's AdapterRef for ``name`` (path == name for
+    streamed adapters). The OFT ref class follows --oft-impl so minted refs
+    match the registry built in init_tokenizer_peft."""
+    if tm.peft_kind == "oft":
+        if tm.server_args.oft_impl == "sibling":
+            from sglang.srt.oft.oft_registry import OFTRef
+        else:
+            from sglang.srt.peft.oft.oft_registry import OFTRef
 
         return OFTRef(adapter_name=name, adapter_path=name, pinned=False)
     from sglang.srt.peft.lora.lora_registry import LoRARef
@@ -53,7 +58,13 @@ def init_tokenizer_peft(tm):
     tm._logged_peft_base_only_request = False
 
     if kind == "oft":
-        from sglang.srt.peft.oft.oft_registry import OFTRegistry
+        # Registry class follows --oft-impl (byte-identical twins); its ctor
+        # asserts the refs are its own OFTRef class, which validate_peft_args
+        # normalized with the same dispatch.
+        if tm.server_args.oft_impl == "sibling":
+            from sglang.srt.oft.oft_registry import OFTRegistry
+        else:
+            from sglang.srt.peft.oft.oft_registry import OFTRegistry
 
         tm.peft_registry = OFTRegistry(tm.server_args.peft_paths)
         for ref in tm.server_args.peft_paths or []:
@@ -92,7 +103,7 @@ async def register_peft_ref(tm, obj):
         return
     name = obj.adapter_name
     if name not in tm.peft_ref_cache:
-        ref = _mint_ref(tm.peft_kind, name)
+        ref = _mint_ref(tm, name)
         await tm.peft_registry.register(ref)
         tm.peft_ref_cache[name] = ref
     obj.adapter_id = tm.peft_ref_cache[name].adapter_id
@@ -172,8 +183,15 @@ async def resolve_peft_path(tm, obj):
     # Set the kind's request-side id/version fields the scheduler reads.
     if tm.peft_kind == "oft":
         obj.adapter_id = adapter_id
-        obj.adapter_version = await tm.peft_registry.get_version_by_id(adapter_id)
+        adapter_version = await tm.peft_registry.get_version_by_id(adapter_id)
+        obj.adapter_version = adapter_version
         _propagate_id_to_cached_sub_objs(obj, field="adapter_id", resolved=adapter_id)
+        # The version needs the same propagation as the id: batched sub-objects
+        # are materialized before this resolver runs, so a version set only on
+        # the parent never reaches the tokenized requests built from them.
+        _propagate_id_to_cached_sub_objs(
+            obj, field="adapter_version", resolved=adapter_version
+        )
     else:
         obj.lora_id = adapter_id
         _propagate_id_to_cached_sub_objs(obj, field="lora_id", resolved=adapter_id)

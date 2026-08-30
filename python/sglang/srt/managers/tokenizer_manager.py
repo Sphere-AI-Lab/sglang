@@ -1461,6 +1461,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
                 adapter_id=obj.adapter_id,
+                adapter_version=getattr(obj, "adapter_version", None),
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,

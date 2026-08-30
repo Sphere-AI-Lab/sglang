@@ -83,7 +83,18 @@ def _init_oft_manager(model_runner: "ModelRunner", server_args: "ServerArgs") ->
     # communicator -> forward_batch_info, which forms an import cycle when a
     # module in that chain imports this façade at module scope (e.g.
     # forward_batch_info). Deferring keeps ``peft.integration`` light to import.
-    from sglang.srt.peft.oft.oft_manager import OFTManager
+    if getattr(server_args, "oft_impl", "sibling") == "sibling":
+        from sglang.srt.oft.oft_manager import OFTManager
+    else:
+        from sglang.srt.peft.oft.oft_manager import OFTManager
+
+    # Runtime witness for the A/B parity work: every boot names the stack that
+    # actually serves, so "which implementation ran" is in the log, not inferred.
+    logger.info(
+        "OFT implementation: %s (oft_impl=%s)",
+        OFTManager.__module__,
+        getattr(server_args, "oft_impl", "sibling"),
+    )
 
     model_runner.oft_manager = OFTManager(
         base_model=model_runner.model,

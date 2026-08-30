@@ -1,4 +1,13 @@
-"""Orbit PEFT package: OFT (and, later, our own LoRA) adapters plus the thin
+"""Orbit PEFT package -- FROZEN REFERENCE since the 2026-08-29 cutover.
+
+The default OFT serving implementation is the sibling package ``sglang.srt.oft``
+(see ``--oft-impl``; this package remains fully functional as the rollback lever
+via ``--oft-impl peft``). Kept intact deliberately -- do not flag as dead code;
+its fate is settled by the restructure plan, not by reference sweeps.
+
+Original package docstring follows.
+
+Orbit PEFT package: OFT (and, later, our own LoRA) adapters plus the thin
 integration seams into upstream SGLang.
 
 Curated public API. Everything outside this package should import only from here.

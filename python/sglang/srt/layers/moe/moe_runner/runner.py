@@ -83,7 +83,14 @@ class MoeRunner:
 
                 self.runner_core = MarlinLoraRunnerCore(config)
             elif peft_enabled:
-                from sglang.srt.peft.oft.marlin_runner import MarlinOFTRunnerCore
+                from sglang.srt.server_args import get_global_server_args
+
+                if getattr(get_global_server_args(), "oft_impl", "sibling") == "sibling":
+                    from sglang.srt.oft.oft_moe_runner_marlin import (
+                        MarlinOFTRunnerCore,
+                    )
+                else:
+                    from sglang.srt.peft.oft.marlin_runner import MarlinOFTRunnerCore
 
                 self.runner_core = MarlinOFTRunnerCore(config)
             else:
@@ -221,7 +228,12 @@ class MoeRunner:
             from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
                 invoke_fused_moe_kernel,
             )
-            from sglang.srt.peft.oft.moe_invoke import make_oft_invoke
+            from sglang.srt.server_args import get_global_server_args
+
+            if getattr(get_global_server_args(), "oft_impl", "sibling") == "sibling":
+                from sglang.srt.oft.oft_moe_runners import make_oft_invoke
+            else:
+                from sglang.srt.peft.oft.moe_invoke import make_oft_invoke
 
             run_kwargs["invoke"] = make_oft_invoke(
                 self._peft_layer, invoke_fused_moe_kernel

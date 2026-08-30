@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 OFT_BACKEND_CHOICES = ["triton", "torch_native"]
 OFT_TYPE_CHOICES = ["oft", "canonical_oft"]
+OFT_IMPL_CHOICES = ["peft", "sibling"]
 
 
 @dataclass(kw_only=True)
@@ -57,16 +58,23 @@ class PEFTArgs:
     peft_target_modules: A[Optional[Union[set[str], List[str]]], NS("lora")] = None
 
     max_oft_block_size: A[Optional[int], NS("lora")] = None
-    # Default 2 covers the typical single-active-adapter workload: slot 0 holds
-    # the auto-registered `None` placeholder (identity = base/reference model,
-    # used for KL against base in RL), slot 1 holds the active OFT adapter.
-    # This also enables the single-adapter fast-path kernel
-    # (`gemm_oft_r_fwd`) since `TritonOFTBackend.single_adapter_mode = (max_ofts_per_batch <= 2)`.
-    # Multi-tenant deployments serving more than one adapter concurrently
-    # should override with `--max-ofts-per-batch <N>`; for the segmented
-    # kernel to run, also pass `--max-ofts-per-batch >= 3`.
-    max_ofts_per_batch: A[int, NS("lora")] = 2
+    # Default 8 matches the CLI default (argparse resolved to 8 all along) and
+    # upstream LoRA's max_loras_per_batch, so CLI and programmatic launches now
+    # select the same kernel path. Slot 0 holds the auto-registered `None`
+    # placeholder (identity = base/reference model, used for KL against base in
+    # RL); the rest hold adapters. Values <= 2 select the single-adapter
+    # fast-path kernels (`TritonOFTBackend.single_adapter_mode`); orbit's RL
+    # launcher pins the value explicitly (2..4) and ignores this default.
+    max_ofts_per_batch: A[int, NS("lora")] = 8
     oft_backend: A[str, NS("lora")] = "triton"
+    # Which OFT implementation serves when peft_method == "oft". CUTOVER
+    # 2026-08-29: default is "sibling" = srt/oft (the srt/lora-shaped mirror),
+    # after the equivalence gate passed bitwise on the full parity matrix.
+    # "peft" = srt/peft/oft, kept intact as the rollback lever and frozen
+    # reference. The tokenizer-side registry/ref classes follow this flag too
+    # (byte-identical twins; dispatched in validate_peft_args and
+    # peft/tokenizer_hooks.py).
+    oft_impl: A[str, NS("lora")] = "sibling"
     oft_dtype: A[Optional[str], NS("lora")] = None
     # Single global signal for split(canonical)-vs-fused OFT (attention qkv,
     # dense MLP gate_up, MoE expert gate_up all derive split-vs-fused from
@@ -154,7 +162,7 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-ofts-per-batch",
         type=int,
-        default=8,
+        default=PEFTArgs.max_ofts_per_batch,
         help="Maximum number of OFT adapters for a running batch, include base-only request.",
     )
     parser.add_argument(
@@ -205,10 +213,22 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         help="Reserve a staging slot and enable the double-buffer stage/activate "
              "adapter endpoints (async-RL NCCL weight-sync).",
     )
-
+    parser.add_argument(
+        "--oft-impl",
+        type=str,
+        default="sibling",
+        choices=OFT_IMPL_CHOICES,
+        help="Which OFT implementation serves for peft_method='oft'. "
+        "'sibling' = srt/oft (default since the 2026-08-29 cutover); "
+        "'peft' = srt/peft/oft (rollback lever / frozen reference).",
+    )
 
 def validate_peft_args(server_args) -> None:
     """Validate + normalize OFT server args in place (was check_oft_server_args)."""
+    if getattr(server_args, "oft_impl", "sibling") not in OFT_IMPL_CHOICES:
+        raise ValueError(
+            f"Invalid --oft-impl {server_args.oft_impl!r}; choose from {OFT_IMPL_CHOICES}."
+        )
     if server_args.enable_lora and server_args.peft_method is not None:
         raise ValueError(
             "--enable-lora and --peft-method are mutually exclusive: native "
@@ -250,6 +270,41 @@ def validate_peft_args(server_args) -> None:
                 "Currently OFT is only compatible with NGRAM speculative decoding."
             )
 
+        # OFT is not prefill-CUDA-graph-safe: prepare_oft_batch routes
+        # EXTEND-mode prepares to the eager path (forward_mode.is_cuda_graph()
+        # is False for EXTEND), which builds a fresh batch_info and rebinds
+        # backend.batch_info instead of refreshing persistent buffers. Prefill
+        # graph capture therefore freezes device pointers to tensors that are
+        # freed (and reused) by the very next prepare call, and the first
+        # replay reads garbage seg_indptr/weight_indices in the segmented OFT
+        # kernels -> CUDA illegal memory access at the first prefill request.
+        # Decode CUDA graphs are unaffected (decode prepares take the in-place
+        # cuda_graph_batch_info path) and stay enabled. Lifting this requires
+        # mirroring upstream v0.5.18's prefill-graph protocol
+        # (init_prefill_cuda_graph_batch_info + can_use_prefill_cuda_graph +
+        # a can_run_graph gate); see the no-mirrors note in srt/oft/__init__.py.
+        if server_args.cuda_graph_config is not None:
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            if server_args.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                logger.warning(
+                    "peft_method=oft is incompatible with prefill CUDA graphs "
+                    "(captured OFT batch metadata goes stale before replay -> "
+                    "illegal memory access); disabling the prefill CUDA graph "
+                    "(was backend=%s). Decode CUDA graphs stay enabled.",
+                    server_args.cuda_graph_config.prefill.backend,
+                )
+                server_args.cuda_graph_config.prefill.backend = Backend.DISABLED
+
+        # Refs must be the class family of the serving implementation: the
+        # sibling registry's ctor asserts its own OFTRef type (a byte-identical
+        # twin of the peft one), and both the tokenizer-side registry and the
+        # worker-side manager are built from these refs.
+        if server_args.oft_impl == "sibling":
+            from sglang.srt.oft.oft_registry import OFTRef as _ImplOFTRef
+        else:
+            _ImplOFTRef = OFTRef
+
         # Parse peft_paths -> List[OFTRef]. Normalize through locals -- not
         # server_args.peft_paths directly -- because ServerArgs is read-only
         # once __post_init__ reaches materialize_declarations() (well before
@@ -262,18 +317,18 @@ def validate_peft_args(server_args) -> None:
                 if isinstance(adapter_path, str):
                     if "=" in adapter_path:
                         name, path = adapter_path.split("=", 1)
-                        oft_ref = OFTRef(
+                        oft_ref = _ImplOFTRef(
                             adapter_name=name, adapter_path=path, pinned=False
                         )
                     else:
-                        oft_ref = OFTRef(
+                        oft_ref = _ImplOFTRef(
                             adapter_name=adapter_path, adapter_path=adapter_path, pinned=False
                         )
                 elif isinstance(adapter_path, dict):
                     assert (
                         "adapter_name" in adapter_path and "adapter_path" in adapter_path
                     ), f"When providing OFT paths as a list of dict, each dict should contain 'adapter_name' and 'adapter_path' keys. Got: {adapter_path}"
-                    oft_ref = OFTRef(
+                    oft_ref = _ImplOFTRef(
                         adapter_name=adapter_path["adapter_name"],
                         adapter_path=adapter_path["adapter_path"],
                         pinned=adapter_path.get("pinned", False),
@@ -286,7 +341,7 @@ def validate_peft_args(server_args) -> None:
                 peft_paths.append(oft_ref)
         elif isinstance(peft_paths, dict):
             peft_paths = [
-                OFTRef(adapter_name=k, adapter_path=v, pinned=False)
+                _ImplOFTRef(adapter_name=k, adapter_path=v, pinned=False)
                 for k, v in peft_paths.items()
             ]
         elif peft_paths is None:
