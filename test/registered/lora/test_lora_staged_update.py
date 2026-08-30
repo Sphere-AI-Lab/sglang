@@ -12,6 +12,13 @@ import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
+# Match SGLang's established distributed-weight test setup. CUDA's cuMem and
+# NVLS transports are not valid for this trainer-plus-inference rank layout on
+# every CI/Slurm node, and can fail the first NCCL broadcast with
+# ncclUnhandledCudaError before any adapter code runs.
+os.environ["NCCL_CUMEM_ENABLE"] = "0"
+os.environ["NCCL_NVLS_ENABLE"] = "0"
+
 from sglang.srt.utils import init_custom_process_group
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
