@@ -240,6 +240,26 @@ class StagedLoRAManager(LoRAManager):
                 )
                 break   # all MoE LoRA layers share one buffer set
 
+    def prepare_lora_batch(self, forward_batch):
+        """Skip when the batch carries no per-request adapter ids.
+
+        Upstream's implementation indexes ``forward_batch.lora_ids``; the fork's
+        facade calls this unconditionally because the FROZEN peft/lora manager
+        ignores that field entirely (single-active: it applies the adapter to
+        every request and sizes off input_ids). During CUDA-graph capture there
+        are no requests and the field is None, which upstream's version cannot
+        take. Upstream guards identically in its own capture path.
+
+        KNOWN GAP: upstream also seeds dummy ``lora_ids`` during capture so its
+        batch metadata is recorded in the graph. The fork's capture path does
+        not, so with decode CUDA graphs enabled a replayed batch would find no
+        prepared metadata and skip LoRA silently. Until that is wired, run the
+        staged stack with --disable-cuda-graph.
+        """
+        if getattr(forward_batch, "lora_ids", None) is None:
+            return
+        return super().prepare_lora_batch(forward_batch)
+
     def _unsupported_ipc(self, what):
         raise NotImplementedError(
             f"{what} belongs to the IPC/in-place streaming transport, which is not "
