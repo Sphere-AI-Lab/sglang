@@ -68,6 +68,18 @@ class StagedLoRAMemoryPool(LoRAMemoryPool):
     def available_serving_slots(self) -> int:
         return self.max_loras_per_batch
 
+    def get_tensor(self, target_module, layer_id, lora_type):
+        """Expose only serving slots to forward-time LoRA kernels."""
+        tensor = super().get_tensor(target_module, layer_id, lora_type)
+        return tensor[: self.max_loras_per_batch]
+
+    def get_embedding_tensor(self, target_module, lora_type):
+        """Hide the staging slot from embedding and lm-head kernels too."""
+        tensor = super().get_embedding_tensor(target_module, lora_type)
+        if tensor is None:
+            return None
+        return tensor[: self.max_loras_per_batch]
+
     def staged_identity(self) -> Optional[tuple[str, int]]:
         if self._staged_uid is None:
             return None

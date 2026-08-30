@@ -18,6 +18,7 @@ from sglang.srt.adapter_sync.backends.lora import (
 )
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
+from sglang.srt.lora.utils import LoRAType
 
 
 CONFIG_DICT = {"target_modules": ["q_proj"], "r": 4, "lora_alpha": 8}
@@ -100,6 +101,17 @@ class TestSlotReservation(CustomTestCase):
 
     def test_buffers_are_one_slot_wider_than_advertised(self):
         pool = _pool(n_slots=2)
+        self.assertEqual(pool.A_buffer["q_proj"][0].shape[0], 3)
+        self.assertEqual(pool.embedding_A_buffer["embed_tokens"].shape[0], 3)
+
+    def test_serving_getters_hide_staging_slot(self):
+        pool = _pool(n_slots=2)
+
+        layer = pool.get_tensor("q_proj", 0, LoRAType.LORA_A)
+        embedding = pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_A)
+
+        self.assertEqual(layer.shape[0], 2)
+        self.assertEqual(embedding.shape[0], 2)
         self.assertEqual(pool.A_buffer["q_proj"][0].shape[0], 3)
         self.assertEqual(pool.embedding_A_buffer["embed_tokens"].shape[0], 3)
 
