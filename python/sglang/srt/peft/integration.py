@@ -132,7 +132,12 @@ def _init_lora_manager(
         model_runner.peft_lora_manager = StagedLoRAManager(
             base_model=model_runner.model,
             base_hf_config=model_runner.model_config.hf_config,
-            max_loras_per_batch=1,  # single-active; the staging slot is extra
+            # 2 serving slots: upstream registers the BASE model (uid None) at
+            # slot 0 during init, so a single slot leaves no room for an adapter
+            # beside it. The staging slot is allocated on top of these, not
+            # carved out of them. (OFT hits the same constraint: its
+            # double-buffer path requires max_ofts_per_batch >= 3.)
+            max_loras_per_batch=2,
             load_config=model_runner.load_config,
             dtype=model_runner.dtype,
             server_args=server_args,

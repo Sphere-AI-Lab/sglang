@@ -58,7 +58,16 @@ class VersionedStaging:
                 f"staged_adapter_mismatch: staged={self._staged_uid} requested={uid}. "
                 "Refusing to promote one adapter's weights into another's slot."
             )
-        self._copy_slot(self.staging_idx, self._slot_for_uid(uid))
+        dst = self._slot_for_uid(uid)
+        if dst == self.staging_idx:
+            raise RuntimeError(
+                f"staging_slot_is_serving_slot: adapter {uid!r} is mapped to slot "
+                f"{dst}, which is also the staging slot. The staging slot must be "
+                "reserved: promoting would copy a slot onto itself and, worse, the "
+                "adapter would be serving out of the buffer the next stage "
+                "overwrites."
+            )
+        self._copy_slot(self.staging_idx, dst)
         self._active_versions[uid] = version
         self._staged_version = None
         self._staged_uid = None

@@ -23,7 +23,7 @@ import torch
 
 from sglang.srt.adapter_sync.versioning import VersionedStaging
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.lora.mem_pool import LoRAMemoryPool
+from sglang.srt.lora.mem_pool import EMPTY_SLOT, LoRAMemoryPool
 
 logger = logging.getLogger(__name__)
 
@@ -215,9 +215,24 @@ class StagedLoRAManager(LoRAManager):
         #     would no-op, i.e. the adapter would silently not apply.
         pool = self.memory_pool
         if uid not in pool.uid_to_buffer_id:
-            slot = pool.active_idx      # single-active convention
+            # Take a SERVING slot, never the staging slot. Upstream registers the
+            # base model (uid None) at slot 0 during init, so claiming
+            # active_idx unconditionally would both evict base routing and, when
+            # the pool advertises a single slot, collide with staging.
+            slot = next(
+                (i for i in range(pool.max_loras_per_batch)
+                 if pool.buffer_id_to_uid[i] is EMPTY_SLOT),
+                None,
+            )
+            if slot is None:
+                raise RuntimeError(
+                    "no free serving slot for a staged adapter "
+                    f"(pool advertises {pool.max_loras_per_batch}; the staging slot "
+                    "is separate). Raise --max-loras-per-batch."
+                )
             pool.uid_to_buffer_id[uid] = slot
             pool.buffer_id_to_uid[slot] = uid
+            logger.info("staged adapter %s registered at serving slot %d", uid, slot)
         self.loras[uid] = adapter
 
         self.memory_pool.stage(
