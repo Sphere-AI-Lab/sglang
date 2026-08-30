@@ -30,6 +30,30 @@
 - GPU checks run under Slurm, never on the login node, and use the existing shared environment `/data/home/zeju/miles-orbit-dev/envs/candidate` with worktree source supplied through `PYTHONPATH`.
 - Preserve all unrelated branch changes and do not delete remote files, jobs, worktrees, or sessions.
 
+## Pre-implementation CPU baseline
+
+Recorded on 2026-08-30 before Task 1 source or test changes. The bounded baseline command was:
+
+```bash
+env PYTHONPATH="$PWD/python" \
+  /data/home/zeju/miles-orbit-dev/envs/candidate/bin/python -m pytest -q \
+  test/registered/unit/lora/test_lora_lease.py \
+  test/registered/unit/managers/test_msgpack_ipc_roundtrip.py
+```
+
+Result: `3 failed, 20 passed, 16 subtests passed` in 61.48 seconds. The three failures already exist at target base `1c15111fba954babe2b9742caefcbedb22ce306c`:
+
+1. `TestUnloadRefCacheCleanup.test_explicit_unload_drops_ref_cache_entry`
+2. `TestUnloadRefCacheCleanup.test_failed_unload_keeps_ref_cache_entry`
+
+   Both reach `tokenizer_control_mixin.py:1024` without a published parallel runtime configuration and fail because `ParallelContext` has no `dp_size` attribute.
+
+3. `TestMsgpackIpcRoundtrip.test_check_weights_mirrors_match_pydantic_models`
+
+   The existing `ParallelismInfo` IPC model contains `role`, while its Pydantic mirror does not.
+
+These failures are outside the staged-LoRA port and are not part of Tasks 1-5. During implementation, the regression gate is: all new staged-LoRA tests pass, all previously passing focused tests remain passing, and any full-suite rerun has exactly this same three-test failure set with no new failure. Fixing the baseline failures requires separate scope and evidence.
+
 ---
 
 ## File map
@@ -935,7 +959,7 @@ env PYTHONPATH="$PWD/python" /data/home/zeju/miles-orbit-dev/envs/candidate/bin/
   test/registered/unit/managers/test_msgpack_ipc_roundtrip.py
 ```
 
-Expected: zero failures and zero errors.
+Expected: every new staged-LoRA test and every test that passed in the recorded baseline passes. A full rerun may reproduce exactly the three pre-implementation failures recorded above; any additional failure or changed failure signature blocks qualification. If the three unrelated baseline defects have been fixed separately by this point, expect zero failures and zero errors.
 
 - [ ] **Step 2: Run formatting and diff hygiene**
 
