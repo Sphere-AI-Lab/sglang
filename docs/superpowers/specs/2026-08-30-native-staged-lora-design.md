@@ -35,6 +35,8 @@ eviction machinery.
 - Rewrite the corrected branch's native one-step LoRA upsert API.
 - Introduce dynamic REST load/unload features beyond the target's existing API.
 - Change adapter math, kernels, or quantization behavior.
+- Add a third public prepare/finalize phase. The external trainer contract remains
+  stage then activate.
 - Guarantee recovery from a fatal CUDA context error. Such an error makes the
   worker unhealthy and requires restart.
 
@@ -102,10 +104,12 @@ Stage:
    _create_lora_adapter_from_tensors path.
 3. Validate target modules, ranks, added-token metadata, and compatibility with
    an existing adapter.
-4. Place the adapter into staging_idx with the native pool loader.
-5. Retain the staged adapter, configuration, reference candidate, uid, and
+4. Preserve the existing adapter's pinned status when the stable uid is reused;
+   first-time streamed adapters are unpinned.
+5. Place the adapter into staging_idx with the native pool loader.
+6. Retain the staged adapter, configuration, reference candidate, uid, and
    version in manager-local pending state.
-6. Return success without changing configs, loras, lora_refs, the tokenizer
+7. Return success without changing configs, loras, lora_refs, the tokenizer
    registry, serving routing, or active versions.
 
 Activate:
@@ -138,6 +142,10 @@ The tokenizer registry owns the externally visible active version:
   version.
 - A failed aggregate activation leaves the registry at the old version and
   returns failure.
+- If workers disagree during activation, the tokenizer records the affected
+  adapter in failed_lora_activations before releasing model_update_lock. Future
+  admission for that adapter fails with a restart-required error. Base-model and
+  unrelated-adapter admission remain available.
 
 Request admission must snapshot lora_id and version under the same registry
 lock that increments the adapter lease counter. This prevents an activation
@@ -198,7 +206,10 @@ No native LoRA request is routed through peft_method.
 - A multi-worker stage failure prevents activation.
 - A multi-worker activation failure is reported as a consistency failure. The
   implementation must avoid publishing the new tokenizer-registry version.
-  Recoverable local failures restore their prior slot before responding.
+  Recoverable local failures restore their prior slot before responding. Because
+  a worker that already succeeded cannot be assumed to roll back, the tokenizer
+  must quarantine the affected adapter before admission resumes. The quarantine
+  is fail-closed and lasts until process restart.
 
 ## Verification
 
@@ -214,6 +225,9 @@ No native LoRA request is routed through peft_method.
 - Nonresident activation commits metadata without evicting another adapter.
 - Failed placement restores prior manager and buffer state.
 - Registry publication occurs only after aggregate success.
+- Aggregate activation failure quarantines only the affected adapter before the
+  writer lock is released; base and unrelated adapters remain admissible.
+- Existing pinned metadata survives a staged refresh.
 - Request admission snapshots id and version atomically.
 - Radix keys distinguish versions and preserve base keys.
 - Existing native LoRA upsert, registry, lease, eviction, and multi-LoRA tests
@@ -221,12 +235,14 @@ No native LoRA request is routed through peft_method.
 
 ### GPU qualification
 
-- One GPU: serve v1, stage v2, prove output remains v1, activate v2, and compare
-  bitwise against a fresh v2 server.
+- TP=1 serving: allocate a second physical GPU for the NCCL trainer rank, serve
+  v1, stage v2, prove output remains v1, activate v2, and compare bitwise
+  against a fresh v2 server.
 - Cache negative control: withholding version reuses a stale prefix; including
   version produces a miss and correct output.
-- TP=2: every rank stages and activates the same version and output matches the
-  single-version reference.
+- TP=2: allocate a distinct trainer GPU plus two server GPUs; every server rank
+  stages and activates the same version and output matches the single-version
+  reference.
 - Multi-tenant: updating adapter A leaves adapter B and base output unchanged.
 - Slot pressure: eviction never selects the hidden staging slot.
 - Decode CUDA graphs enabled and disabled: activation is applied and does not
