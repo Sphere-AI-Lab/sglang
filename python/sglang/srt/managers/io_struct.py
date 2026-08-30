@@ -250,6 +250,8 @@ class GenerateReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
+    # Active weight version, resolved atomically with lora_id by tokenizer manager.
+    lora_version: Optional[Union[List[Optional[int]], int]] = None
 
     # The path and resolved identity of single-active OFT adapters.
     adapter_path: Optional[Union[List[Optional[str]], str]] = None
@@ -524,6 +526,7 @@ class GenerateReqInput:
         self._expand_inputs(num)
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
+        self._normalize_lora_versions(num)
         self._normalize_adapter_paths(num)
         self._normalize_image_data(num)
         self._normalize_mm_hashes(num)
@@ -565,6 +568,17 @@ class GenerateReqInput:
                 self.lora_path = self.lora_path * self.parallel_sample_num
             else:
                 raise ValueError("lora_path should be a list or a string.")
+
+    def _normalize_lora_versions(self, num):
+        """Normalize resolved LoRA versions for batch processing."""
+        if self.lora_version is None:
+            return
+        if isinstance(self.lora_version, int):
+            self.lora_version = [self.lora_version] * num
+        elif isinstance(self.lora_version, list):
+            self.lora_version = self.lora_version * self.parallel_sample_num
+        else:
+            raise ValueError("lora_version should be a list or an integer.")
 
     def _normalize_adapter_paths(self, num):
         """Normalize single-active adapter paths for batch processing."""
@@ -904,6 +918,11 @@ class GenerateReqInput:
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
+            lora_version=(
+                self.lora_version[i]
+                if isinstance(self.lora_version, list)
+                else self.lora_version
+            ),
             adapter_path=self.adapter_path[i] if self.adapter_path is not None else None,
             adapter_id=self.adapter_id[i] if self.adapter_id is not None else None,
             custom_logit_processor=(
@@ -1005,7 +1024,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Adapter weight version at admission time, resolved tokenizer-side from the
     # registry. Carried so the radix key can separate KV computed under different
     # on-policy weights of the SAME adapter (see Req.__init__). None for base
-    # requests, and for LoRA, which has no per-request adapter identity yet.
+    # requests. Native LoRA carries its independent version in the final field.
     adapter_version: Optional[int] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
@@ -1066,6 +1085,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # Active native LoRA weight version. This must remain the final declared
+    # field to preserve older positional IPC payloads.
+    lora_version: Optional[int] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)
@@ -1136,6 +1159,8 @@ class EmbeddingReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
+    # Active weight version, resolved atomically with lora_id by tokenizer manager.
+    lora_version: Optional[Union[List[Optional[int]], int]] = None
     # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     positional_embed_overrides: Any = None
@@ -1235,6 +1260,7 @@ class EmbeddingReqInput:
                 self.sampling_params[i]["max_new_tokens"] = 0
 
             self._normalize_lora_paths(self.batch_size)
+            self._normalize_lora_versions(self.batch_size)
 
         self._validate_rid_uniqueness()
 
@@ -1250,6 +1276,20 @@ class EmbeddingReqInput:
                     )
             else:
                 raise ValueError("lora_path should be a list or a string.")
+
+    def _normalize_lora_versions(self, num):
+        """Normalize resolved LoRA versions for batch processing."""
+        if self.lora_version is None:
+            return
+        if isinstance(self.lora_version, int):
+            self.lora_version = [self.lora_version] * num
+        elif isinstance(self.lora_version, list):
+            if len(self.lora_version) != num:
+                raise ValueError(
+                    f"lora_version list length ({len(self.lora_version)}) must match batch size ({num})"
+                )
+        else:
+            raise ValueError("lora_version should be a list or an integer.")
 
     def contains_mm_input(self) -> bool:
         return (
@@ -1282,6 +1322,11 @@ class EmbeddingReqInput:
                 is_cross_encoder_request=True,
                 lora_path=self.lora_path[i] if self.lora_path is not None else None,
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
+                lora_version=(
+                    self.lora_version[i]
+                    if isinstance(self.lora_version, list)
+                    else self.lora_version
+                ),
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
@@ -1310,6 +1355,11 @@ class EmbeddingReqInput:
                 sampling_params=self.sampling_params[i],
                 lora_path=self.lora_path[i] if self.lora_path is not None else None,
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
+                lora_version=(
+                    self.lora_version[i]
+                    if isinstance(self.lora_version, list)
+                    else self.lora_version
+                ),
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
@@ -1356,6 +1406,10 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
+    # Active native LoRA weight version. This must remain the final declared
+    # field to preserve older positional IPC payloads.
+    lora_version: Optional[int] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)

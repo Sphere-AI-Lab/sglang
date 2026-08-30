@@ -44,6 +44,9 @@ class LoRARef(msgspec.Struct, frozen=True, array_like=True):
     # Trailing field with a default keeps the array_like wire format
     # compatible with refs encoded before this field existed.
     reloadable: bool = True
+    # Active weight version. Keep this as the final field so older positional
+    # payloads decode with version zero.
+    version: int = 0
 
     def __post_init__(self):
         if self.lora_id is None:
@@ -86,8 +89,9 @@ class LoRARegistry:
         )
 
         # A read-write lock to ensure adapters loading / unloading operations are exclusive.
-        # Please note that the counter increment/decrement operations are not synchronized through this
-        # lock, as they are designed to be non-blocking and can be performed concurrently.
+        # Admission increments run under the writer lock so lookup, version
+        # snapshot, and lease acquisition are atomic. Releases use the reader
+        # lock and can proceed concurrently.
         self._registry_lock = RWLock()
         # An ordered dictionary to hold LoRARef objects, mapping from LoRA name to LoRARef.
         # The LoRARefs are stored in LRU order, such that LoRA adapters that have been
@@ -136,7 +140,11 @@ class LoRARegistry:
             return lora_ref.lora_id if lora_ref is not None else None
 
     async def register_or_reuse(
-        self, lora_ref: LoRARef, upsert: bool = False
+        self,
+        lora_ref: LoRARef,
+        upsert: bool = False,
+        *,
+        preserve_pinned: bool = False,
     ) -> Tuple[LoRARef, bool]:
         """Resolve which identity a load request should use.
 
@@ -152,9 +160,12 @@ class LoRARegistry:
             return lora_ref, False
         async with self._registry_lock.reader_lock:
             existing = self._registry.get(lora_ref.lora_name, None)
-        if existing is None:
-            return lora_ref, False
-        return replace(lora_ref, lora_id=existing.lora_id), True
+            if existing is None:
+                return lora_ref, False
+            updates: Dict[str, object] = {"lora_id": existing.lora_id}
+            if preserve_pinned:
+                updates["pinned"] = existing.pinned
+            return replace(lora_ref, **updates), True
 
     async def refresh(self, lora_ref: LoRARef):
         """Replace a registered adapter's ref after a successful upsert.
@@ -171,50 +182,73 @@ class LoRARegistry:
             self._registry[lora_ref.lora_name] = lora_ref
             self._registry.move_to_end(lora_ref.lora_name)
 
-    async def acquire(self, lora_name: Union[str, List[str]]) -> Union[str, List[str]]:
-        """
-        Queries registry for LoRA IDs based on LoRA names and start tracking the usage of the corresponding LoRA adapters
-        by incrementing its counter.
-        """
+    def _lookup_refs_for_admission(
+        self, lora_name: Union[str, List[Optional[str]]]
+    ) -> List[Optional[LoRARef]]:
+        if isinstance(lora_name, str):
+            names = [lora_name]
+        elif isinstance(lora_name, list):
+            names = lora_name
+        else:
+            raise TypeError("lora_name must be either a string or a list of strings.")
 
-        def _lookup(name: str) -> str:
+        refs = []
+        for name in names:
             if name is None:
-                return None
-
-            lora_ref = self._registry.get(name, None)
-            if lora_ref is None:
+                refs.append(None)
+                continue
+            ref = self._registry.get(name)
+            if ref is None:
                 raise ValueError(
                     f"The following requested LoRA adapters are not loaded: {name}\n"
                     f"Loaded adapters: {self._registry.keys()}."
                 )
             self._registry.move_to_end(name)
-            return lora_ref.lora_id
+            refs.append(ref)
+        return refs
 
-        # Lookup and increment must be one atomic admission step under the
-        # writer lock: with the increment outside, an unload can slip between
-        # them — unregister the adapter, observe the counter at zero, delete
-        # the counter — leaving this request to KeyError or to run on an
-        # adapter that is already gone. wait_for_unload never awaits inside
-        # this lock, so holding it across the increment cannot deadlock.
+    async def _increment_ref_counters(
+        self, refs: List[Optional[LoRARef]]
+    ) -> None:
+        await asyncio.gather(
+            *[
+                self._counters[ref.lora_id].increment(notify_all=False)
+                for ref in refs
+                if ref is not None
+            ]
+        )
+
+    async def _acquire_refs(
+        self, lora_name: Union[str, List[Optional[str]]]
+    ) -> List[Optional[LoRARef]]:
+        # Lookup, version snapshot, and counter increment are one atomic
+        # admission step. An unload cannot remove the adapter between them.
+        async with self._registry_lock.writer_lock:
+            refs = self._lookup_refs_for_admission(lora_name)
+            await self._increment_ref_counters(refs)
+            return refs
+
+    async def acquire(
+        self, lora_name: Union[str, List[Optional[str]]]
+    ) -> Union[str, List[Optional[str]]]:
+        """Acquire request leases and return the existing ID-only shape."""
+        refs = await self._acquire_refs(lora_name)
+        ids = [ref.lora_id if ref is not None else None for ref in refs]
+        return ids[0] if isinstance(lora_name, str) else ids
+
+    async def acquire_with_version(
+        self, lora_name: Union[str, List[Optional[str]]]
+    ) -> Union[
+        Tuple[str, int],
+        Tuple[List[Optional[str]], List[Optional[int]]],
+    ]:
+        """Acquire request leases and atomically snapshot IDs and versions."""
+        refs = await self._acquire_refs(lora_name)
+        ids = [ref.lora_id if ref is not None else None for ref in refs]
+        versions = [ref.version if ref is not None else None for ref in refs]
         if isinstance(lora_name, str):
-            async with self._registry_lock.writer_lock:
-                lora_id = _lookup(lora_name)
-                await self._counters[lora_id].increment(notify_all=False)
-            return lora_id
-        elif isinstance(lora_name, list):
-            async with self._registry_lock.writer_lock:
-                lora_ids = [_lookup(name) for name in lora_name]
-                # Increment the counters only after all IDs are looked up.
-                await asyncio.gather(
-                    *[
-                        self._counters[id].increment(notify_all=False)
-                        for id in lora_ids
-                        if id is not None
-                    ]
-                )
-            return lora_ids
-        else:
-            raise TypeError("lora_name must be either a string or a list of strings.")
+            return ids[0], versions[0]
+        return ids, versions
 
     async def release(self, lora_id: Union[str, List[str]]):
         """

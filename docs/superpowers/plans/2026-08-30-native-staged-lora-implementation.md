@@ -313,7 +313,9 @@ env PYTHONPATH="$PWD/python" /data/home/zeju/miles-orbit-dev/envs/candidate/bin/
   test/registered/unit/managers/test_msgpack_ipc_roundtrip.py
 ```
 
-Expected: all selected tests pass, including old `LoRARef` decoding and exact-once lease release.
+Expected: the new versioning suite passes, every previously passing lease and IPC test remains passing, and the full command reproduces only the three recorded pre-implementation failures.
+
+Observed after Task 1 implementation: the new suite passed all 8 tests. The full command produced `3 failed, 28 passed, 16 subtests passed`; the failure names and signatures exactly matched the recorded baseline. A second run excluding only those three tests produced `28 passed, 3 deselected, 16 subtests passed`.
 
 - [ ] **Step 7: Commit the versioned identity unit**
 

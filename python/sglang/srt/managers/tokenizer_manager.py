@@ -1460,6 +1460,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
+                lora_version=obj.lora_version,
                 adapter_id=obj.adapter_id,
                 adapter_version=getattr(obj, "adapter_version", None),
                 input_embeds=input_embeds,
@@ -1508,6 +1509,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 priority=obj.priority,
                 dimensions=obj.dimensions,
                 lora_id=obj.lora_id,
+                lora_version=obj.lora_version,
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
@@ -3492,12 +3494,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"Failed to implicitly load LoRA adapter {lora_path}: {load_result.error_message}"
                 )
 
-        # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
-        obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
-        # Propagate lora_id to any sub-objects already cached by __getitem__.
+        # Snapshot the active ID/version and start tracking ongoing requests in
+        # one registry admission step.
+        obj.lora_id, obj.lora_version = (
+            await self.lora_registry.acquire_with_version(obj.lora_path)
+        )
+        # Propagate the snapshot to sub-objects already cached by __getitem__.
         for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
+            is_batch = isinstance(obj.lora_id, list)
             sub_obj.lora_id = (
-                obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
+                obj.lora_id[i] if is_batch else obj.lora_id
+            )
+            sub_obj.lora_version = (
+                obj.lora_version[i]
+                if isinstance(obj.lora_version, list)
+                else obj.lora_version
             )
 
     def _init_req_state(
