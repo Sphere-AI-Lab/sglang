@@ -149,6 +149,25 @@ class StagedLoRAManager(LoRAManager):
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
         )
 
+    def _uid_for(self, name, adapter_id):
+        """Resolve one adapter identity for both stage and activate.
+
+        The trainer may supply ``adapter_id`` on one call and not the other --
+        orbit's stage carries the tokenizer-minted id while its activate sends
+        only the name. Resolving each call independently made them disagree, and
+        the pool (correctly) refused to promote weights into a slot staged under
+        a different uid. So remember what a name was staged under and reuse it.
+        """
+        if adapter_id is not None:
+            return adapter_id
+        staged = getattr(self, "_staged_uid_by_name", {}).get(name)
+        if staged is not None:
+            return staged
+        for uid, ref in getattr(self, "lora_refs", {}).items():
+            if getattr(ref, "lora_name", None) == name:
+                return uid
+        return name
+
     def stage_adapter(self, named_tensors, config, name, version, adapter_id=None):
         """Fill the staging slot from raw trainer tensors. Lock-free.
 
@@ -161,7 +180,10 @@ class StagedLoRAManager(LoRAManager):
         from sglang.srt.lora.lora import LoRAAdapter
         from sglang.srt.lora.lora_config import LoRAConfig
 
-        uid = adapter_id if adapter_id is not None else name
+        uid = self._uid_for(name, adapter_id)
+        if not hasattr(self, "_staged_uid_by_name"):
+            self._staged_uid_by_name = {}
+        self._staged_uid_by_name[name] = uid
         lora_config = self.configs.get(uid)
         if lora_config is None:
             if not config:
@@ -190,8 +212,7 @@ class StagedLoRAManager(LoRAManager):
 
     def activate_adapter(self, name, version, adapter_id=None):
         """Promote the staged weights into this adapter's slot."""
-        uid = adapter_id if adapter_id is not None else name
-        self.memory_pool.activate(version, uid=uid)
+        self.memory_pool.activate(version, uid=self._uid_for(name, adapter_id))
 
     # ---- compatibility with the fork's call sites --------------------------
     #

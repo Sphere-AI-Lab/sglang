@@ -89,5 +89,31 @@ class TestEndToEndStaging(unittest.TestCase):
         self.assertIsNone(p.active_version("adapterA"))
 
 
+class TestUidResolution(unittest.TestCase):
+    """stage and activate must agree on identity even when the client is
+    inconsistent -- orbit sends adapter_id on stage and only the name on
+    activate, which previously made the two resolve differently and tripped the
+    pool's staged_adapter_mismatch guard."""
+
+    def _mgr(self):
+        m = object.__new__(StagedLoRAManager)
+        m.lora_refs = {}
+        return m
+
+    def test_activate_reuses_the_uid_that_stage_used(self):
+        m = self._mgr()
+        staged = m._uid_for("policy", "hex-id-123")      # stage: id supplied
+        m._staged_uid_by_name = {"policy": staged}
+        self.assertEqual(m._uid_for("policy", None), "hex-id-123")  # activate: name only
+
+    def test_explicit_id_still_wins(self):
+        m = self._mgr()
+        m._staged_uid_by_name = {"policy": "old"}
+        self.assertEqual(m._uid_for("policy", "explicit"), "explicit")
+
+    def test_falls_back_to_the_name_when_nothing_is_known(self):
+        self.assertEqual(self._mgr()._uid_for("policy", None), "policy")
+
+
 if __name__ == "__main__":
     unittest.main()
