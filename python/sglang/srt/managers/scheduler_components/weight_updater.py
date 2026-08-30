@@ -112,21 +112,32 @@ class SchedulerWeightUpdaterManager:
             assert flush_cache_success, "Cache flush failed after updating weights"
 
     def _flush_radix_after_adapter_activate(self, recv_req) -> None:
-        """Invalidate the radix cache after a double-buffer adapter activate
-        (OFT or our single-active peft-LoRA).
+        """Invalidate the radix cache after a double-buffer adapter activate.
 
         The DB stage/activate path is flush-free by design (lock-free stage +
         drained atomic flip), so a prompt prefix cached before the swap would be
-        served with KV computed under the old adapter weights. Neither of our
-        single-active peft methods versions the radix key per request -- the OFT
-        extra_key versioning (maybe_extend_extra_key) was never wired on the
-        v0.5.14 base, and LoRA names no adapter per request -- so a full radix
-        flush is the correct invalidation. It mirrors the IPC sync path, which
-        already flushes via flush_cache=True. The batch is already drained
-        tokenizer-side (the writer_lock held around activate), so flush_cache
-        succeeds.
+        served with KV computed under the old adapter weights unless something
+        invalidates it.
+
+        OFT no longer needs this: the radix key carries the adapter WEIGHT
+        VERSION (Req.__init__ -> maybe_extend_extra_key), so KV produced under
+        version k lives under a different key than requests arriving at k+1 and
+        can never be matched. Entries for retired versions become unreachable
+        and age out through the cache's normal LRU eviction. Dropping the flush
+        keeps every prefix the swap did NOT invalidate -- above all the
+        base-model prefixes (shared system prompts, the KL/reference path),
+        which a full flush discarded on every training step.
+
+        LoRA still needs the flush: our single-active LoRA path names no adapter
+        per request, so its keys have nothing to version by. It gets per-request
+        identity with the adapter_sync extension; until then, flush.
+
+        Ordering note: this does NOT replace the tokenizer-side drain
+        (model_update_lock.writer_lock around activate). That drain prevents a
+        request from spanning the weight swap; keying prevents cache reuse
+        across versions. Both are required, for different reasons.
         """
-        if recv_req.load_format not in ("oft_adapter", "lora_adapter"):
+        if recv_req.load_format != "lora_adapter":
             return
         flushed = self.flush_cache(empty_cache=False)
         assert flushed, "radix flush failed after peft double-buffer activate"
