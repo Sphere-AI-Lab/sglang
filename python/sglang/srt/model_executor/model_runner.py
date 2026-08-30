@@ -1268,8 +1268,15 @@ class ModelRunner:
         set_global_dwdp_manager(manager)
         manager.setup(self.model)
 
+    def _get_lora_manager_class(self):
+        if self.server_args.enable_lora_staging:
+            from sglang.srt.adapter_sync.backends.lora import StagedLoRAManager
+
+            return StagedLoRAManager
+        return LoRAManager
+
     def init_lora_manager(self):
-        self.lora_manager = LoRAManager(
+        self.lora_manager = self._get_lora_manager_class()(
             base_model=self.model,
             base_hf_config=self.model_config.hf_config,
             max_loras_per_batch=get_lora().max_loras_per_batch,

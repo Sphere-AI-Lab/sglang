@@ -203,9 +203,10 @@ class BaseTpWorker(ABC):
     def activate_adapter_version(self, recv_req):
         # recv_req is either ActivateAdapterVersionReqInput (drained swap) or
         # UpdateAdapterFromDistributedReqInput (double_buffer=False in-place
-        # activate); both carry adapter_name + adapter_version.
+        # activate); both carry adapter_name + adapter_id + adapter_version.
         success, message = self.model_runner.weight_updater.activate_adapter_version(
             adapter_name=recv_req.adapter_name,
+            adapter_id=recv_req.adapter_id,
             adapter_version=recv_req.adapter_version,
         )
         return success, message

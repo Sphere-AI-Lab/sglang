@@ -2896,6 +2896,11 @@ class ServerArgs(PEFTArgs):
         "Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
         NS("lora"),
     ] = None
+    enable_lora_staging: A[
+        bool,
+        "Enable two-phase stage/activate updates for native LoRA serving.",
+        NS("lora"),
+    ] = False
     enable_lora_overlap_loading: A[
         Optional[bool],
         "Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
@@ -9433,6 +9438,9 @@ class ServerArgs(PEFTArgs):
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
+
+        if self.enable_lora_staging and not self.enable_lora:
+            raise ValueError("--enable-lora-staging requires --enable-lora")
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:

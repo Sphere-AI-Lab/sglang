@@ -385,14 +385,14 @@ class WeightUpdater:
         payload_metadata: Optional[dict] = None,
         double_buffer: bool = True,
     ):
-        """Double-buffer STAGE: NCCL-recv the (flattened) adapter payload into a
-        temp, then fill the STAGING slot via ``peft.stage_adapter``. Mirrors the
-        recv of ``update_weights_from_distributed`` (orbit broadcasts one
-        ``__flattened__`` tensor + ``payload_metadata``). Returns ``(bool, str)``
-        like the base-weight distributed path. Version arrives as a STRING and is
-        converted to int at this boundary (managers store int versions).
+        """NCCL-receive a staged adapter payload and route it to its manager.
 
-        ``double_buffer`` is forwarded to ``peft.stage_adapter``, which rejects
+        Native LoRA staging uses ``model_runner.lora_manager`` only when the
+        explicit staging flag and ``lora_adapter`` format are both active. All
+        other configurations retain the existing ``peft.stage_adapter`` path.
+        The version arrives as a string and is converted to int at this boundary.
+
+        On the PEFT fallback, ``double_buffer`` is forwarded unchanged and rejects
         it for OFT (see that function's docstring) -- the in-place-distributed
         (``double_buffer=False``) OFT path is not implemented."""
         assert group_name in self._model_update_group, (
@@ -419,8 +419,26 @@ class WeightUpdater:
             for handle in handles:
                 handle.wait()
 
+            model_runner = self.get_model_runner()
+            if (
+                getattr(model_runner.server_args, "enable_lora_staging", False)
+                and load_format == "lora_adapter"
+            ):
+                if payload_metadata is not None:
+                    tensors = peft.reconstruct_oft_staging(tensors, payload_metadata)
+                result = model_runner.lora_manager.stage_adapter(
+                    tensors,
+                    adapter_config,
+                    adapter_name,
+                    int(adapter_version),
+                    adapter_id=adapter_id,
+                )
+                if not result.success:
+                    return False, result.error_message
+                return True, "Succeeded to stage adapter online."
+
             result = peft.stage_adapter(
-                self.get_model_runner(),
+                model_runner,
                 load_format,
                 tensors,
                 adapter_config,
@@ -445,21 +463,35 @@ class WeightUpdater:
             logger.error(error_msg)
             return False, error_msg
 
-    def activate_adapter_version(self: WeightUpdater, *, adapter_name, adapter_version):
-        """Double-buffer ACTIVATE: copy STAGING->ACTIVE + bump version via
-        ``peft.activate_adapter``. Caller (tokenizer writer_lock) guarantees the
-        running batch is drained. Returns ``(bool, str)``; a missing staged
-        version raises ``inactive_slot_busy`` inside the manager -> ``(False, …)``.
+    def activate_adapter_version(
+        self: WeightUpdater, *, adapter_name, adapter_id, adapter_version
+    ):
+        """Activate a staged adapter through native LoRA or the PEFT fallback.
+
+        The caller's tokenizer writer lock guarantees the running batch is
+        drained. Manager results are normalized to the scheduler's ``(bool, str)``
+        boundary.
         """
         try:
+            model_runner = self.get_model_runner()
+            if getattr(model_runner.server_args, "enable_lora_staging", False):
+                result = model_runner.lora_manager.activate_adapter(
+                    adapter_name,
+                    int(adapter_version),
+                    adapter_id=adapter_id,
+                )
+                if not result.success:
+                    return False, result.error_message
+                return True, "Succeeded to activate adapter version."
+
             result = peft.activate_adapter(
-                self.get_model_runner(), adapter_name, int(adapter_version)
+                model_runner, adapter_name, int(adapter_version)
             )
             if result is peft.NOT_HANDLED:
                 return (
                     False,
                     f"peft activate_adapter not handled (peft_method="
-                    f"{self.get_model_runner().server_args.peft_method}).",
+                    f"{model_runner.server_args.peft_method}).",
                 )
             return True, "Succeeded to activate adapter version."
         except Exception as e:
