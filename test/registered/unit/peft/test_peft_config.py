@@ -18,6 +18,8 @@ def _args(peft_method, *, enable_lora=True):
         peft_max_lora_rank=None,
         peft_double_buffer=False,
         speculative_algorithm=None,
+        cuda_graph_config=None,
+        oft_impl="sibling",
     )
     # Stand-in for ServerArgs._late_resolution: validate_peft_args writes its
     # normalized peft_paths/peft_target_modules through this (real ServerArgs
