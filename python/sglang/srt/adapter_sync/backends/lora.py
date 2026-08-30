@@ -204,6 +204,22 @@ class StagedLoRAManager(LoRAManager):
         )
         adapter.initialize_weights_from_tensors(dict(named_tensors))
 
+        # A trainer-pushed adapter was never loaded from disk, so nothing has
+        # given it a serving slot or a CPU-side object. Register both, mirroring
+        # OFT's register_streamed_adapter:
+        #   * uid -> slot, or activate has nowhere to promote into (and
+        #     get_buffer_id raises a bare KeyError);
+        #   * self.loras[uid], because upstream's prepare_lora_batch reads
+        #     lora.config.r and lora.scaling from it to fill lora_ranks/scalings
+        #     -- without it a served request would find rank 0 and the kernels
+        #     would no-op, i.e. the adapter would silently not apply.
+        pool = self.memory_pool
+        if uid not in pool.uid_to_buffer_id:
+            slot = pool.active_idx      # single-active convention
+            pool.uid_to_buffer_id[uid] = slot
+            pool.buffer_id_to_uid[slot] = uid
+        self.loras[uid] = adapter
+
         self.memory_pool.stage(
             version,
             (adapter, self.lora_modules, self.embed_tokens_module, self.lm_head_module),
