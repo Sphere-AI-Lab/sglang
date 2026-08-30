@@ -32,10 +32,19 @@ class StagedLoRAMemoryPool(VersionedStaging, LoRAMemoryPool):
     """Upstream's pool plus a reserved staging slot and versioned activation."""
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        # Set BEFORE super().__init__: upstream's constructor calls
+        # init_buffers() (mem_pool.py:236), and our override of it assigns
+        # staging_idx. Assigning defaults afterwards would clobber that -- which
+        # left staging_idx None, and t[None] in torch inserts an axis instead of
+        # raising, so the promote silently became a whole-tensor self-copy.
         self.active_idx = 0          # single-active convention (uid=None)
-        self.staging_idx = None      # assigned in init_buffers
+        self.staging_idx = None      # real value assigned in init_buffers
         self._init_versioning()
+        super().__init__(*args, **kwargs)
+        assert self.staging_idx is not None, (
+            "init_buffers did not run: staging_idx is unset, so there is no "
+            "reserved staging slot."
+        )
 
     def init_buffers(self, base_model) -> None:
         """Allocate one MORE slot than the pool advertises, and hide the extra.
