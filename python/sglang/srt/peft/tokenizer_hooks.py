@@ -183,8 +183,15 @@ async def resolve_peft_path(tm, obj):
     # Set the kind's request-side id/version fields the scheduler reads.
     if tm.peft_kind == "oft":
         obj.adapter_id = adapter_id
-        obj.adapter_version = await tm.peft_registry.get_version_by_id(adapter_id)
+        adapter_version = await tm.peft_registry.get_version_by_id(adapter_id)
+        obj.adapter_version = adapter_version
         _propagate_id_to_cached_sub_objs(obj, field="adapter_id", resolved=adapter_id)
+        # The version needs the same propagation as the id: batched sub-objects
+        # are materialized before this resolver runs, so a version set only on
+        # the parent never reaches the tokenized requests built from them.
+        _propagate_id_to_cached_sub_objs(
+            obj, field="adapter_version", resolved=adapter_version
+        )
     else:
         obj.lora_id = adapter_id
         _propagate_id_to_cached_sub_objs(obj, field="lora_id", resolved=adapter_id)

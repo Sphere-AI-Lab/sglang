@@ -1001,6 +1001,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Single-active OFT related
     adapter_id: Optional[str] = None  # None means just use the base model
+    # Adapter weight version at admission time, resolved tokenizer-side from the
+    # registry. Carried so the radix key can separate KV computed under different
+    # on-policy weights of the SAME adapter (see Req.__init__). None for base
+    # requests, and for LoRA, which has no per-request adapter identity yet.
+    adapter_version: Optional[int] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
