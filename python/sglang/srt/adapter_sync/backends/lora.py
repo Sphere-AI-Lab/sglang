@@ -79,28 +79,33 @@ class StagedLoRAMemoryPool(VersionedStaging, LoRAMemoryPool):
         for t in self._slot_buffers():
             t[dst_idx].copy_(t[src_idx])
 
-    def _fill_slot(
-        self, slot_idx: int, named_tensors: List[tuple]
-    ) -> None:
-        """Write incoming ``(buffer_name, layer_id, kind, tensor)`` rows into a slot.
+    def _fill_slot(self, slot_idx, staged) -> None:
+        """Place a staged adapter into ``slot_idx`` using UPSTREAM's own routine.
 
-        ``kind`` is "A" or "B". Ranks below ``max_lora_rank`` occupy the leading
-        sub-slice, matching how upstream pages a smaller adapter into a
-        max-rank buffer; the tail is zeroed so a previous occupant cannot bleed
-        through (upstream's own load path relies on the same invariant).
+        Earlier this method parsed checkpoint names into buffers itself, which
+        was wrong: upstream FUSES projections -- q/k/v share one ``qkv_proj``
+        buffer (stacked x3), gate/up share ``gate_up_proj`` (x2), each occupying
+        a different row range at a max-rank stride -- so name-driven placement
+        matched nothing and silently skipped every q/k/v tensor.
+
+        Both existing implementations in this repo work the other way round:
+        drive from the adapter object and let the placement routine decide where
+        each tensor belongs. So does this now -- it calls
+        ``LoRAMemoryPool.load_lora_weight_to_buffer`` with ``buffer_id=slot_idx``,
+        which is the exact code path a disk load uses, and therefore handles
+        fusion, rank padding, TP slicing and the MoE variants identically. A
+        staged update and a disk load cannot drift apart, because they are the
+        same code.
         """
-        for buffer_name, layer_id, kind, tensor in named_tensors:
-            buf = (self.A_buffer if kind == "A" else self.B_buffer).get(buffer_name)
-            if buf is None:
-                logger.warning(
-                    "staged LoRA update names %r (%s), which this pool has no buffer "
-                    "for; skipping", buffer_name, kind
-                )
-                continue
-            view = buf[layer_id][slot_idx]
-            view.zero_()
-            src = tensor.to(view.device, dtype=view.dtype, non_blocking=True)
-            view[tuple(slice(0, n) for n in src.shape)].copy_(src)
+        adapter, modules, embed_module, lm_head_module = staged
+        self.load_lora_weight_to_buffer(
+            uid=None,                 # placement is by slot; uid is only logged
+            buffer_id=slot_idx,
+            lora_adapter=adapter,
+            lora_modules=modules,
+            lora_embed_tokens_module=embed_module,
+            lora_lm_head_module=lm_head_module,
+        )
 
     def available_serving_slots(self) -> int:
         """Slots usable for serving. The staging slot is extra, not carved out of
@@ -147,62 +152,46 @@ class StagedLoRAManager(LoRAManager):
     def stage_adapter(self, named_tensors, config, name, version, adapter_id=None):
         """Fill the staging slot from raw trainer tensors. Lock-free.
 
-        ``named_tensors`` arrives as checkpoint-style ``(name, tensor)`` rows;
-        they are resolved to (buffer, layer, A|B) here because that mapping is
-        LoRA's business, not the shared core's.
+        Builds the same ``LoRAAdapter`` object a from-tensors disk load builds,
+        then lets the pool place it with upstream's own routine. Nothing here
+        interprets weight names or buffer layouts -- that was the mistake in the
+        first version, which assumed one buffer per projection while upstream
+        fuses q/k/v and gate/up.
         """
+        from sglang.srt.lora.lora import LoRAAdapter
+        from sglang.srt.lora.lora_config import LoRAConfig
+
         uid = adapter_id if adapter_id is not None else name
+        lora_config = self.configs.get(uid)
+        if lora_config is None:
+            if not config:
+                raise ValueError(
+                    "stage_adapter needs an adapter_config the first time an "
+                    f"adapter is staged (adapter {name!r} is not yet known)."
+                )
+            lora_config = LoRAConfig.from_dict(config)
+            self.configs[uid] = lora_config
+
+        adapter = LoRAAdapter(
+            uid,
+            lora_config,
+            self.base_hf_config,
+            self.load_config,
+            self.lora_backend,
+            base_model=self.base_model,
+        )
+        adapter.initialize_weights_from_tensors(dict(named_tensors))
+
         self.memory_pool.stage(
-            version, self._resolve_named_tensors(named_tensors), uid=uid
+            version,
+            (adapter, self.lora_modules, self.embed_tokens_module, self.lm_head_module),
+            uid=uid,
         )
 
     def activate_adapter(self, name, version, adapter_id=None):
         """Promote the staged weights into this adapter's slot."""
         uid = adapter_id if adapter_id is not None else name
         self.memory_pool.activate(version, uid=uid)
-
-    def _resolve_named_tensors(self, named_tensors):
-        """Checkpoint names -> (buffer_name, layer_id, "A"|"B", tensor).
-
-        Mirrors how upstream's own loader interprets adapter weight names, so a
-        staged update and a disk load agree on where a tensor belongs.
-        """
-        from sglang.srt.layers.utils import get_layer_id
-
-        from sglang.srt.adapter_sync.utils import get_target_module_name
-
-        resolved = []
-        for weight_name, tensor in named_tensors:
-            layer_id = get_layer_id(weight_name)
-            if layer_id is None:
-                logger.warning(
-                    "staged LoRA update names %r, which has no layer id "
-                    "(embedding/lm_head staging is not supported yet); skipping",
-                    weight_name,
-                )
-                continue
-            if "lora_A" in weight_name:
-                kind = "A"
-            elif "lora_B" in weight_name:
-                kind = "B"
-            else:
-                logger.warning(
-                    "staged LoRA update names %r, which is neither lora_A nor "
-                    "lora_B; skipping", weight_name
-                )
-                continue
-            try:
-                buffer_name = get_target_module_name(
-                    weight_name, set(self.memory_pool.A_buffer)
-                )
-            except ValueError:
-                logger.warning(
-                    "staged LoRA update names %r, which no buffer matches; skipping",
-                    weight_name,
-                )
-                continue
-            resolved.append((buffer_name, layer_id, kind, tensor))
-        return resolved
 
     # ---- compatibility with the fork's call sites --------------------------
     #

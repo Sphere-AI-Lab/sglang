@@ -46,87 +46,47 @@ class TestSlotReservation(unittest.TestCase):
         self.assertEqual(p.A_buffer["q_proj"][0].shape[0], 3)
 
 
-class TestPrimitives(unittest.TestCase):
-    def test_fill_slot_writes_only_the_named_buffer_and_slot(self):
-        p = _pool()
-        src = torch.full((2, 8), 7.0)                      # rank 2 into a rank-4 buffer
-        p._fill_slot(p.staging_idx, [("q_proj", 0, "A", src)])
-        staged = p.A_buffer["q_proj"][0][p.staging_idx]
-        self.assertEqual(staged[0, 0].item(), 7.0)
-        self.assertEqual(staged[2, 0].item(), 0.0)          # rank tail zeroed
-        self.assertEqual(p.A_buffer["q_proj"][1][p.staging_idx][0, 0].item(), 0.0)  # other layer
-        self.assertEqual(p.A_buffer["q_proj"][0][0][0, 0].item(), 0.0)              # other slot
+class TestPlacementIsDelegatedUpstream(unittest.TestCase):
+    """The backend must NOT interpret weight names or buffer layouts itself.
 
-    def test_fill_slot_zeroes_a_previous_occupant(self):
-        """A shared staging slot must not leak the last adapter's weights."""
-        p = _pool()
-        p._fill_slot(p.staging_idx, [("q_proj", 0, "A", torch.full((4, 8), 9.0))])
-        p._fill_slot(p.staging_idx, [("q_proj", 0, "A", torch.full((2, 8), 1.0))])
-        staged = p.A_buffer["q_proj"][0][p.staging_idx]
-        self.assertEqual(staged[0, 0].item(), 1.0)
-        self.assertEqual(staged[3, 0].item(), 0.0)          # the 9.0s are gone
+    The first version did, and silently skipped every q/k/v tensor: upstream
+    FUSES q/k/v into one qkv_proj buffer (stacked x3) and gate/up into
+    gate_up_proj (x2). Placement is now delegated to upstream's own
+    load_lora_weight_to_buffer, the same routine a disk load uses, so the two
+    cannot drift apart.
+    """
 
-    def test_fill_slot_ignores_an_unknown_buffer_name(self):
+    def test_fill_slot_calls_upstream_placement_with_the_staging_slot(self):
         p = _pool()
-        p._fill_slot(p.staging_idx, [("not_a_module", 0, "A", torch.ones(2, 8))])  # no raise
+        seen = {}
+        p.load_lora_weight_to_buffer = lambda **kw: seen.update(kw)
+        sentinel = ("ADAPTER", "MODULES", "EMBED", "LMHEAD")
+        p._fill_slot(p.staging_idx, sentinel)
+        self.assertEqual(seen["buffer_id"], p.staging_idx)
+        self.assertEqual(seen["lora_adapter"], "ADAPTER")
+        self.assertEqual(seen["lora_modules"], "MODULES")
 
-    def test_copy_slot_moves_every_buffer_family(self):
-        p = _pool()
-        for layer in (0, 1):
-            p.A_buffer["q_proj"][layer][p.staging_idx].fill_(3.0)
-            p.B_buffer["q_proj"][layer][p.staging_idx].fill_(4.0)
-        p._copy_slot(p.staging_idx, 1)
-        for layer in (0, 1):
-            self.assertEqual(p.A_buffer["q_proj"][layer][1][0, 0].item(), 3.0)
-            self.assertEqual(p.B_buffer["q_proj"][layer][1][0, 0].item(), 4.0)
-            self.assertEqual(p.A_buffer["q_proj"][layer][0][0, 0].item(), 0.0)  # slot 0 untouched
+    def test_backend_no_longer_parses_weight_names(self):
+        from sglang.srt.adapter_sync.backends import lora as backend
+        self.assertFalse(
+            hasattr(backend.StagedLoRAManager, "_resolve_named_tensors"),
+            "name-driven placement was the bug; it must not come back",
+        )
 
 
 class TestEndToEndStaging(unittest.TestCase):
     def test_activate_promotes_into_the_named_adapters_slot_only(self):
         p = _pool()
-        p.stage(11, [("q_proj", 0, "A", torch.full((4, 8), 6.0))], uid="adapterB")
+        # stand in for upstream placement: write a marker into the target slot
+        p.load_lora_weight_to_buffer = (
+            lambda **kw: p.A_buffer["q_proj"][0][kw["buffer_id"]].fill_(6.0)
+        )
+        p.stage(11, ("ADAPTER", None, None, None), uid="adapterB")
         p.activate(11, uid="adapterB")
         self.assertEqual(p.A_buffer["q_proj"][0][1][0, 0].item(), 6.0)   # adapterB
         self.assertEqual(p.A_buffer["q_proj"][0][0][0, 0].item(), 0.0)   # adapterA untouched
         self.assertEqual(p.active_version("adapterB"), 11)
         self.assertIsNone(p.active_version("adapterA"))
-
-
-class TestNameResolution(unittest.TestCase):
-    """Checkpoint weight names -> (buffer, layer, A|B). A staged update and a
-    disk load must agree on where a tensor belongs, or the trainer silently
-    writes into the wrong buffer."""
-
-    def _mgr(self):
-        m = object.__new__(StagedLoRAManager)
-        m.memory_pool = _pool()
-        return m
-
-    def test_resolves_layer_and_ab_kind(self):
-        m = self._mgr()
-        rows = m._resolve_named_tensors([
-            ("base_model.model.model.layers.3.self_attn.q_proj.lora_A.weight", torch.ones(2, 8)),
-            ("base_model.model.model.layers.3.self_attn.q_proj.lora_B.weight", torch.ones(8, 2)),
-        ])
-        self.assertEqual([(r[0], r[1], r[2]) for r in rows],
-                         [("q_proj", 3, "A"), ("q_proj", 3, "B")])
-
-    def test_skips_names_with_no_layer_id(self):
-        """embed_tokens/lm_head staging is not supported; skip, do not misfile."""
-        m = self._mgr()
-        self.assertEqual(m._resolve_named_tensors(
-            [("base_model.model.model.embed_tokens.lora_A.weight", torch.ones(2, 8))]), [])
-
-    def test_skips_names_that_are_neither_A_nor_B(self):
-        m = self._mgr()
-        self.assertEqual(m._resolve_named_tensors(
-            [("base_model.model.model.layers.0.self_attn.q_proj.weight", torch.ones(2, 8))]), [])
-
-    def test_skips_modules_the_pool_has_no_buffer_for(self):
-        m = self._mgr()
-        self.assertEqual(m._resolve_named_tensors(
-            [("base_model.model.model.layers.0.mlp.down_proj.lora_A.weight", torch.ones(2, 8))]), [])
 
 
 if __name__ == "__main__":
