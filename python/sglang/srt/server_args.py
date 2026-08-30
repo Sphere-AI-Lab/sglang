@@ -68,6 +68,10 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.peft.config import PEFTArgs, register_peft_args, validate_peft_args
 from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
+from sglang.srt.true_on_policy.contracts import (
+    resolve_true_on_policy_runtime_policy,
+    validate_true_on_policy_contract,
+)
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -318,7 +322,7 @@ BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "fsdp_tp"]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
@@ -1004,6 +1008,11 @@ class ServerArgs(PEFTArgs):
             help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
             aliases=["--nccl-init-addr"],
         ),
+        NS("parallel"),
+    ] = None
+    gated_launch_port: A[
+        Optional[int],
+        "The port of the gated launch control server. When set, every rank blocks right after the distributed environment is initialized, before any sizable GPU allocation, until `POST /gate/activate` is sent to this port on the host of the first rank. This lets an external orchestrator defer the memory hungry part of startup to a safe window. Defaults to None, which disables the gate.",
         NS("parallel"),
     ] = None
     nnodes: A[int, "The number of nodes.", NS("parallel")] = 1
@@ -1913,6 +1922,11 @@ class ServerArgs(PEFTArgs):
         NS("exec.graph"),
     ] = False
     disable_cuda_graph: A[bool, Arg(no_cli=True), NS("exec.graph")] = False
+    disable_draft_cuda_graph: A[
+        bool,
+        "Disable cuda graph for draft model in speculative decoding.",
+        NS("exec.graph"),
+    ] = False
     disable_cuda_graph_padding: A[
         bool,
         "Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
@@ -3242,6 +3256,10 @@ class ServerArgs(PEFTArgs):
         ),
         NS("model"),
     ] = None
+    custom_pull_weights_pre_read_hook: A[
+        Optional[str],
+        "Import path of a hook(source_dir, target_version) that /pull_weights calls before reading the published weights. POSIX shared filesystems need no hook; object-store-backed mounts often lack cross-host read-after-write consistency, so another host's writes only become visible after an explicit refresh.",
+    ] = None
     weight_loader_disable_mmap: A[
         bool, "Disable mmap while loading weight using safetensors.", NS("model")
     ] = False
@@ -3287,6 +3305,14 @@ class ServerArgs(PEFTArgs):
         bool,
         "Start seed server via transfer engine backend for remote instance weight loader.",
         NS("model"),
+    ] = False
+    enable_engine_info_bootstrap: A[
+        bool,
+        "Start the EngineInfoBootstrapServer and register per-rank parallelism config, without the mooncake/verbs P2P transfer-engine seeding.",
+    ] = False
+    enable_rdt_weight_sync: A[
+        bool,
+        "Expose SchedulerActor.pull_weights for RDT (Ray Direct Transport / NIXL) weight sync. Requires --use-ray; implies --enable-engine-info-bootstrap.",
     ] = False
     engine_info_bootstrap_port: A[
         int,
@@ -3400,6 +3426,15 @@ class ServerArgs(PEFTArgs):
         "Enable deterministic inference mode with batch invariant ops.",
         NS("exec.deterministic"),
     ] = False
+    enable_prefill_only_deterministic_inference: A[
+        bool,
+        "Enable prefill-only deterministic inference mode with batch invariant ops.",
+    ] = False
+    true_on_policy_contract: A[
+        Optional[str],
+        "Internal true-on-policy parity contract selected by the launcher. "
+        "Normal users should prefer the Miles true_on_policy switch.",
+    ] = None
     rl_on_policy_target: A[
         Optional[str],
         Arg(
@@ -3620,6 +3655,8 @@ class ServerArgs(PEFTArgs):
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
+        self._handle_rdt_weight_sync()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3973,6 +4010,14 @@ class ServerArgs(PEFTArgs):
             ):
                 ObjectStorageModel.download_and_get_path(model_path)
                 seen_paths.add(model_path)
+
+    def _handle_rdt_weight_sync(self):
+        if not self.enable_rdt_weight_sync:
+            return
+        assert (
+            self.use_ray
+        ), "--enable-rdt-weight-sync requires --use-ray: the trainer pulls weights through SchedulerActors."
+        self.enable_engine_info_bootstrap = True
 
     def _handle_pd_disaggregation(self):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -8195,16 +8240,40 @@ class ServerArgs(PEFTArgs):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
     def _handle_deterministic_inference(self):
+        validate_true_on_policy_contract(self)
+
+        if self.enable_prefill_only_deterministic_inference:
+            self.enable_deterministic_inference = True
+
         if self.rl_on_policy_target is not None:
             logger.warning(
-                "Enable deterministic inference because of rl_on_policy_target."
+                "Enable deterministic inference because of legacy rl_on_policy_target."
+            )
+            self.enable_deterministic_inference = True
+
+        if self.true_on_policy_contract is not None:
+            logger.warning(
+                "Enable deterministic inference because of true_on_policy_contract."
             )
             self.enable_deterministic_inference = True
 
             # For VLM
             envs.SGLANG_VLM_CACHE_SIZE_MB.set(0)
-            # TODO remove this environment variable as a whole
-            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
+
+            if (
+                resolve_true_on_policy_runtime_policy(
+                    self
+                ).disable_flashinfer_allreduce_fusion
+                and self.enable_flashinfer_allreduce_fusion
+            ):
+                self.enable_flashinfer_allreduce_fusion = False
+                logger.warning(
+                    "Disable flashinfer allreduce fusion because of "
+                    "true_on_policy_contract with TP rollout."
+                )
+
+        if self.enable_deterministic_inference:
+            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set("1")
 
         if self.enable_deterministic_inference:
             if self.enable_aiter_allreduce_fusion:
@@ -9642,6 +9711,20 @@ class ServerArgs(PEFTArgs):
         """
         return self.page_size * self.dcp_size
 
+    def needs_engine_info_bootstrap(self) -> bool:
+        """Whether this node (rank 0) hosts the EngineInfoBootstrapServer."""
+        return (
+            self.remote_instance_weight_loader_start_seed_via_transfer_engine
+            or self.enable_engine_info_bootstrap
+        )
+
+    def registers_parallelism_config(self) -> bool:
+        """Whether this rank publishes its parallelism config to the bootstrap server."""
+        return (
+            self.remote_instance_weight_loader_use_transfer_engine()
+            or self.enable_engine_info_bootstrap
+        )
+
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
         publisher, or `None` if publishing is disabled / misconfigured.
@@ -9740,6 +9823,15 @@ class ServerArgs(PEFTArgs):
 
     def should_export_expert_balancedness_to_prometheus(self) -> bool:
         return self.expert_balancedness_report_mode in ("prometheus", "both")
+
+
+def compute_world_size(server_args: ServerArgs) -> int:
+    """Return the total GPU count across all data-parallel replicas."""
+    return (
+        (1 if server_args.enable_dp_attention else server_args.dp_size)
+        * server_args.tp_size
+        * server_args.pp_size
+    )
 
 
 def m3_fp8_attn_gemm_enabled(args) -> bool:

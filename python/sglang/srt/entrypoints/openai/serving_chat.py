@@ -74,6 +74,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -1911,7 +1912,7 @@ class OpenAIServingChat(OpenAIServingBase):
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=build_endpoint_weight_version_metadata(ret[0]["meta_info"]),
             sglext=response_sglext,
         )
 
@@ -1975,6 +1976,15 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process for generating a new and unique `tool_call_id`"""
         if self.tool_call_parser == "kimi_k3":
             return f"{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
+        if self.tool_call_parser == "kimi_k2_raw_id":
+            # RL training needs the model-emitted tool_call_id round-tripped verbatim,
+            # so we skip the history-based renumbering below and return whatever the
+            # detector captured. Fall back to the canonical Kimi-K2 reconstruction
+            # (without history offset) if for any reason the detector did not record
+            # a raw id — the raw id field is best-effort but the format is stable.
+            if call_item.tool_call_id:
+                return call_item.tool_call_id
+            return f"functions.{call_item.name}:{call_item.tool_index}"
         if self.tool_call_parser != "kimi_k2":
             # A simple uuid is sufficient for all models except for Kimi-K2.
             tool_call_id = f"call_{uuid.uuid4().hex[:24]}"

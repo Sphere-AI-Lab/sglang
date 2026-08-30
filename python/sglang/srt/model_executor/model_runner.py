@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -83,6 +83,7 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -166,6 +167,11 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_loader.loader import (
+    post_load_weights,
+    postprocess_weight,
+    restore_weight,
+)
 from sglang.srt.peft import integration as peft
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -204,6 +210,7 @@ from sglang.srt.state_capturer.routed_experts import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
+from sglang.srt.true_on_policy import is_tp_invariant_target
 from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
@@ -259,6 +266,9 @@ def _prefill_cuda_graph_allows_context_parallel(
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
+    # Per-rank padded size of the graph this forward replayed (None for eager);
+    # the dp-gathered buffer is strided by it.
+    graph_num_tokens: Optional[int] = None
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
@@ -558,6 +568,7 @@ class ModelRunner:
 
     def init_remote_instance_weight_transporter(self):
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
+            server_args=self.server_args,
             get_model=lambda: self.model,
             tp_rank=self.ps.tp_rank,
             gpu_id=self.gpu_id,
@@ -671,6 +682,7 @@ class ModelRunner:
     def maybe_init_remote_instance_transfer_engine(self):
         if remote_instance_transfer_engine_enabled(load_format=self.draft_load_format):
             self.remote_instance_weight_transporter.init_engine()
+        self.remote_instance_weight_transporter.maybe_init_parallelism_config()
 
     def maybe_init_expert_location_metadata(self):
         if self.is_draft_worker:
@@ -780,6 +792,10 @@ class ModelRunner:
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
+        if is_tp_invariant_target():
+            from sglang.srt.tp_invariant_ops import enable_tp_invariant_mode
+
+            enable_tp_invariant_mode()
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_topk_size(
@@ -857,7 +873,8 @@ class ModelRunner:
 
         self.maybe_init_hisparse_coordinator()
 
-        self.init_routed_experts_capturer()
+        if not self.is_draft_worker:
+            self.init_routed_experts_capturer()
         self.init_indexer_capturer()
 
         self.graph_shared_output = None
@@ -1279,11 +1296,79 @@ class ModelRunner:
         return self.lora_manager.load_lora_adapter(lora_ref)
 
     def load_lora_adapter_from_tensors(
-        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
+        self,
+        lora_ref: LoRARef,
+        tensors,
+        config_dict,
+        added_tokens_config=None,
+        upsert: bool = False,
     ):
-        return self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
+        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
+        result = self.lora_manager.load_lora_adapter_from_tensors(
+            lora_ref,
+            tensors,
+            config_dict,
+            added_tokens_config,
+            upsert=upsert,
         )
+        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
+        return result
+
+    def load_lora_adapter_from_distributed(
+        self,
+        lora_ref: LoRARef,
+        names,
+        dtypes,
+        shapes,
+        config_dict,
+        group_name,
+        added_tokens_config=None,
+        upsert: bool = False,
+    ):
+        """Load a new lora adapter whose weights are broadcast over the
+        `_model_update_group` process group (no CUDA IPC).
+        """
+        # v0.5.16 moved the update-group registry onto the WeightUpdater component.
+        update_groups = self.weight_updater._model_update_group
+        assert group_name in update_groups, (
+            f"Group {group_name} not in {list(update_groups.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        logger.info(f"LoRA adapter loading from distributed starts: {lora_ref}.")
+        try:
+            tensors = {}
+            handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.broadcast(
+                        weight,
+                        src=0,
+                        group=update_groups[group_name],
+                        async_op=True,
+                    )
+                )
+                tensors[name] = weight
+            for handle in handles:
+                handle.wait()
+        except Exception as e:
+            error_msg = f"Failed to receive LoRA adapter weights from distributed: {e}."
+            logger.error(error_msg)
+            return LoRAUpdateOutput(success=False, error_message=error_msg)
+
+        result = self.lora_manager.load_lora_adapter_from_tensors(
+            lora_ref,
+            tensors,
+            config_dict,
+            added_tokens_config,
+            upsert=upsert,
+        )
+        logger.info(f"LoRA adapter loading from distributed completes: {lora_ref}.")
+        return result
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
@@ -1577,6 +1662,14 @@ class ModelRunner:
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
+        # In speculative decoding more than one token is captured per request, so
+        # pass the actual number of tokens per DP rank in CUDA graph, not the batch
+        # size — the width is captured_req_width.
+
+        # From the runner that ran this forward: the decode runner's own bs is
+        # another graph's stride once a prefill graph replays.
+        cuda_graph_num_tokens = output.graph_num_tokens
+
         if (
             not self.is_draft_worker
             and (experts_capturer := get_global_experts_capturer()) is not None
@@ -1584,7 +1677,7 @@ class ModelRunner:
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=cuda_graph_num_tokens,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -1592,7 +1685,7 @@ class ModelRunner:
             output.indexer_topk_output = indexer_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=cuda_graph_num_tokens,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -1690,13 +1783,20 @@ class ModelRunner:
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            graph_num_tokens = None
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-                return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+                return ModelRunnerOutput(
+                    logits_output=ret,
+                    can_run_graph=can_run_graph,
+                    graph_num_tokens=self.decode_cuda_graph_runner.bs
+                    * self.decode_cuda_graph_runner.captured_req_width,
+                )
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
@@ -1745,6 +1845,7 @@ class ModelRunner:
                         forward_batch, **kwargs
                     )
                 can_run_graph = True
+                graph_num_tokens = self.prefill_cuda_graph_runner.last_replay_num_tokens
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
                 ret = self.eager_runner.execute(
@@ -1757,7 +1858,11 @@ class ModelRunner:
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 
-            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+            return ModelRunnerOutput(
+                logits_output=ret,
+                can_run_graph=can_run_graph,
+                graph_num_tokens=graph_num_tokens,
+            )
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
@@ -1843,9 +1948,29 @@ class ModelRunner:
             forward_batch.token_ids_logprobs,
         )
 
-    def check_weights(self, action: str, allow_quant_error: bool = False):
+    def begin_weight_update(self) -> None:
+        """Begin a weight-update session: restore in-place-packed weights to a
+        loadable state (no-op for schemes that don't repack)."""
+        restore_weight(self.model, torch.device(self.device))
+
+    def end_weight_update(self, run_post_load: bool) -> None:
+        """End the weight-update session: optionally run model.post_load_weights
+        (when load_weights was bypassed this session, e.g. P2P/RDMA), then finalize
+        quantized weights into kernel layout."""
+        if run_post_load:
+            post_load_weights(self.model)
+        postprocess_weight(self.model, torch.device(self.device))
+
+    def check_weights(
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        skip_tensor_list: Optional[List[str]] = None,
+    ):
         return self._weight_checker.handle(
-            action=action, allow_quant_error=allow_quant_error
+            action=action,
+            allow_quant_error=allow_quant_error,
+            skip_tensor_list=skip_tensor_list,
         )
 
     def _expand_eplb_metadata_for_scale(

@@ -53,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.peft import integration as peft
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -847,8 +848,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            # Under --enable-dp-attention an IDLE rank still runs its local experts over
+            # the DP-GATHERED tokens of the other ranks, so MoE-LoRA batch info has to be
+            # re-prepared for THIS batch — sized to the gathered length and stamped via the
+            # idle-rank path — rather than cleared: clearing leaves those experts reading the
+            # previous batch's token_lora_mapping, which is undersized (OOB in the MoE-LoRA
+            # kernels) and points foreign tokens at the wrong adapter. Non-MoE LoRA does no
+            # such cross-rank work on an idle rank, so it takes the base path.
             if model_runner.server_args.enable_lora:
-                model_runner.lora_manager.reset_lora_batch()
+                if model_runner.lora_manager.lora_backend.is_moe_lora:
+                    model_runner.lora_manager.prepare_lora_batch(ret)
+                else:
+                    model_runner.lora_manager.reset_lora_batch()
             return ret
 
         # Override the positions with diffusion LLM or spec_info
@@ -1178,7 +1189,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
         has_multimodal_input = any(mm is not None for mm in mm_inputs)
 
-        if rl_on_policy_target is not None or not has_multimodal_input:
+        if (
+            rl_on_policy_target is not None
+            or is_true_on_policy_enabled()
+            or not has_multimodal_input
+        ):
             # Text-only
             positions_1d = seq_lens_int64 - 1
             self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
@@ -1239,7 +1254,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mm_input = mm_inputs[batch_idx]
             extend_seq_len = extend_lens[batch_idx]
             extend_prefix_len = prefix_lens[batch_idx]
-            if mm_input is None or rl_on_policy_target is not None:
+            if (
+                mm_input is None
+                or rl_on_policy_target is not None
+                or is_true_on_policy_enabled()
+            ):
                 # text only
                 mrope_positions = (
                     torch.arange(

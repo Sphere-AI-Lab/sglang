@@ -17,6 +17,8 @@ from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    BeginWeightUpdateReqInput,
+    BeginWeightUpdateReqOutput,
     ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -29,6 +31,8 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EndWeightUpdateReqInput,
+    EndWeightUpdateReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -44,6 +48,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
+    LoadLoRAAdapterFromDistributedReqInput,
+    LoadLoRAAdapterFromDistributedReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -53,6 +59,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    PullWeightsReqInput,
+    PullWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
@@ -76,6 +84,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    UpdateWeightVersionReqInput,
+    UpdateWeightVersionReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_parallel
@@ -108,10 +118,12 @@ _COMMUNICATOR_SPECS = [
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
+    ("update_weight_version", UpdateWeightVersionReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
+    ("pull_weights", PullWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
@@ -124,6 +136,8 @@ _COMMUNICATOR_SPECS = [
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
+    ("begin_weight_update", BeginWeightUpdateReqOutput),
+    ("end_weight_update", EndWeightUpdateReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
@@ -445,6 +459,40 @@ class TokenizerControlMixin:
 
         results = await self.destroy_weights_update_group_communicator(obj)
         return FanOutCommunicator.merge_results(results)
+
+    async def _weight_update_session_call(
+        self: TokenizerManager, communicator, obj
+    ) -> Tuple[bool, str]:
+        """Run one weight-update session RPC under the same pause-aware locking as
+        update_weights_from_distributed: while the engine is paused the writer lock
+        is already held by whoever paused it, so taking it again would deadlock."""
+        self.auto_create_handle_loop()
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+            if is_paused:
+                results = await communicator(obj)
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await communicator(obj)
+        return FanOutCommunicator.merge_results(results)
+
+    async def begin_weight_update(
+        self: TokenizerManager,
+        obj: BeginWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        return await self._weight_update_session_call(
+            self.begin_weight_update_communicator, obj
+        )
+
+    async def end_weight_update(
+        self: TokenizerManager,
+        obj: EndWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        return await self._weight_update_session_call(
+            self.end_weight_update_communicator, obj
+        )
 
     async def update_weights_from_distributed(
         self: TokenizerManager,
@@ -769,6 +817,24 @@ class TokenizerControlMixin:
                 error_message=str(e),
             )
 
+    def _validate_lora_upsert_supported(
+        self: TokenizerManager,
+        obj: LoadLoRAAdapterFromDistributedReqInput,
+    ) -> None:
+        """Upsert resolves lora_name -> lora_id through this process's registry.
+
+        With multiple tokenizer workers each HTTP worker process holds its own
+        registry, so the resolution depends on which worker the router picks:
+        a worker that never served the original load would mint a fresh id and
+        die on the backend duplicate check. Fail loudly instead.
+        """
+        if obj.upsert and self.server_args.tokenizer_worker_num > 1:
+            raise ValueError(
+                "LoRA upsert is not supported with tokenizer_worker_num > 1: "
+                "each HTTP worker resolves lora_name against its own registry, "
+                "making upsert nondeterministic across workers."
+            )
+
     async def load_lora_adapter_from_tensors(
         self: TokenizerManager,
         obj: LoadLoRAAdapterFromTensorsReqInput,
@@ -785,6 +851,15 @@ class TokenizerControlMixin:
             assert (
                 get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+            if obj.upsert:
+                # In-place refresh is only wired up on the from_distributed
+                # route (the disaggregated RL weight-sync path). Reject
+                # explicitly instead of dying later on the duplicate check
+                # with a fresh uuid.
+                raise ValueError(
+                    "upsert is not supported on the from_tensors route; use "
+                    "/load_lora_adapter_from_distributed to refresh an adapter in place."
+                )
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
                 obj.lora_name,
@@ -799,6 +874,7 @@ class TokenizerControlMixin:
                     lora_name=obj.lora_name,
                     lora_path="__tensor__",
                     pinned=obj.pinned,
+                    reloadable=False,
                 )
                 obj.lora_id = new_adapter.lora_id
                 result = _merge_lora_update_results(
@@ -845,6 +921,88 @@ class TokenizerControlMixin:
                 error_message=str(e),
             )
 
+    async def load_lora_adapter_from_distributed(
+        self: TokenizerManager,
+        obj: LoadLoRAAdapterFromDistributedReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoadLoRAAdapterFromDistributedReqOutput:
+        self.auto_create_handle_loop()
+
+        try:
+            if not self.server_args.enable_lora:
+                raise ValueError(
+                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                )
+
+            assert (
+                self.server_args.dp_size == 1
+            ), "dp_size must be 1 for dynamic lora loading"
+            logger.info(
+                "Start load Lora adapter from distributed. Lora name=%s, group=%s",
+                obj.lora_name,
+                obj.group_name,
+            )
+
+            async with self.lora_update_lock:
+                self._validate_lora_upsert_supported(obj)
+                # With upsert, a same-name adapter keeps its lora_id so the
+                # backend refreshes it in place instead of failing the
+                # duplicate check; otherwise this resolves to a fresh ref.
+                new_adapter, reused = await self.lora_registry.register_or_reuse(
+                    LoRARef(
+                        lora_name=obj.lora_name,
+                        lora_path="__distributed__",
+                        pinned=obj.pinned,
+                        reloadable=False,
+                    ),
+                    upsert=obj.upsert,
+                )
+                obj.lora_id = new_adapter.lora_id
+                result = (await self.update_lora_adapter_communicator(obj))[0]
+
+                if result.success:
+                    if reused:
+                        await self.lora_registry.refresh(new_adapter)
+                    else:
+                        await self.lora_registry.register(new_adapter)
+                    self.lora_ref_cache[obj.lora_name] = new_adapter
+                if self.server_args.max_loaded_loras is not None:
+                    while (
+                        self.lora_registry.num_registered_loras
+                        > self.server_args.max_loaded_loras
+                    ):
+                        lru_lora_name = await self.lora_registry.lru_lora_name(
+                            exclude_pinned=True
+                        )
+                        if lru_lora_name is None:
+                            raise ValueError(
+                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
+                                f"LoRA registry is: {self.lora_registry._registry}"
+                            )
+
+                        logger.info(
+                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
+                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
+                            f"max allowed: {self.server_args.max_loaded_loras})"
+                        )
+
+                        unload_result = await self._unload_lora_adapter_locked(
+                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
+                        )
+                        if not unload_result.success:
+                            raise ValueError(
+                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
+                                f"{unload_result.error_message}"
+                            )
+                        del result.loaded_adapters[lru_lora_name]
+
+                return result
+        except ValueError as e:
+            return LoadLoRAAdapterFromDistributedReqOutput(
+                success=False,
+                error_message=str(e),
+            )
+
     async def unload_lora_adapter(
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
@@ -871,7 +1029,14 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
-                return await self._unload_lora_adapter_locked(obj)
+                result = await self._unload_lora_adapter_locked(obj)
+                # Explicit unload is a DELETE: drop the reload-catalog entry too.
+                # The max_loaded_loras LRU loop calls _unload_lora_adapter_locked
+                # directly — an EVICT — and must keep the entry so disk-backed
+                # adapters can be implicitly reloaded later.
+                if result.success:
+                    self.lora_ref_cache.pop(obj.lora_name, None)
+                return result
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
 
@@ -903,6 +1068,15 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def pull_weights(
+        self: TokenizerManager,
+        obj: PullWeightsReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        results = await self.pull_weights_communicator(obj)
+        return FanOutCommunicator.merge_results(results)
 
     async def check_weights(
         self: TokenizerManager,
@@ -1021,6 +1195,13 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         await self._async_dispatch_to_scheduler(obj)
+
+    async def update_weight_version(
+        self: TokenizerManager, obj: UpdateWeightVersionReqInput
+    ) -> None:
+        self.auto_create_handle_loop()
+        await self.update_weight_version_communicator(obj)
+        self._update_weight_version_if_provided(obj.new_version)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]

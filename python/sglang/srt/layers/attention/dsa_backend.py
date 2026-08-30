@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -15,6 +16,8 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.runtime_context import get_parallel, get_spec
 
 logger = logging.getLogger(__name__)
@@ -78,6 +81,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     print_warning_once,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
 # per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
@@ -271,6 +275,88 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return _compiled_cat([qk_nope, qk_rope], dim=dim)
 
 
+@dataclass(frozen=True)
+class DSAIndexerMetadata(BaseIndexerMetadata):
+    attn_metadata: DSAMetadata
+    topk_transform_method: TopkTransformMethod
+    topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
+    paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
+    force_unfused_topk: bool = False
+
+    def get_seqlens_int32(self) -> torch.Tensor:
+        return self.attn_metadata.cache_seqlens_int32
+
+    def get_page_table_64(self) -> torch.Tensor:
+        return self.attn_metadata.real_page_table
+
+    def get_page_table_1(self) -> torch.Tensor:
+        return self.attn_metadata.page_table_1
+
+    def get_seqlens_expanded(self) -> torch.Tensor:
+        return self.attn_metadata.dsa_seqlens_expanded
+
+    def get_cu_seqlens_k(self) -> torch.Tensor:
+        return self.attn_metadata.cu_seqlens_k
+
+    def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.attn_metadata.indexer_k_start_end
+
+    def get_indexer_seq_len(self) -> torch.Tensor:
+        return self.attn_metadata.indexer_seq_lens
+
+    def get_indexer_seq_len_cpu(self) -> torch.Tensor:
+        return self.attn_metadata.indexer_seq_lens_cpu
+
+    def get_dsa_extend_len_cpu(self) -> List[int]:
+        return self.attn_metadata.dsa_extend_seq_lens_list
+
+    def get_token_to_batch_idx(self) -> torch.Tensor:
+        return self.attn_metadata.token_to_batch_idx
+
+    def topk_transform(
+        self,
+        logits: torch.Tensor,
+        topk: int,
+        ks: Optional[torch.Tensor] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        ke_offset: Optional[torch.Tensor] = None,
+        batch_idx_list: Optional[List[int]] = None,
+        topk_indices_offset_override: Optional[torch.Tensor] = None,
+        return_raw_indices: bool = False,
+    ) -> torch.Tensor:
+        if topk_indices_offset_override is not None:
+            cu_topk_indices_offset = topk_indices_offset_override
+            cu_seqlens_q_topk = None
+        elif cu_seqlens_q is not None:
+            cu_seqlens_q = cu_seqlens_q.to(torch.int32)
+            cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
+            cu_topk_indices_offset = torch.repeat_interleave(
+                cu_seqlens_q_topk[:-1],
+                cu_seqlens_q,
+            )
+        else:
+            cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
+            cu_topk_indices_offset = self.attn_metadata.topk_indices_offset
+        if ke_offset is not None:
+            seq_lens_topk = ke_offset
+        else:
+            seq_lens_topk = self.get_seqlens_expanded()
+        return self.topk_backend.topk_transform(
+            logits=logits,
+            lengths=seq_lens_topk,
+            topk=topk,
+            topk_transform_method=self.topk_transform_method,
+            attn_metadata=self.attn_metadata,
+            cu_seqlens_q_topk=cu_seqlens_q_topk,
+            topk_indices_offset=cu_topk_indices_offset,
+            row_starts=ks,
+            batch_idx_list=batch_idx_list,
+            force_unfused_topk=self.force_unfused_topk,
+            return_raw_indices=return_raw_indices,
+        )
+
+
 _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse",
     "flashmla_sparse_q8",
@@ -318,6 +404,7 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
+        self.enable_memory_saver = model_runner.server_args.enable_memory_saver
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
@@ -1154,6 +1241,16 @@ class DeepseekSparseAttnBackend(
             token_to_batch_idx = split_per_token(token_to_batch_idx)
         return (ks, ke), token_to_batch_idx
 
+    def _cuda_graph_memory_region(self):
+        """Region whose tensors are released while the engine is paused."""
+        adapter = TorchMemorySaverAdapter.create(
+            enable=self.enable_memory_saver
+            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        )
+        if not adapter.enabled:
+            return nullcontext()
+        return adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
@@ -1189,6 +1286,31 @@ class DeepseekSparseAttnBackend(
         )
 
         max_ctx_len = self.req_to_token.shape[1]
+        # The wide page_table (max_num_tokens x max_ctx_len int32) and the
+        # flashmla metadata are rewritten in full before every replay, so they
+        # can live in the pausable cuda-graph region. The others are written
+        # once at init and would come back zeroed after a resume.
+        with self._cuda_graph_memory_region():
+            page_table = (
+                None
+                if self.dsa_drop_wide_page_table
+                else torch.zeros(
+                    max_num_tokens,
+                    max_ctx_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
+            flashmla_metadata = (
+                self._compute_flashmla_metadata(
+                    cache_seqlens=torch.ones(
+                        max_num_tokens, dtype=torch.int32, device=self.device
+                    ),
+                    seq_len_q=1,
+                )
+                if self.dsa_decode_impl == "flashmla_kv"
+                else None
+            )
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -1215,26 +1337,8 @@ class DeepseekSparseAttnBackend(
                 if self.dsa_drop_wide_page_table
                 else None
             ),
-            "page_table": (
-                None
-                if self.dsa_drop_wide_page_table
-                else torch.zeros(
-                    max_num_tokens,
-                    max_ctx_len,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-            ),
-            "flashmla_metadata": (
-                self._compute_flashmla_metadata(
-                    cache_seqlens=torch.ones(
-                        max_num_tokens, dtype=torch.int32, device=self.device
-                    ),
-                    seq_len_q=1,
-                )
-                if self.dsa_decode_impl == "flashmla_kv"
-                else None
-            ),
+            "page_table": page_table,
+            "flashmla_metadata": flashmla_metadata,
         }
 
     def _build_forward_metadata_cuda_graph(

@@ -117,6 +117,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     ActivateAdapterVersionReqInput,
     AttachHiCacheStorageReqInput,
+    BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -124,16 +125,19 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     ProfileReq,
+    PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -1263,6 +1267,19 @@ async def update_weights_from_disk(
         )
 
 
+@app.post("/pull_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pull_weights(obj: Annotated[PullWeightsReqInput, Body()], request: Request):
+    """Have every host of this deployment pull published weight deltas into its
+    local checkpoint (materialized from the model path on first use)."""
+    success, message = await _global_state.tokenizer_manager.pull_weights(obj, request)
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
+    )
+
+
 @app.post("/init_weights_send_group_for_remote_instance")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_send_group_for_remote_instance(
@@ -1338,6 +1355,32 @@ async def remote_instance_transfer_engine_info(rank: int = None):
     )
 
 
+@app.get("/parallelism_config")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def parallelism_config(rank: int = None):
+    """Get per-rank parallelism config from the bootstrap server."""
+    if rank is None or rank < 0:
+        return ORJSONResponse(
+            {"error": {"message": "Missing or invalid rank parameter"}},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    server_args = _global_state.tokenizer_manager.server_args
+    try:
+
+        resp = requests.get(
+            f"{server_args.engine_info_bootstrap_url}/get_parallelism_config",
+            params={"rank": rank},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+
+    return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/init_weights_update_group")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_update_group(
@@ -1389,6 +1432,36 @@ async def update_weights_from_tensor(
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/begin_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def begin_weight_update(
+    obj: Annotated[BeginWeightUpdateReqInput, Body()], request: Request
+):
+    """Open a weight-update session so in-place-quantized weights become loadable."""
+    success, message = await _global_state.tokenizer_manager.begin_weight_update(
+        obj, request
+    )
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/end_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def end_weight_update(
+    obj: Annotated[EndWeightUpdateReqInput, Body()], request: Request
+):
+    """Close the weight-update session and finalize quantized weights."""
+    success, message = await _global_state.tokenizer_manager.end_weight_update(
+        obj, request
+    )
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
     )
 
 
@@ -1492,9 +1565,7 @@ async def update_weight_version(
     # Use a simple approach without the complex lock mechanism for now
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
-        _global_state.tokenizer_manager.record_config_updates(
-            "http.update_weight_version", weight_version=obj.new_version
-        )
+        await _global_state.tokenizer_manager.update_weight_version(obj)
 
         return ORJSONResponse(
             {
@@ -1599,11 +1670,25 @@ async def load_lora_adapter(
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter_from_tensors(
     obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()], request: Request
 ):
     """Load a new LoRA adapter from tensors without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
+        obj, request
+    )
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/load_lora_adapter_from_distributed", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def load_lora_adapter_from_distributed(
+    obj: Annotated[LoadLoRAAdapterFromDistributedReqInput, Body()], request: Request
+):
+    """Load a new LoRA adapter broadcast over a process group without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_lora_adapter_from_distributed(
         obj, request
     )
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
@@ -1661,7 +1746,7 @@ async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
     """Abort a request."""
     try:
         _global_state.tokenizer_manager.abort_request(
-            rid=obj.rid, abort_all=obj.abort_all
+            rid=obj.rid, abort_all=obj.abort_all, prefix=obj.prefix
         )
         return Response(status_code=200)
     except Exception as e:

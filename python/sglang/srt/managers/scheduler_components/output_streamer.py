@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
     from sglang.srt.managers.rust_server import RustServer
@@ -48,6 +49,7 @@ class SchedulerOutputStreamer:
     ps: ParallelState
     server_args: ServerArgs
     is_generation: bool
+    is_multimodal_gen: bool
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
@@ -158,6 +160,7 @@ class SchedulerOutputStreamer:
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
             rust_server_mode=self.rust_server is not None,
+            current_weight_version=get_serving().weight_version,
         )
         for req in reqs:
             if req is skip_req:
@@ -171,6 +174,8 @@ class SchedulerOutputStreamer:
             self._maybe_log_time_stats(req=req)
 
         # Send to detokenizer
+        if self.is_multimodal_gen:
+            return
         payload = acc.to_payload(
             dp_rank=self.ps.dp_rank,
             is_idle_batch=is_idle_batch,
@@ -274,6 +279,7 @@ class _GenerationStreamAccumulator:
     default_stream_interval: int
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
+    current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
     finished_reasons: list = field(default_factory=list)
@@ -301,6 +307,7 @@ class _GenerationStreamAccumulator:
     spec_correct_drafts_histogram: list = field(default_factory=list)
     spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
+    weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
@@ -445,6 +452,16 @@ class _GenerationStreamAccumulator:
         self.video_tokens.append(video_t)
 
         self.retraction_counts.append(req.retraction_count)
+        if req.finished():
+            self.weight_versions.append(
+                compute_weight_version_spans(
+                    req.weight_version_events,
+                    current_version=self.current_weight_version,
+                    num_output_tokens=len(output_ids_),
+                )
+            )
+        else:
+            self.weight_versions.append(None)
 
         self.time_stats.append(req.time_stats)
 
@@ -614,6 +631,15 @@ class _GenerationStreamAccumulator:
         if not (self.rids or is_idle_batch):
             return None
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
+        indexer_topk_num_layers = None
+        if self.return_indexer_topk:
+            from sglang.srt.state_capturer.indexer_topk import (
+                get_global_indexer_capturer,
+            )
+
+            _idx_cap = get_global_indexer_capturer()
+            if _idx_cap is not None:
+                indexer_topk_num_layers = _idx_cap.num_indexer_layers
         return BatchTokenIDOutput(
             rids=self.rids,
             http_worker_ipcs=self.http_worker_ipcs,
@@ -675,11 +701,15 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
+            indexer_topk_num_layers=indexer_topk_num_layers,
             customized_info=(
                 wrap_as_pickle(self.customized_info) if self.customized_info else None
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
+            weight_versions=(
+                self.weight_versions if any(self.weight_versions) else None
+            ),
             dp_ranks=dp_ranks,
         )

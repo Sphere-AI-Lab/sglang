@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional
 
 import torch
 
+from sglang.srt.distributed.parallel_state import RankParallelismConfig
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -16,6 +17,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     remote_instance_transfer_engine_enabled,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -23,12 +25,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True, kw_only=True)
 class RemoteInstanceWeightTransporter:
+    server_args: ServerArgs
     get_model: Callable[[], torch.nn.Module]
     tp_rank: int
     gpu_id: int
     engine: Optional[Any] = None
     session_id: str = ""
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
+    parallelism_config: Optional[RankParallelismConfig] = None
     _nixl_manager: Optional[Any] = None
 
     @property
@@ -55,6 +59,12 @@ class RemoteInstanceWeightTransporter:
             local_ip, self.engine.get_rpc_port()
         ).to_host_port_str()
 
+    def maybe_init_parallelism_config(self) -> None:
+        if self.server_args.registers_parallelism_config():
+            self.parallelism_config = RankParallelismConfig.from_parallel_state(
+                self.tp_rank
+            )
+
     def maybe_register_and_publish_weight_info(self) -> None:
         if (
             remote_instance_transfer_engine_enabled()
@@ -69,6 +79,51 @@ class RemoteInstanceWeightTransporter:
             # Register memory and upstream the transfer engine info to the bootstrap server
             self.weight_info = register_memory_region(self.model, self.engine)
             self._register_to_engine_info_bootstrap()
+
+        # The P2P weight-update client needs each rank's parallelism layout to
+        # map training-side parameters onto this rank's shards.
+        if (
+            self.server_args.registers_parallelism_config()
+            and self.parallelism_config is not None
+        ):
+            self._register_parallelism_config_to_bootstrap()
+
+    def _bootstrap_url(self) -> str:
+        if self.server_args.dist_init_addr:
+            bootstrap_host = (
+                NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
+            )
+        else:
+            bootstrap_host = "127.0.0.1"
+        bootstrap_port = self.server_args.engine_info_bootstrap_port
+        return NetworkAddress(bootstrap_host, bootstrap_port).to_url()
+
+    def _register_parallelism_config_to_bootstrap(self) -> None:
+        """Register this rank's parallelism config with the EngineInfoBootstrapServer."""
+        import requests as http_requests
+
+        bootstrap_url = self._bootstrap_url()
+        url = f"{bootstrap_url}/register_parallelism_config"
+        payload = {
+            "tp_rank": self.tp_rank,
+            "parallelism_config": self.parallelism_config.to_dict(),
+        }
+        try:
+            resp = http_requests.put(url, json=payload, timeout=5)
+            if resp.status_code == 200:
+                logger.info(
+                    f"Registered parallelism config for tp_rank={self.tp_rank} "
+                    f"with bootstrap server at {bootstrap_url}"
+                )
+            else:
+                logger.error(
+                    f"Failed to register parallelism config for tp_rank={self.tp_rank}: "
+                    f"{resp.status_code}, {resp.text}"
+                )
+        except Exception as e:
+            logger.error(
+                f"Failed to register parallelism config for tp_rank={self.tp_rank}: {e}"
+            )
 
     def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.

@@ -271,9 +271,19 @@ class LoRAManager:
 
         return self.create_lora_update_result(success=True)
 
-    def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
+    def validate_new_adapter(
+        self,
+        lora_config: LoRAConfig,
+        lora_ref: LoRARef,
+        is_update: bool = False,
+        old_ref: Optional[LoRARef] = None,
+    ):
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
+
+        For an in-place refresh (``is_update``), pass the currently-loaded ref as
+        ``old_ref`` so checks that count loaded adapters exclude the adapter's
+        own current state.
         """
         if lora_config.lora_added_tokens_size > 0:
             raise ValueError(
@@ -285,18 +295,19 @@ class LoRAManager:
                 f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
             )
 
-        # Check if this LoRA adapter is already loaded
-        for existing_lora_ref in self.lora_refs.values():
-            if lora_ref.lora_name == existing_lora_ref.lora_name:
-                raise ValueError(
-                    f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
-                )
+        # Reject duplicates unless refreshing an existing adapter in place.
+        if not is_update:
+            for existing_lora_ref in self.lora_refs.values():
+                if lora_ref.lora_name == existing_lora_ref.lora_name:
+                    raise ValueError(
+                        f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+                    )
 
-            if lora_ref.lora_path == existing_lora_ref.lora_path:
-                logger.warning(
-                    f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
-                    f"but another copy is being loaded with name: {lora_ref.lora_name}"
-                )
+                if lora_ref.lora_path == existing_lora_ref.lora_path:
+                    logger.warning(
+                        f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
+                        f"but another copy is being loaded with name: {lora_ref.lora_name}"
+                    )
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
@@ -309,7 +320,13 @@ class LoRAManager:
             )
 
         # Ensure pinned LoRA adapters does not exceed maximal limit or cause starvation.
-        if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
+        # On an in-place refresh the adapter's own pin is already counted in
+        # num_pinned_loras; refreshing occupies no additional pinned slot, so
+        # exclude it or a pinned adapter at the limit could never be refreshed.
+        num_other_pinned_loras = self.num_pinned_loras
+        if is_update and old_ref is not None:
+            num_other_pinned_loras -= int(bool(old_ref.pinned))
+        if lora_ref.pinned and num_other_pinned_loras >= self.max_loras_per_batch - 1:
             raise ValueError(
                 f"Failed to load LoRA adapter {lora_ref.lora_name} as a pinned adapter. It is not allowed to pin all slots "
                 "in the LoRA memory pool to avoid starvation for unpinned adapters and base models. Please increase your "
@@ -438,6 +455,23 @@ class LoRAManager:
             and bs <= self.max_bs_in_cuda_graph
             and forward_batch.forward_mode.is_cuda_graph()
         )
+        if use_cuda_graph and self.lora_backend.is_moe_lora:
+            # This flag is a HEURISTIC computed before the runner's real replay decision. Under
+            # --enable-dp-attention a batch that is graph-eligible on THIS rank (small local bs)
+            # can still have a DP-gathered token count exceeding the static MoE capture buffers
+            # (max_bs*dp) when other ranks carry more tokens — such a batch cannot replay the
+            # captured graph and runs eager, so prep the eager (freshly sized) buffers for it
+            # instead of an under-sized static mapping.
+            from sglang.srt.lora.backend.base_backend import get_gathered_moe_num_tokens
+
+            moe_cg_buffers = getattr(self.lora_backend, "moe_cg_buffers", None)
+            if (
+                moe_cg_buffers is not None
+                and get_gathered_moe_num_tokens(forward_batch, bs)
+                > moe_cg_buffers["token_lora_mapping"].shape[0]
+            ):
+                use_cuda_graph = False
+
         # Eligible extend batches refresh the static prefill batch info in
         # place so captured kernels read current values at replay.
         use_prefill_cuda_graph = not use_cuda_graph and self.can_use_prefill_cuda_graph(
@@ -455,6 +489,55 @@ class LoRAManager:
                 lora = self.loras[uid]
                 lora_ranks[weight_indices[i]] = lora.config.r
                 scalings[weight_indices[i]] = lora.scaling
+
+        local_active = any(lora_ranks[wi] > 0 for wi in weight_indices)
+
+        # MoE-expert LoRA under --enable-dp-attention: the MoE runs on DP-GATHERED tokens, so this
+        # rank's local experts also process OTHER ranks' tokens, whose adapter identity is not known
+        # host-side. Under Tier-1 (exactly one adapter loaded — the colocate RL case) the gathered
+        # tail can be attributed to that single adapter. Two mutually-exclusive stamps, both armed
+        # here (policy) and mechanically applied by the backend in _add_moe_lora_info:
+        #   * idle rank (forward_mode.is_idle(), zero local tokens): inject the adapter into
+        #     lora_ranks/scalings (nothing else carries them into the batch tensors) and record its
+        #     buffer id so the backend stamps the WHOLE gathered mapping and enables the adapter —
+        #     otherwise foreign tokens routed to this rank's experts silently lose the LoRA delta.
+        #   * active rank (local requests DO use the adapter): record the buffer id so the backend
+        #     stamps the gathered tail [num_tokens, moe_num_tokens) with it instead of copying an
+        #     arbitrary local token's slot. Base-only local batches (local_active False) and
+        #     multi-adapter batches arm NOTHING: the tail stays -1 (adapter-disabled), foreign
+        #     tokens get base — never a delta this rank cannot attribute.
+        # Buffer ids are host ints (no GPU sync -> cuda-graph safe). NOTE: gate on
+        # global_num_tokens_cpu too, not just global_dp_buffer_len — the eager path runs
+        # prepare_lora_batch from ForwardBatch.init_new BEFORE prepare_mlp_sync_batch assigns
+        # global_dp_buffer_len (only cuda-graph capture pre-sets it).
+        idle_rank_active_buffer_id = None
+        single_active_buffer_id = None
+        if self.lora_backend.is_moe_lora and (
+            getattr(forward_batch, "global_dp_buffer_len", None) is not None
+            or len(getattr(forward_batch, "global_num_tokens_cpu", None) or []) > 1
+        ):
+            loaded = [
+                (uid, bid)
+                for uid, bid in self.memory_pool.uid_to_buffer_id.items()
+                if uid is not None
+                and uid in self.loras
+                and self.loras[uid].config.r > 0
+            ]
+            if len(loaded) == 1:
+                uid, bid = loaded[0]
+                if forward_batch.forward_mode.is_idle():
+                    lora = self.loras[uid]
+                    lora_ranks[bid] = lora.config.r
+                    scalings[bid] = lora.scaling
+                    idle_rank_active_buffer_id = bid
+                elif local_active:
+                    single_active_buffer_id = bid
+
+        # Pass the stamps to the backend (read in _add_moe_lora_info); reset each batch so a
+        # previous batch's stamp never leaks into a later one.
+        self.lora_backend._idle_rank_active_buffer_id = idle_rank_active_buffer_id
+        self.lora_backend._single_loaded_buffer_id = single_active_buffer_id
+
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.lora_backend.prepare_lora_batch(
@@ -465,8 +548,8 @@ class LoRAManager:
             use_cuda_graph=use_cuda_graph,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
-        self.lora_backend.batch_info.has_active_lora = any(
-            lora_ranks[wi] > 0 for wi in weight_indices
+        self.lora_backend.batch_info.has_active_lora = local_active or (
+            idle_rank_active_buffer_id is not None
         )
 
     def update_lora_info(self):
@@ -790,16 +873,25 @@ class LoRAManager:
         """
         Load the weights of a LoRA adapter from tensors to CPU memory.
         """
+        self.loras[lora_ref.lora_id] = self._create_lora_adapter_from_tensors(
+            lora_ref, self.configs[lora_ref.lora_id], tensors
+        )
+
+    def _create_lora_adapter_from_tensors(
+        self, lora_ref: LoRARef, config: LoRAConfig, tensors: Dict[str, torch.Tensor]
+    ) -> LoRAAdapter:
+        """Build and initialize a LoRAAdapter without touching served state,
+        so callers can stage it and commit only after every fallible step."""
         lora_adapter = LoRAAdapter(
             lora_ref.lora_id,
-            self.configs[lora_ref.lora_id],
+            config,
             self.base_hf_config,
             self.load_config,
             self.lora_backend,
             base_model=self.base_model,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
-        self.loras[lora_ref.lora_id] = lora_adapter
+        return lora_adapter
 
     def load_lora_adapter_from_tensors(
         self,
@@ -807,10 +899,11 @@ class LoRAManager:
         tensors: Dict[str, torch.Tensor],
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
+        upsert: bool = False,
     ) -> LoRAUpdateOutput:
         logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
         result = self._load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
+            lora_ref, tensors, config_dict, added_tokens_config, upsert=upsert
         )
         logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
         return result
@@ -821,35 +914,103 @@ class LoRAManager:
         tensors: Dict[str, torch.Tensor],
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
+        upsert: bool = False,
     ) -> LoRAUpdateOutput:
         """
         Load a single LoRA adapter from tensors and config dict.
+
+        With ``upsert``, an already-loaded adapter has its weights refreshed in
+        place (reusing its lora_id); otherwise the adapter must not be loaded yet.
         """
         assert (
             lora_ref.lora_name is not None and lora_ref.lora_path is not None
         ), "LoRARef must have both lora_name and lora_path set for loading."
-        assert (
-            lora_ref.lora_id not in self.loras
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        is_update = upsert and (lora_ref.lora_id in self.loras)
+        if not is_update:
+            assert (
+                lora_ref.lora_id not in self.loras
+            ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
+        uid = lora_ref.lora_id
+        old_config = self.configs.get(uid)
+        old_lora = self.loras.get(uid)
+        old_ref = self.lora_refs.get(uid)
+
+        # Stage every fallible step before mutating served state: a failed
+        # request must not leave a live adapter with new metadata over old
+        # weights (or leak unreachable entries on a fresh insert).
         try:
-            new_adapter = LoRAConfig.from_dict(
+            new_config = LoRAConfig.from_dict(
                 config_dict,
                 added_tokens_config,
                 base_vocab_size=self.base_hf_config.vocab_size,
             )
-            self.validate_new_adapter(new_adapter, lora_ref)
-            self.configs[lora_ref.lora_id] = new_adapter
-
-            self.load_lora_weights_from_tensors(lora_ref, tensors)
-
-            self.lora_refs[lora_ref.lora_id] = lora_ref
-            self.num_pinned_loras += int(lora_ref.pinned)
+            self.validate_new_adapter(
+                new_config, lora_ref, is_update=is_update, old_ref=old_ref
+            )
+            new_lora = self._create_lora_adapter_from_tensors(
+                lora_ref, new_config, tensors
+            )
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
                 error_message=str(e),
             )
+
+        self.configs[uid] = new_config
+        self.loras[uid] = new_lora
+
+        if (
+            is_update
+            and getattr(self, "memory_pool", None) is not None
+            and uid in self.memory_pool.uid_to_buffer_id
+        ):
+            buffer_id = self.memory_pool.uid_to_buffer_id[uid]
+            try:
+                # The served buffer slot is rewritten in place. Wait for
+                # already-launched kernels first: under overlap scheduling /
+                # CUDA-graph replay a forward pass can still be executing on
+                # another stream, and it must not read a half-rewritten slot.
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                self.memory_pool.load_lora_weight_to_buffer(
+                    uid,
+                    buffer_id,
+                    new_lora,
+                    self.lora_modules,
+                    self.embed_tokens_module,
+                    self.lm_head_module,
+                )
+            except Exception as e:
+                # Roll back so the adapter keeps serving its previous weights
+                # instead of a torn half-old/half-new buffer.
+                self.configs[uid] = old_config
+                self.loras[uid] = old_lora
+                try:
+                    self.memory_pool.load_lora_weight_to_buffer(
+                        uid,
+                        buffer_id,
+                        old_lora,
+                        self.lora_modules,
+                        self.embed_tokens_module,
+                        self.lm_head_module,
+                    )
+                except Exception:
+                    logger.exception(
+                        f"Failed to restore previous weights for LoRA adapter "
+                        f"{lora_ref.lora_name} (buffer slot {buffer_id}) after a "
+                        "failed upsert; the served buffer may be corrupted."
+                    )
+                return self.create_lora_update_result(
+                    success=False,
+                    error_message=str(e),
+                )
+
+        self.lora_refs[uid] = lora_ref
+        # An upsert may change ``pinned``; track the delta against the replaced
+        # ref so the counter stays consistent with lora_refs.
+        old_pinned = int(bool(old_ref.pinned)) if is_update else 0
+        self.num_pinned_loras += int(bool(lora_ref.pinned)) - old_pinned
 
         return self.create_lora_update_result(success=True)
 
@@ -889,6 +1050,8 @@ class LoRAManager:
 
         self.embed_tokens_module: Optional[BaseLayerWithLoRA] = None
         self.lm_head_module: Optional[BaseLayerWithLoRA] = None
+        # One MoE layer's worth of warning is enough; the condition is model-wide.
+        warned_one_sided_moe_targets = False
 
         # When tie_word_embeddings=True, lm_head is the same Python object as
         # embed_tokens. PyTorch's named_modules() deduplicates by object identity,
@@ -980,9 +1143,36 @@ class LoRAManager:
                 )
                 continue
 
-            if isinstance(module, (FusedMoE, InklingBatchDenseMLP)) and all(
-                x in self.target_modules for x in ["gate_up_proj", "down_proj"]
-            ):
+            if isinstance(module, (FusedMoE, InklingBatchDenseMLP)):
+                expert_projections = ("gate_up_proj", "down_proj")
+                missing = [
+                    x for x in expert_projections if x not in self.target_modules
+                ]
+                if len(missing) == 1 and not warned_one_sided_moe_targets:
+                    warned_one_sided_moe_targets = True
+                    # The MoE-LoRA hooks inject a delta after gate_up and after
+                    # down together, so wrapping for only one of them is not
+                    # implemented and the layer stays unwrapped. Adapters that only
+                    # train the dense/shared MLP still work, but one that carries
+                    # expert weights for the targeted projection has them loaded
+                    # into the pool and never applied. Warn once -- silently
+                    # dropping part of an adapter reads as a serving/training
+                    # mismatch with no symptom.
+                    present = next(x for x in expert_projections if x != missing[0])
+                    logger.warning(
+                        "LoRA target modules include %r but not %r, so MoE expert layers "
+                        "(e.g. %s) get no adapter at all: expert LoRA needs both projections. "
+                        "Any %r expert weights in a loaded adapter will be ignored. Add %r to "
+                        "the target modules to enable expert LoRA -- an adapter that does not "
+                        "train it keeps zero-filled buffers and contributes no delta.",
+                        present,
+                        missing[0],
+                        module_name,
+                        present,
+                        missing[0],
+                    )
+                if missing:
+                    continue
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     if module_name.startswith("model.meta_mlp."):

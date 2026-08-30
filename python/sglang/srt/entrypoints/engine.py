@@ -63,12 +63,15 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
@@ -225,10 +228,6 @@ class Engine(EngineScoreMixin, EngineBase):
     run_scheduler_process_func: Callable = staticmethod(run_scheduler_process)
     run_detokenizer_process_func: Callable = staticmethod(run_detokenizer_process)
 
-    # Backend-specific launch handle: the Ray engine schedules its actors onto a
-    # placement group. Not config — a live cluster object.
-    _placement_group = None
-
     def __init__(self, **kwargs):
         """
         The arguments of this function is the same as `sglang/srt/server_args.py::ServerArgs`.
@@ -280,7 +279,6 @@ class Engine(EngineScoreMixin, EngineBase):
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
             run_scheduler_process_func=self.run_scheduler_process_func,
             run_detokenizer_process_func=self.run_detokenizer_process_func,
-            placement_group=self._placement_group,
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
@@ -862,8 +860,6 @@ class Engine(EngineScoreMixin, EngineBase):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
-        *,
-        placement_group=None,
     ) -> Tuple[SchedulerInitResult, Optional[List]]:
         """Launch scheduler processes using multiprocessing.
         Override in subclasses for different backends (e.g. Ray).
@@ -1068,7 +1064,6 @@ class Engine(EngineScoreMixin, EngineBase):
         run_scheduler_process_func: Callable,
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
-        placement_group=None,
     ) -> Tuple[
         TokenizerManager,
         TemplateManager,
@@ -1100,10 +1095,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Start the engine info bootstrap server if per-rank info is needed.
         engine_info_bootstrap_server = None
-        if (
-            server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
-            and server_args.node_rank == 0
-        ):
+        if server_args.needs_engine_info_bootstrap() and server_args.node_rank == 0:
             bootstrap_port = server_args.engine_info_bootstrap_port
             if not is_port_available(bootstrap_port):
                 raise RuntimeError(
@@ -1133,13 +1125,8 @@ class Engine(EngineScoreMixin, EngineBase):
             weight_cache_daemon_procs = cls._launch_weight_cache_daemons(server_args)
 
         # Launch scheduler processes
-        # Passed only when there is one: this hook is an override point, and a
-        # subclass written against the three-argument signature must keep working.
-        launch_kwargs = (
-            {"placement_group": placement_group} if placement_group is not None else {}
-        )
         scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
-            server_args, port_args, run_scheduler_process_func, **launch_kwargs
+            server_args, port_args, run_scheduler_process_func
         )
         scheduler_init_result.engine_info_bootstrap_server = (
             engine_info_bootstrap_server
@@ -1431,6 +1418,23 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.destroy_weights_update_group(obj, None)
         )
 
+    def begin_weight_update(self, selector: str = "all"):
+        """Open a weight-update session: unpack in-place-quantized weights on the
+        selected runners so update_weights_from_{distributed,tensor} can load into
+        them. Must be closed with end_weight_update()."""
+        obj = BeginWeightUpdateReqInput(selector=selector)
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.begin_weight_update(obj, None)
+        )
+
+    def end_weight_update(self):
+        """Close the session opened by begin_weight_update() and finalize quantized
+        weights into kernel layout."""
+        obj = EndWeightUpdateReqInput()
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.end_weight_update(obj, None)
+        )
+
     def update_weights_from_distributed(
         self,
         names: list[str],
@@ -1553,6 +1557,34 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+        )
+
+    def load_lora_adapter_from_distributed(
+        self,
+        lora_name: str,
+        config_dict: Dict,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "weight_update_group",
+        pinned: bool = False,
+        added_tokens_config: Optional[Dict] = None,
+    ):
+        """Load a new LoRA adapter whose weights are broadcast over
+        a process group. The weight-update group must already be
+        initialized via `init_weights_update_group`."""
+        lora_req = LoadLoRAAdapterFromDistributedReqInput(
+            lora_name=lora_name,
+            config_dict=config_dict,
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            pinned=pinned,
+            added_tokens_config=added_tokens_config,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_lora_adapter_from_distributed(lora_req, None)
         )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):

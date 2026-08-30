@@ -29,15 +29,14 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -183,20 +182,6 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        success, message = (
-            self.model_runner.weight_updater.update_weights_from_distributed(
-                recv_req.names,
-                recv_req.dtypes,
-                recv_req.shapes,
-                recv_req.group_name,
-                recv_req.load_format,
-            )
-        )
-        return success, message
-
     def update_adapter_from_distributed(
         self, recv_req: UpdateAdapterFromDistributedReqInput
     ):
@@ -233,16 +218,6 @@ class BaseTpWorker(ABC):
         return MultiprocessingSerializer.deserialize(
             serialized_named_tensors[self.ps.tp_rank]
         )
-
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        success, message = self.model_runner.weight_updater.update_weights_from_tensor(
-            named_tensors=self._deserialize_own_rank(recv_req.serialized_named_tensors),
-            load_format=recv_req.load_format,
-            adapter_config=recv_req.adapter_config,
-            adapter_name=recv_req.adapter_name,
-            adapter_id=recv_req.adapter_id,
-        )
-        return success, message
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""
@@ -315,6 +290,22 @@ class BaseTpWorker(ABC):
             tensors,
             recv_req.config_dict,
             recv_req.added_tokens_config,
+            upsert=recv_req.upsert,
+        )
+        return result
+
+    def load_lora_adapter_from_distributed(
+        self, recv_req: LoadLoRAAdapterFromDistributedReqInput
+    ):
+        result = self.model_runner.load_lora_adapter_from_distributed(
+            recv_req.to_ref(),
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.config_dict,
+            recv_req.group_name,
+            recv_req.added_tokens_config,
+            upsert=recv_req.upsert,
         )
         return result
 
@@ -543,6 +534,11 @@ class TpModelWorker(BaseTpWorker):
     @property
     def model_runner(self) -> ModelRunner:
         return self._model_runner
+
+    def iter_runners(self) -> List[Tuple[str, ModelRunner]]:
+        """(role, runner) pairs this worker owns for weight ops. The target worker
+        owns one runner and uses the empty role so its checksum keys stay unprefixed."""
+        return [("", self._model_runner)]
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter

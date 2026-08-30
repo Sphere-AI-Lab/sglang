@@ -89,8 +89,8 @@ dependencies = [
   "uvloop",
   "watchfiles",
   "xgrammar==0.2.1",
-  "xxhash",
-  "zstandard",
+  "xxhash",  # /pull_weights delta checksum
+  "zstandard",  # /pull_weights delta codec
 ]
 
 [[tool.uv.index]]
@@ -133,7 +133,7 @@ diffusion-qvg = [
 ]
 
 ray = [
-  "ray[default]>=2.55.1",
+  "ray[default]>=2.56.0",
 ]
 
 tracing = [
