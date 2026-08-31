@@ -415,6 +415,7 @@ class InternalOFTControl:
         if revision_kind not in {"source", "candidate"}:
             raise ScenarioContractError(f"unknown revision kind: {revision_kind}")
         self.engine = engine
+        self.revision_kind = revision_kind
         self.update_request_type = (
             update_request_type
             or resolve_oft_update_request_type(revision_kind)
@@ -535,6 +536,11 @@ class InternalOFTControl:
                 raise ScenarioContractError(
                     f"internal OFT unload failed: unknown adapter {adapter_name}"
                 )
+            # The frozen source oracle acquires canonical OFT request leases but
+            # predates tokenizer-side cleanup. The oracle runner is serial, so
+            # its completed request can be released before the unload barrier.
+            if self.revision_kind == "source":
+                await manager.peft_registry.release(ref.adapter_id)
             adapter_id = await manager.peft_registry.unregister(adapter_name)
             await manager.peft_registry.wait_for_unload(adapter_id)
             request = self._request(

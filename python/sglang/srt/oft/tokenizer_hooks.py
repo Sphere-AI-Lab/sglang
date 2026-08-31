@@ -16,6 +16,22 @@ def _request_oft_path(obj):
     return getattr(obj, "adapter_path", None)
 
 
+def finalize_oft_lease(tm, state):
+    """Release a request's canonical OFT registry lease exactly once."""
+    if state is None or state.oft_lease_released:
+        return
+    obj = state.obj
+    if getattr(obj, "adapter_path", None) is None:
+        return
+    adapter_id = getattr(obj, "adapter_id", None)
+    if adapter_id is None:
+        return
+    if getattr(tm, "peft_kind", None) != "oft" or tm.peft_registry is None:
+        return
+    state.oft_lease_released = True
+    asyncio.create_task(tm.peft_registry.release(adapter_id))
+
+
 def init_tokenizer_oft(tm):
     """Initialize the canonical OFT registry and tokenizer-side caches."""
     tm.peft_kind = tm.server_args.peft_method
