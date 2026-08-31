@@ -2895,6 +2895,11 @@ class ServerArgs:
         "Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
         NS("lora"),
     ] = None
+    enable_lora_staging: A[
+        bool,
+        "Enable two-phase stage/activate updates for native LoRA serving.",
+        NS("lora"),
+    ] = False
     enable_lora_overlap_loading: A[
         Optional[bool],
         "Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
@@ -9422,6 +9427,9 @@ class ServerArgs:
                 logger.warning(
                     "--enable-lora is set to False, any provided lora_paths will be ignored."
                 )
+
+        if self.enable_lora_staging and not self.enable_lora:
+            raise ValueError("--enable-lora-staging requires --enable-lora")
 
         if self.enable_lora:
             if self.enable_lora_overlap_loading is None:

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.adapter_sync.utils import reconstruct_adapter_staging
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -368,6 +369,94 @@ class WeightUpdater:
             )
             logger.error(error_msg)
             return False, error_msg
+
+    def stage_adapter(
+        self: WeightUpdater,
+        *,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        load_format: Optional[str] = None,
+        adapter_config: Optional[dict] = None,
+        adapter_name: Optional[str] = None,
+        adapter_id: Optional[str] = None,
+        adapter_version=None,
+        payload_metadata: Optional[dict] = None,
+        double_buffer: bool = True,
+    ):
+        """Receive and stage a native LoRA payload without publishing it."""
+        model_runner = self.get_model_runner()
+        if (
+            not model_runner.server_args.enable_lora_staging
+            or load_format != "lora_adapter"
+        ):
+            return False, (
+                "native LoRA staging requires --enable-lora-staging and "
+                "load_format=lora_adapter"
+            )
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        try:
+            tensors = []
+            handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.broadcast(
+                        weight,
+                        src=0,
+                        group=self._model_update_group[group_name],
+                        async_op=True,
+                    )
+                )
+                tensors.append((name, weight))
+            for handle in handles:
+                handle.wait()
+
+            if payload_metadata is not None:
+                tensors = reconstruct_adapter_staging(tensors, payload_metadata)
+            result = model_runner.lora_manager.stage_adapter(
+                tensors,
+                adapter_config,
+                adapter_name,
+                int(adapter_version),
+                adapter_id=adapter_id,
+            )
+            if not result.success:
+                return False, result.error_message
+            return True, "Succeeded to stage adapter online."
+        except Exception as error:
+            error_message = f"Failed to stage adapter online: {error}."
+            logger.error(error_message)
+            return False, error_message
+
+    def activate_adapter_version(
+        self: WeightUpdater, *, adapter_name, adapter_id, adapter_version
+    ):
+        """Activate the exact native LoRA version previously staged."""
+        model_runner = self.get_model_runner()
+        if not model_runner.server_args.enable_lora_staging:
+            return False, "native LoRA staging is not enabled"
+        try:
+            result = model_runner.lora_manager.activate_adapter(
+                adapter_name,
+                int(adapter_version),
+                adapter_id=adapter_id,
+            )
+            if not result.success:
+                return False, result.error_message
+            return True, "Succeeded to activate adapter version."
+        except Exception as error:
+            error_message = f"Failed to activate adapter version: {error}."
+            logger.error(error_message)
+            return False, error_message
 
     def update_weights_from_tensor(
         self: WeightUpdater,

@@ -788,6 +788,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # serves as the source of truth for available adapters and maps user-friendly LoRA names
         # to internally used unique LoRA IDs.
         self.lora_registry = LoRARegistry(get_lora().lora_paths)
+        self.pending_lora_stage: Optional[LoRARef] = None
+        self.failed_lora_activations: Dict[str, str] = {}
         # Lock to serialize LoRA update operations.
         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
         # LoRA updates and inference to overlap.
@@ -1587,6 +1589,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
+                lora_version=obj.lora_version,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
@@ -1633,6 +1636,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 priority=obj.priority,
                 dimensions=obj.dimensions,
                 lora_id=obj.lora_id,
+                lora_version=obj.lora_version,
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
@@ -3568,6 +3572,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         await self._resolve_lora_path(obj)
 
     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
+        self._assert_native_lora_available(obj.lora_path)
         if isinstance(obj.lora_path, str):
             unique_lora_paths = set([obj.lora_path])
         else:
@@ -3620,12 +3625,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"Failed to implicitly load LoRA adapter {lora_path}: {load_result.error_message}"
                 )
 
-        # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
-        obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
-        # Propagate lora_id to any sub-objects already cached by __getitem__.
+        # Snapshot ID/version and acquire the request lease atomically.
+        obj.lora_id, obj.lora_version = (
+            await self.lora_registry.acquire_with_version(obj.lora_path)
+        )
+        # Propagate the snapshot to sub-objects already cached by __getitem__.
         for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
             sub_obj.lora_id = (
                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
+            )
+            sub_obj.lora_version = (
+                obj.lora_version[i]
+                if isinstance(obj.lora_version, list)
+                else obj.lora_version
             )
 
     def _init_req_state(

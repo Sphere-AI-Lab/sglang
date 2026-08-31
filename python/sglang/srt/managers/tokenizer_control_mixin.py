@@ -11,6 +11,8 @@ import fastapi
 
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
+    ActivateAdapterVersionReqInput,
+    ActivateAdapterVersionReqOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
@@ -74,6 +76,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateAdapterFromDistributedReqInput,
+    UpdateAdapterFromDistributedReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -105,6 +109,8 @@ _COMMUNICATOR_SPECS = [
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
+    ("update_adapter_from_distributed", UpdateAdapterFromDistributedReqOutput),
+    ("activate_adapter_version", ActivateAdapterVersionReqOutput),
     (
         "init_weights_send_group_for_remote_instance",
         InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -519,6 +525,83 @@ class TokenizerControlMixin:
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
+
+    def _assert_native_lora_available(self, lora_path) -> None:
+        """Reject adapters quarantined by a partial activation failure."""
+        names = [lora_path] if isinstance(lora_path, str) else (lora_path or [])
+        for name in names:
+            if name in self.failed_lora_activations:
+                raise ValueError(
+                    f"LoRA adapter '{name}' is unavailable after a partial "
+                    "activation failure; restart required"
+                )
+
+    def _staging_backend_for(self, obj):
+        from sglang.srt.adapter_sync.tokenizer_backend import get_staging_backend
+
+        return get_staging_backend(self, obj)
+
+    async def update_adapter_from_distributed(
+        self: TokenizerManager,
+        obj: UpdateAdapterFromDistributedReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Stage native LoRA weights, optionally activating while drained."""
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for adapter staging"
+
+        backend = self._staging_backend_for(obj)
+        if backend is None:
+            raise ValueError(
+                "native LoRA staging requires --enable-lora-staging and "
+                "load_format=lora_adapter"
+            )
+        await backend.reserve_stage(obj)
+
+        if obj.double_buffer:
+            results = await self.update_adapter_from_distributed_communicator(obj)
+            return FanOutCommunicator.merge_results(results)
+
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+            if is_paused:
+                results = await self.update_adapter_from_distributed_communicator(obj)
+                return await backend.finish_activation(obj, results)
+
+        async with self.model_update_lock.writer_lock:
+            results = await self.update_adapter_from_distributed_communicator(obj)
+            return await backend.finish_activation(obj, results)
+
+    async def activate_adapter_version(
+        self: TokenizerManager,
+        obj: ActivateAdapterVersionReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Drain admission, activate a staged LoRA, then publish its version."""
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for adapter activation"
+
+        backend = self._staging_backend_for(obj)
+        if backend is None:
+            raise ValueError(
+                "native LoRA staging requires --enable-lora-staging and "
+                "load_format=lora_adapter"
+            )
+        backend.prepare_activation(obj)
+
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+            if is_paused:
+                results = await self.activate_adapter_version_communicator(obj)
+                return await backend.finish_activation(obj, results)
+
+        async with self.model_update_lock.writer_lock:
+            results = await self.activate_adapter_version_communicator(obj)
+            return await backend.finish_activation(obj, results)
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,

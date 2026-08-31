@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromIPCReqInput,
 )
@@ -153,6 +154,30 @@ class BaseTpWorker(ABC):
             )
         )
         return success, message
+
+    def update_adapter_from_distributed(
+        self, recv_req: UpdateAdapterFromDistributedReqInput
+    ):
+        return self.model_runner.weight_updater.stage_adapter(
+            names=recv_req.names,
+            dtypes=recv_req.dtypes,
+            shapes=recv_req.shapes,
+            group_name=recv_req.group_name,
+            load_format=recv_req.load_format,
+            adapter_config=recv_req.adapter_config,
+            adapter_name=recv_req.adapter_name,
+            adapter_id=recv_req.adapter_id,
+            adapter_version=recv_req.adapter_version,
+            payload_metadata=recv_req.payload_metadata,
+            double_buffer=recv_req.double_buffer,
+        )
+
+    def activate_adapter_version(self, recv_req):
+        return self.model_runner.weight_updater.activate_adapter_version(
+            adapter_name=recv_req.adapter_name,
+            adapter_id=recv_req.adapter_id,
+            adapter_version=recv_req.adapter_version,
+        )
 
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput

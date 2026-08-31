@@ -18,6 +18,8 @@ from sglang.srt.constants import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    ActivateAdapterVersionReqInput,
+    ActivateAdapterVersionReqOutput,
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
     ChecksumInfo,
@@ -37,6 +39,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    UpdateAdapterFromDistributedReqInput,
+    UpdateAdapterFromDistributedReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -252,6 +256,49 @@ class SchedulerWeightUpdaterManager:
                 self.record_weight_version_after_update(recv_req.weight_version)
             return UpdateWeightsFromDistributedReqOutput(
                 success=success, message=message
+            )
+
+    def update_adapter_from_distributed(
+        self, recv_req: UpdateAdapterFromDistributedReqInput
+    ) -> UpdateAdapterFromDistributedReqOutput:
+        """Stage native LoRA weights while the active version keeps serving."""
+        with self._observe_weight_load("distributed_adapter"):
+            stage_success, message = self.tp_worker.update_adapter_from_distributed(
+                recv_req
+            )
+            success = stage_success
+            active_version = None
+            if stage_success and not recv_req.double_buffer:
+                success, message = self.tp_worker.activate_adapter_version(recv_req)
+                if success:
+                    active_version = recv_req.adapter_version
+            if not success:
+                logger.error(message)
+            return UpdateAdapterFromDistributedReqOutput(
+                success=success,
+                message=message,
+                staged_adapter_version=(
+                    recv_req.adapter_version if stage_success else None
+                ),
+                adapter_version=recv_req.adapter_version,
+                weight_version=recv_req.weight_version,
+                active_adapter_version=active_version,
+            )
+
+    def activate_adapter_version(
+        self, recv_req: ActivateAdapterVersionReqInput
+    ) -> ActivateAdapterVersionReqOutput:
+        """Promote the exact native LoRA stage after tokenizer-side drain."""
+        with self._observe_weight_load("activate_adapter"):
+            success, message = self.tp_worker.activate_adapter_version(recv_req)
+            if not success:
+                logger.error(message)
+            return ActivateAdapterVersionReqOutput(
+                success=success,
+                message=message,
+                active_adapter_version=(
+                    recv_req.adapter_version if success else None
+                ),
             )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

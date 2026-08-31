@@ -115,6 +115,7 @@ from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActivateAdapterVersionReqInput,
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
@@ -179,6 +180,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1644,6 +1646,14 @@ class Scheduler(
                     self.weight_updater.update_weights_from_distributed,
                 ),
                 (
+                    UpdateAdapterFromDistributedReqInput,
+                    self.weight_updater.update_adapter_from_distributed,
+                ),
+                (
+                    ActivateAdapterVersionReqInput,
+                    self.weight_updater.activate_adapter_version,
+                ),
+                (
                     UpdateWeightsFromTensorReqInput,
                     self.weight_updater.update_weights_from_tensor,
                 ),
@@ -2492,6 +2502,7 @@ class Scheduler(
                 return_flat_raw_top_logprobs=recv_req.return_flat_raw_top_logprobs,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
+                lora_version=recv_req.lora_version,
                 session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
@@ -2986,6 +2997,7 @@ class Scheduler(
             priority=recv_req.priority,
             dimensions=recv_req.dimensions,
             lora_id=recv_req.lora_id,
+            lora_version=recv_req.lora_version,
             http_worker_ipc=recv_req.http_worker_ipc,
             time_stats=recv_req.time_stats,
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,

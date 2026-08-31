@@ -804,6 +804,16 @@ class ReqKvInfo:
     swa_evicted_seqlen: int
 
 
+def _extend_lora_extra_key(
+    extra_key: Optional[str], lora_id: Optional[str], lora_version: Optional[int]
+) -> Optional[str]:
+    """Separate radix entries by native LoRA identity and active weights."""
+    if lora_id is None:
+        return extra_key
+    version = 0 if lora_version is None else lora_version
+    return (extra_key or "") + f"|lora:{lora_id}:v{version}"
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -822,6 +832,7 @@ class Req(ReqDllmMixin):
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
+        lora_version: Optional[int] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
         token_type_ids: List[int] = None,
@@ -924,14 +935,12 @@ class Req(ReqDllmMixin):
         )
 
         # Extra key for caller-defined request classification.
-        if lora_id is not None:
-            extra_key = (
-                extra_key or ""
-            ) + lora_id  # lora_id is concatenated to the extra key
+        extra_key = _extend_lora_extra_key(extra_key, lora_id, lora_version)
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
         self.lora_id = lora_id
+        self.lora_version = lora_version
         self.routing_key = routing_key
 
         # Memory pool info
