@@ -13,7 +13,8 @@ from typing import List, Tuple
 
 
 class AdapterStagingBackend(ABC):
-    """One instance per TokenizerManager, selected by ``obj.load_format``."""
+    """One instance per TokenizerManager, selected by the server's staging
+    server_args flag (see ``_STAGING_BACKENDS`` below)."""
 
     @abstractmethod
     async def reserve_stage(self, obj) -> None:

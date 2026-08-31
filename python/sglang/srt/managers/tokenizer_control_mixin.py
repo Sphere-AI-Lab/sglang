@@ -526,6 +526,22 @@ class TokenizerControlMixin:
 
         return success, message
 
+    def _assert_native_lora_available(self, lora_path) -> None:
+        """Reject a request naming an adapter quarantined by a partial native
+        LoRA activation failure. Runs unconditionally for every generate/
+        embedding request with a lora_path (see _resolve_lora_path in
+        tokenizer_manager.py) -- not gated on enable_lora_staging, since
+        self.failed_lora_activations is initialized unconditionally in
+        __init__ and a previously staged-and-quarantined adapter name must
+        stay rejected regardless of the server's current staging config."""
+        names = [lora_path] if isinstance(lora_path, str) else (lora_path or [])
+        for name in names:
+            if name in self.failed_lora_activations:
+                raise ValueError(
+                    f"LoRA adapter '{name}' is unavailable after a partial "
+                    "activation failure; restart required"
+                )
+
     def _staging_backend_for(self, obj):
         from sglang.srt.adapter_sync.tokenizer_backend import get_staging_backend
 

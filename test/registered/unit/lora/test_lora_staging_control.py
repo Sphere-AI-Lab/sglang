@@ -496,5 +496,45 @@ class TestTokenizerNativeStaging(unittest.TestCase):
         self.assertIn("policy", tm.failed_lora_activations)
 
 
+class TestResolveLoraPathRejectsQuarantine(unittest.TestCase):
+    """Regression test for a bug introduced by the AdapterStagingBackend
+    extraction: _resolve_lora_path (called from _validate_and_resolve_lora,
+    the admission path every generate/embedding request with a lora_path
+    goes through) used to call self._assert_native_lora_available directly.
+    That method briefly only existed on LoRAStagingBackend after the
+    extraction, so any request naming a lora_path raised AttributeError
+    instead of the intended ValueError -- unconditionally, independent of
+    enable_lora_staging. The fix restores an always-available
+    _assert_native_lora_available on TokenizerControlMixin."""
+
+    def _tm(self, *, enable_lora_staging):
+        tm = TokenizerManager.__new__(TokenizerManager)
+        tm.server_args = SimpleNamespace(enable_lora_staging=enable_lora_staging)
+        tm.enable_lora = True
+        tm.failed_lora_activations = {"policy": "partial activation failure"}
+        return tm
+
+    def test_resolve_lora_path_rejects_quarantined_adapter_with_staging_off(self):
+        tm = self._tm(enable_lora_staging=False)
+        obj = SimpleNamespace(lora_path="policy")
+
+        with self.assertRaisesRegex(ValueError, "policy.*restart required"):
+            asyncio.run(tm._resolve_lora_path(obj))
+
+    def test_resolve_lora_path_rejects_quarantined_adapter_with_staging_on(self):
+        tm = self._tm(enable_lora_staging=True)
+        obj = SimpleNamespace(lora_path="policy")
+
+        with self.assertRaisesRegex(ValueError, "policy.*restart required"):
+            asyncio.run(tm._resolve_lora_path(obj))
+
+    def test_validate_and_resolve_lora_rejects_quarantined_adapter(self):
+        tm = self._tm(enable_lora_staging=False)
+        obj = SimpleNamespace(lora_path="policy")
+
+        with self.assertRaisesRegex(ValueError, "policy.*restart required"):
+            asyncio.run(tm._validate_and_resolve_lora(obj))
+
+
 if __name__ == "__main__":
     unittest.main()

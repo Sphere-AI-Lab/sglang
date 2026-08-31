@@ -325,13 +325,10 @@ class LoRAStagingBackend(AdapterStagingBackend):
         self._tm = tm
 
     def _assert_available(self, lora_path) -> None:
-        names = [lora_path] if isinstance(lora_path, str) else (lora_path or [])
-        for name in names:
-            if name in self._tm.failed_lora_activations:
-                raise ValueError(
-                    f"LoRA adapter '{name}' is unavailable after a partial "
-                    "activation failure; restart required"
-                )
+        # Shared with the always-on check in _resolve_lora_path
+        # (tokenizer_manager.py) -- one quarantine check, read off the same
+        # self._tm.failed_lora_activations dict either way.
+        self._tm._assert_native_lora_available(lora_path)
 
     def _quarantine(self, name: str, message: str) -> None:
         self._tm.failed_lora_activations[name] = message

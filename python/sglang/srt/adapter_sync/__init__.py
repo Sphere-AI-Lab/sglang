@@ -8,9 +8,11 @@ refresh. This package owns that machinery once, rather than each method growing
 its own copy.
 
 Layout:
-    manager.py   method-agnostic lifecycle; per-method work goes through hooks
-    mem_pool.py  slot-paged buffers + the stage/activate state machine
-    utils.py     helpers the two above need
+    manager.py           method-agnostic lifecycle; per-method work goes through hooks
+    mem_pool.py          slot-paged buffers + the stage/activate state machine
+    utils.py             helpers the two above need
+    tokenizer_backend.py AdapterStagingBackend ABC + the get_staging_backend() registry
+                         tokenizer_control_mixin.py dispatches through
 
 Deliberately NOT here: the adapter registry. Registry state (ids, refcounts,
 pinning) is adapter IDENTITY, needed for ordinary multi-tenant serving with no
@@ -19,6 +21,9 @@ hot-swap at all, and upstream keeps its own registry inside the serving package
 this extension. It stays in the serving packages.
 
 Status: WS2-1 copied manager.py and mem_pool.py out of ``srt/oft/base/``.
-``srt/oft`` still runs on its own copy, so nothing imports this yet -- it is
-inert scaffolding until WS2-3 (LoRA backend) and WS2-4 (migrate srt/oft).
+``srt/oft`` still runs on its own copy of manager.py/mem_pool.py, so those two
+remain inert scaffolding until WS2-4 migrates it here. tokenizer_backend.py is
+live: TokenizerControlMixin's update_adapter_from_distributed/
+activate_adapter_version dispatch through get_staging_backend(), and
+srt/lora/staged_manager.py's LoRAStagingBackend is its first implementation.
 """
