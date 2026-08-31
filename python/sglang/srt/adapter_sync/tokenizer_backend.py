@@ -45,8 +45,8 @@ class AdapterStagingBackend(ABC):
 # a third adapter method means adding one entry here -- never touching
 # tokenizer_control_mixin.py again.
 #
-# Task 4 registers native LoRA only. Other adapter methods can add their own
-# registry rows when their staging implementations land.
+# Task 4 registers native LoRA; Task 5 adds canonical OFT without changing
+# the shared dispatch loop.
 #
 # is_enabled is a lambda doing DIRECT attribute access (sa.enable_lora_staging),
 # not a string-keyed getattr(sa, flag_name, False) -- these fields are
@@ -65,6 +65,12 @@ _STAGING_BACKENDS = [
         and obj.load_format == "lora_adapter",
         "sglang.srt.lora.staged_manager",
         "LoRAStagingBackend",
+    ),
+    (
+        lambda sa, obj: sa.peft_method == "oft"
+        and obj.load_format == "oft_adapter",
+        "sglang.srt.oft.staged_manager",
+        "OFTStagingBackend",
     ),
 ]
 
