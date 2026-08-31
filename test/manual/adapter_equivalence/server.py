@@ -23,6 +23,7 @@ _CANDIDATE_MODE_ARGS = {
 }
 
 _OFT_MODES = {"legacy_oft", "canonical_oft"}
+_INTERNAL_OFT_CONTROL_FORMAT = "adapter_equivalence_oft_control"
 
 
 @dataclass(frozen=True)
@@ -228,54 +229,249 @@ def engine_kwargs(spec: ServerSpec) -> dict[str, object]:
 
 
 @dataclass(frozen=True)
-class OFTRequestTypes:
-    """Revision-specific OFT request constructors used by the internal shim."""
+class OFTControlResult:
+    """Normalized result from the harness-only OFT control channel."""
 
-    load: Callable[..., object]
-    unload: Callable[..., object]
+    success: bool
+    error_message: str = ""
 
 
-def resolve_oft_request_types(revision_kind: str) -> OFTRequestTypes:
-    """Resolve request types without importing removed source modules eagerly."""
+def resolve_oft_update_request_type(revision_kind: str) -> Callable[..., object]:
+    """Resolve the existing scheduler request used as the control transport."""
+
+    if revision_kind not in {"source", "candidate"}:
+        raise ScenarioContractError(f"unknown revision kind: {revision_kind}")
+    from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+
+    return UpdateWeightsFromTensorReqInput
+
+
+def _normalize_oft_control_result(result: object) -> OFTControlResult:
+    if isinstance(result, tuple) and len(result) >= 2:
+        success, message = result[:2]
+        return OFTControlResult(
+            success=bool(success),
+            error_message="" if success else str(message),
+        )
+    success = getattr(result, "success", False) is True
+    message = getattr(result, "error_message", None)
+    return OFTControlResult(
+        success=success,
+        error_message="" if success else str(message or "unknown failure"),
+    )
+
+
+def _dispatch_internal_oft_control(
+    model_runner: object,
+    *,
+    adapter_config: dict[str, object] | None,
+    adapter_id: str | None,
+    ref_type: Callable[..., object],
+) -> tuple[bool, str]:
+    """Execute one control message against the worker's real OFT manager."""
+
+    if getattr(model_runner.server_args, "peft_method", None) != "oft":
+        return False, "OFT is not enabled"
+    if adapter_config is None or adapter_id is None:
+        return False, "internal OFT control requires adapter metadata and adapter_id"
+
+    operation = adapter_config.get("operation")
+    if operation not in {"load", "unload"}:
+        return False, f"unknown internal OFT operation: {operation}"
+    try:
+        ref = ref_type(
+            adapter_id=adapter_id,
+            adapter_name=adapter_config["adapter_name"],
+            adapter_path=adapter_config["adapter_path"],
+            pinned=adapter_config["pinned"],
+        )
+        manager = model_runner.oft_manager
+        method = (
+            manager.load_oft_adapter
+            if operation == "load"
+            else manager.unload_oft_adapter
+        )
+        result = method(ref)
+    except Exception as exc:
+        return False, str(exc)
+    normalized = _normalize_oft_control_result(result)
+    return normalized.success, normalized.error_message
+
+
+def _resolve_worker_oft_ref_type(
+    model_runner: object,
+    revision_kind: str,
+) -> Callable[..., object]:
+    oft_impl = getattr(model_runner.server_args, "oft_impl", None)
+    if revision_kind == "source" and oft_impl not in {"sibling", "staged"}:
+        from sglang.srt.peft.oft.oft_registry import OFTRef
+    else:
+        from sglang.srt.oft.oft_registry import OFTRef
+    return OFTRef
+
+
+def install_internal_oft_control_bridge(revision_kind: str) -> None:
+    """Install the harness-only worker dispatch before Engine subprocess spawn."""
 
     if revision_kind == "source":
-        from sglang.srt.peft.io_types import (
-            LoadOFTAdapterReqInput,
-            UnloadOFTAdapterReqInput,
-        )
+        from sglang.srt.peft import integration
     elif revision_kind == "candidate":
-        from sglang.srt.oft.io_types import (
-            LoadOFTAdapterReqInput,
-            UnloadOFTAdapterReqInput,
-        )
+        from sglang.srt.oft import integration
     else:
         raise ScenarioContractError(f"unknown revision kind: {revision_kind}")
-    return OFTRequestTypes(LoadOFTAdapterReqInput, UnloadOFTAdapterReqInput)
+
+    marker = "_adapter_equivalence_oft_control_bridge"
+    installed_revision = getattr(integration, marker, None)
+    if installed_revision == revision_kind:
+        return
+    if installed_revision is not None:
+        raise ScenarioContractError(
+            "internal OFT bridge cannot switch revisions in one process"
+        )
+
+    original = integration.maybe_load_adapter_format
+
+    def maybe_load_adapter_format(
+        model_runner,
+        load_format,
+        tensors,
+        adapter_config,
+        adapter_name,
+        adapter_id,
+        **kwargs,
+    ):
+        if load_format != _INTERNAL_OFT_CONTROL_FORMAT:
+            return original(
+                model_runner,
+                load_format,
+                tensors,
+                adapter_config,
+                adapter_name,
+                adapter_id,
+                **kwargs,
+            )
+        return _dispatch_internal_oft_control(
+            model_runner,
+            adapter_config=adapter_config,
+            adapter_id=adapter_id,
+            ref_type=_resolve_worker_oft_ref_type(model_runner, revision_kind),
+        )
+
+    integration.maybe_load_adapter_format = maybe_load_adapter_format
+    setattr(integration, marker, revision_kind)
 
 
 class InternalOFTControl:
-    """Drive the unchanged source's real OFT manager when HTTP routes are absent."""
+    """Drive real worker OFT managers through an existing scheduler channel."""
 
     def __init__(
         self,
         engine: object,
         *,
         revision_kind: str,
-        request_types: OFTRequestTypes | None = None,
+        update_request_type: Callable[..., object] | None = None,
     ) -> None:
         if revision_kind not in {"source", "candidate"}:
             raise ScenarioContractError(f"unknown revision kind: {revision_kind}")
         self.engine = engine
-        self.request_types = request_types or resolve_oft_request_types(
-            revision_kind
+        self.update_request_type = (
+            update_request_type
+            or resolve_oft_update_request_type(revision_kind)
         )
 
     def _run(self, operation: str, awaitable: object) -> object:
-        result = self.engine.loop.run_until_complete(awaitable)
-        if getattr(result, "success", False) is not True:
-            message = getattr(result, "error_message", None) or "unknown failure"
-            raise ScenarioContractError(f"internal OFT {operation} failed: {message}")
+        result = _normalize_oft_control_result(
+            self.engine.loop.run_until_complete(awaitable)
+        )
+        if not result.success:
+            raise ScenarioContractError(
+                f"internal OFT {operation} failed: {result.error_message}"
+            )
         return result
+
+    def _request(
+        self,
+        *,
+        operation: str,
+        adapter_name: str,
+        adapter_path: str,
+        pinned: bool,
+        adapter_id: str | None,
+    ) -> object:
+        return self.update_request_type(
+            serialized_named_tensors=self.engine._serialize_tensors_per_rank(
+                [], _INTERNAL_OFT_CONTROL_FORMAT
+            ),
+            load_format=_INTERNAL_OFT_CONTROL_FORMAT,
+            flush_cache=True,
+            adapter_config={
+                "operation": operation,
+                "adapter_name": adapter_name,
+                "adapter_path": adapter_path,
+                "pinned": pinned,
+            },
+            adapter_name=adapter_name if operation == "load" else None,
+            adapter_id=adapter_id,
+        )
+
+    async def _load(
+        self,
+        adapter_name: str,
+        adapter_path: str,
+        pinned: bool,
+    ) -> object:
+        manager = self.engine.tokenizer_manager
+        async with manager.peft_update_lock:
+            request = self._request(
+                operation="load",
+                adapter_name=adapter_name,
+                adapter_path=adapter_path,
+                pinned=pinned,
+                adapter_id=None,
+            )
+            try:
+                result = await manager.update_weights_from_tensor(request, None)
+            except Exception:
+                await self._rollback_load_registration(adapter_name)
+                raise
+            if not _normalize_oft_control_result(result).success:
+                await self._rollback_load_registration(adapter_name)
+            return result
+
+    async def _rollback_load_registration(self, adapter_name: str) -> None:
+        manager = self.engine.tokenizer_manager
+        if adapter_name not in manager.peft_ref_cache:
+            return
+        manager.peft_ref_cache.pop(adapter_name, None)
+        await manager.peft_registry.unregister(adapter_name)
+
+    async def _unload(self, adapter_name: str) -> object:
+        manager = self.engine.tokenizer_manager
+        async with manager.peft_update_lock:
+            ref = manager.peft_ref_cache.get(adapter_name)
+            if ref is None:
+                raise ScenarioContractError(
+                    f"internal OFT unload failed: unknown adapter {adapter_name}"
+                )
+            adapter_id = await manager.peft_registry.unregister(adapter_name)
+            await manager.peft_registry.wait_for_unload(adapter_id)
+            request = self._request(
+                operation="unload",
+                adapter_name=adapter_name,
+                adapter_path=ref.adapter_path,
+                pinned=bool(ref.pinned),
+                adapter_id=adapter_id,
+            )
+            try:
+                result = await manager.update_weights_from_tensor(request, None)
+            except Exception:
+                await manager.peft_registry.register(ref)
+                raise
+            if _normalize_oft_control_result(result).success:
+                manager.peft_ref_cache.pop(adapter_name, None)
+            else:
+                await manager.peft_registry.register(ref)
+            return result
 
     def load(
         self,
@@ -284,22 +480,10 @@ class InternalOFTControl:
         *,
         pinned: bool = False,
     ) -> object:
-        request = self.request_types.load(
-            adapter_name=adapter_name,
-            adapter_path=adapter_path,
-            pinned=pinned,
-        )
-        return self._run(
-            "load",
-            self.engine.tokenizer_manager.load_oft_adapter(request, None),
-        )
+        return self._run("load", self._load(adapter_name, adapter_path, pinned))
 
     def unload(self, adapter_name: str) -> object:
-        request = self.request_types.unload(adapter_name=adapter_name)
-        return self._run(
-            "unload",
-            self.engine.tokenizer_manager.unload_oft_adapter(request, None),
-        )
+        return self._run("unload", self._unload(adapter_name))
 
 
 def launch_server(
