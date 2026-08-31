@@ -246,6 +246,87 @@ class TestUnloadDeleteVsEvictSemantics(CustomTestCase):
         self.assertEqual(tm.peft_registry.num_registered_ofts, 0)
 
 
+class TestUnloadWaitsBeforeCommunicatorDispatch(CustomTestCase):
+    """Regression guard: _unload_oft_adapter_locked must wait for in-flight
+    leases to drain (wait_for_unload) BEFORE telling the backend to free GPU
+    state (the communicator dispatch) -- mirrors _unload_lora_adapter_locked's
+    ordering. An earlier version of this code dispatched the communicator
+    first and called wait_for_unload after, which could free backend state
+    while a request was still in flight against it."""
+
+    def test_wait_for_unload_precedes_communicator_call(self):
+        tm = _make_tokenizer_manager()
+        ref = OFTRef(adapter_name="a", adapter_path="/x")
+        asyncio.run(tm.peft_registry.register(ref))
+        tm.peft_ref_cache["a"] = ref
+
+        call_order = []
+        real_wait_for_unload = tm.peft_registry.wait_for_unload
+
+        async def _tracking_wait_for_unload(uid):
+            call_order.append("wait_for_unload")
+            return await real_wait_for_unload(uid)
+
+        tm.peft_registry.wait_for_unload = _tracking_wait_for_unload
+
+        async def _tracking_communicator(obj):
+            call_order.append("communicator")
+            return [OFTUpdateOutput(success=True)]
+
+        tm.update_oft_adapter_communicator = AsyncMock(
+            side_effect=_tracking_communicator
+        )
+
+        result = asyncio.run(
+            tm.unload_oft_adapter(UnloadOFTAdapterReqInput(adapter_name="a"))
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(call_order, ["wait_for_unload", "communicator"])
+
+
+class TestMultiRankFailureNotSwallowed(CustomTestCase):
+    """Regression guard: unload and load_from_distributed used to take only
+    rank 0's reply ([0]) with no dp_size==1 guard backing that shortcut (unlike
+    LoRA's from_distributed route), so a failure on any later rank was
+    silently reported as success. Both must merge all ranks' replies instead."""
+
+    def test_unload_reports_non_first_rank_failure(self):
+        tm = _make_tokenizer_manager()
+        ref = OFTRef(adapter_name="a", adapter_path="/x")
+        asyncio.run(tm.peft_registry.register(ref))
+        tm.peft_ref_cache["a"] = ref
+        tm.update_oft_adapter_communicator = AsyncMock(
+            return_value=[
+                OFTUpdateOutput(success=True),
+                OFTUpdateOutput(success=False, error_message="rank1 oom"),
+            ]
+        )
+
+        result = asyncio.run(
+            tm.unload_oft_adapter(UnloadOFTAdapterReqInput(adapter_name="a"))
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("rank1 oom", result.error_message)
+
+    def test_load_from_distributed_reports_non_first_rank_failure(self):
+        tm = _make_tokenizer_manager()
+        tm.update_oft_adapter_communicator = AsyncMock(
+            return_value=[
+                OFTUpdateOutput(success=True, loaded_adapters={"a": "id"}),
+                OFTUpdateOutput(success=False, error_message="rank1 oom"),
+            ]
+        )
+
+        result = asyncio.run(
+            tm.load_oft_adapter_from_distributed(_make_distributed_req("a"))
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("rank1 oom", result.error_message)
+
+
 class TestWrongPeftConfigRejected(CustomTestCase):
     """The native OFT RPC handlers must reject loudly -- before touching the
     lock or the communicator -- unless the engine actually booted with

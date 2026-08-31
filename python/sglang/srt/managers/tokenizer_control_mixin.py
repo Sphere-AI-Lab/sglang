@@ -1206,7 +1206,12 @@ class TokenizerControlMixin:
                     upsert=obj.upsert,
                 )
                 obj.adapter_id = new_ref.adapter_id
-                result = (await self.update_oft_adapter_communicator(obj))[0]
+                # Merge (not [0]): unlike LoRA's from_distributed route, this
+                # handler has no dp_size == 1 guard, so a non-rank-0 failure
+                # must not be silently reported as success.
+                result = _merge_oft_update_results(
+                    await self.update_oft_adapter_communicator(obj)
+                )
 
                 if result.success:
                     if reused:
@@ -1250,10 +1255,18 @@ class TokenizerControlMixin:
         scheduler to free GPU state; does NOT touch peft_ref_cache (the
         caller decides evict-vs-delete semantics, mirroring
         _unload_lora_adapter_locked)."""
+        # Unregister the OFT adapter from the registry to stop new requests
+        # for this adapter from being started.
         adapter_id = await self.peft_registry.unregister(obj.adapter_name)
-        obj.adapter_id = adapter_id
-        result = (await self.update_oft_adapter_communicator(obj))[0]
+
+        # Initiate the actual unloading operation at the backend processes
+        # only after all ongoing requests using this adapter are finished.
         await self.peft_registry.wait_for_unload(adapter_id)
+        obj.adapter_id = adapter_id
+        result = _merge_oft_update_results(
+            await self.update_oft_adapter_communicator(obj)
+        )
+
         return result
 
     async def unload_oft_adapter(
