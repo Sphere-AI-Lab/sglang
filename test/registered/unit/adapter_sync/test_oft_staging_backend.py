@@ -127,6 +127,38 @@ class TestOFTStagingTransaction(unittest.TestCase):
             pool.activate("adapter-a", 1, destination=pool.staging_idx)
 
 
+class TestStagingCoexistsWithMultiTenancy(unittest.TestCase):
+    """Guards the exact gap found while designing this: AdapterMemPool.activate()
+    is pool-wide (one _active_version for the whole pool); StagedOFTMemoryPool
+    must NOT have that property, or admitting a second adapter while a first
+    is being staged would corrupt the first's serving slot."""
+
+    def test_two_resident_adapters_keep_independent_versions(self):
+        pool = _make_pool(max_ofts_per_batch=4)
+        pool.uid_to_buffer_id["adapter-a"] = 0
+        pool.uid_to_buffer_id["adapter-b"] = 1
+
+        pool.stage("adapter-a", 1, _named_tensors_for_layer_0(fill_value=1.0))
+        pool.activate("adapter-a", 1, destination=0)
+
+        pool.stage("adapter-b", 5, _named_tensors_for_layer_0(fill_value=2.0))
+        pool.activate("adapter-b", 5, destination=1)
+
+        self.assertEqual(pool.active_version_for("adapter-a"), 1)
+        self.assertEqual(pool.active_version_for("adapter-b"), 5)
+
+    def test_activating_one_adapter_does_not_touch_a_second_resident_slot(self):
+        pool = _make_pool(max_ofts_per_batch=4)
+        pool.uid_to_buffer_id["adapter-a"] = 0
+        pool.uid_to_buffer_id["adapter-b"] = 1
+        slot_1_before = pool.slot(f"R:{TARGET_MODULE}", 0, 1).clone()
+
+        pool.stage("adapter-a", 1, _named_tensors_for_layer_0(fill_value=1.0))
+        pool.activate("adapter-a", 1, destination=0)
+
+        self.assertTrue((pool.slot(f"R:{TARGET_MODULE}", 0, 1) == slot_1_before).all())
+
+
 def _manager_for_pool_construction(max_ofts_per_batch=4):
     """Attributes OFTManager.__init__/init_state would have set before
     calling init_memory_pool -- built directly (object.__new__, no real
