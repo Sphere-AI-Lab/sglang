@@ -1410,6 +1410,7 @@ def test_task8_internal_oft_control_streams_fixture_and_uses_control_for_unload(
     class Registry:
         def __init__(self):
             self.refs = {}
+            self.released = []
             self.waited_for = []
 
         async def register(self, ref):
@@ -1417,6 +1418,9 @@ def test_task8_internal_oft_control_streams_fixture_and_uses_control_for_unload(
 
         async def unregister(self, name):
             return self.refs.pop(name).adapter_id
+
+        async def release(self, adapter_id):
+            self.released.append(adapter_id)
 
         async def wait_for_unload(self, adapter_id):
             self.waited_for.append(adapter_id)
@@ -1520,6 +1524,7 @@ def test_task8_internal_oft_control_streams_fixture_and_uses_control_for_unload(
         "pinned": False,
     }
     assert manager.peft_registry.refs == {}
+    assert manager.peft_registry.released == ["adapter-id-a"]
     assert manager.peft_registry.waited_for == ["adapter-id-a"]
     assert manager.peft_ref_cache == {}
 
