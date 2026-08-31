@@ -1317,6 +1317,73 @@ def test_task8_offline_engine_kwargs_preserve_source_oft_selection():
     }
 
 
+def test_task8_dynamic_oft_engine_kwargs_declare_fixture_shape_contract():
+    from adapter_equivalence.server import ServerSpec, engine_kwargs
+
+    target_modules = (
+        "down_proj",
+        "gate_proj",
+        "o_proj",
+        "q_proj",
+        "up_proj",
+    )
+    spec = ServerSpec(
+        revision_kind="source",
+        model_path="/models/qwen3-4b",
+        mode="canonical_oft",
+        port=31002,
+        tp_size=1,
+        ep_size=1,
+        cuda_graph=False,
+        max_oft_block_size=128,
+        peft_target_modules=target_modules,
+    )
+
+    assert engine_kwargs(spec) == {
+        "base_gpu_id": 1,
+        "disable_cuda_graph": True,
+        "ep_size": 1,
+        "log_level": "error",
+        "max_oft_block_size": 128,
+        "mem_fraction_static": 0.8,
+        "model_path": "/models/qwen3-4b",
+        "oft_impl": "sibling",
+        "peft_method": "oft",
+        "peft_target_modules": target_modules,
+        "tp_size": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["max_oft_block_size", "peft_target_modules"],
+)
+def test_task8_dynamic_oft_requires_fixture_shape_contract(missing_field):
+    from adapter_equivalence.scenarios import ScenarioContractError
+    from adapter_equivalence.server import ServerSpec
+
+    arguments = {
+        "revision_kind": "source",
+        "model_path": "/models/qwen3-4b",
+        "mode": "canonical_oft",
+        "port": 31002,
+        "tp_size": 1,
+        "ep_size": 1,
+        "cuda_graph": False,
+        "max_oft_block_size": 128,
+        "peft_target_modules": ("q_proj",),
+    }
+    arguments[missing_field] = (
+        None if missing_field == "max_oft_block_size" else ()
+    )
+
+    with pytest.raises(
+        ScenarioContractError,
+        match="dynamic OFT requires max_oft_block_size and peft_target_modules",
+    ):
+        ServerSpec(**arguments)
+
+
 def test_task8_internal_oft_control_calls_real_manager_contract():
     import asyncio
     from dataclasses import dataclass
