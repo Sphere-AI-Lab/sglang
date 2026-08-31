@@ -896,7 +896,7 @@ class ReplicatedLinearWithOFT(BaseLayerWithOFT):
     NOT ``ColumnParallelLinearWithOFT`` -- because ``ReplicatedLinear`` has no
     ``tp_size``/``gather_output``/``input_size_per_partition``; inheriting the
     ColumnParallel forward would ``AttributeError`` (mirrors
-    ``ReplicatedLinearWithLoRA``, peft/lora/layers.py:511).
+    ``ReplicatedLinearWithLoRA``, srt/lora/layers.py).
 
     Mirrors ``MergedColumnParallelLinearWithOFT``'s merged/split detection: an
     ``R_buffer`` with an odd block count is the legacy shared-R (one rotation

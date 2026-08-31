@@ -27,6 +27,19 @@ def _args(peft_method, *, enable_lora=True):
     return ns
 
 
+def test_removed_lora_method_is_rejected_even_when_set_programmatically():
+    """Regression: argparse's ``choices=["oft"]`` rejects ``--peft-method lora``
+    on the CLI, but a caller that builds ``ServerArgs`` directly (e.g. an RL
+    launcher passing ``peft_method="lora"`` as a kwarg) bypasses argparse
+    entirely and used to sail through ``validate_peft_args`` uncaught after
+    srt/peft/lora was deleted -- silently no-op'ing to base-model-only serving
+    instead of failing loudly."""
+    from sglang.srt.peft.config import validate_peft_args
+
+    with pytest.raises(ValueError, match=r"--peft-method 'lora' is no longer supported"):
+        validate_peft_args(_args("lora", enable_lora=False))
+
+
 def test_native_lora_and_single_active_peft_are_mutually_exclusive():
     """Catch the PEFT method initializing alongside native LoRA."""
     from sglang.srt.peft.config import validate_peft_args

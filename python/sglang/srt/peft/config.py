@@ -152,7 +152,7 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         action=PeftPathAction,
         help='The list of PEFT adapters to load (requires --peft-method). Each adapter: '
-        '<PATH> | <NAME>=<PATH> | JSON {"<method>_name":str,"<method>_path":str,"pinned":bool}',
+        '<PATH> | <NAME>=<PATH> | JSON {"adapter_name":str,"adapter_path":str,"pinned":bool}',
     )
     parser.add_argument(
         "--max-ofts-per-batch",
@@ -214,6 +214,13 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
 
 def validate_peft_args(server_args) -> None:
     """Validate + normalize OFT server args in place (was check_oft_server_args)."""
+    if server_args.peft_method not in (None, "oft"):
+        raise ValueError(
+            f"--peft-method {server_args.peft_method!r} is no longer supported: "
+            "srt/peft/lora was deleted (superseded by srt/lora + "
+            "StagedLoRAManager; see --enable-lora for native multi-tenant "
+            "LoRA). Only None and 'oft' are valid for --peft-method."
+        )
     if getattr(server_args, "oft_impl", "sibling") not in OFT_IMPL_CHOICES:
         raise ValueError(
             f"Invalid --oft-impl {server_args.oft_impl!r}; choose from {OFT_IMPL_CHOICES}."

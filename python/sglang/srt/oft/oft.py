@@ -98,8 +98,9 @@ class OFTAdapter(nn.Module):
         # load_format="dummy" (e.g. perf/parity fixtures), that format leaks in
         # via the shared load_config and DefaultModelLoader._prepare_weights
         # hard-raises on DUMMY -- override it to AUTO for the adapter's real
-        # safetensors. No-op for real bases (already AUTO/safetensors). Mirrors
-        # the identical fix in peft/lora/lora.py.
+        # safetensors. No-op for real bases (already AUTO/safetensors). The same
+        # fix applies to any other adapter loader that shares load_config with a
+        # dummy-loaded base.
         load_config = self.load_config
         if load_config.load_format == LoadFormat.DUMMY:
             load_config = dataclasses.replace(load_config, load_format=LoadFormat.AUTO)
