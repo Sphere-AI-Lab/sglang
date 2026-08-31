@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import IO, Callable, Literal
 
 from .scenarios import ScenarioContractError
@@ -246,6 +248,41 @@ def resolve_oft_update_request_type(revision_kind: str) -> Callable[..., object]
     return UpdateWeightsFromTensorReqInput
 
 
+def resolve_oft_payload_serializer(
+    revision_kind: str,
+) -> Callable[[object], bytes]:
+    """Resolve the canonical streamed-OFT serializer for a frozen revision."""
+
+    if revision_kind == "source":
+        from sglang.srt.peft.oft.streamed_weight_loader import (
+            serialize_flattened_oft_payload,
+        )
+    elif revision_kind == "candidate":
+        from sglang.srt.oft.streamed_weight_loader import (
+            serialize_flattened_oft_payload,
+        )
+    else:
+        raise ScenarioContractError(f"unknown revision kind: {revision_kind}")
+    return serialize_flattened_oft_payload
+
+
+def load_oft_fixture(
+    adapter_path: str,
+) -> tuple[list[tuple[str, object]], dict[str, object]]:
+    """Read one deterministic OFT fixture in the production wire format."""
+
+    from safetensors.torch import load_file
+
+    path = Path(adapter_path)
+    config = json.loads(
+        (path / "adapter_config.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(config, dict):
+        raise ScenarioContractError("OFT adapter_config.json must contain an object")
+    tensors = load_file(path / "adapter_model.safetensors", device="cpu")
+    return sorted(tensors.items()), config
+
+
 def _normalize_oft_control_result(result: object) -> OFTControlResult:
     if isinstance(result, tuple) and len(result) >= 2:
         success, message = result[:2]
@@ -370,6 +407,10 @@ class InternalOFTControl:
         *,
         revision_kind: str,
         update_request_type: Callable[..., object] | None = None,
+        fixture_loader: Callable[
+            [str], tuple[list[tuple[str, object]], dict[str, object]]
+        ] | None = None,
+        payload_serializer: Callable[[object], bytes] | None = None,
     ) -> None:
         if revision_kind not in {"source", "candidate"}:
             raise ScenarioContractError(f"unknown revision kind: {revision_kind}")
@@ -377,6 +418,11 @@ class InternalOFTControl:
         self.update_request_type = (
             update_request_type
             or resolve_oft_update_request_type(revision_kind)
+        )
+        self.fixture_loader = fixture_loader or load_oft_fixture
+        self.payload_serializer = (
+            payload_serializer
+            or resolve_oft_payload_serializer(revision_kind)
         )
 
     def _run(
@@ -421,6 +467,19 @@ class InternalOFTControl:
         pinned: bool,
         adapter_id: str | None,
     ) -> object:
+        if operation == "load":
+            tensors, config = self.fixture_loader(adapter_path)
+            serialized = self.payload_serializer(tensors)
+            return self.update_request_type(
+                serialized_named_tensors=[
+                    serialized for _ in range(self.engine.server_args.tp_size)
+                ],
+                load_format="oft_adapter",
+                flush_cache=True,
+                adapter_config=config,
+                adapter_name=adapter_name,
+                adapter_id=None,
+            )
         return self.update_request_type(
             serialized_named_tensors=self.engine._serialize_tensors_per_rank(
                 [], _INTERNAL_OFT_CONTROL_FORMAT
