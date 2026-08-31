@@ -3,14 +3,15 @@ from types import SimpleNamespace
 import pytest
 
 
-def _args(peft_method, *, enable_lora=True):
+def _args(peft_method, *, enable_lora=True, max_loaded_ofts=None, max_ofts_per_batch=2):
     ns = SimpleNamespace(
         enable_lora=enable_lora,
         peft_method=peft_method,
         peft_paths=["/models/adapter"] if peft_method is not None else None,
         peft_target_modules=None,
         max_oft_block_size=None,
-        max_ofts_per_batch=2,
+        max_ofts_per_batch=max_ofts_per_batch,
+        max_loaded_ofts=max_loaded_ofts,
         oft_backend="triton",
         oft_dtype=None,
         oft_type="canonical_oft",
@@ -62,3 +63,12 @@ def test_native_lora_and_single_active_peft_validate_independently(
     from sglang.srt.peft.config import validate_peft_args
 
     validate_peft_args(_args(peft_method, enable_lora=enable_lora))
+
+
+def test_max_loaded_ofts_must_be_at_least_max_ofts_per_batch():
+    """Validate that max_loaded_ofts must be >= max_ofts_per_batch."""
+    from sglang.srt.peft.config import validate_peft_args
+
+    # Test case where max_loaded_ofts < max_ofts_per_batch should fail
+    with pytest.raises(AssertionError, match=r"max_loaded_ofts should be greater than or equal"):
+        validate_peft_args(_args("oft", enable_lora=False, max_loaded_ofts=2, max_ofts_per_batch=4))

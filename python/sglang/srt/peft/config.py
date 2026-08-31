@@ -65,6 +65,14 @@ class PEFTArgs:
     # fast-path kernels (`TritonOFTBackend.single_adapter_mode`); orbit's RL
     # launcher pins the value explicitly (2..4) and ignores this default.
     max_ofts_per_batch: A[int, NS("lora")] = 8
+    max_loaded_ofts: A[
+        Optional[int],
+        "If specified, limits the maximum number of OFT adapters loaded in "
+        "the tokenizer-side registry at a time (CPU-side bookkeeping — "
+        "independent of --max-ofts-per-batch's GPU-resident batch capacity). "
+        "Must be >= --max-ofts-per-batch.",
+        NS("lora"),
+    ] = None
     oft_backend: A[str, NS("lora")] = "triton"
     # Which OFT implementation serves when peft_method == "oft". CUTOVER
     # 2026-08-29: default is "sibling" = srt/oft (the srt/lora-shaped mirror),
@@ -163,6 +171,12 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         help="Maximum number of OFT adapters for a running batch, include base-only request.",
     )
     parser.add_argument(
+        "--max-loaded-ofts",
+        type=int,
+        default=PEFTArgs.max_loaded_ofts,
+        help="If specified, limits the maximum number of OFT adapters loaded in the tokenizer-side registry at a time. The value must be greater than or equal to `--max-ofts-per-batch`.",
+    )
+    parser.add_argument(
         "--oft-backend",
         type=str,
         choices=OFT_BACKEND_CHOICES,
@@ -235,6 +249,20 @@ def validate_peft_args(server_args) -> None:
     from sglang.srt.utils.common import SUPPORTED_OFT_TARGET_MODULES
 
     assert server_args.max_ofts_per_batch > 0, "max_ofts_per_batch must be positive"
+
+    if server_args.max_loaded_ofts is not None:
+        assert server_args.max_loaded_ofts >= server_args.max_ofts_per_batch, (
+            "max_loaded_ofts should be greater than or equal to "
+            "max_ofts_per_batch. "
+            f"max_loaded_ofts={server_args.max_loaded_ofts}, "
+            f"max_ofts_per_batch={server_args.max_ofts_per_batch}"
+        )
+        if server_args.peft_paths:
+            assert len(server_args.peft_paths) <= server_args.max_loaded_ofts, (
+                "The number of OFT paths should not exceed max_loaded_ofts. "
+                f"max_loaded_ofts={server_args.max_loaded_ofts}, "
+                f"peft_paths={len(server_args.peft_paths)}"
+            )
 
     # peft_paths is method-agnostic, so the method can no longer be inferred from
     # which path field was set -- require it explicitly when paths are given.
