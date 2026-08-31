@@ -37,8 +37,12 @@ _MANIFEST_FIELDS = {
     "case_key",
     "performance_procedure_hash",
     "provenance_hashes",
+    "server_args",
+    "request_order",
+    "seed",
     "metadata",
 }
+_MANIFEST_RESERVED_METADATA_FIELDS = {"server_args", "request_order", "seed"}
 _PROVENANCE_FIELDS = {
     "git_sha",
     "dirty",
@@ -109,6 +113,26 @@ def _thaw_json(value: object) -> object:
     if isinstance(value, (list, tuple)):
         return [_thaw_json(item) for item in value]
     return value
+
+
+def _exact_json_equal(expected: object, actual: object) -> bool:
+    """Compare JSON-shaped values without Python's bool/int coercion."""
+
+    if type(expected) is not type(actual):
+        return False
+    if isinstance(expected, Mapping):
+        if set(expected) != set(actual):  # type: ignore[arg-type]
+            return False
+        return all(
+            _exact_json_equal(expected[key], actual[key])  # type: ignore[index]
+            for key in expected
+        )
+    if isinstance(expected, (list, tuple)):
+        return len(expected) == len(actual) and all(  # type: ignore[arg-type]
+            _exact_json_equal(expected_item, actual_item)
+            for expected_item, actual_item in zip(expected, actual)  # type: ignore[arg-type]
+        )
+    return expected == actual
 
 
 def _require_mapping(value: object, context: str) -> Mapping[str, object]:
@@ -568,10 +592,40 @@ class RunBundle:
             raise BundleValidationError(
                 "manifest.schema_version does not match schema_version"
             )
-        if _thaw_json(manifest["case_key"]) != self.case_key.to_dict():
+        manifest_case_key = CaseKey.from_dict(_thaw_json(manifest["case_key"]))
+        if not _exact_json_equal(
+            manifest_case_key.to_dict(), self.case_key.to_dict()
+        ):
             raise BundleValidationError("manifest.case_key does not match case_key")
 
-        _require_mapping(manifest["metadata"], "manifest.metadata")
+        server_args = manifest["server_args"]
+        if type(server_args) is not tuple or any(
+            type(argument) is not str for argument in server_args
+        ):
+            raise BundleValidationError(
+                "manifest.server_args must be an array of strings"
+            )
+        request_order = manifest["request_order"]
+        if type(request_order) is not tuple:
+            raise BundleValidationError("manifest.request_order must be an array")
+        if any(
+            type(request_id) is not str or not request_id
+            for request_id in request_order
+        ):
+            raise BundleValidationError(
+                "manifest.request_order entries must be non-empty strings"
+            )
+        if type(manifest["seed"]) is not int:
+            raise BundleValidationError("manifest.seed must be an integer")
+        metadata = _require_mapping(manifest["metadata"], "manifest.metadata")
+        reserved_metadata = sorted(
+            _MANIFEST_RESERVED_METADATA_FIELDS.intersection(metadata)
+        )
+        if reserved_metadata:
+            raise BundleValidationError(
+                "manifest.metadata contains reserved contract fields: "
+                + ", ".join(reserved_metadata)
+            )
 
         provenance = _require_mapping(self.provenance, "provenance")
         _require_exact_fields(provenance, _PROVENANCE_FIELDS, "provenance")

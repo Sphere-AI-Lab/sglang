@@ -79,11 +79,10 @@ def _bundle() -> RunBundle:
             key: provenance[key] for key in PROVENANCE_HASH_KEYS
         },
         "performance_procedure_hash": _sha("7"),
-        "metadata": {
-            "server_args": ["--peft-method", "oft"],
-            "request_order": ["req-0"],
-            "seed": 1729,
-        },
+        "server_args": ["--peft-method", "oft"],
+        "request_order": ["req-0"],
+        "seed": 1729,
+        "metadata": {},
     }
     return RunBundle.create(
         case_key=case,
@@ -112,28 +111,42 @@ def _round_trip(tmp_path, name: str, bundle: RunBundle) -> RunBundle:
     return RunBundle.read_json(path)
 
 
+def _round_trip_envelope(
+    tmp_path, name: str, envelope: ToleranceEnvelope
+) -> ToleranceEnvelope:
+    path = tmp_path / f"{name}.json"
+    envelope.write_json(path)
+    return ToleranceEnvelope.read_json(path)
+
+
 def _envelope(bundle: RunBundle, **tolerances: NumericTolerance) -> ToleranceEnvelope:
-    return ToleranceEnvelope.create(
+    unreviewed = ToleranceEnvelope.create(
         baseline_manifest_hash=bundle.manifest_hash,
         tolerances=tolerances,
     )
+    return unreviewed.with_policy(_policy(bundle, unreviewed))
 
 
-def _policy(
-    bundle: RunBundle, envelope: ToleranceEnvelope | None = None
-) -> ComparisonPolicy:
-    envelope = envelope or _envelope(bundle)
+def _policy(bundle: RunBundle, envelope: ToleranceEnvelope) -> ComparisonPolicy:
     return ComparisonPolicy.create(
         baseline_manifest_hash=bundle.manifest_hash,
         tolerance_envelope_hash=envelope.manifest_hash,
     )
 
 
-def _comparison_inputs(
-    bundle: RunBundle, **tolerances: NumericTolerance
-) -> tuple[ToleranceEnvelope, ComparisonPolicy]:
-    envelope = _envelope(bundle, **tolerances)
-    return envelope, _policy(bundle, envelope)
+def _rehash_bundle_manifest(payload: dict[str, object]) -> None:
+    manifest_hash = canonical_sha256(payload["manifest"])
+    payload["manifest_hash"] = manifest_hash
+    payload["provenance"]["manifest_hash"] = manifest_hash
+
+
+def _rehash_envelope_manifest(payload: dict[str, object]) -> None:
+    manifest_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"comparison_policy", "manifest_hash"}
+    }
+    payload["manifest_hash"] = canonical_sha256(manifest_payload)
 
 
 def _baseline_repetitions(
@@ -209,11 +222,17 @@ def _rebuild_bundle(
     )
 
 
-def test_identical_serialized_bundles_compare_equal(tmp_path):
+def test_three_argument_exact_comparison_accepts_identical_serialized_bundles(
+    tmp_path,
+):
     expected = _round_trip(tmp_path, "expected", _bundle())
     actual = _round_trip(tmp_path, "actual", _bundle())
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    envelope = _round_trip_envelope(
+        tmp_path, "exact-envelope", _envelope(expected)
+    )
+
+    report = compare_bundles(expected, actual, envelope)
 
     assert report.passed
     assert report.mismatches == ()
@@ -224,7 +243,7 @@ def test_token_mismatch_reports_request_and_position(tmp_path):
     actual = _replace_observation(expected, output_ids=(101, 999, 303))
     actual = _round_trip(tmp_path, "actual", actual)
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert not report.passed
     mismatch = report.mismatches[0]
@@ -246,7 +265,7 @@ def test_token_shape_mismatch_is_exact(tmp_path):
     )
     actual = _round_trip(tmp_path, "actual", actual)
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert not report.passed
     mismatch = report.mismatches[0]
@@ -280,7 +299,7 @@ def test_adapter_version_mismatch_reports_state_path(tmp_path):
         _replace_observation(expected, adapter_state=state),
     )
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert not report.passed
     mismatch = report.mismatches[0]
@@ -300,7 +319,7 @@ def test_error_mismatch_reports_error_path(tmp_path):
     expected = _round_trip(tmp_path, "expected", expected)
     actual = _round_trip(tmp_path, "actual", actual)
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert not report.passed
     mismatch = report.mismatches[0]
@@ -325,7 +344,7 @@ def test_manifest_hash_mismatch_is_rejected_from_serialized_bundle(tmp_path):
     path = tmp_path / "bad-manifest-hash.json"
     _bundle().write_json(path)
     payload = json.loads(path.read_text())
-    payload["manifest"]["metadata"]["seed"] = 2718
+    payload["manifest"]["seed"] = 2718
     path.write_text(json.dumps(payload))
 
     with pytest.raises(BundleValidationError, match="manifest_hash"):
@@ -367,6 +386,93 @@ def test_unknown_manifest_field_is_rejected_even_when_rehashed(tmp_path):
 
     with pytest.raises(
         BundleValidationError, match="manifest: unknown fields.*future_field"
+    ):
+        RunBundle.read_json(path)
+
+
+def test_embedded_manifest_case_key_rejects_integer_for_boolean(tmp_path):
+    path = tmp_path / "manifest-case-key-int-for-bool.json"
+    _bundle().write_json(path)
+    payload = json.loads(path.read_text())
+    payload["manifest"]["case_key"]["cuda_graph"] = 1
+    _rehash_bundle_manifest(payload)
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(
+        BundleValidationError,
+        match="case_key.cuda_graph must be a boolean",
+    ):
+        RunBundle.read_json(path)
+
+
+@pytest.mark.parametrize("field_name", ["server_args", "request_order", "seed"])
+def test_required_manifest_execution_field_cannot_be_hidden_in_metadata(
+    tmp_path, field_name
+):
+    path = tmp_path / f"missing-{field_name}.json"
+    _bundle().write_json(path)
+    payload = json.loads(path.read_text())
+    payload["manifest"]["metadata"][field_name] = payload["manifest"].pop(
+        field_name
+    )
+    _rehash_bundle_manifest(payload)
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(
+        BundleValidationError,
+        match=rf"manifest: missing fields: {field_name}",
+    ):
+        RunBundle.read_json(path)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "confused_value", "error_match"),
+    [
+        pytest.param(
+            "server_args",
+            False,
+            "manifest.server_args must be an array of strings",
+            id="server-args-boolean",
+        ),
+        pytest.param(
+            "request_order",
+            ["req-0", 1],
+            "manifest.request_order entries must be non-empty strings",
+            id="request-order-integer",
+        ),
+        pytest.param(
+            "seed",
+            True,
+            "manifest.seed must be an integer",
+            id="seed-boolean",
+        ),
+    ],
+)
+def test_required_manifest_execution_field_rejects_type_confusion(
+    tmp_path, field_name, confused_value, error_match
+):
+    path = tmp_path / f"type-confused-{field_name}.json"
+    _bundle().write_json(path)
+    payload = json.loads(path.read_text())
+    payload["manifest"][field_name] = confused_value
+    _rehash_bundle_manifest(payload)
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(BundleValidationError, match=error_match):
+        RunBundle.read_json(path)
+
+
+def test_manifest_metadata_rejects_reserved_execution_field_names(tmp_path):
+    path = tmp_path / "reserved-metadata-field.json"
+    _bundle().write_json(path)
+    payload = json.loads(path.read_text())
+    payload["manifest"]["metadata"]["seed"] = 2718
+    _rehash_bundle_manifest(payload)
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(
+        BundleValidationError,
+        match="manifest.metadata contains reserved contract fields: seed",
     ):
         RunBundle.read_json(path)
 
@@ -415,7 +521,7 @@ def test_provenance_hash_mismatch_precedes_observation_comparison(tmp_path):
     actual = _replace_observation(actual, output_ids=(999, 202, 303))
     actual = _round_trip(tmp_path, "actual", actual)
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert not report.passed
     assert report.mismatches[0].kind == "provenance_mismatch"
@@ -439,7 +545,7 @@ def test_revision_mode_and_code_hash_differences_are_allowed(tmp_path):
     )
     actual = _round_trip(tmp_path, "actual", actual)
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert report.passed
 
@@ -467,10 +573,10 @@ def test_multiple_mismatch_order_and_report_serialization_are_deterministic(
         error={"code": "unexpected", "status": 500},
     )
     actual = _round_trip(tmp_path, "actual", actual)
-    envelope, policy = _comparison_inputs(expected)
+    envelope = _envelope(expected)
 
-    first = compare_bundles(expected, actual, envelope, policy)
-    second = compare_bundles(expected, actual, envelope, policy)
+    first = compare_bundles(expected, actual, envelope)
+    second = compare_bundles(expected, actual, envelope)
 
     assert [mismatch.position for mismatch in first.mismatches] == [
         "provenance.checkpoint_hash",
@@ -493,7 +599,7 @@ def test_logprob_mismatch_fails_when_envelope_is_exact(tmp_path):
     )
     actual = _round_trip(tmp_path, "actual", actual)
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert not report.passed
     mismatch = report.mismatches[0]
@@ -508,7 +614,7 @@ def test_selected_logit_shape_mismatch_is_exact(tmp_path):
     )
     actual = _round_trip(tmp_path, "actual", actual)
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert not report.passed
     assert report.mismatches[0].kind == "shape_mismatch"
@@ -533,10 +639,8 @@ def test_selected_logit_uses_exact_then_reviewed_tolerance_path(tmp_path):
     )
     actual = _round_trip(tmp_path, "actual", actual)
 
-    exact_report = compare_bundles(
-        expected, actual, *_comparison_inputs(expected)
-    )
-    envelope, policy = _comparison_inputs(
+    exact_report = compare_bundles(expected, actual, _envelope(expected))
+    envelope = _envelope(
         expected,
         **{
             "selected_logits.decoder.output": _tolerance(
@@ -547,7 +651,7 @@ def test_selected_logit_uses_exact_then_reviewed_tolerance_path(tmp_path):
             )
         },
     )
-    tolerant_report = compare_bundles(expected, actual, envelope, policy)
+    tolerant_report = compare_bundles(expected, actual, envelope)
 
     assert not exact_report.passed
     assert exact_report.mismatches[0].position == (
@@ -556,13 +660,13 @@ def test_selected_logit_uses_exact_then_reviewed_tolerance_path(tmp_path):
     assert tolerant_report.passed
 
 
-def test_named_unchanged_baseline_tolerance_allows_numeric_drift(tmp_path):
+def test_three_argument_reviewed_tolerance_allows_numeric_drift(tmp_path):
     expected = _round_trip(tmp_path, "expected", _bundle())
     actual = _replace_observation(
         expected, token_logprobs=(-0.1, -0.2001, -0.3)
     )
     actual = _round_trip(tmp_path, "actual", actual)
-    envelope, policy = _comparison_inputs(
+    envelope = _envelope(
         expected,
         token_logprobs=_tolerance(
             expected,
@@ -572,7 +676,9 @@ def test_named_unchanged_baseline_tolerance_allows_numeric_drift(tmp_path):
         ),
     )
 
-    report = compare_bundles(expected, actual, envelope, policy)
+    envelope = _round_trip_envelope(tmp_path, "reviewed-envelope", envelope)
+
+    report = compare_bundles(expected, actual, envelope)
 
     assert report.passed
 
@@ -581,7 +687,7 @@ def test_token_divergence_fails_even_with_wide_numeric_tolerance(tmp_path):
     expected = _round_trip(tmp_path, "expected", _bundle())
     actual = _replace_observation(expected, output_ids=(101, 999, 303))
     actual = _round_trip(tmp_path, "actual", actual)
-    envelope, policy = _comparison_inputs(
+    envelope = _envelope(
         expected,
         token_logprobs=_tolerance(
             expected,
@@ -591,7 +697,7 @@ def test_token_divergence_fails_even_with_wide_numeric_tolerance(tmp_path):
         ),
     )
 
-    report = compare_bundles(expected, actual, envelope, policy)
+    report = compare_bundles(expected, actual, envelope)
 
     assert not report.passed
     assert report.mismatches[0].kind == "token_mismatch"
@@ -608,7 +714,7 @@ def test_peak_memory_regression_fails_at_five_percent_ratio(tmp_path):
         _rebuild_bundle(expected, performance=performance),
     )
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert not report.passed
     mismatch = report.mismatches[0]
@@ -628,7 +734,7 @@ def test_throughput_at_five_percent_floor_passes(tmp_path):
         tmp_path, "actual", replace(expected, performance=performance)
     )
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert report.passed
 
@@ -643,7 +749,7 @@ def test_throughput_below_five_percent_floor_fails(tmp_path):
         tmp_path, "actual", replace(expected, performance=performance)
     )
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert not report.passed
     assert report.mismatches[0].position == (
@@ -693,7 +799,7 @@ def test_performance_procedure_mismatch_withholds_regression_ratios(tmp_path):
         _rebuild_bundle(expected, performance=performance),
     )
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert [mismatch.kind for mismatch in report.mismatches] == [
         "performance_identity_mismatch"
@@ -718,7 +824,7 @@ def test_placement_identity_mismatch_withholds_regression_ratios(
     )
     actual = _round_trip(tmp_path, "actual", actual)
 
-    report = compare_bundles(expected, actual, *_comparison_inputs(expected))
+    report = compare_bundles(expected, actual, _envelope(expected))
 
     assert not report.passed
     assert report.mismatches[0].kind == "provenance_mismatch"
@@ -734,7 +840,7 @@ def test_widened_tolerance_with_stale_envelope_hash_invalidates_comparison(
 ):
     expected = _round_trip(tmp_path, "expected", _bundle())
     actual = _round_trip(tmp_path, "actual", _bundle())
-    envelope, policy = _comparison_inputs(
+    envelope = _envelope(
         expected,
         token_logprobs=_tolerance(
             expected,
@@ -755,7 +861,7 @@ def test_widened_tolerance_with_stale_envelope_hash_invalidates_comparison(
         },
     )
 
-    report = compare_bundles(expected, actual, widened, policy)
+    report = compare_bundles(expected, actual, widened)
 
     assert not report.passed
     mismatch = report.mismatches[0]
@@ -778,9 +884,7 @@ def test_serialized_tolerance_rejects_bounds_not_derived_from_evidence(tmp_path)
     envelope.write_json(path)
     payload = json.loads(path.read_text())
     payload["tolerances"]["token_logprobs"]["observed_atol"] = 100.0
-    manifest_payload = dict(payload)
-    manifest_payload.pop("manifest_hash")
-    payload["manifest_hash"] = canonical_sha256(manifest_payload)
+    _rehash_envelope_manifest(payload)
     path.write_text(json.dumps(payload))
 
     with pytest.raises(
@@ -806,9 +910,7 @@ def test_serialized_tolerance_rejects_repetition_from_another_manifest(tmp_path)
     payload = json.loads(path.read_text())
     repetition = payload["tolerances"]["token_logprobs"]["repetitions"][0]
     repetition["baseline_manifest_hash"] = _sha("f")
-    manifest_payload = dict(payload)
-    manifest_payload.pop("manifest_hash")
-    payload["manifest_hash"] = canonical_sha256(manifest_payload)
+    _rehash_envelope_manifest(payload)
     path.write_text(json.dumps(payload))
 
     with pytest.raises(
@@ -820,7 +922,6 @@ def test_serialized_tolerance_rejects_repetition_from_another_manifest(tmp_path)
 
 def test_reviewed_policy_rejects_fabricated_repetition_evidence(tmp_path):
     expected = _round_trip(tmp_path, "expected", _bundle())
-    actual = _round_trip(tmp_path, "actual", _bundle())
     reviewed_envelope = _envelope(
         expected,
         token_logprobs=_tolerance(
@@ -830,7 +931,6 @@ def test_reviewed_policy_rejects_fabricated_repetition_evidence(tmp_path):
             (-0.1, -0.2, -0.3),
         ),
     )
-    reviewed_policy = _policy(expected, reviewed_envelope)
     fabricated = ToleranceEnvelope.create(
         baseline_manifest_hash=expected.manifest_hash,
         tolerances={
@@ -856,67 +956,109 @@ def test_reviewed_policy_rejects_fabricated_repetition_evidence(tmp_path):
         },
     )
     envelope_path = tmp_path / "fabricated-envelope.json"
-    policy_path = tmp_path / "reviewed-policy.json"
-    fabricated.write_json(envelope_path)
-    reviewed_policy.write_json(policy_path)
+    payload = reviewed_envelope.to_dict()
+    payload["tolerances"] = {
+        name: tolerance.to_dict()
+        for name, tolerance in fabricated.tolerances.items()
+    }
+    _rehash_envelope_manifest(payload)
+    envelope_path.write_text(json.dumps(payload))
 
-    report = compare_bundles(
-        expected,
-        actual,
-        ToleranceEnvelope.read_json(envelope_path),
-        ComparisonPolicy.read_json(policy_path),
-    )
-
-    assert not report.passed
-    assert report.mismatches[0].kind == "policy_envelope_mismatch"
-    assert report.mismatches[0].position == "tolerance_envelope_hash"
+    with pytest.raises(
+        BundleValidationError,
+        match="ComparisonPolicy.tolerance_envelope_hash does not match envelope",
+    ):
+        ToleranceEnvelope.read_json(envelope_path)
 
 
 def test_reviewed_policy_rejects_freshly_rehashed_widened_envelope(tmp_path):
     expected = _round_trip(tmp_path, "expected", _bundle())
-    actual = _replace_observation(
-        expected, token_logprobs=(-0.1, -0.9, -0.3)
-    )
-    actual = _round_trip(tmp_path, "actual", actual)
     reviewed_envelope = _envelope(expected)
-    reviewed_policy = _policy(expected, reviewed_envelope)
-    widened = _envelope(
-        expected,
-        token_logprobs=_tolerance(
-            expected,
-            (-0.1, -0.2, -0.3),
-            (-0.1, -10.0, -0.3),
-            (-0.1, 10.0, -0.3),
-        ),
+    widened_evidence = ToleranceEnvelope.create(
+        baseline_manifest_hash=expected.manifest_hash,
+        tolerances={
+            "token_logprobs": _tolerance(
+                expected,
+                (-0.1, -0.2, -0.3),
+                (-0.1, -10.0, -0.3),
+                (-0.1, 10.0, -0.3),
+            )
+        },
     )
     envelope_path = tmp_path / "widened-envelope.json"
-    policy_path = tmp_path / "reviewed-exact-policy.json"
-    widened.write_json(envelope_path)
-    reviewed_policy.write_json(policy_path)
+    payload = reviewed_envelope.to_dict()
+    payload["tolerances"] = {
+        name: tolerance.to_dict()
+        for name, tolerance in widened_evidence.tolerances.items()
+    }
+    _rehash_envelope_manifest(payload)
+    envelope_path.write_text(json.dumps(payload))
 
-    report = compare_bundles(
-        expected,
-        actual,
-        ToleranceEnvelope.read_json(envelope_path),
-        ComparisonPolicy.read_json(policy_path),
+    with pytest.raises(
+        BundleValidationError,
+        match="ComparisonPolicy.tolerance_envelope_hash does not match envelope",
+    ):
+        ToleranceEnvelope.read_json(envelope_path)
+
+
+def test_three_argument_comparison_rejects_freshly_widened_evidence(tmp_path):
+    expected = _round_trip(tmp_path, "expected", _bundle())
+    actual = _round_trip(tmp_path, "actual", _bundle())
+    reviewed = _envelope(expected)
+    widened_evidence = ToleranceEnvelope.create(
+        baseline_manifest_hash=expected.manifest_hash,
+        tolerances={
+            "token_logprobs": _tolerance(
+                expected,
+                (-0.1, -0.2, -0.3),
+                (-0.1, -10.0, -0.3),
+                (-0.1, 10.0, -0.3),
+            )
+        },
+    )
+    widened = replace(
+        widened_evidence,
+        comparison_policy=reviewed.comparison_policy,
     )
 
+    report = compare_bundles(expected, actual, widened)
+
     assert not report.passed
-    assert [mismatch.kind for mismatch in report.mismatches] == [
-        "policy_envelope_mismatch"
-    ]
+    assert report.mismatches[0].kind == "invalid_envelope"
+    assert "tolerance_envelope_hash does not match" in report.mismatches[0].actual
 
 
 def test_envelope_for_another_baseline_manifest_is_rejected(tmp_path):
     expected = _round_trip(tmp_path, "expected", _bundle())
     actual = _round_trip(tmp_path, "actual", _bundle())
-    envelope = ToleranceEnvelope.create(
+    unreviewed = ToleranceEnvelope.create(
         baseline_manifest_hash=_sha("f"), tolerances={}
     )
+    envelope = unreviewed.with_policy(
+        ComparisonPolicy.create(
+            baseline_manifest_hash=_sha("f"),
+            tolerance_envelope_hash=unreviewed.manifest_hash,
+        )
+    )
 
-    report = compare_bundles(expected, actual, envelope, _policy(expected, envelope))
+    report = compare_bundles(expected, actual, envelope)
 
     assert not report.passed
     mismatch = report.mismatches[0]
     assert mismatch.kind == "envelope_baseline_mismatch"
     assert mismatch.position == "baseline_manifest_hash"
+
+
+def test_three_argument_comparison_rejects_unreviewed_envelope(tmp_path):
+    expected = _round_trip(tmp_path, "expected", _bundle())
+    actual = _round_trip(tmp_path, "actual", _bundle())
+    unreviewed = ToleranceEnvelope.create(
+        baseline_manifest_hash=expected.manifest_hash,
+        tolerances={},
+    )
+
+    report = compare_bundles(expected, actual, unreviewed)
+
+    assert not report.passed
+    assert report.mismatches[0].kind == "invalid_envelope"
+    assert "reviewed ComparisonPolicy" in report.mismatches[0].actual

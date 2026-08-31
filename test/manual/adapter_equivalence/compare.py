@@ -10,7 +10,6 @@ from .schema import (
     COMPARABLE_PROVENANCE_HASH_KEYS,
     BundleValidationError,
     CaseKey,
-    ComparisonPolicy,
     NumericTolerance,
     RunBundle,
     ToleranceEnvelope,
@@ -197,7 +196,6 @@ def compare_bundles(
     expected: RunBundle,
     actual: RunBundle,
     envelope: ToleranceEnvelope,
-    policy: ComparisonPolicy,
 ) -> ComparisonReport:
     """Compare validated bundles, with exact identity before numeric tolerance."""
 
@@ -235,19 +233,6 @@ def compare_bundles(
             position=position,
             error=error,
         )
-    try:
-        policy.validate()
-    except BundleValidationError as error:
-        position = "manifest_hash" if "manifest_hash" in str(error) else "validation"
-        return _validation_report(
-            expected,
-            actual,
-            envelope,
-            kind="invalid_comparison_policy",
-            position=position,
-            error=error,
-        )
-
     if envelope.baseline_manifest_hash != expected.manifest_hash:
         mismatch = _mismatch(
             kind="envelope_baseline_mismatch",
@@ -256,30 +241,6 @@ def compare_bundles(
             position="baseline_manifest_hash",
             expected=expected.manifest_hash,
             actual=envelope.baseline_manifest_hash,
-            envelope=envelope,
-        )
-        return ComparisonReport(expected.case_key, actual.case_key, (mismatch,))
-
-    if policy.baseline_manifest_hash != expected.manifest_hash:
-        mismatch = _mismatch(
-            kind="policy_baseline_mismatch",
-            case_key=actual.case_key,
-            request_id=_BUNDLE_REQUEST_ID,
-            position="baseline_manifest_hash",
-            expected=expected.manifest_hash,
-            actual=policy.baseline_manifest_hash,
-            envelope=envelope,
-        )
-        return ComparisonReport(expected.case_key, actual.case_key, (mismatch,))
-
-    if policy.tolerance_envelope_hash != envelope.manifest_hash:
-        mismatch = _mismatch(
-            kind="policy_envelope_mismatch",
-            case_key=actual.case_key,
-            request_id=_BUNDLE_REQUEST_ID,
-            position="tolerance_envelope_hash",
-            expected=policy.tolerance_envelope_hash,
-            actual=envelope.manifest_hash,
             envelope=envelope,
         )
         return ComparisonReport(expected.case_key, actual.case_key, (mismatch,))

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping
 
 from .schema import (
@@ -198,6 +198,7 @@ class ToleranceEnvelope:
     tolerances: dict[str, NumericTolerance]
     metadata: dict[str, object]
     manifest_hash: str
+    comparison_policy: ComparisonPolicy | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tolerances", FrozenDict(dict(self.tolerances)))
@@ -222,8 +223,15 @@ class ToleranceEnvelope:
             metadata=metadata_value,
             manifest_hash=canonical_sha256(payload),
         )
-        envelope.validate()
+        envelope._validate_evidence()
         return envelope
+
+    def with_policy(self, policy: ComparisonPolicy) -> ToleranceEnvelope:
+        """Bind separately reviewed policy material to this evidence envelope."""
+
+        reviewed = replace(self, comparison_policy=policy)
+        reviewed.validate()
+        return reviewed
 
     @staticmethod
     def _manifest_payload(
@@ -242,7 +250,7 @@ class ToleranceEnvelope:
             "metadata": _thaw_json(metadata),
         }
 
-    def validate(self) -> None:
+    def _validate_evidence(self) -> None:
         if (
             type(self.schema_version) is not int
             or self.schema_version != SCHEMA_VERSION
@@ -282,7 +290,27 @@ class ToleranceEnvelope:
                 "ToleranceEnvelope.manifest_hash does not match its canonical payload"
             )
 
+    def validate(self) -> None:
+        self._validate_evidence()
+        policy = self.comparison_policy
+        if not isinstance(policy, ComparisonPolicy):
+            raise BundleValidationError(
+                "ToleranceEnvelope requires a reviewed ComparisonPolicy"
+            )
+        policy.validate()
+        if policy.baseline_manifest_hash != self.baseline_manifest_hash:
+            raise BundleValidationError(
+                "ComparisonPolicy.baseline_manifest_hash does not match envelope"
+            )
+        if policy.tolerance_envelope_hash != self.manifest_hash:
+            raise BundleValidationError(
+                "ComparisonPolicy.tolerance_envelope_hash does not match envelope"
+            )
+
     def to_dict(self) -> dict[str, object]:
+        self.validate()
+        policy = self.comparison_policy
+        assert isinstance(policy, ComparisonPolicy)
         payload = self._manifest_payload(
             self.schema_version,
             self.baseline_manifest_hash,
@@ -290,6 +318,7 @@ class ToleranceEnvelope:
             self.metadata,
         )
         payload["manifest_hash"] = self.manifest_hash
+        payload["comparison_policy"] = policy.to_dict()
         return payload
 
     @classmethod
@@ -303,6 +332,7 @@ class ToleranceEnvelope:
                 "tolerances",
                 "metadata",
                 "manifest_hash",
+                "comparison_policy",
             },
             "ToleranceEnvelope",
         )
@@ -318,6 +348,9 @@ class ToleranceEnvelope:
                 _require_mapping(mapping["metadata"], "ToleranceEnvelope.metadata")
             ),
             manifest_hash=mapping["manifest_hash"],  # type: ignore[arg-type]
+            comparison_policy=ComparisonPolicy.from_dict(
+                mapping["comparison_policy"]
+            ),
         )
         envelope.validate()
         return envelope
