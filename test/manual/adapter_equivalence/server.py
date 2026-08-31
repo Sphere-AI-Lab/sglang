@@ -379,13 +379,36 @@ class InternalOFTControl:
             or resolve_oft_update_request_type(revision_kind)
         )
 
-    def _run(self, operation: str, awaitable: object) -> object:
-        result = _normalize_oft_control_result(
-            self.engine.loop.run_until_complete(awaitable)
+    def _run(
+        self,
+        operation: str,
+        awaitable_factory: Callable[[], object],
+    ) -> object:
+        begin = _normalize_oft_control_result(
+            self.engine.begin_weight_update()
         )
+        if not begin.success:
+            raise ScenarioContractError(
+                "internal OFT weight-update session failed to begin: "
+                f"{begin.error_message}"
+            )
+        try:
+            raw_result = self.engine.loop.run_until_complete(
+                awaitable_factory()
+            )
+        finally:
+            end = _normalize_oft_control_result(
+                self.engine.end_weight_update()
+            )
+        result = _normalize_oft_control_result(raw_result)
         if not result.success:
             raise ScenarioContractError(
                 f"internal OFT {operation} failed: {result.error_message}"
+            )
+        if not end.success:
+            raise ScenarioContractError(
+                "internal OFT weight-update session failed to end: "
+                f"{end.error_message}"
             )
         return result
 
@@ -480,10 +503,13 @@ class InternalOFTControl:
         *,
         pinned: bool = False,
     ) -> object:
-        return self._run("load", self._load(adapter_name, adapter_path, pinned))
+        return self._run(
+            "load",
+            lambda: self._load(adapter_name, adapter_path, pinned),
+        )
 
     def unload(self, adapter_name: str) -> object:
-        return self._run("unload", self._unload(adapter_name))
+        return self._run("unload", lambda: self._unload(adapter_name))
 
 
 def launch_server(
