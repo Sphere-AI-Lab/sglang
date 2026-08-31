@@ -27,7 +27,11 @@ def test_server_args_rejects_legacy_lora_selector():
     from sglang.srt.server_args import ServerArgs
 
     with pytest.raises(ValueError, match=r"(?i)only.*oft"):
-        ServerArgs(model_path="dummy", peft_method="lora").check_server_args()
+        ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            peft_method="lora",
+        ).check_server_args()
 
 
 @pytest.mark.parametrize(
