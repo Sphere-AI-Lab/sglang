@@ -30,10 +30,13 @@ class MoeRunner:
         runner_backend: MoeRunnerBackend,
         config: MoeRunnerConfig,
         lora_enabled: bool = False,
+        peft_enabled: bool = False,
     ):
         self.runner_backend = runner_backend
         self.config = config
         self.lora_enabled = lora_enabled
+        self.peft_enabled = peft_enabled
+        self._peft_layer = None
 
         # --moe-runner-backend hpc_ops makes the standard dispatcher keep
         # global expert ids (skip_local_expert_mapping), so every MoE layer
@@ -75,6 +78,12 @@ class MoeRunner:
                 from sglang.srt.lora.lora_moe_runner_marlin import MarlinLoraRunnerCore
 
                 self.runner_core = MarlinLoraRunnerCore(config)
+            elif peft_enabled:
+                from sglang.srt.oft.oft_moe_runner_marlin import (
+                    MarlinOFTRunnerCore,
+                )
+
+                self.runner_core = MarlinOFTRunnerCore(config)
             else:
                 self.runner_core = None  # Marlin only supports fused path
         elif (
@@ -112,8 +121,8 @@ class MoeRunner:
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
-        # Skip fused func if LoRA is enabled (LoRA requires non-fused path)
-        if not lora_enabled:
+        # Adapter-aware runners require the non-fused path.
+        if not (lora_enabled or peft_enabled):
             a2a_backend_name = get_moe_a2a_backend().value
             runner_backend_name = runner_backend.value
 
@@ -143,7 +152,11 @@ class MoeRunner:
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
-        if self.fused_func is not None and not self.lora_enabled:
+        if (
+            self.fused_func is not None
+            and not self.lora_enabled
+            and not self.peft_enabled
+        ):
             return self.fused_func(dispatch_output, quant_info, self.config)
 
         assert self.runner_core is not None
@@ -171,6 +184,13 @@ class MoeRunner:
         # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore)
         # bypass the pre-permute step and do their own alignment internally.
         if hasattr(self.runner_core, "run_from_dispatch"):
+            if self._peft_layer is not None:
+                return self.runner_core.run_from_dispatch(
+                    dispatch_output,
+                    quant_info,
+                    self.config,
+                    peft_layer=self._peft_layer,
+                )
             hooks = _maybe_build_lora_hooks(dispatch_output)
             return self.runner_core.run_from_dispatch(
                 dispatch_output, quant_info, self.config, hooks=hooks
@@ -194,8 +214,19 @@ class MoeRunner:
 
         hooks = _maybe_build_lora_hooks(runner_input)
 
+        run_kwargs = {}
+        if self._peft_layer is not None:
+            from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+                invoke_fused_moe_kernel,
+            )
+            from sglang.srt.oft.oft_moe_runners import make_oft_invoke
+
+            run_kwargs["invoke"] = make_oft_invoke(
+                self._peft_layer, invoke_fused_moe_kernel
+            )
+
         runner_output = self.runner_core.run(
-            runner_input, quant_info, running_state, hooks=hooks
+            runner_input, quant_info, running_state, hooks=hooks, **run_kwargs
         )
         runner_format = self.runner_core.runner_backend.value
         combine_format = dispatch_output.format.value

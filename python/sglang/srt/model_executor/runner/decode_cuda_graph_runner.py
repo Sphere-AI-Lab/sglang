@@ -70,6 +70,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.oft import integration as oft
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -392,6 +393,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_req=self.captured_req_width,
             )
+
+        oft.maybe_init_cuda_graph_batch_info(
+            self.model_runner, self.max_bs, self.captured_req_width
+        )
 
         enable_mamba_track = (
             self.model_runner.server_args.enable_mamba_extra_buffer()
@@ -937,6 +942,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             lora_ids = None
 
+        adapter_ids = oft.maybe_dummy_ids(self.model_runner.server_args, bs)
+
         # mamba state tracking (registry-owned when enabled)
         mamba_track_indices = (
             _slot("mamba_track_indices")
@@ -982,6 +989,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            adapter_ids=adapter_ids,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
@@ -1157,6 +1165,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+
+            oft.maybe_prepare_oft_batch(self.model_runner, forward_batch)
 
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
@@ -1338,6 +1348,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+
+        oft.maybe_prepare_replay_batch(self.model_runner, forward_batch, bs, raw_bs)
 
         if (
             not is_ragged

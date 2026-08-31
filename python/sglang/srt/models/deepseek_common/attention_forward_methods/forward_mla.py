@@ -38,6 +38,19 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
+
+_OFT_MLA = None
+
+
+def _oft_mla():
+    global _OFT_MLA
+    if _OFT_MLA is None:
+        from sglang.srt.oft import deepseek_mla_correction
+
+        _OFT_MLA = deepseek_mla_correction
+    return _OFT_MLA
+
+
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -459,6 +472,11 @@ class DeepseekMLAForwardMixin:
 
         if q_nope is None:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+
+        # The absorbed MLA path bypasses the wrapped kv_b projection, so apply
+        # its canonical OFT input rotation to the compressed KV latent here.
+        if _oft_mla().is_kv_b_oft_active(self):
+            k_nope = _oft_mla().apply_kv_b_rotation(self, k_nope)
 
         _kvb_q = None
         born_q_backend = None

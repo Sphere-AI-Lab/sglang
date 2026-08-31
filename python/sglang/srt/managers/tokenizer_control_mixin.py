@@ -546,62 +546,81 @@ class TokenizerControlMixin:
         obj: UpdateAdapterFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        """Stage native LoRA weights, optionally activating while drained."""
+        """Stage native LoRA or canonical OFT adapter weights."""
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for adapter staging"
 
+        from sglang.srt.oft import tokenizer_hooks as oft_tokenizer_hooks
+
         backend = self._staging_backend_for(obj)
-        if backend is None:
-            raise ValueError(
-                "native LoRA staging requires --enable-lora-staging and "
-                "load_format=lora_adapter"
-            )
-        await backend.reserve_stage(obj)
+        if backend is not None:
+            await backend.reserve_stage(obj)
+        else:
+            await oft_tokenizer_hooks.register_oft_ref(self, obj)
 
         if obj.double_buffer:
             results = await self.update_adapter_from_distributed_communicator(obj)
-            return FanOutCommunicator.merge_results(results)
+            success, message = FanOutCommunicator.merge_results(results)
+            if backend is not None:
+                return success, message
+        else:
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
+                if is_paused:
+                    results = await self.update_adapter_from_distributed_communicator(
+                        obj
+                    )
+                    if backend is not None:
+                        backend_result = await backend.finish_activation(obj, results)
 
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_adapter_from_distributed_communicator(obj)
-                return await backend.finish_activation(obj, results)
+            if not is_paused:
+                async with self.model_update_lock.writer_lock:
+                    results = await self.update_adapter_from_distributed_communicator(
+                        obj
+                    )
+                    if backend is not None:
+                        backend_result = await backend.finish_activation(obj, results)
 
-        async with self.model_update_lock.writer_lock:
-            results = await self.update_adapter_from_distributed_communicator(obj)
-            return await backend.finish_activation(obj, results)
+            if backend is not None:
+                return backend_result
+            success, message = FanOutCommunicator.merge_results(results)
+
+        message += await oft_tokenizer_hooks.bump_oft_version(self, obj, success)
+        return success, message
 
     async def activate_adapter_version(
         self: TokenizerManager,
         obj: ActivateAdapterVersionReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        """Drain admission, activate a staged LoRA, then publish its version."""
+        """Drain admission and activate native LoRA or canonical OFT."""
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for adapter activation"
 
         backend = self._staging_backend_for(obj)
-        if backend is None:
-            raise ValueError(
-                "native LoRA staging requires --enable-lora-staging and "
-                "load_format=lora_adapter"
-            )
-        backend.prepare_activation(obj)
+        if backend is not None:
+            backend.prepare_activation(obj)
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:
                 results = await self.activate_adapter_version_communicator(obj)
-                return await backend.finish_activation(obj, results)
+                if backend is not None:
+                    backend_result = await backend.finish_activation(obj, results)
 
-        async with self.model_update_lock.writer_lock:
-            results = await self.activate_adapter_version_communicator(obj)
-            return await backend.finish_activation(obj, results)
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await self.activate_adapter_version_communicator(obj)
+                if backend is not None:
+                    backend_result = await backend.finish_activation(obj, results)
+
+        if backend is not None:
+            return backend_result
+        return FanOutCommunicator.merge_results(results)
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
@@ -648,6 +667,10 @@ class TokenizerControlMixin:
             obj.serialized_named_tensors
         )
 
+        from sglang.srt.oft import tokenizer_hooks as oft_tokenizer_hooks
+
+        await oft_tokenizer_hooks.register_oft_ref(self, obj)
+
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:
@@ -663,6 +686,7 @@ class TokenizerControlMixin:
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
+        message += await oft_tokenizer_hooks.bump_oft_version(self, obj, success)
 
         return success, message
 

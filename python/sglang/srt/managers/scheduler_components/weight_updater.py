@@ -317,6 +317,9 @@ class SchedulerWeightUpdaterManager:
                 success, message = runner.weight_updater.update_weights_from_tensor(
                     named_tensors=named_tensors,
                     load_format=recv_req.load_format,
+                    adapter_config=recv_req.adapter_config,
+                    adapter_name=recv_req.adapter_name,
+                    adapter_id=recv_req.adapter_id,
                 )
                 if not success:
                     break

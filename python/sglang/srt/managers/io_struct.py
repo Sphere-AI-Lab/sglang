@@ -260,6 +260,10 @@ class GenerateReqInput:
     # Active weight version, resolved atomically with lora_id.
     lora_version: Optional[Union[List[Optional[int]], int]] = None
 
+    # The path and resolved identity of canonical OFT adapters.
+    adapter_path: Optional[Union[List[Optional[str]], str]] = None
+    adapter_id: Optional[Union[List[Optional[str]], str]] = None
+
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
@@ -542,6 +546,7 @@ class GenerateReqInput:
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_lora_versions(num)
+        self._normalize_adapter_paths(num)
         self._normalize_image_data(num)
         self._normalize_mm_hashes(num)
         self._normalize_video_data(num)
@@ -614,6 +619,16 @@ class GenerateReqInput:
             self.lora_version = self.lora_version * self.parallel_sample_num
         else:
             raise ValueError("lora_version should be a list or an integer.")
+
+    def _normalize_adapter_paths(self, num):
+        """Normalize canonical OFT paths for batch processing."""
+        if self.adapter_path is not None:
+            if isinstance(self.adapter_path, str):
+                self.adapter_path = [self.adapter_path] * num
+            elif isinstance(self.adapter_path, list):
+                self.adapter_path = self.adapter_path * self.parallel_sample_num
+            else:
+                raise ValueError("adapter_path should be a list or a string.")
 
     def _normalize_image_data(self, num):
         """Normalize image data for batch processing."""
@@ -953,6 +968,10 @@ class GenerateReqInput:
                 if isinstance(self.lora_version, list)
                 else self.lora_version
             ),
+            adapter_path=(
+                self.adapter_path[i] if self.adapter_path is not None else None
+            ),
+            adapter_id=self.adapter_id[i] if self.adapter_id is not None else None,
             custom_logit_processor=(
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
@@ -1051,6 +1070,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
+
+    # Canonical OFT identity resolved by the tokenizer manager.
+    adapter_id: Optional[str] = None  # None means just use the base model
+    adapter_version: Optional[int] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -1921,6 +1944,10 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    # Optional streamed adapter metadata.
+    adapter_config: Optional[dict] = None
+    adapter_name: Optional[str] = None
+    adapter_id: Optional[str] = None
 
 
 class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
@@ -1981,6 +2008,10 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
     # Optional format specification for loading
     load_format: Optional[str] = None
+    # Optional streamed adapter metadata.
+    adapter_config: Optional[dict] = None
+    adapter_name: Optional[str] = None
+    adapter_id: Optional[str] = None
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
@@ -2585,6 +2616,15 @@ def _check_all_req_types():
             raise ValueError(
                 f"{name} is a subclass of BaseReq but not follow the naming convention."
             )
+
+
+def __getattr__(name):
+    """Lazily re-export canonical OFT IPC types without creating a cycle."""
+    from sglang.srt.oft import io_types
+
+    if name in io_types.__all__:
+        return getattr(io_types, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 _check_all_req_types()

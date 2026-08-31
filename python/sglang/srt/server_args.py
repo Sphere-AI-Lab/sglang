@@ -65,6 +65,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     parse_cuda_graph_config_arg,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.oft.config import OFTArgs, register_oft_args, validate_oft_args
 from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.true_on_policy.contracts import (
@@ -449,7 +450,7 @@ def add_linear_attn_kernel_backend_choices(choices):
 
 
 @dataclasses.dataclass
-class ServerArgs:
+class ServerArgs(OFTArgs):
     """Server-wide configuration for SGLang.
 
     Adding new arguments
@@ -4672,6 +4673,13 @@ class ServerArgs:
             # rebinds break guards); breakable/full support LoRA.
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
+                "OFT",
+                # The OFT layer forward reads batch metadata populated by the
+                # real prepare step, which is unavailable to tc_piecewise's
+                # dummy compile forward.
+                lambda: self.peft_method == "oft",
+            ),
+            (
                 "multimodal model",
                 lambda: self.get_model_config().is_multimodal
                 and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported,
@@ -8739,6 +8747,10 @@ class ServerArgs:
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
 
+        # OFTArgs uses import-light namespace annotations, so its dedicated
+        # registrar owns the canonical OFT CLI surface.
+        register_oft_args(parser)
+
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(
@@ -9266,6 +9278,9 @@ class ServerArgs:
 
         # Check LoRA
         self.check_lora_server_args()
+
+        # Check canonical OFT independently from native multi-tenant LoRA.
+        validate_oft_args(self)
 
         # Check speculative decoding
         if self.speculative_algorithm is not None:

@@ -125,6 +125,7 @@ from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
+from sglang.srt.oft import tokenizer_hooks as oft_tokenizer_hooks
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -588,6 +589,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init LoRA status
         self.init_lora()
 
+        # Init canonical OFT registry state independently from native LoRA.
+        self.init_oft()
+
         # Init PD disaggregation and encoder disaggregation
         self.init_disaggregation(start_pd_bootstrap_service=start_pd_bootstrap_service)
 
@@ -802,6 +806,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for lora_ref in get_lora().lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
+    def init_oft(self):
+        oft_tokenizer_hooks.init_tokenizer_oft(self)
+
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
@@ -951,7 +958,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
             async with self.model_update_lock.reader_lock:
-                await self._validate_and_resolve_lora(obj)
+                if (
+                    self.server_args.peft_method == "oft"
+                    and isinstance(obj, GenerateReqInput)
+                ):
+                    await oft_tokenizer_hooks.maybe_resolve_oft_path(self, obj)
+                else:
+                    await self._validate_and_resolve_lora(obj)
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
@@ -1590,6 +1603,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
                 lora_version=obj.lora_version,
+                adapter_id=obj.adapter_id,
+                adapter_version=getattr(obj, "adapter_version", None),
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,

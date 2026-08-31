@@ -12,6 +12,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.oft import integration as oft
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -385,16 +386,8 @@ class WeightUpdater:
         payload_metadata: Optional[dict] = None,
         double_buffer: bool = True,
     ):
-        """Receive and stage a native LoRA payload without publishing it."""
+        """Receive and stage a native LoRA or canonical OFT payload."""
         model_runner = self.get_model_runner()
-        if (
-            not model_runner.server_args.enable_lora_staging
-            or load_format != "lora_adapter"
-        ):
-            return False, (
-                "native LoRA staging requires --enable-lora-staging and "
-                "load_format=lora_adapter"
-            )
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
@@ -420,15 +413,36 @@ class WeightUpdater:
             for handle in handles:
                 handle.wait()
 
-            if payload_metadata is not None:
-                tensors = reconstruct_adapter_staging(tensors, payload_metadata)
-            result = model_runner.lora_manager.stage_adapter(
+            if (
+                model_runner.server_args.enable_lora_staging
+                and load_format == "lora_adapter"
+            ):
+                if payload_metadata is not None:
+                    tensors = reconstruct_adapter_staging(tensors, payload_metadata)
+                result = model_runner.lora_manager.stage_adapter(
+                    tensors,
+                    adapter_config,
+                    adapter_name,
+                    int(adapter_version),
+                    adapter_id=adapter_id,
+                )
+                if not result.success:
+                    return False, result.error_message
+                return True, "Succeeded to stage adapter online."
+
+            result = oft.stage_adapter(
+                model_runner,
+                load_format,
                 tensors,
                 adapter_config,
                 adapter_name,
-                int(adapter_version),
-                adapter_id=adapter_id,
+                adapter_id=adapter_id if adapter_id is not None else adapter_name,
+                version=int(adapter_version),
+                payload_metadata=payload_metadata,
+                double_buffer=double_buffer,
             )
+            if result is oft.NOT_HANDLED:
+                return False, f"adapter stage not handled for {load_format=}"
             if not result.success:
                 return False, result.error_message
             return True, "Succeeded to stage adapter online."
@@ -440,16 +454,21 @@ class WeightUpdater:
     def activate_adapter_version(
         self: WeightUpdater, *, adapter_name, adapter_id, adapter_version
     ):
-        """Activate the exact native LoRA version previously staged."""
+        """Activate the exact native LoRA or canonical OFT version."""
         model_runner = self.get_model_runner()
-        if not model_runner.server_args.enable_lora_staging:
-            return False, "native LoRA staging is not enabled"
         try:
-            result = model_runner.lora_manager.activate_adapter(
-                adapter_name,
-                int(adapter_version),
-                adapter_id=adapter_id,
-            )
+            if model_runner.server_args.enable_lora_staging:
+                result = model_runner.lora_manager.activate_adapter(
+                    adapter_name,
+                    int(adapter_version),
+                    adapter_id=adapter_id,
+                )
+            else:
+                result = oft.activate_adapter(
+                    model_runner, adapter_name, int(adapter_version)
+                )
+                if result is oft.NOT_HANDLED:
+                    return False, "canonical OFT activation is not enabled"
             if not result.success:
                 return False, result.error_message
             return True, "Succeeded to activate adapter version."
@@ -462,6 +481,9 @@ class WeightUpdater:
         self: WeightUpdater,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
+        adapter_config: Optional[dict] = None,
+        adapter_name: Optional[str] = None,
+        adapter_id: Optional[str] = None,
     ):
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
@@ -478,6 +500,18 @@ class WeightUpdater:
         # We need to get device after patch otherwise the device would be wrong
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
+
+        result = oft.maybe_load_adapter_format(
+            self.get_model_runner(),
+            load_format,
+            named_tensors,
+            adapter_config,
+            adapter_name,
+            adapter_id,
+            device=infered_device,
+        )
+        if result is not oft.NOT_HANDLED:
+            return result
 
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))

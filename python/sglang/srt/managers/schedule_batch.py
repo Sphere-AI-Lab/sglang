@@ -833,6 +833,8 @@ class Req(ReqDllmMixin):
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
         lora_version: Optional[int] = None,
+        adapter_id: Optional[str] = None,
+        adapter_version: Optional[int] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
         token_type_ids: List[int] = None,
@@ -936,11 +938,19 @@ class Req(ReqDllmMixin):
 
         # Extra key for caller-defined request classification.
         extra_key = _extend_lora_extra_key(extra_key, lora_id, lora_version)
+        if adapter_id is not None:
+            from sglang.srt.oft.integration import maybe_extend_extra_key
+
+            extra_key = maybe_extend_extra_key(
+                extra_key, adapter_id, adapter_version
+            )
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
         self.lora_id = lora_id
         self.lora_version = lora_version
+        self.adapter_id = adapter_id
+        self.adapter_version = adapter_version
         self.routing_key = routing_key
 
         # Memory pool info

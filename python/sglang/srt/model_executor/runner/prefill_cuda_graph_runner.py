@@ -85,6 +85,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.oft import integration as oft
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -700,6 +701,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         fb, attn_backend = self.capture_prepare(num_tokens)
         attn_backend.init_forward_metadata(fb)
+        oft.maybe_prepare_oft_batch(self.model_runner, fb)
         self._run_forward(fb, num_tokens)
 
     def run_dummy_multimodal_deepstack_forward(
@@ -1251,6 +1253,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_gpu = None
             global_num_tokens_for_logprob_gpu = None
 
+        adapter_dummy_ids = oft.maybe_dummy_ids(self.model_runner.server_args, bs)
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -1313,6 +1317,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # All-None ids are safe: kernels no-op at rank 0 and replay
                 # refreshes the static batch info with live values.
                 lora_ids=([None] * bs if self._capture_lora else None),
+                adapter_ids=adapter_dummy_ids,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
@@ -1378,6 +1383,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 "limits; the graph would read stale LoRA metadata at replay."
             )
             lora_manager.prepare_lora_batch(forward_batch)
+        oft.maybe_prepare_oft_batch(self.model_runner, forward_batch)
         shape_key = ShapeKey(
             size=num_tokens,
             variant_label=(
@@ -1566,6 +1572,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
+            adapter_ids=forward_batch.adapter_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
             temperature=forward_batch.temperature,
@@ -1646,6 +1653,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._prepare_forward_metadata_for_replay(
             metadata_forward_batch, static_forward_batch, static_num_tokens
         )
+
+        oft.maybe_prepare_oft_batch(self.model_runner, static_forward_batch)
 
         return static_forward_batch
 
