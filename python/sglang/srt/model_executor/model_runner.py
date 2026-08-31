@@ -1270,7 +1270,7 @@ class ModelRunner:
 
     def _get_lora_manager_class(self):
         if self.server_args.enable_lora_staging:
-            from sglang.srt.adapter_sync.backends.lora import StagedLoRAManager
+            from sglang.srt.lora.staged_manager import StagedLoRAManager
 
             return StagedLoRAManager
         return LoRAManager

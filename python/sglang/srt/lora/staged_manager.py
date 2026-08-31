@@ -310,3 +310,146 @@ class StagedLoRAManager(LoRAManager):
         self.memory_pool.discard_stage(uid, version)
         self._pending_lora_stage = None
         return self.create_lora_update_result(success=True)
+
+
+from sglang.srt.adapter_sync.tokenizer_backend import AdapterStagingBackend
+
+
+class LoRAStagingBackend(AdapterStagingBackend):
+    """Tokenizer-layer staging for native LoRA. Wraps TokenizerManager's
+    lora_registry/lora_ref_cache/failed_lora_activations/pending_lora_stage
+    state — same objects tokenizer_control_mixin.py used directly before
+    this extraction; the fields did not move, only which class reads them."""
+
+    def __init__(self, tm):
+        self._tm = tm
+
+    def _assert_available(self, lora_path) -> None:
+        names = [lora_path] if isinstance(lora_path, str) else (lora_path or [])
+        for name in names:
+            if name in self._tm.failed_lora_activations:
+                raise ValueError(
+                    f"LoRA adapter '{name}' is unavailable after a partial "
+                    "activation failure; restart required"
+                )
+
+    def _quarantine(self, name: str, message: str) -> None:
+        self._tm.failed_lora_activations[name] = message
+
+    async def reserve_stage(self, obj) -> None:
+        # Reservation must be atomic across concurrent stage requests. The
+        # communicator serializes dispatch, but reservation happens before it.
+        async with self._tm.lora_update_lock:
+            await self._reserve_locked(obj)
+
+    async def _reserve_locked(self, obj) -> None:
+        if obj.load_format != "lora_adapter" or not obj.adapter_name:
+            raise ValueError(
+                "native LoRA staging requires load_format=lora_adapter "
+                "and adapter_name"
+            )
+        try:
+            version = int(obj.adapter_version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "native LoRA staging requires an integer adapter_version"
+            ) from exc
+        if self._tm.server_args.tokenizer_worker_num > 1:
+            raise ValueError("native LoRA staging requires tokenizer_worker_num == 1")
+        if obj.adapter_name in self._tm.failed_lora_activations:
+            raise ValueError(
+                f"LoRA adapter '{obj.adapter_name}' is quarantined; restart required"
+            )
+
+        pending = self._tm.pending_lora_stage
+        if pending is not None:
+            if pending.lora_name == obj.adapter_name and pending.version == version:
+                obj.adapter_id = pending.lora_id
+                return
+            raise ValueError(
+                "staging slot already reserved for "
+                f"name={pending.lora_name} id={pending.lora_id} "
+                f"version={pending.version}"
+            )
+
+        candidate, _ = await self._tm.lora_registry.register_or_reuse(
+            LoRARef(
+                lora_name=obj.adapter_name,
+                lora_path="__distributed__",
+                pinned=False,
+                reloadable=False,
+                version=version,
+            ),
+            upsert=True,
+            preserve_pinned=True,
+        )
+        self._tm.pending_lora_stage = candidate
+        obj.adapter_id = candidate.lora_id
+
+    def prepare_activation(self, obj) -> None:
+        try:
+            version = int(obj.adapter_version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "native LoRA activation requires an integer adapter_version"
+            ) from exc
+
+        pending = self._tm.pending_lora_stage
+        if pending is None or (pending.lora_name, pending.version) != (
+            obj.adapter_name,
+            version,
+        ):
+            if pending is None:
+                detail = "no native LoRA stage is pending"
+            else:
+                detail = (
+                    f"pending name={pending.lora_name} id={pending.lora_id} "
+                    f"version={pending.version}"
+                )
+            raise ValueError(
+                f"Cannot activate name={obj.adapter_name} version={version}; {detail}"
+            )
+        self._assert_available(obj.adapter_name)
+        obj.adapter_id = pending.lora_id
+
+    async def _publish(self) -> None:
+        pending = self._tm.pending_lora_stage
+        if pending is None:
+            raise RuntimeError("No native LoRA stage is pending for publication")
+        registered = self._tm.lora_registry.get_all_adapters().get(pending.lora_name)
+        if registered is None:
+            await self._tm.lora_registry.register(pending)
+        else:
+            await self._tm.lora_registry.refresh(pending)
+        self._tm.lora_ref_cache[pending.lora_name] = pending
+        self._tm.failed_lora_activations.pop(pending.lora_name, None)
+        self._tm.pending_lora_stage = None
+
+    async def finish_activation(self, obj, results):
+        from sglang.srt.managers.communicator import FanOutCommunicator
+
+        pending = self._tm.pending_lora_stage
+        if pending is None:
+            raise RuntimeError("No native LoRA stage is pending during activation")
+        success, message = FanOutCommunicator.merge_results(results)
+        expected_version = int(obj.adapter_version)
+
+        def version_matches(result) -> bool:
+            try:
+                return int(result.active_adapter_version) == expected_version
+            except (TypeError, ValueError):
+                return False
+
+        versions_match = bool(results) and all(version_matches(r) for r in results)
+        if success and versions_match:
+            await self._publish()
+            return True, message
+
+        active_versions = [getattr(r, "active_adapter_version", None) for r in results]
+        failure = (
+            "Native LoRA activation consistency failure for "
+            f"adapter '{pending.lora_name}' version={pending.version}: "
+            f"{message}; worker active versions={active_versions}; restart required"
+        )
+        self._quarantine(pending.lora_name, failure)
+        return False, failure

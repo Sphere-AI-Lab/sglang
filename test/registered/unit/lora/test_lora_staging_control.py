@@ -23,6 +23,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.staged_manager import LoRAStagingBackend
 from sglang.srt.model_executor.model_runner_components import weight_updater
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
@@ -136,7 +137,7 @@ class TestStagingFlagAndSelection(unittest.TestCase):
         runner.server_args = MagicMock(enable_lora_staging=True)
 
         with patch(
-            "sglang.srt.adapter_sync.backends.lora.StagedLoRAManager",
+            "sglang.srt.lora.staged_manager.StagedLoRAManager",
             new=sentinel.staged_manager,
         ):
             self.assertIs(
@@ -432,17 +433,18 @@ class TestTokenizerNativeStaging(unittest.TestCase):
         self.assertEqual(tm.lora_registry.get_all_adapters()["policy"].version, 3)
         self.assertIn("policy", tm.failed_lora_activations)
         with self.assertRaisesRegex(ValueError, "policy.*restart required"):
-            tm._assert_native_lora_available("policy")
+            LoRAStagingBackend(tm)._assert_available("policy")
 
     def test_quarantine_does_not_block_base_or_other_adapter(self):
         tm = _make_tm()
-        tm._quarantine_native_lora_activation("policy", "partial activation")
+        backend = LoRAStagingBackend(tm)
+        backend._quarantine("policy", "partial activation")
 
-        tm._assert_native_lora_available(None)
-        tm._assert_native_lora_available("unrelated")
-        tm._assert_native_lora_available([None, "unrelated"])
+        backend._assert_available(None)
+        backend._assert_available("unrelated")
+        backend._assert_available([None, "unrelated"])
         with self.assertRaisesRegex(ValueError, "policy.*restart required"):
-            tm._assert_native_lora_available([None, "policy"])
+            backend._assert_available([None, "policy"])
 
     def test_multi_tokenizer_native_stage_is_rejected(self):
         tm = _make_tm(tokenizer_worker_num=2)

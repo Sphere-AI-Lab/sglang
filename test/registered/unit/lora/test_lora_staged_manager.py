@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
-from sglang.srt.adapter_sync.backends.lora import (
+from sglang.srt.lora.staged_manager import (
     PendingLoRAStage,
     StagedLoRAManager,
     StagedLoRAMemoryPool,
