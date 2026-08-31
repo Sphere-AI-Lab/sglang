@@ -483,5 +483,39 @@ class TestOFTStagingBackendIsSymmetric(unittest.TestCase):
         self.assertTrue(issubclass(OFTStagingBackend, AdapterStagingBackend))
 
 
+class TestOFTStagingBackendPrepareActivation(unittest.TestCase):
+    """Regression for round-1 review: a real client's obj.adapter_id defaults
+    to None, so prepare_activation must resolve it from tm.peft_ref_cache
+    (the same lookup register_peft_ref itself uses) -- otherwise
+    StagedOFTManager.activate_adapter's uid falls back to obj.adapter_name
+    and never matches the UUID stage_adapter recorded."""
+
+    def test_resolves_adapter_id_from_the_ref_cache(self):
+        from sglang.srt.oft.staged_manager import OFTStagingBackend
+
+        ref = MagicMock()
+        ref.adapter_id = "uuid-123"
+        tm = MagicMock()
+        tm.peft_ref_cache = {"adapter-a": ref}
+        obj = MagicMock()
+        obj.adapter_name = "adapter-a"
+        obj.adapter_id = None
+
+        OFTStagingBackend(tm).prepare_activation(obj)
+
+        self.assertEqual(obj.adapter_id, "uuid-123")
+
+    def test_raises_when_the_adapter_name_is_not_registered(self):
+        from sglang.srt.oft.staged_manager import OFTStagingBackend
+
+        tm = MagicMock()
+        tm.peft_ref_cache = {}
+        obj = MagicMock()
+        obj.adapter_name = "adapter-a"
+
+        with self.assertRaises(ValueError):
+            OFTStagingBackend(tm).prepare_activation(obj)
+
+
 if __name__ == "__main__":
     unittest.main()

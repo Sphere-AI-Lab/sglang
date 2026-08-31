@@ -455,11 +455,20 @@ class OFTStagingBackend(AdapterStagingBackend):
         await peft_tokenizer_hooks.register_peft_ref(self._tm, obj)
 
     def prepare_activation(self, obj) -> None:
-        # OFT's existing activate path resolves identity from obj.adapter_id,
-        # already set by reserve_stage on the prior stage call; no separate
-        # pre-activation validation exists in the current peft_tokenizer_hooks
-        # flow.
-        return
+        # A real client's obj.adapter_id defaults to None -- it has no way to
+        # know the server-minted id -- so this must resolve it here the same
+        # way register_peft_ref does (peft/tokenizer_hooks.py:109), or
+        # StagedOFTManager.activate_adapter's `uid = adapter_id if adapter_id
+        # is not None else name` falls back to obj.adapter_name, which never
+        # matches the UUID stage_adapter recorded for this adapter. No
+        # separate pre-activation validation exists beyond this identity
+        # resolution in the current peft_tokenizer_hooks flow.
+        if obj.adapter_name not in self._tm.peft_ref_cache:
+            raise ValueError(
+                f"Cannot activate name={obj.adapter_name}; no OFT adapter "
+                "with that name is registered"
+            )
+        obj.adapter_id = self._tm.peft_ref_cache[obj.adapter_name].adapter_id
 
     async def finish_activation(self, obj, results):
         from sglang.srt.managers.communicator import FanOutCommunicator
