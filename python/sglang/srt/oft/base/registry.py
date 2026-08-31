@@ -25,10 +25,10 @@ from sglang.srt.utils.aio_rwlock import RWLock
 
 @dataclass(frozen=True)
 class AdapterRef:
-    """Generic adapter-reference record shared by the single-active peft methods
-    (OFT, LoRA). Holds the unified adapter identity; AdapterRegistry accesses
-    adapters only through these members. Subclasses (OFTRef, LoRARef) inherit this
-    identity vocabulary and may add method-specific behaviour.
+    """Generic adapter-reference record. Originally intended to be shared with
+    LoRA, but LoRARef evolved independently as its own ``msgspec.Struct`` --
+    today only OFTRef subclasses this. Holds the unified adapter identity;
+    AdapterRegistry accesses adapters only through these members.
 
     The unique ``adapter_id`` eliminates conflicts from reused names/paths and can
     be used to generate deterministic cache keys (e.g. radix cache)."""
