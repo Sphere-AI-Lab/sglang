@@ -384,7 +384,7 @@ class LoRAMemoryPool:
         the LoRA buffer matches the actual shard regardless of which TP group
         owns it — covers DP-attention (``o_proj`` uses ``attn_tp_size``) and
         shared-expert dense-vs-MoE per-layer-TP differences. Falls back to
-        ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
+        the module-classified TP width. Cached per ``(module_name, layer_idx)``.
 
         MoE-internal names go through ``self.moe_tp_size`` upstream.
         """
@@ -420,7 +420,9 @@ class LoRAMemoryPool:
                 found = r
                 break
 
-        out = found if found is not None else self.tp_size
+        out = (
+            found if found is not None else self._effective_tp_size(module_name)
+        )
         cache[key] = out
         return out
 
@@ -440,7 +442,8 @@ class LoRAMemoryPool:
         ``shared_experts.gate_up_proj``). The output-axis ratio is
         quantization-independent: ``output_size_per_partition`` is set in
         ``ColumnParallelLinear.__init__`` before the quant method runs. Falls
-        back to ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
+        back to the module-classified TP width. Cached per ``(module_name,
+        layer_idx)``.
         """
         cache = getattr(self, "_col_parallel_tp_cache", None)
         if cache is None:
@@ -474,7 +477,9 @@ class LoRAMemoryPool:
                 found = r
                 break
 
-        out = found if found is not None else self.tp_size
+        out = (
+            found if found is not None else self._effective_tp_size(module_name)
+        )
         cache[key] = out
         return out
 

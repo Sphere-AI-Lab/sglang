@@ -31,6 +31,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -353,6 +354,14 @@ class TestValidateNewAdapterDuplicates(CustomTestCase):
         manager.validate_new_adapter(config, existing, is_update=True)
 
 
+def _publish_parallel_config(case: CustomTestCase) -> None:
+    parallel_config = get_context().override_server_args(
+        dp_size=1, enable_dp_attention=False
+    )
+    parallel_config.install()
+    case.addCleanup(parallel_config.restore)
+
+
 def _make_tokenizer_manager(tokenizer_worker_num: int = 1) -> TokenizerManager:
     tm = TokenizerManager.__new__(TokenizerManager)
     tm.server_args = MagicMock()
@@ -474,6 +483,10 @@ class TestLoadFromTensorsUpsertUnsupported(CustomTestCase):
     from_tensors route must reject upsert explicitly instead of minting a
     fresh uuid and dying later on the backend duplicate check."""
 
+    def setUp(self):
+        super().setUp()
+        _publish_parallel_config(self)
+
     def test_upsert_rejected_explicitly(self):
         tm = _make_tokenizer_manager()
         asyncio.run(
@@ -512,6 +525,10 @@ class TestLoadFromTensorsUpsertUnsupported(CustomTestCase):
 class TestUpsertMultiTokenizerWorkerGuard(CustomTestCase):
     """Upsert resolves names against a per-process registry; with >1 tokenizer
     workers that resolution is nondeterministic, so it must fail loudly."""
+
+    def setUp(self):
+        super().setUp()
+        _publish_parallel_config(self)
 
     def test_distributed_upsert_rejected_with_multiple_workers(self):
         tm = _make_tokenizer_manager(tokenizer_worker_num=2)
