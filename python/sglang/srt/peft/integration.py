@@ -96,8 +96,8 @@ def _init_oft_manager(model_runner: "ModelRunner", server_args: "ServerArgs") ->
     """Body of the former ``ModelRunner.init_oft_manager``."""
     OFTManager = _get_oft_manager_class(server_args)
 
-    # Runtime witness for the A/B parity work: every boot names the stack that
-    # actually serves, so "which implementation ran" is in the log, not inferred.
+    # Runtime witness: every boot names the stack that actually serves (sibling
+    # vs staged), so "which implementation ran" is in the log, not inferred.
     logger.info(
         "OFT implementation: %s (oft_impl=%s)",
         OFTManager.__module__,

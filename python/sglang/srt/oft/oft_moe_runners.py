@@ -1,4 +1,4 @@
-"""Peft-owned MoE kernel-invoker wrapper for OFT expert pre-rotation.
+"""OFT MoE kernel-invoker wrapper for expert pre-rotation.
 
 Upstream sglang ships only POST-GEMM void hooks (``LoRAHooks.after_gate_up`` /
 ``after_down``) that mutate the GEMM *output* in place. OFT is different: it is a
@@ -20,10 +20,11 @@ never rebound -- so the LoRA ``after_down`` hook and the combine path keep seein
 the ORIGINAL ``topk_weights``/``topk_ids``/``topk`` by construction, which the
 previous design had to preserve by hand via renamed variables.
 
-``_oft_prerotate`` and the split gate-up body are VERBATIM moves (from
-``peft/oft/moe_hooks.py``, itself a verbatim move of the in-kernel originals) so
-numerics stay bit-identical -- guarded by the A/B golden
-``tests/peft/oft_moe_hook_golden_lib.py`` (drift MUST be 0, 3 configs).
+``_oft_prerotate`` and the split gate-up body are VERBATIM moves (originally from
+the now-deleted ``peft/oft/moe_hooks.py``, itself a verbatim move of the in-kernel
+originals) so numerics stay bit-identical to the in-kernel originals; this was
+checked against an A/B golden (drift MUST be 0, 3 configs) before the legacy
+package was deleted.
 
 The wrapper closes over the LAYER and re-reads ``layer.w*_oft_r`` on EVERY call,
 so a streamed in-place weight sync stays visible under CUDA-graph replay, and an

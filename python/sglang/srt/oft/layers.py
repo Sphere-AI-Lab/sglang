@@ -960,13 +960,13 @@ class ReplicatedLinearWithOFT(BaseLayerWithOFT):
 
 
 class FusedMoEWithOFT(nn.Module):
-    """Wrapper around FusedMoE that routes the MoE forward through a peft-owned
+    """Wrapper around FusedMoE that routes the MoE forward through a dedicated
     runner so OFT rides a dedicated fused_func=None runner (like LoRA's
     FusedMoEWithLoRA), letting the base runner drop the _has_expert_adapters gate.
 
     OFT buffers stay on ``self.base_layer`` (w13_oft_r / w1_oft_r / w3_oft_r /
     w2_oft_r); the runner reads them live via ``_peft_layer`` and applies the
-    rotation through the peft MoE invoker (oft/oft_moe_runners.py). This is a thin
+    rotation through the OFT MoE invoker (oft/oft_moe_runners.py). This is a thin
     shell: it does NOT move buffers into a pool, so the streamed-sync /
     double-buffer / cuda-graph machinery keeps working unchanged on base_layer.
     """

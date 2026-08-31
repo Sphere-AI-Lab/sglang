@@ -74,9 +74,9 @@ class PEFTArgs:
     # see srt/oft/staged_manager.py). (Also used to be "peft" = srt/peft/oft,
     # the frozen pre-cutover reference; that legacy path was deleted once the
     # equivalence gate passed -- see srt/lora + StagedLoRAManager's analogous
-    # history for LoRA.) The tokenizer-side registry/ref classes follow this
-    # flag too (byte-identical twins; dispatched in validate_peft_args and
-    # peft/tokenizer_hooks.py).
+    # history for LoRA.) The tokenizer-side registry/ref class (OFTRef, from
+    # srt/oft/oft_registry.py) is shared by both "sibling" and "staged" now
+    # that the legacy twin is gone -- no per-oft_impl dispatch remains.
     oft_impl: A[str, NS("lora")] = "sibling"
     oft_dtype: A[Optional[str], NS("lora")] = None
     # Single global signal for split(canonical)-vs-fused OFT (attention qkv,
