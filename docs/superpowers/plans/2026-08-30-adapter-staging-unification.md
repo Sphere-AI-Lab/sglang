@@ -16,7 +16,7 @@
 - Registries stay separate (`lora_registry` for LoRA, `peft_registry` for OFT) — do not attempt to unify them into one registry as part of this work (see spec's "Registries stay separate" rationale).
 - No `getattr(obj, "x", default)` for fields the type guarantees — this codebase's `no-getattr-defensive` rule. Use direct attribute access or an explicit `None` default set at construction.
 - Per-method staged manager/pool/tokenizer-backend code goes inside that method's own package (`srt/lora/staged_manager.py`, `srt/oft/staged_manager.py`), never `srt/peft/` and never a third `adapter_sync/backends/` location. `srt/adapter_sync/` holds only the method-agnostic `AdapterStagingBackend` ABC and the `_STAGING_BACKENDS` registry.
-- Legacy deletion (Task 8) only proceeds after Task 7's GPU gate passes — do not delete `srt/peft/lora`/`srt/peft/oft` speculatively.
+- Legacy deletion (Task 8a/8b) only proceeds after their respective GPU gates (Task 7a/7b) pass — do not delete `srt/peft/lora`/`srt/peft/oft` speculatively.
 
 ---
 
@@ -900,7 +900,7 @@ restore-previous-adapter-on-failure branch, because OFT's `activate` (Task
 is partially overwritten before failure (the copy either fully succeeds or
 raises before any tensor is touched, since `_require_staged_identity`
 validates before any `.copy_()` call). Confirm this reasoning holds against
-the actual GPU behavior in Task 7's gate — if a partial-copy failure mode
+the actual GPU behavior in Task 7b's gate — if a partial-copy failure mode
 is discovered there, port `StagedLoRAManager`'s restore-on-failure pattern
 back into this method.
 
@@ -1198,7 +1198,83 @@ git commit -m "test(adapter_sync): guard OFT staging against the pool-wide-versi
 
 ---
 
-## Task 7: GPU validation gate
+## Task 7a: LoRA GPU validation gate — independent, does not wait on Tasks 2-6
+
+**This track has no dependency on this plan's OFT work and can run as soon
+as Task 1 lands (or even before it, against the native-staged-lora batch as
+already shipped).** `StagedLoRAManager` already exists; nothing here is
+blocked on `StagedOFTManager` existing. Splitting this out matters
+concretely: `srt/peft/lora` is 2,495 LOC across 9 files that can be deleted
+*now*, without waiting for the much larger `srt/peft/oft` (11,122 LOC, 32
+files) to have its own replacement finished.
+
+**Files:**
+- The GPU test file already exists:
+  `test/registered/lora/test_lora_staged_update.py` (shipped with the
+  native-staged-lora batch). Check whether it's already been run to a
+  recorded PASS (`docs/superpowers/plans/2026-08-30-native-staged-lora-implementation.md`'s
+  own Steps 3-9 describe the intended run — its checkboxes were unchecked
+  as of this plan's writing; confirm current status before assuming it's
+  done or not done).
+
+- [ ] **Step 1: Check whether this gate has already been run**
+
+Read `docs/superpowers/plans/2026-08-30-native-staged-lora-implementation.md`'s
+Steps 3-9 checkboxes and any run-store provenance it references
+(`/data/home/*/.local/state/remote-cluster-runs/slurm/...`). If already
+recorded PASS with a verified commit match, skip to Task 8a. If not, continue.
+
+- [ ] **Step 2: Ask the user for explicit approval before requesting GPUs**,
+      exactly as that plan's own Step 3 required.
+
+- [ ] **Step 3: Run `test_lora_staged_update.py`/`test_lora_staged_update_tp.py`
+      on the approved GPU allocation**, per that plan's Steps 4-5.
+
+- [ ] **Step 4: Record results** (provenance, logs, exit codes, commit hash
+      tested) the same way that plan's Step 6 did.
+
+- [ ] **Step 5: Benchmark the single-active (capacity=1) case — this is what
+      decides whether `srt/peft/lora` needs anything beyond deletion**
+
+Configure `StagedLoRAManager` at `max_loras_per_batch=1` (one resident
+serving slot + the hidden staging slot, i.e. the exact shape of the
+single-active RL use case: one adapter identity, refreshed every step) and
+measure per-step throughput against the historical `srt/peft/lora`
+single-active-only baseline, same hardware/model/batch config for both.
+
+**Revised expectation, based on prior internal experiments (not just
+theory)**: a real regression here is the *likely* outcome, not an edge
+case — past experience found a specialized single-adapter kernel measurably
+faster than the multi-tenant kernel even at capacity=1, because the
+multi-tenant kernel still does a per-request slot-index lookup for every
+request, even when every request resolves to the same slot, whereas a
+specialized kernel skips indexing and applies one dense rotation/GEMM
+uniformly across the batch. Budget for needing the kernel-level fix below,
+not just the bookkeeping one.
+
+- If throughput is comparable (no material regression): nothing further to
+  build — proceed straight to Task 8a.
+- If there's a regression (the expected case per prior experience): fix it
+  in two parts, both still inside `StagedLoRAManager`, not a separate class
+  (a parallel LoRA weight-placement implementation is the exact drift risk
+  `32a1e22907` already proved out):
+  1. Skip `running_loras` admission-set bookkeeping entirely when
+     `max_loras_per_batch == 1` (the Python-level part — cheap, and was
+     always going to be needed regardless of the kernel finding).
+  2. Add a kernel-level dispatch: when capacity==1, route to a specialized
+     dense/uniform kernel instead of the general segmented multi-tenant
+     one — an `if capacity == 1: ... else: ...` branch inside the existing
+     forward/invoke path (the same seam pattern the `invoke=` parameter
+     already provides for OFT's MoE runner), not a different weight-
+     placement implementation or a different manager class.
+
+Record the measured numbers (not just pass/fail) in this step's result —
+they're the basis for either conclusion above, and for sizing how much of
+the gap the kernel-level fix needs to close.
+
+---
+
+## Task 7b: OFT GPU validation gate — after Tasks 2-6
 
 **Files:**
 - Create: `test/registered/lora/test_oft_staged_update.py` (mirroring `test/registered/lora/test_lora_staged_update.py`'s structure)
@@ -1207,7 +1283,7 @@ This task is a template, not a checklist to execute unattended — mirror
 `docs/superpowers/plans/2026-08-30-native-staged-lora-implementation.md`'s
 own Steps 3-9 (Slurm run-record creation, explicit approval before each
 multi-GPU submission, snapshot verification, self-review before considering
-Task 8) exactly, substituting OFT's staged manager/backend for LoRA's.
+Task 8b) exactly, substituting OFT's staged manager/backend for LoRA's.
 
 - [ ] **Step 1: Write GPU-requiring test cases** covering: single-GPU
       stage/activate round-trip producing bitwise-identical output to a
@@ -1226,43 +1302,110 @@ Task 8) exactly, substituting OFT's staged manager/backend for LoRA's.
 - [ ] **Step 4: Record results** (provenance, logs, exit codes) the same
       way the native-staged-LoRA implementation plan's Step 6 did.
 
+- [ ] **Step 5: Benchmark the single-active (capacity=1) case — same
+      question as Task 7a Step 5, for OFT — this is what decides whether
+      `srt/peft/oft` needs anything beyond deletion**
+
+Configure `StagedOFTManager` at the minimal capacity the single-active RL
+use case needs (one resident serving slot + the hidden staging slot — check
+`max_ofts_per_batch`'s actual minimum against Task 3's `StagedOFTMemoryPool`
+sizing, since OFT's slot accounting may differ slightly from LoRA's) and
+measure per-step throughput against the historical `srt/peft/oft`
+single-active/double-buffer-only baseline, same hardware/model/batch config
+for both.
+
+**Same revised expectation as Task 7a Step 5, and for the same reason**:
+prior internal experiments found a specialized single-adapter kernel
+measurably faster than the multi-tenant kernel even at capacity=1 (skips
+per-request slot-index lookup, applies one dense rotation over the whole
+batch instead of a segmented one) — treat a regression here as the likely
+outcome, not an edge case.
+
+Same fix shape as Task 7a Step 5, both inside `StagedOFTManager` (not a
+separate `SingleActiveOFTManager` class): (1) skip `running_ofts`
+admission-set bookkeeping when capacity is minimal, and (2) a kernel-level
+`if capacity == 1: ... else: ...` dispatch to a specialized dense/uniform
+OFT rotation kernel instead of the general segmented multi-tenant one, via
+the same `invoke=`-style seam OFT's MoE runner already uses elsewhere. If
+no regression shows up: proceed straight to Task 8b. Record the measured
+numbers, not just pass/fail.
+
 ---
 
-## Task 8: Delete `srt/peft/lora` and `srt/peft/oft`
+## Task 8a: Delete `srt/peft/lora`
 
-**Gated on Task 7 passing.** Do not start this task until Task 7's GPU gate
-has actual recorded PASS evidence, not just "the plan says it should work."
+**Gated on Task 7a passing.** Independent of Task 8b — do not wait for
+OFT's work to delete this. Do not start until Task 7a's GPU gate has actual
+recorded PASS evidence, not just "the plan says it should work."
 
 **Files:**
 - Delete: `python/sglang/srt/peft/lora/` (entire directory)
-- Delete: `python/sglang/srt/peft/oft/` (entire directory)
 - Modify: `python/sglang/srt/peft/config.py`, `python/sglang/srt/peft/integration.py`,
   `python/sglang/srt/peft/tokenizer_hooks.py`, `python/sglang/srt/server_args.py`
-  — remove now-dead references to `--peft-method lora`/`--peft-method oft`
-  legacy construction paths and `--oft-impl peft`.
+  — remove now-dead references to `--peft-method lora` legacy construction paths.
 - Modify: `python/sglang/srt/model_executor/model_runner.py` — remove the
-  legacy manager construction branches these paths fed.
+  legacy `srt/peft/lora`-backed manager construction branch.
 
 - [ ] **Step 1: Grep for every remaining reference before deleting anything**
 
 ```bash
-grep -rln "srt\.peft\.lora\|srt\.peft\.oft\|peft_method.*lora\|peft_method.*oft\|oft_impl.*peft" python/sglang/ test/
+grep -rln "srt\.peft\.lora\|peft_method.*lora" python/sglang/ test/
 ```
 
-Read every result. Do not delete a directory while a non-test file still
+Read every result. Do not delete the directory while a non-test file still
 imports from it.
 
-- [ ] **Step 2: Delete the directories and dead references found in Step 1**
+- [ ] **Step 2: Delete the directory and dead references found in Step 1**
 
-- [ ] **Step 3: Run the full unit + adapter_sync + peft + lora + oft test suites**
+- [ ] **Step 3: Run the full unit + adapter_sync + peft + lora test suites**
 
-Run: `python3 -m pytest test/registered/unit/ -k "lora or oft or peft or adapter_sync" -v`
+Run: `python3 -m pytest test/registered/unit/ -k "lora or peft or adapter_sync" -v`
 Expected: PASS, or a clearly-explained set of removed test files whose only
-purpose was exercising the deleted legacy paths.
+purpose was exercising the deleted legacy path.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add -A
-git commit -m "cleanup: delete srt/peft/lora and srt/peft/oft, superseded by staged managers"
+git commit -m "cleanup: delete srt/peft/lora, superseded by srt/lora + StagedLoRAManager"
+```
+
+---
+
+## Task 8b: Delete `srt/peft/oft`
+
+**Gated on Task 7b passing.** Do not start until Task 7b's GPU gate has
+actual recorded PASS evidence, not just "the plan says it should work."
+
+**Files:**
+- Delete: `python/sglang/srt/peft/oft/` (entire directory)
+- Modify: `python/sglang/srt/peft/config.py`, `python/sglang/srt/peft/integration.py`,
+  `python/sglang/srt/peft/tokenizer_hooks.py`, `python/sglang/srt/server_args.py`
+  — remove now-dead references to `--peft-method oft` legacy construction
+  paths and `--oft-impl peft`.
+- Modify: `python/sglang/srt/model_executor/model_runner.py` — remove the
+  legacy `srt/peft/oft`-backed manager construction branch.
+
+- [ ] **Step 1: Grep for every remaining reference before deleting anything**
+
+```bash
+grep -rln "srt\.peft\.oft\|peft_method.*oft\|oft_impl.*peft" python/sglang/ test/
+```
+
+Read every result. Do not delete the directory while a non-test file still
+imports from it.
+
+- [ ] **Step 2: Delete the directory and dead references found in Step 1**
+
+- [ ] **Step 3: Run the full unit + adapter_sync + peft + oft test suites**
+
+Run: `python3 -m pytest test/registered/unit/ -k "oft or peft or adapter_sync" -v`
+Expected: PASS, or a clearly-explained set of removed test files whose only
+purpose was exercising the deleted legacy path.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add -A
+git commit -m "cleanup: delete srt/peft/oft, superseded by srt/oft + StagedOFTManager"
 ```
