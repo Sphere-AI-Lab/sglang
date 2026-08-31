@@ -4373,7 +4373,7 @@ SUPPORTED_OFT_TARGET_MODULES = [
     # DeepSeek V4 attention sublayer names. V4 uses native-quant
     # DeepSeekV4Linear primitives that are NOT fused into qkv_proj/gate_up_proj,
     # so each attention sublayer ships as its own OFT target. The
-    # corresponding wrap classes live in sglang/srt/peft/oft/layers.py.
+    # corresponding wrap classes live in sglang/srt/oft/layers.py.
     "wq_a",
     "wq_b",
     "wkv",

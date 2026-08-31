@@ -966,7 +966,7 @@ class FusedMoEWithOFT(nn.Module):
 
     OFT buffers stay on ``self.base_layer`` (w13_oft_r / w1_oft_r / w3_oft_r /
     w2_oft_r); the runner reads them live via ``_peft_layer`` and applies the
-    rotation through the peft MoE invoker (peft/oft/moe_invoke.py). This is a thin
+    rotation through the peft MoE invoker (oft/oft_moe_runners.py). This is a thin
     shell: it does NOT move buffers into a pool, so the streamed-sync /
     double-buffer / cuda-graph machinery keeps working unchanged on base_layer.
     """

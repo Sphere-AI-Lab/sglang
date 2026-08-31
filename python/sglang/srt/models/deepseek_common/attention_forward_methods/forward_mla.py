@@ -38,18 +38,14 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
-_OFT_MLA = None  # resolved once per process: sibling vs peft mla-correction module
+_OFT_MLA = None  # resolved once per process
 
 
 def _oft_mla():
     global _OFT_MLA
     if _OFT_MLA is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.oft import deepseek_mla_correction as _m
 
-        if getattr(get_global_server_args(), "oft_impl", "sibling") == "sibling":
-            from sglang.srt.oft import deepseek_mla_correction as _m
-        else:
-            from sglang.srt.peft.oft import deepseek_mla_correction as _m
         _OFT_MLA = _m
     return _OFT_MLA
 

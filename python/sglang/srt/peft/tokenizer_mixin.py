@@ -23,7 +23,7 @@ from sglang.srt.peft.io_types import (
     UnloadOFTAdapterReqInput,
     UnloadOFTAdapterReqOutput,
 )
-from sglang.srt.peft.oft.oft_registry import OFTRef
+from sglang.srt.oft.oft_registry import OFTRef
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager

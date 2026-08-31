@@ -18,13 +18,13 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 from sglang.srt.arg_groups.arg_utils import NS, A
-from sglang.srt.peft.oft.oft_registry import OFTRef
+from sglang.srt.oft.oft_registry import OFTRef
 
 logger = logging.getLogger(__name__)
 
 OFT_BACKEND_CHOICES = ["triton", "torch_native"]
 OFT_TYPE_CHOICES = ["oft", "canonical_oft"]
-OFT_IMPL_CHOICES = ["peft", "sibling", "staged"]
+OFT_IMPL_CHOICES = ["sibling", "staged"]
 
 
 @dataclass(kw_only=True)
@@ -69,17 +69,19 @@ class PEFTArgs:
     # Which OFT implementation serves when peft_method == "oft". CUTOVER
     # 2026-08-29: default is "sibling" = srt/oft (the srt/lora-shaped mirror),
     # after the equivalence gate passed bitwise on the full parity matrix.
-    # "peft" = srt/peft/oft, kept intact as the rollback lever and frozen
-    # reference. "staged" = srt/oft's StagedOFTManager, an explicit
-    # stage/activate transaction on top of the same srt/oft family (async-RL
-    # weight sync; see srt/oft/staged_manager.py). The tokenizer-side
-    # registry/ref classes follow this flag too (byte-identical twins;
-    # dispatched in validate_peft_args and peft/tokenizer_hooks.py).
+    # "staged" = srt/oft's StagedOFTManager, an explicit stage/activate
+    # transaction on top of the same srt/oft family (async-RL weight sync;
+    # see srt/oft/staged_manager.py). (Also used to be "peft" = srt/peft/oft,
+    # the frozen pre-cutover reference; that legacy path was deleted once the
+    # equivalence gate passed -- see srt/lora + StagedLoRAManager's analogous
+    # history for LoRA.) The tokenizer-side registry/ref classes follow this
+    # flag too (byte-identical twins; dispatched in validate_peft_args and
+    # peft/tokenizer_hooks.py).
     oft_impl: A[str, NS("lora")] = "sibling"
     oft_dtype: A[Optional[str], NS("lora")] = None
     # Single global signal for split(canonical)-vs-fused OFT (attention qkv,
     # dense MLP gate_up, MoE expert gate_up all derive split-vs-fused from
-    # this one flag; see sglang.srt.peft.oft.utils.detect_canonical_split_active
+    # this one flag; see sglang.srt.oft.utils.detect_canonical_split_active
     # and oft/mem_pool.py's _declare_expert_groups). "canonical_oft" is orbit's
     # ONLY trained variant (Megatron-Bridge canonical_oft emits per-sub-
     # projection SPLIT rotations); "oft" is the legacy shared-R fused variant.
@@ -207,7 +209,6 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         choices=OFT_IMPL_CHOICES,
         help="Which OFT implementation serves for peft_method='oft'. "
         "'sibling' = srt/oft (default since the 2026-08-29 cutover); "
-        "'peft' = srt/peft/oft (rollback lever / frozen reference); "
         "'staged' = srt/oft's StagedOFTManager (explicit stage/activate "
         "transaction for async-RL weight sync).",
     )
@@ -292,16 +293,6 @@ def validate_peft_args(server_args) -> None:
                 )
                 server_args.cuda_graph_config.prefill.backend = Backend.DISABLED
 
-        # Refs must be the class family of the serving implementation: the
-        # sibling registry's ctor asserts its own OFTRef type (a byte-identical
-        # twin of the peft one), and both the tokenizer-side registry and the
-        # worker-side manager are built from these refs. "staged" serves via
-        # StagedOFTManager (srt/oft), the same OFTRef family as "sibling".
-        if server_args.oft_impl in ("sibling", "staged"):
-            from sglang.srt.oft.oft_registry import OFTRef as _ImplOFTRef
-        else:
-            _ImplOFTRef = OFTRef
-
         # Parse peft_paths -> List[OFTRef]. Normalize through locals -- not
         # server_args.peft_paths directly -- because ServerArgs is read-only
         # once __post_init__ reaches materialize_declarations() (well before
@@ -314,18 +305,18 @@ def validate_peft_args(server_args) -> None:
                 if isinstance(adapter_path, str):
                     if "=" in adapter_path:
                         name, path = adapter_path.split("=", 1)
-                        oft_ref = _ImplOFTRef(
+                        oft_ref = OFTRef(
                             adapter_name=name, adapter_path=path, pinned=False
                         )
                     else:
-                        oft_ref = _ImplOFTRef(
+                        oft_ref = OFTRef(
                             adapter_name=adapter_path, adapter_path=adapter_path, pinned=False
                         )
                 elif isinstance(adapter_path, dict):
                     assert (
                         "adapter_name" in adapter_path and "adapter_path" in adapter_path
                     ), f"When providing OFT paths as a list of dict, each dict should contain 'adapter_name' and 'adapter_path' keys. Got: {adapter_path}"
-                    oft_ref = _ImplOFTRef(
+                    oft_ref = OFTRef(
                         adapter_name=adapter_path["adapter_name"],
                         adapter_path=adapter_path["adapter_path"],
                         pinned=adapter_path.get("pinned", False),
@@ -338,7 +329,7 @@ def validate_peft_args(server_args) -> None:
                 peft_paths.append(oft_ref)
         elif isinstance(peft_paths, dict):
             peft_paths = [
-                _ImplOFTRef(adapter_name=k, adapter_path=v, pinned=False)
+                OFTRef(adapter_name=k, adapter_path=v, pinned=False)
                 for k, v in peft_paths.items()
             ]
         elif peft_paths is None:

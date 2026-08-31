@@ -10,7 +10,7 @@ imports keep working.
 from typing import Any, Dict, Optional
 
 from sglang.srt.managers.io_struct import BaseReq
-from sglang.srt.peft.oft.oft_registry import OFTRef
+from sglang.srt.oft.oft_registry import OFTRef
 
 __all__ = [
     "LoadOFTAdapterReqInput",

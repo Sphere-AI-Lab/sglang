@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.peft.oft.oft_registry import OFTRef
-from sglang.srt.peft.oft.streamed_weight_loader import (
+from sglang.srt.oft.oft_registry import OFTRef
+from sglang.srt.oft.streamed_weight_loader import (
     FlattenedOFTTensorPayload,
     load_streamed_oft_adapter,
     normalize_oft_weight_payload,
@@ -76,7 +76,7 @@ def maybe_init_peft_manager(
 
 def _get_oft_manager_class(server_args: "ServerArgs"):
     """Resolve the OFTManager class for ``server_args.oft_impl``, mirroring
-    ``ModelRunner._get_lora_manager_class``'s pattern for OFT's third choice.
+    ``ModelRunner._get_lora_manager_class``'s pattern for OFT's two choices.
 
     Imported lazily: OFTManager pulls in vocab_parallel_embedding ->
     communicator -> forward_batch_info, which forms an import cycle when a
@@ -87,11 +87,7 @@ def _get_oft_manager_class(server_args: "ServerArgs"):
         from sglang.srt.oft.staged_manager import StagedOFTManager
 
         return StagedOFTManager
-    if server_args.oft_impl == "sibling":
-        from sglang.srt.oft.oft_manager import OFTManager
-
-        return OFTManager
-    from sglang.srt.peft.oft.oft_manager import OFTManager
+    from sglang.srt.oft.oft_manager import OFTManager
 
     return OFTManager
 

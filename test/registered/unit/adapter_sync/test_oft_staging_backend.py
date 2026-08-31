@@ -510,9 +510,9 @@ class TestActivateUpdatesManagerBookkeeping(unittest.TestCase):
 
 class TestOFTManagerClassSelection(unittest.TestCase):
     """Mirrors test_lora_staging_control.py's TestStagingFlagAndSelection for
-    OFT's third oft_impl choice: _get_oft_manager_class (peft/integration.py)
+    OFT's oft_impl choice: _get_oft_manager_class (peft/integration.py)
     is the construction-site helper model_runner.py's maybe_init_peft_manager
-    ultimately calls through, and must resolve all three oft_impl choices to
+    ultimately calls through, and must resolve both oft_impl choices to
     the right manager class."""
 
     def test_selects_staged_manager_when_oft_impl_is_staged(self):
@@ -530,14 +530,6 @@ class TestOFTManagerClassSelection(unittest.TestCase):
         server_args = SimpleNamespace(oft_impl="sibling")
 
         self.assertIs(_get_oft_manager_class(server_args), OFTManager)
-
-    def test_falls_back_to_the_peft_manager_for_the_peft_impl(self):
-        from sglang.srt.peft.integration import _get_oft_manager_class
-        from sglang.srt.peft.oft.oft_manager import OFTManager as PeftOFTManager
-
-        server_args = SimpleNamespace(oft_impl="peft")
-
-        self.assertIs(_get_oft_manager_class(server_args), PeftOFTManager)
 
 
 class TestWeightUpdaterStagedRouting(unittest.TestCase):

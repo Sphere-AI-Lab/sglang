@@ -25,12 +25,8 @@ def _peft_kind(tm):
 
 def _mint_ref(tm, name):
     """Build the OFT AdapterRef for ``name`` (path == name for streamed
-    adapters). The ref class follows --oft-impl so minted refs match the
-    registry built in init_tokenizer_peft."""
-    if tm.server_args.oft_impl in ("sibling", "staged"):
-        from sglang.srt.oft.oft_registry import OFTRef
-    else:
-        from sglang.srt.peft.oft.oft_registry import OFTRef
+    adapters). Matches the registry class built in init_tokenizer_peft."""
+    from sglang.srt.oft.oft_registry import OFTRef
 
     return OFTRef(adapter_name=name, adapter_path=name, pinned=False)
 
@@ -54,13 +50,9 @@ def init_tokenizer_peft(tm):
     tm._logged_peft_base_only_request = False
 
     if kind == "oft":
-        # Registry class follows --oft-impl (byte-identical twins); its ctor
-        # asserts the refs are its own OFTRef class, which validate_peft_args
-        # normalized with the same dispatch.
-        if tm.server_args.oft_impl in ("sibling", "staged"):
-            from sglang.srt.oft.oft_registry import OFTRegistry
-        else:
-            from sglang.srt.peft.oft.oft_registry import OFTRegistry
+        # Its ctor asserts the refs are its own OFTRef class, which
+        # validate_peft_args normalized with the same class.
+        from sglang.srt.oft.oft_registry import OFTRegistry
 
         tm.peft_registry = OFTRegistry(tm.server_args.peft_paths)
         for ref in tm.server_args.peft_paths or []:

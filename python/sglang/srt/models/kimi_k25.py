@@ -45,18 +45,14 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
-_KIMI_OFT_POLICY = None  # resolved once per process: sibling vs peft policy module
+_KIMI_OFT_POLICY = None  # resolved once per process
 
 
 def _kimi_oft_policy():
     global _KIMI_OFT_POLICY
     if _KIMI_OFT_POLICY is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.oft import kimi_k25_policy as _m
 
-        if getattr(get_global_server_args(), "oft_impl", "sibling") == "sibling":
-            from sglang.srt.oft import kimi_k25_policy as _m
-        else:
-            from sglang.srt.peft.oft import kimi_k25_policy as _m
         _KIMI_OFT_POLICY = _m
     return _KIMI_OFT_POLICY
 
