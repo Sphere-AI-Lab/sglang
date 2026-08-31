@@ -52,7 +52,6 @@ from pydantic import PlainValidator
 
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -60,6 +59,7 @@ from sglang.srt.managers.schedule_batch import (
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
