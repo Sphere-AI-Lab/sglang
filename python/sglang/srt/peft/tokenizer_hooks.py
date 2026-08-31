@@ -1,12 +1,12 @@
-"""Tokenizer-side PEFT adapter registry hooks — unified across the single-active
-peft methods (LoRA and OFT).
+"""Tokenizer-side PEFT adapter registry hooks for the single-active OFT peft
+method.
 
 Single-active invariant: the engine boots with ``enable_peft_lora`` XOR
 ``enable_oft``, so there is exactly ONE active peft registry / ref_cache. These
-hooks route to that active registry and never branch on ``load_format`` or adapter
-type -- the ``LoRARef`` vs ``OFTRef`` choice is fixed once at init via a ref
-factory. The AdapterRegistry base (peft/base/registry.py) provides all the
-register/acquire/LRU behaviour for both.
+hooks route to that active registry and never branch on ``load_format`` or
+adapter type -- the ref class is fixed once at init via a ref factory. The
+AdapterRegistry base (peft/base/registry.py) provides the register/acquire/LRU
+behaviour.
 
 Import-light by design (registry classes imported lazily): the tokenizer-manager
 boot chain is deep. See commit c42b88a1c for the cycle this avoids.
@@ -19,24 +19,20 @@ logger = logging.getLogger(__name__)
 
 
 def _peft_kind(tm):
-    """The active single-active peft method: "oft", "lora", or None."""
+    """The active single-active peft method: "oft", or None."""
     return tm.server_args.peft_method
 
 
 def _mint_ref(tm, name):
-    """Build the active kind's AdapterRef for ``name`` (path == name for
-    streamed adapters). The OFT ref class follows --oft-impl so minted refs
-    match the registry built in init_tokenizer_peft."""
-    if tm.peft_kind == "oft":
-        if tm.server_args.oft_impl in ("sibling", "staged"):
-            from sglang.srt.oft.oft_registry import OFTRef
-        else:
-            from sglang.srt.peft.oft.oft_registry import OFTRef
+    """Build the OFT AdapterRef for ``name`` (path == name for streamed
+    adapters). The ref class follows --oft-impl so minted refs match the
+    registry built in init_tokenizer_peft."""
+    if tm.server_args.oft_impl in ("sibling", "staged"):
+        from sglang.srt.oft.oft_registry import OFTRef
+    else:
+        from sglang.srt.peft.oft.oft_registry import OFTRef
 
-        return OFTRef(adapter_name=name, adapter_path=name, pinned=False)
-    from sglang.srt.peft.lora.lora_registry import LoRARef
-
-    return LoRARef(adapter_name=name, adapter_path=name, pinned=False)
+    return OFTRef(adapter_name=name, adapter_path=name, pinned=False)
 
 
 def _request_peft_path(obj):
@@ -69,19 +65,6 @@ def init_tokenizer_peft(tm):
         tm.peft_registry = OFTRegistry(tm.server_args.peft_paths)
         for ref in tm.server_args.peft_paths or []:
             tm.peft_ref_cache[ref.adapter_name] = ref
-    elif kind == "lora":
-        from sglang.srt.peft.lora.lora_registry import LoRARef, LoRARegistry
-
-        # peft_paths is {name: path} (or None/[] at identity boot).
-        raw = tm.server_args.peft_paths
-        initial = (
-            [LoRARef(adapter_name=n, adapter_path=p, pinned=False) for n, p in raw.items()]
-            if isinstance(raw, dict)
-            else list(raw or [])
-        )
-        tm.peft_registry = LoRARegistry(initial)
-        for ref in initial:
-            tm.peft_ref_cache[ref.adapter_name] = ref
 
     if kind is not None:
         logger.info(
@@ -110,8 +93,8 @@ async def register_peft_ref(tm, obj):
 
 
 async def bump_peft_version(tm, obj, success):
-    """Bump the adapter version after a successful update. OFT tracks versions;
-    LoRA has none (no bump_version_by_id) -> no-op. Returns a message suffix."""
+    """Bump the adapter version after a successful update (OFT tracks
+    versions via bump_version_by_id). Returns a message suffix."""
     if not (success and obj.adapter_name is not None and tm.peft_registry is not None):
         return ""
     reg = tm.peft_registry
@@ -144,9 +127,8 @@ def _propagate_id_to_cached_sub_objs(obj, *, field, resolved):
 
 
 async def resolve_peft_path(tm, obj):
-    """Per-request peft adapter resolver: acquire the adapter id (+ version), and
-    for OFT reload any dynamically-evicted adapter (single-active LoRA never
-    evicts). Generic over the active registry."""
+    """Per-request peft adapter resolver: acquire the adapter id (+ version),
+    and reload any dynamically-evicted OFT adapter."""
     path = _request_peft_path(obj)
     unique_paths = {path} if isinstance(path, str) else set(path)
 
@@ -180,21 +162,17 @@ async def resolve_peft_path(tm, obj):
                 )
 
     adapter_id = await tm.peft_registry.acquire(path)
-    # Set the kind's request-side id/version fields the scheduler reads.
-    if tm.peft_kind == "oft":
-        obj.adapter_id = adapter_id
-        adapter_version = await tm.peft_registry.get_version_by_id(adapter_id)
-        obj.adapter_version = adapter_version
-        _propagate_id_to_cached_sub_objs(obj, field="adapter_id", resolved=adapter_id)
-        # The version needs the same propagation as the id: batched sub-objects
-        # are materialized before this resolver runs, so a version set only on
-        # the parent never reaches the tokenized requests built from them.
-        _propagate_id_to_cached_sub_objs(
-            obj, field="adapter_version", resolved=adapter_version
-        )
-    else:
-        obj.lora_id = adapter_id
-        _propagate_id_to_cached_sub_objs(obj, field="lora_id", resolved=adapter_id)
+    # Set the request-side id/version fields the scheduler reads.
+    obj.adapter_id = adapter_id
+    adapter_version = await tm.peft_registry.get_version_by_id(adapter_id)
+    obj.adapter_version = adapter_version
+    _propagate_id_to_cached_sub_objs(obj, field="adapter_id", resolved=adapter_id)
+    # The version needs the same propagation as the id: batched sub-objects
+    # are materialized before this resolver runs, so a version set only on
+    # the parent never reaches the tokenized requests built from them.
+    _propagate_id_to_cached_sub_objs(
+        obj, field="adapter_version", resolved=adapter_version
+    )
 
 
 async def maybe_resolve_peft_path(tm, obj):

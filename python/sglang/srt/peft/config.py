@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 from sglang.srt.arg_groups.arg_utils import NS, A
-from sglang.srt.peft.lora.lora_registry import LoRARef
 from sglang.srt.peft.oft.oft_registry import OFTRef
 
 logger = logging.getLogger(__name__)
@@ -32,14 +31,15 @@ OFT_IMPL_CHOICES = ["peft", "sibling", "staged"]
 class PEFTArgs:
     """OFT (Orthogonal Finetuning) server-arg fields, mixed into ServerArgs."""
 
-    # Single-active PEFT method: None (off) | "oft" | "lora". This one field
-    # replaces the former enable_oft / enable_peft_lora boolean pair -- two bools
-    # could encode illegal states (both set) that the single-active invariant
-    # forbids; a 3-valued enum makes those unrepresentable.
+    # Single-active PEFT method: None (off) | "oft". This one field replaces
+    # the former enable_oft / enable_peft_lora boolean pair -- two bools could
+    # encode illegal states (both set) that the single-active invariant
+    # forbids. (Also used to be "lora", served by srt/peft/lora; that legacy
+    # path was deleted once srt/lora + StagedLoRAManager superseded it.)
     peft_method: A[Optional[str], NS("lora")] = None
 
     # Shared single-active PEFT inputs (the active method is `peft_method`):
-    #   peft_paths          adapter path map; normalized to OFTRef or LoRARef by
+    #   peft_paths          adapter path map; normalized to OFTRef by
     #                       peft_method in validate_peft_args.
     #   peft_target_modules module allow-list; method-specific normalization
     #                       ("all"/embed/lm_head handling is OFT-only) in validate.
@@ -50,7 +50,6 @@ class PEFTArgs:
                 List[dict[str, str]],
                 List[str],
                 List[OFTRef],
-                List["LoRARef"],
             ]
         ],
         NS("lora"),
@@ -87,11 +86,6 @@ class PEFTArgs:
     oft_type: A[str, NS("lora")] = "canonical_oft"
     max_oft_chunk_size: A[Optional[int], NS("lora")] = 16
 
-    # peft-lora (single-active method under srt/peft/lora): the low-rank dim.
-    # Distinct from OFT's max_oft_block_size -- different hyperparameter, kept
-    # separate. Paths/target-modules are shared (peft_paths/peft_target_modules).
-    peft_max_lora_rank: A[Optional[int], NS("lora")] = None
-
     # Double-buffer weight-sync (async RL, NCCL transport). When set, adapter
     # memory pools reserve a staging slot and the stage/activate endpoints are
     # live. Orbit sets this alongside --adapter-double-buffer. Off => in-place
@@ -100,15 +94,14 @@ class PEFTArgs:
 
     @property
     def enable_peft(self) -> bool:
-        """True if a single-active peft method (LoRA or OFT) is enabled."""
+        """True if the single-active peft method (OFT) is enabled."""
         return self.peft_method is not None
 
 
 class PeftPathAction(argparse.Action):
     """Collect --peft-paths entries (strings or JSON dicts). Dict entries use
-    {adapter_name, adapter_path} keys (unified across our LoRA/OFT); key
-    validation is deferred to validate_peft_args, which knows the active
-    peft_method."""
+    {adapter_name, adapter_path} keys; key validation is deferred to
+    validate_peft_args, which knows the active peft_method."""
 
     def __call__(self, parser, namespace, values, option_string=None):
         paths = []
@@ -132,10 +125,10 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         "--peft-method",
         type=str,
         default=PEFTArgs.peft_method,
-        choices=["oft", "lora"],
-        help="Single-active PEFT method: 'oft' (Orthogonal Finetuning) or 'lora' "
-        "(the srt/peft/lora single-active method). Required when --peft-paths is "
-        "given. Distinct from upstream --enable-lora (multi-tenant).",
+        choices=["oft"],
+        help="Single-active PEFT method: 'oft' (Orthogonal Finetuning). "
+        "Required when --peft-paths is given. Distinct from upstream "
+        "--enable-lora (multi-tenant).",
     )
     parser.add_argument(
         "--max-oft-block-size",
@@ -200,14 +193,6 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         help="Maximum chunk size for the OFT backend. Choosing a larger value might improve performance.",
     )
 
-    # peft-lora (single-active method under srt/peft/lora): paths/targets are the
-    # shared --peft-paths / --peft-target-modules; only the rank is LoRA-specific.
-    parser.add_argument(
-        "--peft-max-lora-rank",
-        type=int,
-        default=None,
-        help="Max LoRA rank; inferred from --peft-paths if omitted.",
-    )
     parser.add_argument(
         "--peft-double-buffer",
         action="store_true",
@@ -247,7 +232,7 @@ def validate_peft_args(server_args) -> None:
     # which path field was set -- require it explicitly when paths are given.
     if server_args.peft_paths and server_args.peft_method is None:
         raise ValueError(
-            "--peft-paths requires --peft-method (oft|lora) to be set explicitly."
+            "--peft-paths requires --peft-method (oft) to be set explicitly."
         )
 
     if server_args.peft_method == "oft":
@@ -386,77 +371,6 @@ def validate_peft_args(server_args) -> None:
                 16 <= server_args.max_oft_chunk_size <= 128
                 and (server_args.max_oft_chunk_size & (server_args.max_oft_chunk_size - 1)) == 0
             ), "--max-oft-chunk-size must be a power of 2 between 16 and 128."
-
-        server_args._late_resolution(
-            "validate_peft_args",
-            peft_paths=peft_paths,
-            peft_target_modules=peft_target_modules,
-        )
-
-    # ------------------------------------------------------------------ #
-    #  peft-lora (single-active). Mirrors the OFT block above, simpler
-    #  (no overlap/spec-decode/max_loaded checks).
-    # ------------------------------------------------------------------ #
-    if server_args.peft_method == "lora":
-        from sglang.srt.peft.lora.lora_registry import LoRARef
-
-        # Parse peft_paths -> List[LoRARef] (mirror the OFT branch, LoRARef keys).
-        # Normalize through locals -- see the OFT branch's comment on why.
-        peft_paths = server_args.peft_paths
-        if isinstance(peft_paths, list):
-            adapter_paths = peft_paths
-            peft_paths = []
-            for adapter_path in adapter_paths:
-                if isinstance(adapter_path, str):
-                    if "=" in adapter_path:
-                        name, path = adapter_path.split("=", 1)
-                        lora_ref = LoRARef(
-                            adapter_name=name, adapter_path=path, pinned=False
-                        )
-                    else:
-                        lora_ref = LoRARef(
-                            adapter_name=adapter_path,
-                            adapter_path=adapter_path,
-                            pinned=False,
-                        )
-                elif isinstance(adapter_path, dict):
-                    assert (
-                        "adapter_name" in adapter_path and "adapter_path" in adapter_path
-                    ), f"When providing peft LoRA paths as a list of dict, each dict should contain 'adapter_name' and 'adapter_path' keys. Got: {adapter_path}"
-                    lora_ref = LoRARef(
-                        adapter_name=adapter_path["adapter_name"],
-                        adapter_path=adapter_path["adapter_path"],
-                        pinned=adapter_path.get("pinned", False),
-                    )
-                else:
-                    raise ValueError(
-                        f"Invalid type for item in --peft-paths list: {type(adapter_path)}. "
-                        "Expected a string or a dictionary."
-                    )
-                peft_paths.append(lora_ref)
-        elif isinstance(peft_paths, dict):
-            peft_paths = [
-                LoRARef(adapter_name=k, adapter_path=v, pinned=False)
-                for k, v in peft_paths.items()
-            ]
-        elif peft_paths is None:
-            peft_paths = []
-        else:
-            raise ValueError(
-                f"Invalid type for --peft-paths: {type(peft_paths)}. "
-                "Expected a list or a dictionary."
-            )
-
-        # Expand target modules (simple: just set(...) if provided; MVP skips
-        # "all"/embed/lm_head handling).
-        peft_target_modules = server_args.peft_target_modules
-        if peft_target_modules:
-            peft_target_modules = set(peft_target_modules)
-
-        # Ensure sufficient info (mirror OFT's assert).
-        assert peft_paths or (
-            server_args.peft_max_lora_rank and peft_target_modules
-        ), "When no --peft-paths is provided, specify both --peft-max-lora-rank and --peft-target-modules."
 
         server_args._late_resolution(
             "validate_peft_args",

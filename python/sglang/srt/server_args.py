@@ -4667,16 +4667,9 @@ class ServerArgs(PEFTArgs):
             ),
             # Dynamo blocks LoRA under tc_piecewise (per-batch LoRABatchInfo
             # rebinds break guards); breakable/full support LoRA.
-            # Fork's single-active peft/lora rides the SAME MoE-LoRA path
-            # (FusedMoEWithLoRA -> _prepare_fused_moe_run -> get_config_file_name
-            # -> get_device_name, a torch.* op returning str) that makes
-            # upstream LoRA torch.compile-incompatible, so peft_method=="lora"
-            # needs the same tc_piecewise disable as upstream --enable-lora.
             (
                 "LoRA",
-                lambda: bool(self.lora_paths)
-                or self.enable_lora
-                or self.peft_method == "lora",
+                lambda: bool(self.lora_paths) or self.enable_lora,
             ),
             (
                 "OFT",

@@ -941,11 +941,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        # Init peft-lora (single-active) batch info. Distinct namespace/guard
-        # from the upstream enable_lora block above.
-        if model_runner.server_args.peft_method == "lora":
-            peft.maybe_prepare_lora_batch(model_runner, ret)
-
         # Init OFT (single-active) batch info. Distinct namespace/guard from
         # the upstream enable_lora block above.
         if model_runner.server_args.peft_method == "oft":

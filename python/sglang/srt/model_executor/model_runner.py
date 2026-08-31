@@ -769,23 +769,9 @@ class ModelRunner:
             self.init_lora_manager()
 
     def maybe_init_peft_manager(self):
-        # Init the peft adapter manager (OFT or LoRA) for the configured
-        # peft_method. No-op when peft_method is None.
+        # Init the peft adapter manager (OFT) for the configured peft_method.
+        # No-op when peft_method is None.
         peft.maybe_init_peft_manager(self, self.server_args)
-        if (
-            self.server_args.peft_method == "lora"
-            and not cuda_graph_fully_disabled()
-        ):
-            # Phase 1 of peft-lora CUDA graph init: pre-allocate the MoE cg
-            # buffers so decode CAPTURE uses the GPU moe-align path, not the CPU
-            # fallback in lora_moe_runners (`.cpu().tolist()` + `.to(device)`),
-            # which copies CPU->GPU and fails cuda-graph capture. Mirrors the
-            # enable_lora branch above; _init_lora_cuda_graph_moe_buffers only
-            # handles the upstream self.lora_manager, not peft_lora_manager.
-            self.peft_lora_manager.init_cuda_graph_moe_buffers(
-                max_bs=self.server_args.cuda_graph_config.decode.max_bs,
-                disable_cuda_graph=False,
-            )
 
     def maybe_enable_batch_invariant_mode(self):
         if get_exec().deterministic.enable_deterministic_inference:

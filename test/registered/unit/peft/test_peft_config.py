@@ -15,7 +15,6 @@ def _args(peft_method, *, enable_lora=True):
         oft_dtype=None,
         oft_type="canonical_oft",
         max_oft_chunk_size=16,
-        peft_max_lora_rank=None,
         peft_double_buffer=False,
         speculative_algorithm=None,
         cuda_graph_config=None,
@@ -28,21 +27,20 @@ def _args(peft_method, *, enable_lora=True):
     return ns
 
 
-@pytest.mark.parametrize("peft_method", ["oft", "lora"])
-def test_native_lora_and_single_active_peft_are_mutually_exclusive(peft_method):
-    """Catch either PEFT method initializing alongside native LoRA."""
+def test_native_lora_and_single_active_peft_are_mutually_exclusive():
+    """Catch the PEFT method initializing alongside native LoRA."""
     from sglang.srt.peft.config import validate_peft_args
 
     with pytest.raises(
         ValueError,
         match=r"--enable-lora.*--peft-method.*mutually exclusive",
     ):
-        validate_peft_args(_args(peft_method))
+        validate_peft_args(_args("oft"))
 
 
 @pytest.mark.parametrize(
     ("enable_lora", "peft_method"),
-    [(True, None), (False, "oft"), (False, "lora")],
+    [(True, None), (False, "oft")],
 )
 def test_native_lora_and_single_active_peft_validate_independently(
     enable_lora, peft_method

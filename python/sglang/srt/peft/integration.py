@@ -53,7 +53,6 @@ __all__ = [
     "maybe_init_cuda_graph_batch_info",
     "maybe_prepare_replay_batch",
     "maybe_apply_forward",
-    "maybe_prepare_lora_batch",
     "stage_adapter",
     "activate_adapter",
 ]
@@ -68,13 +67,11 @@ def maybe_init_peft_manager(
 ) -> None:
     """Single peft init seam ``model_runner.py`` calls: build the adapter
     manager for the configured ``server_args.peft_method``. ``"oft"`` builds an
-    OFTManager on ``model_runner.oft_manager``; ``"lora"`` builds a LoRAManager
-    on ``model_runner.peft_lora_manager``. No-op when ``peft_method`` is None.
+    OFTManager on ``model_runner.oft_manager``. No-op when ``peft_method`` is
+    None.
     """
     if server_args.peft_method == "oft":
         _init_oft_manager(model_runner, server_args)
-    elif server_args.peft_method == "lora":
-        _init_lora_manager(model_runner, server_args)
 
 
 def _get_oft_manager_class(server_args: "ServerArgs"):
@@ -129,33 +126,6 @@ def _init_oft_manager(model_runner: "ModelRunner", server_args: "ServerArgs") ->
     )
 
 
-def _init_lora_manager(
-    model_runner: "ModelRunner", server_args: "ServerArgs"
-) -> None:
-    """Init the single-active peft-lora manager. LoRAManager.__init__ takes NO
-    ``server_args`` param (unlike OFTManager), so we match its signature.
-    """
-    # Lazy import: same vocab_parallel_embedding -> forward_batch_info cycle
-    # reason as the OFT manager above.
-    from sglang.srt.peft.lora.manager import LoRAManager
-
-    model_runner.peft_lora_manager = LoRAManager(
-        base_model=model_runner.model,
-        base_hf_config=model_runner.model_config.hf_config,
-        max_loras_per_batch=1,  # single-active
-        load_config=model_runner.load_config,
-        dtype=model_runner.dtype,
-        tp_size=model_runner.ps.tp_size,
-        tp_rank=model_runner.ps.tp_rank,
-        max_lora_rank=server_args.peft_max_lora_rank,
-        target_modules=server_args.peft_target_modules,
-        lora_paths=server_args.peft_paths,
-        memory_saver_adapter=model_runner.memory_saver_adapter,
-        memory_saver_cpu_backup=server_args.enable_weights_cpu_backup,
-        peft_double_buffer=server_args.peft_double_buffer,
-    )
-
-
 def maybe_load_adapter_format(
     model_runner: "ModelRunner",
     load_format,
@@ -167,15 +137,10 @@ def maybe_load_adapter_format(
     payload_metadata: Optional[dict] = None,
     device=None,
 ):
-    """Absorbs the OFT bodies of the 3 ``load_format == "oft_adapter"`` sites,
-    and also handles ``load_format == "lora_adapter"`` directly when
-    ``model_runner.peft_lora_manager`` is set (streamed CUDA IPC / NCCL LoRA
-    sync).
+    """Absorbs the OFT bodies of the 3 ``load_format == "oft_adapter"`` sites.
 
-    Returns ``NOT_HANDLED`` when neither of the above applies -- i.e.
-    ``load_format`` is ``"lora_adapter"`` but no peft LoRA manager is present,
-    or the format is some other value -- so the caller can fall through to
-    its own (upstream ``srt/lora``) handling.
+    Returns ``NOT_HANDLED`` when ``load_format`` is some other value -- so the
+    caller can fall through to its own (upstream ``srt/lora``) handling.
     """
     if load_format == "oft_adapter":
         if payload_metadata is not None:
@@ -188,25 +153,6 @@ def maybe_load_adapter_format(
             adapter_config,
             adapter_name,
             adapter_id,
-        )
-
-    if load_format == "lora_adapter" and getattr(
-        model_runner, "peft_lora_manager", None
-    ) is not None:
-        from sglang.srt.peft.lora.streamed_weight_loader import (
-            load_streamed_lora_adapter,
-            normalize_lora_weight_payload,
-        )
-
-        # CUDA IPC path passes device=; NCCL path (update_adapter_from_distributed)
-        # passes payload_metadata and pre-reconstructs via reconstruct_oft_staging-
-        # equivalent. MVP wires the CUDA IPC (device) path; when device is set and
-        # the payload is a flattened tuple, normalize it. A plain list (already
-        # per-tensor, e.g. NCCL staging) is passed through unchanged.
-        if device is not None and isinstance(tensors, tuple):
-            tensors = normalize_lora_weight_payload(tensors, device=device)
-        return load_streamed_lora_adapter(
-            model_runner, tensors, adapter_config, adapter_name, adapter_id,
         )
 
     return NOT_HANDLED
@@ -277,18 +223,13 @@ def stage_adapter(
     double_buffer: bool = True,
 ):
     """Double-buffer STAGING fill -- the ``stage()`` counterpart of
-    ``maybe_load_adapter_format``'s ``oft_adapter``/``lora_adapter``
-    dispatch. Reconstructs the wire payload identically (the
-    ``payload_metadata`` path only -- NCCL is the sole transport the
-    stage/activate endpoints use, unlike the CUDA-IPC ``device=`` path
-    ``maybe_load_adapter_format`` also supports), then calls the resolved
-    manager's ``stage_adapter``. Returns ``NOT_HANDLED`` when ``load_format``
-    doesn't resolve to an active manager, mirroring
+    ``maybe_load_adapter_format``'s ``oft_adapter`` dispatch. Reconstructs the
+    wire payload identically (the ``payload_metadata`` path only -- NCCL is
+    the sole transport the stage/activate endpoints use, unlike the CUDA-IPC
+    ``device=`` path ``maybe_load_adapter_format`` also supports), then calls
+    the resolved manager's ``stage_adapter``. Returns ``NOT_HANDLED`` when
+    ``load_format`` doesn't resolve to an active manager, mirroring
     ``maybe_load_adapter_format``.
-
-    ``reconstruct_oft_staging`` is reused for BOTH formats: despite its name,
-    the flattened-bucket reconstruction it performs is generic (OFT and LoRA
-    share the identical wire layout).
 
     ``double_buffer=False`` (distributed sync without ``--adapter-double-
     buffer``) is rejected for OFT: with DB-off sizing the pool inherits the
@@ -300,9 +241,7 @@ def stage_adapter(
     staging_idx->active_idx (slot1->slot0) -- CLOBBERING the base-identity
     slot with adapter data instead of updating the adapter in place (the
     runtime already reads the adapter's weights straight from slot 1; there
-    is no correct use for copying into slot 0). LoRA's DB-off sizing
-    collapses to 1 slot (active==staging==0), so its activate() is a
-    harmless no-op and is NOT rejected here.
+    is no correct use for copying into slot 0).
     """
     if payload_metadata is not None:
         tensors = reconstruct_oft_staging(tensors, payload_metadata)
@@ -319,13 +258,6 @@ def stage_adapter(
             tensors, adapter_config, adapter_name, version, adapter_id=adapter_id
         )
 
-    if load_format == "lora_adapter" and getattr(
-        model_runner, "peft_lora_manager", None
-    ) is not None:
-        return model_runner.peft_lora_manager.stage_adapter(
-            tensors, adapter_config, adapter_name, version, adapter_id=adapter_id
-        )
-
     return NOT_HANDLED
 
 
@@ -334,17 +266,12 @@ def activate_adapter(model_runner: "ModelRunner", adapter_name: str, version):
     resolved manager's memory pool. Unlike ``stage_adapter``, there is no
     ``load_format`` to dispatch on here, so this dispatches on
     ``server_args.peft_method`` directly (mirroring
-    ``maybe_load_adapter_format``'s oft/lora routing). Returns
-    ``NOT_HANDLED`` when neither method is active.
+    ``maybe_load_adapter_format``'s dispatch). Returns ``NOT_HANDLED`` when
+    the method isn't active.
     """
     peft_method = model_runner.server_args.peft_method
     if peft_method == "oft":
         return model_runner.oft_manager.activate_adapter(adapter_name, version)
-
-    if peft_method == "lora" and getattr(
-        model_runner, "peft_lora_manager", None
-    ) is not None:
-        return model_runner.peft_lora_manager.activate_adapter(adapter_name, version)
 
     return NOT_HANDLED
 
@@ -410,17 +337,14 @@ def maybe_prepare_peft_batch(
     model_runner: "ModelRunner", forward_batch: "ForwardBatch"
 ) -> None:
     """Unified peft batch-prep seam for the cuda-graph runners (decode capture +
-    the prefill compile pass). Dispatches on peft_method so a runner makes ONE
-    call instead of a per-method pair: OFT preps its batch_info when the batch
-    carries adapter_ids; LoRA preps the single-active MoE-wrapper batch_info.
-    No-op when peft_method is None.
+    the prefill compile pass). Dispatches on peft_method: OFT preps its
+    batch_info when the batch carries adapter_ids. No-op when peft_method is
+    None.
     """
     method = model_runner.server_args.peft_method
     if method == "oft":
         if forward_batch.adapter_ids is not None:
             model_runner.oft_manager.prepare_oft_batch(forward_batch)
-    elif method == "lora":
-        model_runner.peft_lora_manager.prepare_lora_batch(forward_batch)
 
 
 def maybe_admit_request(scheduler: "Scheduler", req: "Req", running_ofts) -> bool:
@@ -470,12 +394,3 @@ def maybe_apply_forward(model_runner: "ModelRunner", forward_batch: "ForwardBatc
     if model_runner.server_args.peft_method == "oft":
         model_runner.oft_manager.fetch_new_ofts(set(forward_batch.adapter_ids))
         model_runner.oft_manager.prepare_oft_batch(forward_batch)
-
-
-def maybe_prepare_lora_batch(
-    model_runner: "ModelRunner", forward_batch: "ForwardBatch"
-) -> None:
-    """peft-lora analog of ``maybe_apply_forward``, called from
-    ``ForwardBatch.init_new``. No-op unless ``enable_peft_lora``."""
-    if model_runner.server_args.peft_method == "lora":
-        model_runner.peft_lora_manager.prepare_lora_batch(forward_batch)
