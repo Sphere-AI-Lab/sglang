@@ -1062,3 +1062,129 @@ def test_three_argument_comparison_rejects_unreviewed_envelope(tmp_path):
     assert not report.passed
     assert report.mismatches[0].kind == "invalid_envelope"
     assert "reviewed ComparisonPolicy" in report.mismatches[0].actual
+
+
+def test_task8_source_and_candidate_mode_arguments_are_frozen():
+    from adapter_equivalence.scenarios import ScenarioContractError
+    from adapter_equivalence.server import mode_server_args
+
+    assert {
+        mode: mode_server_args("source", mode)
+        for mode in (
+            "base",
+            "legacy_oft",
+            "canonical_oft",
+            "legacy_lora",
+            "native_lora",
+        )
+    } == {
+        "base": (),
+        "legacy_oft": ("--peft-method", "oft", "--oft-impl", "peft"),
+        "canonical_oft": (
+            "--peft-method",
+            "oft",
+            "--oft-impl",
+            "sibling",
+        ),
+        "legacy_lora": ("--peft-method", "lora"),
+        "native_lora": ("--enable-lora", "--enable-lora-staging"),
+    }
+    assert {
+        mode: mode_server_args("candidate", mode)
+        for mode in ("base", "canonical_oft", "native_lora")
+    } == {
+        "base": (),
+        "canonical_oft": ("--peft-method", "oft"),
+        "native_lora": ("--enable-lora", "--enable-lora-staging"),
+    }
+    for legacy_mode in ("legacy_oft", "legacy_lora"):
+        with pytest.raises(
+            ScenarioContractError,
+            match=f"{legacy_mode} is a source-only oracle mode",
+        ):
+            mode_server_args("candidate", legacy_mode)
+
+
+def test_task8_adapter_lifecycle_contains_every_required_transition():
+    from adapter_equivalence.scenarios import lifecycle_transition_names
+
+    assert lifecycle_transition_names("canonical_oft") == (
+        "base.initial",
+        "startup.adapter",
+        "dynamic.load",
+        "dynamic.infer",
+        "dynamic.unload",
+        "dynamic.post-unload-base",
+        "switch.a",
+        "switch.b",
+        "switch.a-again",
+        "mixed.base-a-b",
+        "concurrent.stream",
+        "concurrent.non-stream",
+        "prefill.short",
+        "prefill.long",
+        "decode.short",
+        "decode.long",
+        "stage.v1",
+        "activate.v1",
+        "stage.v2",
+        "activate.v2",
+        "reject.duplicate",
+        "reject.stale",
+        "reject.invalid-id",
+        "reject.invalid-config",
+        "rollback.previous",
+        "restart.same-manifest",
+    )
+
+
+def test_task8_post_unload_output_must_exactly_restore_initial_base():
+    from adapter_equivalence.scenarios import (
+        ScenarioContractError,
+        validate_lifecycle_observations,
+    )
+
+    initial = _observation()
+    validate_lifecycle_observations(
+        {
+            "base.initial": initial,
+            "dynamic.post-unload-base": initial,
+        }
+    )
+
+    divergent = replace(initial, output_ids=initial.output_ids[:-1] + (999,))
+    with pytest.raises(
+        ScenarioContractError,
+        match="post-unload output does not exactly match initial base output",
+    ):
+        validate_lifecycle_observations(
+            {
+                "base.initial": initial,
+                "dynamic.post-unload-base": divergent,
+            }
+        )
+
+
+def test_task8_only_unchanged_source_legacy_startup_can_be_unsupported():
+    from adapter_equivalence.scenarios import (
+        ScenarioContractError,
+        classify_startup_failure,
+    )
+
+    traceback = "RuntimeError: kernel not implemented for this precision"
+    assert classify_startup_failure("source", "legacy_oft", traceback) == {
+        "status": "unsupported_by_legacy",
+        "mode": "legacy_oft",
+        "traceback": traceback,
+    }
+
+    with pytest.raises(
+        ScenarioContractError,
+        match="startup failure is not eligible for legacy-source classification",
+    ):
+        classify_startup_failure("source", "canonical_oft", traceback)
+    with pytest.raises(
+        ScenarioContractError,
+        match="startup failure is not eligible for legacy-source classification",
+    ):
+        classify_startup_failure("candidate", "legacy_oft", traceback)
