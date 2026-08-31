@@ -12,6 +12,31 @@ logger = logging.getLogger(__name__)
 
 OFT_BACKEND_CHOICES = ["triton", "torch_native"]
 OFT_TYPE_CHOICES = ["oft", "canonical_oft"]
+SUPPORTED_OFT_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "qkv_proj",
+    "q_a_proj",
+    "q_b_proj",
+    "kv_a_proj_with_mqa",
+    "kv_b_proj",
+    "gate_up_proj",
+    "embed_tokens",
+    "lm_head",
+    "wq_a",
+    "wq_b",
+    "wkv",
+    "wo_a",
+    "wo_b",
+    "w1",
+    "w2",
+    "w3",
+]
 
 
 @dataclass(kw_only=True)
@@ -199,8 +224,6 @@ def validate_oft_args(server_args) -> None:
         raise ValueError("--peft-paths requires --peft-method oft.")
     if method is None:
         return
-
-    from sglang.srt.utils.common import SUPPORTED_OFT_TARGET_MODULES
 
     assert server_args.oft_type in OFT_TYPE_CHOICES, (
         f"--oft-type must be one of {OFT_TYPE_CHOICES}, got "
