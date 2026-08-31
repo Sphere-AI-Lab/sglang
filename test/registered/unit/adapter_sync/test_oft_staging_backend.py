@@ -278,6 +278,50 @@ class TestStagedOFTManagerStaging(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("block_size", result.error_message)
 
+    def test_a_construction_failure_never_touches_the_pool_or_jams_the_slot(self):
+        """Regression for round-2 review: OFTConfig.from_dict/OFTAdapter
+        construction must run, and fail, BEFORE memory_pool.stage() is ever
+        called -- there is no rollback for a pool mutation once it has run.
+        Getting the order backwards leaves the hidden staging slot
+        permanently occupied by the failed uid (StagedOFTMemoryPool.stage's
+        own _require_staged_identity then rejects every subsequent
+        stage_adapter call, for ANY uid, until someone retries the exact
+        failed (uid, version) with a corrected config -- an unexposed,
+        untested recovery path). Mirrors StagedLoRAManager.stage_adapter's
+        order: LoRAConfig.from_dict -> validate -> adapter construction, all
+        strictly before memory_pool.stage(...)."""
+        manager = _manager()
+        bad_config = {"target_modules": [TARGET_MODULE], "oft_block_size": BLOCK_SIZE}
+        self.assertNotIn("peft_type", bad_config)
+
+        result = manager.stage_adapter(
+            _raw_named_tensors_for_layer_0(fill_value=9.0),
+            bad_config,
+            "adapter-a",
+            1,
+            "adapter-a",
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("peft_type", result.error_message)
+        self.assertIsNone(
+            manager.memory_pool.staged_identity(),
+            "a construction failure must never touch the pool",
+        )
+        self.assertIsNone(manager._pending_oft_stage)
+
+        # The slot must not be jammed: a different uid can still stage.
+        result = manager.stage_adapter(
+            _raw_named_tensors_for_layer_0(fill_value=1.0),
+            CONFIG_DICT,
+            "adapter-b",
+            2,
+            "adapter-b",
+        )
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(manager.memory_pool.staged_identity(), ("adapter-b", 2))
+
 
 class TestStagedOFTManagerActivation(unittest.TestCase):
     def _staged(self, manager, uid="adapter-a", version=1, fill_value=9.0):

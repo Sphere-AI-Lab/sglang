@@ -309,6 +309,23 @@ class StagedOFTManager(OFTManager):
                     f"version={pending.version}."
                 )
 
+            # Construct and validate the adapter's identity FIRST, before the
+            # pool is touched at all: a failure here (e.g. a missing
+            # peft_type/target_modules/oft_block_size key) must leave the
+            # hidden staging slot untouched, or it jams permanently -- there
+            # is no rollback for memory_pool.stage() once it has run, and
+            # _pending_oft_stage would stay None (this call never reaches the
+            # assignment below), so no later stage_adapter call for ANY uid
+            # could ever re-occupy the slot. Matches
+            # StagedLoRAManager.stage_adapter's order exactly: LoRAConfig.
+            # from_dict -> validate -> _create_lora_adapter_from_tensors, all
+            # strictly before memory_pool.stage(...).
+            oft_config = OFTConfig.from_dict(config)
+            oft_adapter = OFTAdapter(
+                uid, oft_config, self.base_hf_config, self.load_config, self.oft_backend
+            )
+            oft_adapter.initialize_weights_from_tensors(dict(named_tensors))
+
             staged_dense, fused_expert_chunk, block_size = (
                 self._partition_and_precompute(named_tensors, config)
             )
@@ -317,18 +334,6 @@ class StagedOFTManager(OFTManager):
                 self.apply_streamed_expert_oft(
                     fused_expert_chunk, block_size, slot_idx=self.memory_pool.staging_idx
                 )
-
-            # Construct and validate the adapter's identity NOW, before any
-            # pool-level activate() is ever attempted for this uid: unlike a
-            # deferred construction at activate time, a failure here (e.g. a
-            # missing peft_type/target_modules/oft_block_size key) leaves
-            # nothing staged and no pending transaction to get stuck --
-            # activate_adapter can then be a trivial, non-failing dict commit.
-            oft_config = OFTConfig.from_dict(config)
-            oft_adapter = OFTAdapter(
-                uid, oft_config, self.base_hf_config, self.load_config, self.oft_backend
-            )
-            oft_adapter.initialize_weights_from_tensors(dict(named_tensors))
 
             self._pending_oft_stage = PendingOFTStage(
                 uid=uid,
