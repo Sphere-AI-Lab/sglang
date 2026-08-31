@@ -211,14 +211,8 @@ class StagedOFTTestHarness:
             "oft",
             "--oft-impl",
             "staged",
-            # Deliberate: keeps the OFT rotation buffers in float32
-            # regardless of the model's own bf16 dtype, so the bitwise
-            # comparisons below (staged-update-then-activate vs. a fresh
-            # boot reaching the same version) aren't also comparing bf16
-            # rounding taken through two different code paths (the regular
-            # boot-time disk-load path vs. the staged NCCL-load path).
-            "--oft-dtype",
-            "float32",
+            # No --oft-dtype: defaults to the base model's dtype (bf16),
+            # matching test_lora_staged_update.py's approach.
             "--max-oft-block-size",
             str(BLOCK_SIZE),
             "--peft-target-modules",
