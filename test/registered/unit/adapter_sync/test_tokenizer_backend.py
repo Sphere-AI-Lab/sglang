@@ -26,7 +26,12 @@ class TestStagingBackendSelection(unittest.TestCase):
         from sglang.srt.adapter_sync.tokenizer_backend import get_staging_backend
         from sglang.srt.lora.staged_manager import LoRAStagingBackend
 
-        tm = SimpleNamespace(server_args=SimpleNamespace(enable_lora_staging=True))
+        tm = SimpleNamespace(
+            server_args=SimpleNamespace(
+                enable_lora_staging=True,
+                peft_method=None,
+            )
+        )
         obj = SimpleNamespace(load_format="lora_adapter")
         self.assertIsInstance(get_staging_backend(tm, obj), LoRAStagingBackend)
 
@@ -35,7 +40,12 @@ class TestStagingBackendSelection(unittest.TestCase):
 
         from sglang.srt.adapter_sync.tokenizer_backend import get_staging_backend
 
-        tm = SimpleNamespace(server_args=SimpleNamespace(enable_lora_staging=False))
+        tm = SimpleNamespace(
+            server_args=SimpleNamespace(
+                enable_lora_staging=False,
+                peft_method=None,
+            )
+        )
         obj = SimpleNamespace(load_format="lora_adapter")
         self.assertIsNone(get_staging_backend(tm, obj))
 
@@ -44,6 +54,26 @@ class TestStagingBackendSelection(unittest.TestCase):
 
         from sglang.srt.adapter_sync.tokenizer_backend import get_staging_backend
 
-        tm = SimpleNamespace(server_args=SimpleNamespace(enable_lora_staging=True))
+        tm = SimpleNamespace(
+            server_args=SimpleNamespace(
+                enable_lora_staging=True,
+                peft_method=None,
+            )
+        )
         obj = SimpleNamespace(load_format="oft_adapter")
         self.assertIsNone(get_staging_backend(tm, obj))
+
+    def test_selects_oft_backend_for_canonical_oft_update(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.adapter_sync.tokenizer_backend import get_staging_backend
+        from sglang.srt.oft.staged_manager import OFTStagingBackend
+
+        tm = SimpleNamespace(
+            server_args=SimpleNamespace(
+                enable_lora_staging=False,
+                peft_method="oft",
+            )
+        )
+        obj = SimpleNamespace(load_format="oft_adapter")
+        self.assertIsInstance(get_staging_backend(tm, obj), OFTStagingBackend)
