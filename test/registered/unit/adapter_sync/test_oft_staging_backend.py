@@ -57,9 +57,30 @@ def _named_tensors_for_layer_0(fill_value: float):
     expects; shape/content correctness for the OFT math itself is covered by
     existing tests in test/registered/unit/oft/ -- these tests only need a
     tensor _write_oft_r_block will accept without raising, distinguishable by
-    fill_value so slot-isolation assertions can tell slots apart."""
+    fill_value so slot-isolation assertions can tell slots apart. This is the
+    memory pool's OWN internal format -- exercised directly against
+    StagedOFTMemoryPool.stage()/activate() in TestOFTStaging{SlotReservation,
+    Transaction} above. StagedOFTManager.stage_adapter does NOT take this
+    format (see _raw_named_tensors_for_layer_0 below)."""
     r = torch.full((BLOCK_SIZE, BLOCK_SIZE), fill_value, dtype=torch.float32)
     return {(TARGET_MODULE, 0): (r, BLOCK_SIZE, None, 1)}
+
+
+def _raw_named_tensors_for_layer_0(fill_value: float):
+    """Raw checkpoint-name compact OFT weight for layer 0's target module --
+    the actual shape StagedOFTManager.stage_adapter's named_tensors argument
+    takes in production (weight_updater.py -> peft/integration.py ->
+    oft_manager.stage_adapter(tensors, ...), and OFTManager._stage_fill's own
+    docstring: "raw checkpoint-name tensors -- the SAME format
+    load_streamed_oft_adapter consumes"). A single compact block
+    (num_blocks=1) so precompute_oft_r's result broadcasts to every block
+    position in the runtime buffer regardless of that buffer's own block
+    count -- the same "block_share" case _write_oft_r_block already handles
+    for a real single-block adapter -- so this test doesn't need to know the
+    pool's inferred per-module block count."""
+    n_elements = BLOCK_SIZE * (BLOCK_SIZE - 1) // 2
+    compact = torch.full((1, n_elements), fill_value, dtype=torch.float32)
+    return [(f"model.layers.0.self_attn.{TARGET_MODULE}.oft_R", compact)]
 
 
 class TestOFTStagingSlotReservation(unittest.TestCase):
@@ -158,6 +179,8 @@ def _manager(max_ofts_per_batch=4):
     manager.base_hf_config = manager.memory_pool.base_hf_config
     manager.load_config = MagicMock()
     manager.oft_backend = MagicMock()
+    manager.max_oft_block_size = BLOCK_SIZE
+    manager.adapter_modules = [{}]
     manager.configs = {}
     manager.adapters = {}
     manager.refs = {}
@@ -183,24 +206,16 @@ class TestStagedOFTManagerStaging(unittest.TestCase):
         manager = _manager()
 
         result = manager.stage_adapter(
-            _named_tensors_for_layer_0(fill_value=9.0),
+            _raw_named_tensors_for_layer_0(fill_value=9.0),
             CONFIG_DICT,
             name="adapter-a",
             version=1,
             adapter_id="adapter-a",
         )
 
-        self.assertTrue(result.success)
+        self.assertTrue(result.success, result.error_message)
         self.assertEqual(
             manager.memory_pool.staged_identity(), ("adapter-a", 1)
-        )
-        self.assertTrue(
-            (
-                manager.memory_pool.slot(
-                    f"R:{TARGET_MODULE}", 0, manager.memory_pool.staging_idx
-                )
-                == 9.0
-            ).all()
         )
         self.assertIsNotNone(manager._pending_oft_stage)
         self.assertEqual(manager._pending_oft_stage.uid, "adapter-a")
@@ -208,7 +223,7 @@ class TestStagedOFTManagerStaging(unittest.TestCase):
     def test_same_pending_identity_retry_is_idempotent(self):
         manager = _manager()
         args = (
-            _named_tensors_for_layer_0(fill_value=9.0),
+            _raw_named_tensors_for_layer_0(fill_value=9.0),
             CONFIG_DICT,
             "adapter-a",
             1,
@@ -218,14 +233,14 @@ class TestStagedOFTManagerStaging(unittest.TestCase):
         first = manager.stage_adapter(*args)
         second = manager.stage_adapter(*args)
 
-        self.assertTrue(first.success)
-        self.assertTrue(second.success)
+        self.assertTrue(first.success, first.error_message)
+        self.assertTrue(second.success, second.error_message)
 
     def test_conflicting_pending_stage_is_rejected(self):
         manager = _manager()
         self.assertTrue(
             manager.stage_adapter(
-                _named_tensors_for_layer_0(fill_value=9.0),
+                _raw_named_tensors_for_layer_0(fill_value=9.0),
                 CONFIG_DICT,
                 "adapter-a",
                 1,
@@ -234,7 +249,7 @@ class TestStagedOFTManagerStaging(unittest.TestCase):
         )
 
         result = manager.stage_adapter(
-            _named_tensors_for_layer_0(fill_value=1.0),
+            _raw_named_tensors_for_layer_0(fill_value=1.0),
             CONFIG_DICT,
             "adapter-b",
             2,
@@ -244,17 +259,36 @@ class TestStagedOFTManagerStaging(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("adapter-a", result.error_message)
 
+    def test_stage_rejects_a_block_size_mismatch(self):
+        """Guards OFTManager._stage_fill's block_size check (oft_manager.py:
+        1440-1449), reused unchanged by _partition_and_precompute -- a
+        streamed update whose PEFT config disagrees with the server's
+        --max-oft-block-size must be rejected, not silently misapplied."""
+        manager = _manager()
+        bad_config = dict(CONFIG_DICT, oft_block_size=BLOCK_SIZE * 2)
+
+        result = manager.stage_adapter(
+            _raw_named_tensors_for_layer_0(fill_value=9.0),
+            bad_config,
+            "adapter-a",
+            1,
+            "adapter-a",
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("block_size", result.error_message)
+
 
 class TestStagedOFTManagerActivation(unittest.TestCase):
     def _staged(self, manager, uid="adapter-a", version=1, fill_value=9.0):
         result = manager.stage_adapter(
-            _named_tensors_for_layer_0(fill_value=fill_value),
+            _raw_named_tensors_for_layer_0(fill_value=fill_value),
             CONFIG_DICT,
             uid,
             version,
             uid,
         )
-        self.assertTrue(result.success)
+        self.assertTrue(result.success, result.error_message)
 
     def test_activate_requires_a_pending_stage_matching_identity(self):
         manager = _manager()
@@ -273,16 +307,35 @@ class TestStagedOFTManagerActivation(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("No serving slot is reserved", result.error_message)
 
-    def test_activate_copies_staged_data_and_clears_pending(self):
+    def test_stage_then_activate_from_raw_tensors_lands_the_transformed_value(self):
+        """End-to-end through the real transformation (mirrors Task 2's
+        TestOFTStagingTransaction.test_stage_then_activate_writes_only_the_
+        destination_slot, but driven through StagedOFTManager.stage_adapter/
+        activate_adapter with a RAW checkpoint-name tensor -- the shape a
+        real weight_updater.py -> peft/integration.py ->
+        oft_manager.stage_adapter(...) call actually supplies -- rather than
+        the pool's internal format directly)."""
+        from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
+
         manager = _manager()
+        compact = _raw_named_tensors_for_layer_0(fill_value=9.0)[0][1]
+        slot_0_before = manager.memory_pool.slot(f"R:{TARGET_MODULE}", 0, 0).clone()
+
         self._staged(manager, fill_value=9.0)
         manager.memory_pool.uid_to_buffer_id["adapter-a"] = 2
-
         result = manager.activate_adapter("adapter-a", 1, "adapter-a")
 
-        self.assertTrue(result.success)
+        self.assertTrue(result.success, result.error_message)
+        expected_r = precompute_oft_r(compact, BLOCK_SIZE)[0]
+        actual = manager.memory_pool.slot(f"R:{TARGET_MODULE}", 0, 2)
         self.assertTrue(
-            (manager.memory_pool.slot(f"R:{TARGET_MODULE}", 0, 2) == 9.0).all()
+            torch.allclose(actual, expected_r.expand_as(actual)),
+            "activate must land the Cayley-transformed raw tensor, not the "
+            "raw compact weight, in the destination slot",
+        )
+        self.assertTrue(
+            (manager.memory_pool.slot(f"R:{TARGET_MODULE}", 0, 0) == slot_0_before).all(),
+            "activating one uid must not touch slot 0",
         )
         self.assertIsNone(manager._pending_oft_stage)
         self.assertIsNone(manager.memory_pool.staged_identity())
@@ -301,20 +354,20 @@ class TestActivateUpdatesManagerBookkeeping(unittest.TestCase):
     def test_activate_populates_configs_and_adapters_for_the_new_uid(self):
         manager = _manager()
         result = manager.stage_adapter(
-            _named_tensors_for_layer_0(fill_value=9.0),
+            _raw_named_tensors_for_layer_0(fill_value=9.0),
             CONFIG_DICT,
             "adapter-a",
             1,
             "adapter-a",
         )
-        self.assertTrue(result.success)
+        self.assertTrue(result.success, result.error_message)
         manager.memory_pool.uid_to_buffer_id["adapter-a"] = 2
         self.assertNotIn("adapter-a", manager.configs)
         self.assertNotIn("adapter-a", manager.adapters)
 
         result = manager.activate_adapter("adapter-a", 1, "adapter-a")
 
-        self.assertTrue(result.success)
+        self.assertTrue(result.success, result.error_message)
         self.assertIn("adapter-a", manager.configs)
         self.assertIn("adapter-a", manager.adapters)
         self.assertEqual(manager.configs["adapter-a"].block_size, BLOCK_SIZE)

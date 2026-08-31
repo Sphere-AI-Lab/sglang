@@ -5,6 +5,7 @@ eviction (unaffected by this file)."""
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.oft.mem_pool import OFTMemoryPool
 from sglang.srt.oft.oft import OFTAdapter
 from sglang.srt.oft.oft_config import OFTConfig
@@ -123,15 +124,22 @@ class StagedOFTMemoryPool(OFTMemoryPool):
 
 
 class PendingOFTStage:
-    """CPU metadata retained until a staged OFT adapter is activated."""
+    """CPU metadata retained until a staged OFT adapter is activated.
 
-    __slots__ = ("uid", "version", "named_tensors", "config", "name")
+    ``config``/``adapter`` are already fully constructed and validated (see
+    ``StagedOFTManager.stage_adapter``) -- activation is then a trivial dict
+    commit, mirroring ``PendingLoRAStage``/``StagedLoRAManager.activate_adapter``
+    exactly, with no adapter-construction work (and no way for it to fail)
+    left to do after the pool-level copy has already succeeded.
+    """
 
-    def __init__(self, uid, version, named_tensors, config, name):
+    __slots__ = ("uid", "version", "config", "adapter", "name")
+
+    def __init__(self, uid, version, config, adapter, name):
         self.uid = uid
         self.version = version
-        self.named_tensors = named_tensors
         self.config = config
+        self.adapter = adapter
         self.name = name
 
 
@@ -139,15 +147,22 @@ class StagedOFTManager(OFTManager):
     """OFT manager with an explicit stage/activate transaction, alongside
     B1's existing multi-tenant admission and eviction (unaffected).
 
-    ``named_tensors`` here is the memory pool's own per-uid ``stage()``
-    payload -- ``Dict[(target_module, layer_id), (r, block_size,
-    slice_index, split_count)]`` (see ``StagedOFTMemoryPool.stage`` and
-    ``OFTMemoryPool._fill_slot``) -- NOT raw checkpoint-name tensors.
-    Translating a raw streamed payload into that shape is the existing
-    ``OFTManager._stage_fill`` machinery (Cayley precompute + dense/expert
-    partitioning) built for the single-slot double-buffer path; wiring that
-    translation onto this per-uid transaction is out of scope here (this
-    class only wires the already-staged tensors through the new pool).
+    ``stage_adapter``'s ``named_tensors`` is raw checkpoint-name tensors --
+    the SAME format ``OFTManager._stage_fill``/``load_streamed_oft_adapter``
+    consume, and the SAME format ``weight_updater.py`` -> ``peft/
+    integration.py`` -> ``oft_manager.stage_adapter(...)`` actually supplies
+    in production. This class reuses every transformation primitive
+    ``_stage_fill`` (oft_manager.py:1412-1538, unedited) itself uses --
+    ``_partition_expert_oft_tensors``, ``normalize_merged_oft_weights``,
+    ``memory_pool._resolve_oft_tensor_plan``/``_slice_oft_compact_weight``,
+    ``precompute_oft_r``, and the inherited ``apply_streamed_expert_oft`` --
+    only the orchestration loop is duplicated here (see
+    ``_partition_and_precompute``), because ``_stage_fill`` itself ends by
+    calling the OLD pool-wide, single-slot ``AdapterMemPool.stage(version,
+    named_tensors)`` (2 args), which is incompatible with
+    ``StagedOFTMemoryPool.stage(uid, version, named_tensors)`` (3 args,
+    per-uid). ``_stage_fill`` is untouched and still serves the original
+    single-slot double-buffer path.
     """
 
     def __init__(self, *args, **kwargs):
@@ -188,6 +203,97 @@ class StagedOFTManager(OFTManager):
         # Initializing memory pool with base model
         self.fetch_new_ofts({None})
 
+    def _partition_and_precompute(self, named_tensors, config):
+        """Raw checkpoint-name tensors -> (staged_dense, fused_expert_chunk,
+        block_size), the per-uid analogue of ``OFTManager._stage_fill``
+        (oft_manager.py:1412-1538, unedited -- still the hook for the
+        original single-slot ``AdapterManager.stage_adapter``). Reuses every
+        transformation primitive that method uses; only the final pool call
+        differs (per-uid ``memory_pool.stage(uid, version, staged_dense)``
+        here vs. the pool-wide ``memory_pool.stage(version, staged_dense)``
+        there), which is why this loop is duplicated rather than shared.
+
+        Unlike ``_stage_fill``, this does NOT raise when other adapters are
+        already resident: that guard existed because the OLD pool-wide
+        single-slot path cannot represent more than one resident adapter --
+        exactly the limitation ``StagedOFTMemoryPool`` (per-uid destination
+        slots, Task 2) removes. Concurrent/conflicting use of the ONE hidden
+        staging slot itself is still guarded, by
+        ``StagedOFTMemoryPool.stage()``'s own ``_require_staged_identity``
+        and by this class's own ``_pending_oft_stage`` check in
+        ``stage_adapter``.
+        """
+        from sglang.srt.oft.mem_pool import normalize_merged_oft_weights
+        from sglang.srt.oft.streamed_weight_loader import (
+            _partition_expert_oft_tensors,
+        )
+        from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
+
+        memory_pool = self.memory_pool
+        block_size = (
+            config.get("oft_block_size", 32) if config else self.max_oft_block_size
+        )
+        if block_size != memory_pool.max_oft_block_size:
+            raise ValueError(
+                f"OFT staged update has block_size={block_size}, but the "
+                f"server pool is allocated for --max-oft-block-size="
+                f"{memory_pool.max_oft_block_size}; smaller or mixed block "
+                f"sizes are unsupported."
+            )
+
+        fused_expert_chunk, dsv4_expert_chunk, dense_named_tensors = (
+            _partition_expert_oft_tensors(named_tensors, tp_rank=memory_pool.tp_rank)
+        )
+        assert not dsv4_expert_chunk, (
+            "DSV4-style expert OFT staging is not supported (fork "
+            "DeepSeekV4 model support was removed)"
+        )
+
+        if dense_named_tensors:
+            dense_dict = dict(dense_named_tensors)
+            if len(dense_dict) == len(dense_named_tensors):
+                dense_named_tensors = list(
+                    normalize_merged_oft_weights(
+                        dense_dict, available_fused_targets=set(memory_pool.R_buffer)
+                    ).items()
+                )
+
+        staged_dense = {}
+        oft_modules = self.adapter_modules
+        for tensor_name, tensor in dense_named_tensors:
+            layer_id = get_layer_id(tensor_name)
+            if layer_id is None:
+                continue  # embeddings/lm_head: out of scope, see _stage_fill.
+            fused_target, slice_module, is_row_parallel, slice_index, split_count = (
+                memory_pool._resolve_oft_tensor_plan(tensor_name, oft_modules, layer_id)
+            )
+            compact_weight = tensor
+            if is_row_parallel:
+                compact_weight = memory_pool._slice_oft_compact_weight(
+                    compact_weight, slice_module
+                )
+            target_device = memory_pool.R_buffer[fused_target][layer_id].device
+            if compact_weight.device != target_device:
+                compact_weight = compact_weight.to(target_device)
+            r = precompute_oft_r(compact_weight, block_size)
+            existing = staged_dense.get((fused_target, layer_id))
+            if existing is not None and existing[2] != slice_index:
+                raise RuntimeError(
+                    f"stage_adapter: multiple split OFT slices for the same "
+                    f"fused target {fused_target!r} (layer {layer_id}) arrived "
+                    f"in one call without all siblings present to pre-fuse "
+                    f"(slice_index {existing[2]} then {slice_index}); send "
+                    f"the fused target's siblings together in one payload."
+                )
+            staged_dense[(fused_target, layer_id)] = (
+                r,
+                block_size,
+                slice_index,
+                split_count,
+            )
+
+        return staged_dense, fused_expert_chunk, block_size
+
     def stage_adapter(
         self, named_tensors, config, name, version, adapter_id=None
     ) -> "OFTUpdateOutput":
@@ -202,12 +308,33 @@ class StagedOFTManager(OFTManager):
                     f"An OFT stage is already pending for uid={pending.uid} "
                     f"version={pending.version}."
                 )
-            self.memory_pool.stage(uid, version, named_tensors)
+
+            staged_dense, fused_expert_chunk, block_size = (
+                self._partition_and_precompute(named_tensors, config)
+            )
+            self.memory_pool.stage(uid, version, staged_dense)
+            if fused_expert_chunk:
+                self.apply_streamed_expert_oft(
+                    fused_expert_chunk, block_size, slot_idx=self.memory_pool.staging_idx
+                )
+
+            # Construct and validate the adapter's identity NOW, before any
+            # pool-level activate() is ever attempted for this uid: unlike a
+            # deferred construction at activate time, a failure here (e.g. a
+            # missing peft_type/target_modules/oft_block_size key) leaves
+            # nothing staged and no pending transaction to get stuck --
+            # activate_adapter can then be a trivial, non-failing dict commit.
+            oft_config = OFTConfig.from_dict(config)
+            oft_adapter = OFTAdapter(
+                uid, oft_config, self.base_hf_config, self.load_config, self.oft_backend
+            )
+            oft_adapter.initialize_weights_from_tensors(dict(named_tensors))
+
             self._pending_oft_stage = PendingOFTStage(
                 uid=uid,
                 version=version,
-                named_tensors=named_tensors,
-                config=config,
+                config=oft_config,
+                adapter=oft_adapter,
                 name=name,
             )
         except Exception as error:
@@ -258,26 +385,13 @@ class StagedOFTManager(OFTManager):
         # self.adapters[uid].block_size / self.configs[uid].block_size for
         # every resident uid on every batch. Activating a new uid without
         # populating these leaves it physically live in the GPU slot but
-        # invisible to the manager's own bookkeeping. Mirrors
-        # load_oft_weights_from_tensors's construction (OFTConfig + OFTAdapter
-        # from the adapter's own config), except no raw checkpoint tensors are
-        # available here (named_tensors is the pool's already-Cayley-baked
-        # per-uid payload, not the raw HF weights `initialize_weights_from_
-        # tensors` expects) -- the R data itself is already correctly resident
-        # in the memory pool via stage()/activate() above, so the OFTAdapter
-        # built here is a metadata shell (block_size, target_modules) rather
-        # than a fully weight-populated one.
-        try:
-            oft_config = OFTConfig.from_dict(pending.config)
-            oft_adapter = OFTAdapter(
-                uid, oft_config, self.base_hf_config, self.load_config, self.oft_backend
-            )
-        except Exception as bookkeeping_error:
-            return self.create_oft_update_result(
-                success=False, error_message=str(bookkeeping_error)
-            )
-        self.configs[uid] = oft_config
-        self.adapters[uid] = oft_adapter
+        # invisible to the manager's own bookkeeping. pending.config/
+        # pending.adapter were already fully constructed and validated in
+        # stage_adapter, so this is a trivial commit, mirroring
+        # StagedLoRAManager.activate_adapter's
+        # `self.configs[uid] = pending.config; self.loras[uid] = pending.adapter`.
+        self.configs[uid] = pending.config
+        self.adapters[uid] = pending.adapter
 
         # No discard_stage() call here, unlike StagedLoRAManager: unlike
         # StagedLoRAMemoryPool.activate (which leaves _staged_uid/_staged_
