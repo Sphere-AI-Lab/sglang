@@ -1450,10 +1450,19 @@ def test_task8_internal_oft_control_uses_scheduler_bridge_and_registry_lifecycle
             self.loop = Loop()
             self.tokenizer_manager = manager
             self.serialized = []
+            self.weight_update_sessions = []
 
         def _serialize_tensors_per_rank(self, tensors, load_format):
             self.serialized.append((tensors, load_format))
             return [b"empty-control-payload"]
+
+        def begin_weight_update(self):
+            self.weight_update_sessions.append("begin")
+            return True, "ok"
+
+        def end_weight_update(self):
+            self.weight_update_sessions.append("end")
+            return True, "ok"
 
     manager = Manager()
     engine = Engine(manager)
@@ -1469,6 +1478,7 @@ def test_task8_internal_oft_control_uses_scheduler_bridge_and_registry_lifecycle
         ([], "adapter_equivalence_oft_control"),
         ([], "adapter_equivalence_oft_control"),
     ]
+    assert engine.weight_update_sessions == ["begin", "end", "begin", "end"]
     load_request, load_http_request = manager.calls[0]
     assert load_http_request is None
     assert load_request.adapter_name == "policy-a"
