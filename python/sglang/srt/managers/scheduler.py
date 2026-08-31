@@ -3340,11 +3340,19 @@ class Scheduler(
             running_ofts.update(req.adapter_id for req in adder.can_run_list)
 
         if self.enable_lora:
-            running_loras = {
-                req.lora_id for req in running_batch.reqs if not req.finished()
-            }
-            # Account for LoRAs that are already loaded in the adder, such as chunked requests
-            running_loras.update(req.lora_id for req in adder.can_run_list)
+            if self.max_loras_per_batch == 1:
+                # At most one distinct LoRA identity can ever be admitted, so
+                # track it as a scalar instead of paying for set construction
+                # on every scheduling step (see _can_schedule_lora_req_fast).
+                has_active_lora, active_lora_id = self._resolve_active_lora_fast(
+                    running_batch, adder.can_run_list
+                )
+            else:
+                running_loras = {
+                    req.lora_id for req in running_batch.reqs if not req.finished()
+                }
+                # Account for LoRAs that are already loaded in the adder, such as chunked requests
+                running_loras.update(req.lora_id for req in adder.can_run_list)
 
             if self.lora_drainer:
                 self.lora_drainer.update_draining_state(
@@ -3357,8 +3365,15 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
-                continue
+            if self.enable_lora:
+                if self.max_loras_per_batch == 1:
+                    can_schedule_lora = self._can_schedule_lora_req_fast(
+                        req, has_active_lora, active_lora_id
+                    )
+                else:
+                    can_schedule_lora = self._can_schedule_lora_req(req, running_loras)
+                if not can_schedule_lora:
+                    continue
 
             if self.enable_oft and not peft.maybe_admit_request(
                 self, req, running_ofts
@@ -3399,7 +3414,10 @@ class Scheduler(
             )
 
             if self.enable_lora:
-                running_loras.add(req.lora_id)
+                if self.max_loras_per_batch == 1:
+                    has_active_lora, active_lora_id = True, req.lora_id
+                else:
+                    running_loras.add(req.lora_id)
 
             if self.enable_oft:
                 running_ofts.add(req.adapter_id)
@@ -3547,6 +3565,52 @@ class Scheduler(
             return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
                 new_lora_set
             )
+
+    def _resolve_active_lora_fast(
+        self, running_batch: ScheduleBatch, can_run_list: List[Req]
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        max_loras_per_batch == 1 equivalent of building the `running_loras` set:
+        with only one serving slot, admission never lets more than one distinct
+        lora_id be running at a time, so the first non-finished request's
+        lora_id (falling back to the adder's can_run_list) already identifies
+        the sole active identity, if any.
+        """
+        for req in running_batch.reqs:
+            if not req.finished():
+                return True, req.lora_id
+
+        for req in can_run_list:
+            return True, req.lora_id
+
+        return False, None
+
+    def _can_schedule_lora_req_fast(
+        self, req: Req, has_active_lora: bool, active_lora_id: Optional[str]
+    ) -> bool:
+        """
+        max_loras_per_batch == 1 equivalent of _can_schedule_lora_req: with a
+        single serving slot, admission reduces to comparing req.lora_id against
+        the one currently active identity (if any) instead of building/testing
+        a set, while still respecting the drainer and overlap-loading.
+        """
+        if self.lora_drainer and not self.lora_drainer.can_schedule(req):
+            return False
+
+        if has_active_lora and req.lora_id == active_lora_id:
+            return True
+
+        if self.enable_lora_overlap_loading:
+            running_loras = {active_lora_id} if has_active_lora else set()
+            return self.lora_overlap_loader.try_overlap_load_lora(
+                req.lora_id, running_loras
+            )
+        else:
+            # req.lora_id differs from active_lora_id (or nothing checked yet is
+            # active). validate_lora_batch({req.lora_id} | {active_lora_id, ...})
+            # can only pass when that union stays at size <= 1, i.e. only when
+            # there's no active identity yet.
+            return not has_active_lora
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
