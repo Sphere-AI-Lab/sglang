@@ -22,6 +22,8 @@ _CANDIDATE_MODE_ARGS = {
     "native_lora": ("--enable-lora", "--enable-lora-staging"),
 }
 
+_OFT_MODES = {"legacy_oft", "canonical_oft"}
+
 
 @dataclass(frozen=True)
 class ServerSpec:
@@ -37,11 +39,16 @@ class ServerSpec:
     quantization: str | None = None
     moe_runner: str | None = None
     startup_adapters: tuple[tuple[str, str], ...] = ()
+    max_oft_block_size: int | None = None
+    peft_target_modules: tuple[str, ...] = ()
     base_gpu_id: int = 1
     mem_fraction_static: float = 0.8
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "startup_adapters", tuple(self.startup_adapters))
+        object.__setattr__(
+            self, "peft_target_modules", tuple(self.peft_target_modules)
+        )
         if not self.model_path:
             raise ScenarioContractError("model_path must be non-empty")
         if type(self.port) is not int or not 1 <= self.port <= 65535:
@@ -71,6 +78,39 @@ class ServerSpec:
         if self.mode == "base" and self.startup_adapters:
             raise ScenarioContractError("base mode cannot preload adapters")
         mode_server_args(self.revision_kind, self.mode)
+        if self.max_oft_block_size is not None and (
+            type(self.max_oft_block_size) is not int
+            or self.max_oft_block_size <= 0
+        ):
+            raise ScenarioContractError(
+                "max_oft_block_size must be a positive integer when present"
+            )
+        if any(
+            type(module) is not str or not module
+            for module in self.peft_target_modules
+        ):
+            raise ScenarioContractError(
+                "peft_target_modules must contain non-empty strings"
+            )
+        if len(self.peft_target_modules) != len(set(self.peft_target_modules)):
+            raise ScenarioContractError("peft_target_modules must be unique")
+        if self.mode not in _OFT_MODES and (
+            self.max_oft_block_size is not None or self.peft_target_modules
+        ):
+            raise ScenarioContractError(
+                "OFT shape fields require an OFT mode"
+            )
+        if (
+            self.mode in _OFT_MODES
+            and not self.startup_adapters
+            and (
+                self.max_oft_block_size is None
+                or not self.peft_target_modules
+            )
+        ):
+            raise ScenarioContractError(
+                "dynamic OFT requires max_oft_block_size and peft_target_modules"
+            )
 
     @property
     def base_url(self) -> str:
@@ -123,6 +163,13 @@ def server_other_args(spec: ServerSpec) -> tuple[str, ...]:
     if not spec.cuda_graph:
         arguments.append("--disable-cuda-graph")
     arguments.extend(mode_server_args(spec.revision_kind, spec.mode))
+    if spec.max_oft_block_size is not None:
+        arguments.extend(
+            ("--max-oft-block-size", str(spec.max_oft_block_size))
+        )
+    if spec.peft_target_modules:
+        arguments.append("--peft-target-modules")
+        arguments.extend(spec.peft_target_modules)
     if spec.startup_adapters:
         arguments.append(_startup_adapter_flag(spec.mode))
         arguments.extend(
@@ -155,6 +202,10 @@ def engine_kwargs(spec: ServerSpec) -> dict[str, object]:
         arguments["quantization"] = spec.quantization
     if spec.moe_runner is not None:
         arguments["moe_runner_backend"] = spec.moe_runner
+    if spec.max_oft_block_size is not None:
+        arguments["max_oft_block_size"] = spec.max_oft_block_size
+    if spec.peft_target_modules:
+        arguments["peft_target_modules"] = spec.peft_target_modules
 
     if spec.mode == "legacy_oft":
         arguments.update(peft_method="oft", oft_impl="peft")
