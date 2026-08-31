@@ -329,11 +329,39 @@ class StagedOFTManager(OFTManager):
             staged_dense, fused_expert_chunk, block_size = (
                 self._partition_and_precompute(named_tensors, config)
             )
-            self.memory_pool.stage(uid, version, staged_dense)
-            if fused_expert_chunk:
-                self.apply_streamed_expert_oft(
-                    fused_expert_chunk, block_size, slot_idx=self.memory_pool.staging_idx
-                )
+            # memory_pool.stage()/apply_streamed_expert_oft() are the two
+            # calls that actually mutate the hidden staging slot; either can
+            # still raise (e.g. apply_streamed_expert_oft's shape/dtype/
+            # device mismatch or tp_size divisibility checks on a bad expert
+            # chunk) AFTER the dense stage() call has already run. Neither
+            # has its own rollback, and self._pending_oft_stage is not
+            # assigned until both succeed -- so a bare exception here would
+            # leave the pool's _staged_uid/_staged_version set for this
+            # (uid, version) with no pending transaction pointing at it,
+            # jamming the one hidden slot for every future stage_adapter
+            # call (any uid) until someone retries this exact identity.
+            # discard_stage() clears that regardless of which of the two
+            # calls failed, so the slot is clean again before the failure
+            # result is returned.
+            try:
+                self.memory_pool.stage(uid, version, staged_dense)
+                if fused_expert_chunk:
+                    self.apply_streamed_expert_oft(
+                        fused_expert_chunk,
+                        block_size,
+                        slot_idx=self.memory_pool.staging_idx,
+                    )
+            except Exception as mutation_error:
+                try:
+                    self.memory_pool.discard_stage(uid, version)
+                except Exception:
+                    # stage() itself may have raised before ever setting
+                    # _staged_uid/_staged_version (e.g. a bad tensor shape
+                    # inside _fill_slot), in which case there is nothing to
+                    # discard and this would raise "the staging slot is
+                    # empty" -- the original mutation_error is what matters.
+                    pass
+                raise mutation_error
 
             self._pending_oft_stage = PendingOFTStage(
                 uid=uid,

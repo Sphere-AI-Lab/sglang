@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -307,6 +307,63 @@ class TestStagedOFTManagerStaging(unittest.TestCase):
         self.assertIsNone(
             manager.memory_pool.staged_identity(),
             "a construction failure must never touch the pool",
+        )
+        self.assertIsNone(manager._pending_oft_stage)
+
+        # The slot must not be jammed: a different uid can still stage.
+        result = manager.stage_adapter(
+            _raw_named_tensors_for_layer_0(fill_value=1.0),
+            CONFIG_DICT,
+            "adapter-b",
+            2,
+            "adapter-b",
+        )
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(manager.memory_pool.staged_identity(), ("adapter-b", 2))
+
+    def test_an_expert_apply_failure_never_touches_the_pool_or_jams_the_slot(self):
+        """Regression for round-3 review: the SAME jamming failure class as
+        test_a_construction_failure_never_touches_the_pool_or_jams_the_slot,
+        but triggered from apply_streamed_expert_oft (oft_manager.py:1171+,
+        unedited) instead of adapter construction. That method has real raise
+        paths for a mismatched expert/MoE OFT chunk (a shape/dtype/device
+        mismatch via _raise_streamed_expert_oft_buffer_mismatch, or a
+        tp_size-divisibility assert) and runs AFTER memory_pool.stage(...)
+        has already mutated the dense group and set _staged_uid/
+        _staged_version. Without the discard_stage() cleanup in
+        stage_adapter's mutation try/except, this leaves the pool believing
+        the failed (uid, version) is staged while self._pending_oft_stage is
+        never set -- jamming the one hidden slot for every future
+        stage_adapter call (any uid).
+
+        Building a real mismatched-expert-buffer fixture would need a
+        FusedMoE module wired into base_model (this file's fixtures use a
+        bare MagicMock, matching Task 2's own fixtures, which also don't
+        cover the expert path) -- mocking apply_streamed_expert_oft's raise
+        directly is the maintainable way to trigger this specific method's
+        failure without that heavier fixture, while still exercising the
+        real stage_adapter code path end to end (real _partition_and_
+        precompute, real memory_pool.stage(), real OFTAdapter construction)."""
+        manager = _manager()
+        raw_expert_tensor = [
+            ("model.layers.0.mlp.experts.0.gate_proj.oft_R", torch.randn(2, 6))
+        ]
+
+        with patch.object(
+            manager,
+            "apply_streamed_expert_oft",
+            side_effect=RuntimeError("expert buffer mismatch"),
+        ):
+            result = manager.stage_adapter(
+                raw_expert_tensor, CONFIG_DICT, "adapter-a", 1, "adapter-a"
+            )
+
+        self.assertFalse(result.success)
+        self.assertIn("expert buffer mismatch", result.error_message)
+        self.assertIsNone(
+            manager.memory_pool.staged_identity(),
+            "an expert-apply failure must leave the pool clean, not jammed",
         )
         self.assertIsNone(manager._pending_oft_stage)
 
