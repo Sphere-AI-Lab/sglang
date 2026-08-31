@@ -475,5 +475,13 @@ class TestActivateUpdatesManagerBookkeeping(unittest.TestCase):
         self.assertEqual(manager.adapters["adapter-a"].block_size, BLOCK_SIZE)
 
 
+class TestOFTStagingBackendIsSymmetric(unittest.TestCase):
+    def test_implements_the_shared_interface(self):
+        from sglang.srt.adapter_sync.tokenizer_backend import AdapterStagingBackend
+        from sglang.srt.oft.staged_manager import OFTStagingBackend
+
+        self.assertTrue(issubclass(OFTStagingBackend, AdapterStagingBackend))
+
+
 if __name__ == "__main__":
     unittest.main()
