@@ -30,6 +30,24 @@ COMPARABLE_PROVENANCE_HASH_KEYS = (
     "hardware_hash",
 )
 
+PERFORMANCE_REPETITIONS = 3
+
+_MANIFEST_FIELDS = {
+    "schema_version",
+    "case_key",
+    "performance_procedure_hash",
+    "provenance_hashes",
+    "metadata",
+}
+_PROVENANCE_FIELDS = {
+    "git_sha",
+    "dirty",
+    "manifest_hash",
+    *PROVENANCE_HASH_KEYS,
+    "metadata",
+}
+_COMPLETION_FIELDS = {"status", "exit_code", "metadata"}
+
 _RUN_BUNDLE_FIELDS = {
     "schema_version",
     "case_key",
@@ -71,7 +89,7 @@ def _freeze_json(value: object, context: str = "value") -> object:
     if isinstance(value, Mapping):
         frozen: dict[str, object] = {}
         for key, item in value.items():
-            if not isinstance(key, str):
+            if type(key) is not str:
                 raise BundleValidationError(f"{context} keys must be strings")
             frozen[key] = _freeze_json(item, f"{context}.{key}")
         return FrozenDict(frozen)
@@ -96,7 +114,7 @@ def _thaw_json(value: object) -> object:
 def _require_mapping(value: object, context: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise BundleValidationError(f"{context} must be an object")
-    if any(not isinstance(key, str) for key in value):
+    if any(type(key) is not str for key in value):
         raise BundleValidationError(f"{context} keys must be strings")
     return value
 
@@ -112,16 +130,8 @@ def _require_exact_fields(
         raise BundleValidationError(f"{context}: unknown fields: {', '.join(unknown)}")
 
 
-def _require_fields(
-    value: Mapping[str, object], required: set[str], context: str
-) -> None:
-    missing = sorted(required - set(value))
-    if missing:
-        raise BundleValidationError(f"{context}: missing fields: {', '.join(missing)}")
-
-
 def _validate_sha256(value: object, context: str) -> None:
-    if not isinstance(value, str) or len(value) != 64:
+    if type(value) is not str or len(value) != 64:
         raise BundleValidationError(f"{context} must be a 64-character SHA-256")
     if any(character not in "0123456789abcdef" for character in value):
         raise BundleValidationError(f"{context} must be a lowercase SHA-256")
@@ -141,6 +151,48 @@ def canonical_sha256(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _reject_duplicate_object_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise BundleValidationError(f"duplicate object key: {key}")
+        result[key] = value
+    return result
+
+
+def _read_json_document(
+    path: str | os.PathLike[str], context: str
+) -> object:
+    try:
+        with Path(path).open(encoding="utf-8") as stream:
+            return json.load(stream, object_pairs_hook=_reject_duplicate_object_keys)
+    except BundleValidationError:
+        raise
+    except (OSError, json.JSONDecodeError) as error:
+        raise BundleValidationError(f"cannot read {context}: {error}") from error
+
+
+def _write_json_document(
+    path: str | os.PathLike[str], value: object
+) -> None:
+    destination = Path(path)
+    payload = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(destination, flags, 0o644)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 @dataclass(frozen=True)
 class CaseKey:
     model: str
@@ -156,13 +208,20 @@ class CaseKey:
     def validate(self) -> None:
         for field_name in ("model", "revision", "scenario"):
             value = getattr(self, field_name)
-            if not isinstance(value, str) or not value:
+            if type(value) is not str or not value:
                 raise BundleValidationError(f"case_key.{field_name} must be non-empty")
-        if self.architecture not in ("dense", "moe"):
+        if type(self.architecture) is not str or self.architecture not in (
+            "dense",
+            "moe",
+        ):
             raise BundleValidationError("case_key.architecture is invalid")
-        if self.precision not in ("bf16", "fp8", "nvfp4"):
+        if type(self.precision) is not str or self.precision not in (
+            "bf16",
+            "fp8",
+            "nvfp4",
+        ):
             raise BundleValidationError("case_key.precision is invalid")
-        if self.mode not in (
+        if type(self.mode) is not str or self.mode not in (
             "base",
             "legacy_oft",
             "canonical_oft",
@@ -232,7 +291,7 @@ class Observation:
             raise BundleValidationError(
                 f"{context}.output_ids entries must be integers"
             )
-        if not isinstance(self.text, str):
+        if type(self.text) is not str:
             raise BundleValidationError(f"{context}.text must be a string")
         if any(type(value) is not float for value in self.token_logprobs):
             raise BundleValidationError(
@@ -247,7 +306,7 @@ class Observation:
                 f"{context}.token_logprobs shape must match output_ids shape"
             )
         for name, values in self.selected_logits.items():
-            if not isinstance(name, str) or not name:
+            if type(name) is not str or not name:
                 raise BundleValidationError(
                     f"{context}.selected_logits names must be non-empty strings"
                 )
@@ -297,13 +356,13 @@ class Observation:
         selected_logits = _require_mapping(
             mapping["selected_logits"], f"{context}.selected_logits"
         )
-        if not isinstance(output_ids, (list, tuple)):
+        if type(output_ids) is not list:
             raise BundleValidationError(f"{context}.output_ids must be an array")
-        if not isinstance(token_logprobs, (list, tuple)):
+        if type(token_logprobs) is not list:
             raise BundleValidationError(f"{context}.token_logprobs must be an array")
         logits: dict[str, tuple[float, ...]] = {}
         for name, values in selected_logits.items():
-            if not isinstance(values, (list, tuple)):
+            if type(values) is not list:
                 raise BundleValidationError(
                     f"{context}.selected_logits.{name} must be an array"
                 )
@@ -328,28 +387,36 @@ class Observation:
 
 @dataclass(frozen=True)
 class PerformanceMetrics:
+    procedure_hash: str
     startup_seconds: tuple[float, ...]
     latency_seconds: tuple[float, ...]
     throughput_tokens_per_second: tuple[float, ...]
-    peak_allocated_bytes: int
-    peak_reserved_bytes: int
+    peak_allocated_bytes: tuple[int, ...]
+    peak_reserved_bytes: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "startup_seconds", tuple(self.startup_seconds))
-        object.__setattr__(self, "latency_seconds", tuple(self.latency_seconds))
-        object.__setattr__(
-            self,
+        for field_name in (
+            "startup_seconds",
+            "latency_seconds",
             "throughput_tokens_per_second",
-            tuple(self.throughput_tokens_per_second),
-        )
+            "peak_allocated_bytes",
+            "peak_reserved_bytes",
+        ):
+            object.__setattr__(self, field_name, tuple(getattr(self, field_name)))
 
     def validate(self) -> None:
+        _validate_sha256(self.procedure_hash, "performance.procedure_hash")
         for field_name in (
             "startup_seconds",
             "latency_seconds",
             "throughput_tokens_per_second",
         ):
             samples = getattr(self, field_name)
+            if len(samples) != PERFORMANCE_REPETITIONS:
+                raise BundleValidationError(
+                    f"performance.{field_name} must contain exactly "
+                    f"{PERFORMANCE_REPETITIONS} post-warm-up repetitions"
+                )
             if any(type(sample) is not float for sample in samples):
                 raise BundleValidationError(
                     f"performance.{field_name} entries must have float dtype"
@@ -359,21 +426,27 @@ class PerformanceMetrics:
                     f"performance.{field_name} entries must be finite and non-negative"
                 )
         for field_name in ("peak_allocated_bytes", "peak_reserved_bytes"):
-            value = getattr(self, field_name)
-            if type(value) is not int or value < 0:
+            samples = getattr(self, field_name)
+            if len(samples) != PERFORMANCE_REPETITIONS:
                 raise BundleValidationError(
-                    f"performance.{field_name} must be a non-negative integer"
+                    f"performance.{field_name} must contain exactly "
+                    f"{PERFORMANCE_REPETITIONS} post-warm-up repetitions"
+                )
+            if any(type(sample) is not int or sample < 0 for sample in samples):
+                raise BundleValidationError(
+                    f"performance.{field_name} entries must be non-negative integers"
                 )
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "procedure_hash": self.procedure_hash,
             "startup_seconds": list(self.startup_seconds),
             "latency_seconds": list(self.latency_seconds),
             "throughput_tokens_per_second": list(
                 self.throughput_tokens_per_second
             ),
-            "peak_allocated_bytes": self.peak_allocated_bytes,
-            "peak_reserved_bytes": self.peak_reserved_bytes,
+            "peak_allocated_bytes": list(self.peak_allocated_bytes),
+            "peak_reserved_bytes": list(self.peak_reserved_bytes),
         }
 
     @classmethod
@@ -382,6 +455,7 @@ class PerformanceMetrics:
         _require_exact_fields(
             mapping,
             {
+                "procedure_hash",
                 "startup_seconds",
                 "latency_seconds",
                 "throughput_tokens_per_second",
@@ -394,23 +468,26 @@ class PerformanceMetrics:
             "startup_seconds",
             "latency_seconds",
             "throughput_tokens_per_second",
+            "peak_allocated_bytes",
+            "peak_reserved_bytes",
         ):
-            if not isinstance(mapping[field_name], (list, tuple)):
+            if type(mapping[field_name]) is not list:
                 raise BundleValidationError(
                     f"performance.{field_name} must be an array"
                 )
         metrics = cls(
+            procedure_hash=mapping["procedure_hash"],  # type: ignore[arg-type]
             startup_seconds=tuple(mapping["startup_seconds"]),  # type: ignore[arg-type]
             latency_seconds=tuple(mapping["latency_seconds"]),  # type: ignore[arg-type]
             throughput_tokens_per_second=tuple(
                 mapping["throughput_tokens_per_second"]  # type: ignore[arg-type]
             ),
-            peak_allocated_bytes=mapping[  # type: ignore[arg-type]
-                "peak_allocated_bytes"
-            ],
-            peak_reserved_bytes=mapping[  # type: ignore[arg-type]
-                "peak_reserved_bytes"
-            ],
+            peak_allocated_bytes=tuple(  # type: ignore[arg-type]
+                mapping["peak_allocated_bytes"]
+            ),
+            peak_reserved_bytes=tuple(  # type: ignore[arg-type]
+                mapping["peak_reserved_bytes"]
+            ),
         )
         metrics.validate()
         return metrics
@@ -483,30 +560,31 @@ class RunBundle:
             raise BundleValidationError("case_key must be a CaseKey")
         self.case_key.validate()
         manifest = _require_mapping(self.manifest, "manifest")
-        _require_fields(
-            manifest,
-            {"schema_version", "case_key", "provenance_hashes"},
-            "manifest",
-        )
-        if manifest["schema_version"] != self.schema_version:
+        _require_exact_fields(manifest, _MANIFEST_FIELDS, "manifest")
+        if (
+            type(manifest["schema_version"]) is not int
+            or manifest["schema_version"] != self.schema_version
+        ):
             raise BundleValidationError(
                 "manifest.schema_version does not match schema_version"
             )
         if _thaw_json(manifest["case_key"]) != self.case_key.to_dict():
             raise BundleValidationError("manifest.case_key does not match case_key")
 
+        _require_mapping(manifest["metadata"], "manifest.metadata")
+
         provenance = _require_mapping(self.provenance, "provenance")
-        _require_fields(
-            provenance,
-            {"git_sha", "dirty", "manifest_hash", *PROVENANCE_HASH_KEYS},
-            "provenance",
-        )
-        if provenance["git_sha"] != self.case_key.revision:
+        _require_exact_fields(provenance, _PROVENANCE_FIELDS, "provenance")
+        if (
+            type(provenance["git_sha"]) is not str
+            or provenance["git_sha"] != self.case_key.revision
+        ):
             raise BundleValidationError(
                 "provenance.git_sha does not match case_key.revision"
             )
-        if provenance["dirty"] is not False:
+        if type(provenance["dirty"]) is not bool or provenance["dirty"] is not False:
             raise BundleValidationError("provenance.dirty must be false")
+        _require_mapping(provenance["metadata"], "provenance.metadata")
         for key in (*PROVENANCE_HASH_KEYS, "manifest_hash"):
             _validate_sha256(provenance[key], f"provenance.{key}")
 
@@ -536,12 +614,23 @@ class RunBundle:
         if not isinstance(self.performance, PerformanceMetrics):
             raise BundleValidationError("performance must be PerformanceMetrics")
         self.performance.validate()
+        _validate_sha256(
+            manifest["performance_procedure_hash"],
+            "manifest.performance_procedure_hash",
+        )
+        if (
+            self.performance.procedure_hash
+            != manifest["performance_procedure_hash"]
+        ):
+            raise BundleValidationError(
+                "performance.procedure_hash does not match manifest"
+            )
 
         observations = _require_mapping(self.observations, "observations")
         if not observations:
             raise BundleValidationError("observations must not be empty")
         for request_id, observation in observations.items():
-            if not request_id:
+            if type(request_id) is not str or not request_id:
                 raise BundleValidationError("observation request IDs must be non-empty")
             if not isinstance(observation, Observation):
                 raise BundleValidationError(
@@ -550,13 +639,14 @@ class RunBundle:
             observation.validate(f"observations.{request_id}")
 
         completion = _require_mapping(self.completion, "completion")
-        _require_fields(completion, {"status", "exit_code"}, "completion")
+        _require_exact_fields(completion, _COMPLETION_FIELDS, "completion")
+        _require_mapping(completion["metadata"], "completion.metadata")
         _validate_sha256(self.completion_hash, "completion_hash")
         if self.completion_hash != canonical_sha256(completion):
             raise BundleValidationError(
                 "completion_hash does not match the canonical completion marker"
             )
-        if completion["status"] != "complete":
+        if type(completion["status"]) is not str or completion["status"] != "complete":
             raise BundleValidationError("completion.status must be 'complete'")
         if type(completion["exit_code"]) is not int or completion["exit_code"] != 0:
             raise BundleValidationError("completion.exit_code must be 0")
@@ -607,197 +697,19 @@ class RunBundle:
         return bundle
 
     def write_json(self, path: str | os.PathLike[str]) -> None:
-        destination = Path(path)
-        payload = json.dumps(
-            self.to_dict(),
-            allow_nan=False,
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        ) + "\n"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        descriptor = os.open(destination, flags, 0o644)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-        except BaseException:
-            raise
+        _write_json_document(path, self.to_dict())
 
     @classmethod
     def read_json(cls, path: str | os.PathLike[str]) -> RunBundle:
-        try:
-            with Path(path).open(encoding="utf-8") as stream:
-                value = json.load(stream)
-        except (OSError, json.JSONDecodeError) as error:
-            raise BundleValidationError(f"cannot read RunBundle: {error}") from error
-        return cls.from_dict(value)
+        return cls.from_dict(_read_json_document(path, "RunBundle"))
 
     def digest(self) -> str:
         return canonical_sha256(self.to_dict())
 
 
-@dataclass(frozen=True)
-class NumericTolerance:
-    atol: float
-    rtol: float
-    baseline_repetitions: int
-
-    def validate(self, name: str) -> None:
-        for field_name in ("atol", "rtol"):
-            value = getattr(self, field_name)
-            if type(value) is not float or not math.isfinite(value) or value < 0:
-                raise BundleValidationError(
-                    f"tolerances.{name}.{field_name} must be a finite "
-                    "non-negative float"
-                )
-        if type(self.baseline_repetitions) is not int or self.baseline_repetitions < 1:
-            raise BundleValidationError(
-                f"tolerances.{name}.baseline_repetitions must be a positive integer"
-            )
-        if (self.atol > 0 or self.rtol > 0) and self.baseline_repetitions < 2:
-            raise BundleValidationError(
-                f"tolerances.{name} requires unchanged-baseline repetition evidence"
-            )
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "atol": self.atol,
-            "rtol": self.rtol,
-            "baseline_repetitions": self.baseline_repetitions,
-        }
-
-    @classmethod
-    def from_dict(cls, value: object, name: str) -> NumericTolerance:
-        mapping = _require_mapping(value, f"tolerances.{name}")
-        _require_exact_fields(
-            mapping,
-            {"atol", "rtol", "baseline_repetitions"},
-            f"tolerances.{name}",
-        )
-        tolerance = cls(
-            atol=mapping["atol"],  # type: ignore[arg-type]
-            rtol=mapping["rtol"],  # type: ignore[arg-type]
-            baseline_repetitions=mapping[  # type: ignore[arg-type]
-                "baseline_repetitions"
-            ],
-        )
-        tolerance.validate(name)
-        return tolerance
-
-
-@dataclass(frozen=True)
-class ToleranceEnvelope:
-    schema_version: int
-    baseline_manifest_hash: str
-    tolerances: dict[str, NumericTolerance]
-    manifest_hash: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "tolerances", FrozenDict(dict(self.tolerances)))
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        baseline_manifest_hash: str,
-        tolerances: Mapping[str, NumericTolerance],
-    ) -> ToleranceEnvelope:
-        payload = cls._manifest_payload(
-            SCHEMA_VERSION, baseline_manifest_hash, tolerances
-        )
-        envelope = cls(
-            schema_version=SCHEMA_VERSION,
-            baseline_manifest_hash=baseline_manifest_hash,
-            tolerances=dict(tolerances),
-            manifest_hash=canonical_sha256(payload),
-        )
-        envelope.validate()
-        return envelope
-
-    @staticmethod
-    def _manifest_payload(
-        schema_version: int,
-        baseline_manifest_hash: str,
-        tolerances: Mapping[str, NumericTolerance],
-    ) -> dict[str, object]:
-        return {
-            "schema_version": schema_version,
-            "baseline_manifest_hash": baseline_manifest_hash,
-            "tolerances": {
-                name: tolerance.to_dict()
-                for name, tolerance in sorted(tolerances.items())
-            },
-        }
-
-    def validate(self) -> None:
-        if (
-            type(self.schema_version) is not int
-            or self.schema_version != SCHEMA_VERSION
-        ):
-            raise BundleValidationError(
-                f"ToleranceEnvelope.schema_version must equal {SCHEMA_VERSION}"
-            )
-        _validate_sha256(
-            self.baseline_manifest_hash, "baseline_manifest_hash"
-        )
-        for name, tolerance in self.tolerances.items():
-            if not isinstance(name, str) or not name:
-                raise BundleValidationError(
-                    "tolerance names must be non-empty strings"
-                )
-            if not isinstance(tolerance, NumericTolerance):
-                raise BundleValidationError(
-                    f"tolerances.{name} must be a NumericTolerance"
-                )
-            tolerance.validate(name)
-        _validate_sha256(self.manifest_hash, "ToleranceEnvelope.manifest_hash")
-        expected_hash = canonical_sha256(
-            self._manifest_payload(
-                self.schema_version,
-                self.baseline_manifest_hash,
-                self.tolerances,
-            )
-        )
-        if self.manifest_hash != expected_hash:
-            raise BundleValidationError(
-                "ToleranceEnvelope.manifest_hash does not match its canonical payload"
-            )
-
-    def to_dict(self) -> dict[str, object]:
-        payload = self._manifest_payload(
-            self.schema_version,
-            self.baseline_manifest_hash,
-            self.tolerances,
-        )
-        payload["manifest_hash"] = self.manifest_hash
-        return payload
-
-    @classmethod
-    def from_dict(cls, value: object) -> ToleranceEnvelope:
-        mapping = _require_mapping(value, "ToleranceEnvelope")
-        _require_exact_fields(
-            mapping,
-            {
-                "schema_version",
-                "baseline_manifest_hash",
-                "tolerances",
-                "manifest_hash",
-            },
-            "ToleranceEnvelope",
-        )
-        tolerance_data = _require_mapping(mapping["tolerances"], "tolerances")
-        envelope = cls(
-            schema_version=mapping["schema_version"],  # type: ignore[arg-type]
-            baseline_manifest_hash=mapping[  # type: ignore[arg-type]
-                "baseline_manifest_hash"
-            ],
-            tolerances={
-                name: NumericTolerance.from_dict(tolerance, name)
-                for name, tolerance in tolerance_data.items()
-            },
-            manifest_hash=mapping["manifest_hash"],  # type: ignore[arg-type]
-        )
-        envelope.validate()
-        return envelope
+from .policy import (  # noqa: E402  (re-export the public schema contract)
+    BaselineRepetition,
+    ComparisonPolicy,
+    NumericTolerance,
+    ToleranceEnvelope,
+)

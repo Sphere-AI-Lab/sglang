@@ -7,8 +7,10 @@ from .compare import (
 )
 from .schema import (
     SCHEMA_VERSION,
+    BaselineRepetition,
     BundleValidationError,
     CaseKey,
+    ComparisonPolicy,
     NumericTolerance,
     Observation,
     PerformanceMetrics,
@@ -19,10 +21,12 @@ from .schema import (
 
 __all__ = [
     "SCHEMA_VERSION",
+    "BaselineRepetition",
     "BundleValidationError",
     "CaseKey",
     "ComparisonMismatch",
     "ComparisonReport",
+    "ComparisonPolicy",
     "NumericTolerance",
     "Observation",
     "PerformanceMetrics",

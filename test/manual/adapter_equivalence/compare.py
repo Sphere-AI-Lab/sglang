@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import statistics
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from .schema import (
     COMPARABLE_PROVENANCE_HASH_KEYS,
     BundleValidationError,
     CaseKey,
+    ComparisonPolicy,
     NumericTolerance,
     RunBundle,
     ToleranceEnvelope,
@@ -60,6 +62,15 @@ class ComparisonReport:
             "actual_case_key": self.actual_case_key.to_dict(),
             "mismatches": [mismatch.to_dict() for mismatch in self.mismatches],
         }
+
+    def to_json(self) -> str:
+        return json.dumps(
+            self.to_dict(),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
 
 
 def _envelope_dict(envelope: ToleranceEnvelope) -> dict[str, object]:
@@ -166,13 +177,15 @@ def _numeric_equal(
     actual: float,
     tolerance: NumericTolerance | None,
 ) -> bool:
-    if tolerance is None or (tolerance.atol == 0.0 and tolerance.rtol == 0.0):
+    if tolerance is None or (
+        tolerance.observed_atol == 0.0 and tolerance.observed_rtol == 0.0
+    ):
         return expected == actual
     return math.isclose(
         expected,
         actual,
-        abs_tol=tolerance.atol,
-        rel_tol=tolerance.rtol,
+        abs_tol=tolerance.observed_atol,
+        rel_tol=tolerance.observed_rtol,
     )
 
 
@@ -184,6 +197,7 @@ def compare_bundles(
     expected: RunBundle,
     actual: RunBundle,
     envelope: ToleranceEnvelope,
+    policy: ComparisonPolicy,
 ) -> ComparisonReport:
     """Compare validated bundles, with exact identity before numeric tolerance."""
 
@@ -221,6 +235,18 @@ def compare_bundles(
             position=position,
             error=error,
         )
+    try:
+        policy.validate()
+    except BundleValidationError as error:
+        position = "manifest_hash" if "manifest_hash" in str(error) else "validation"
+        return _validation_report(
+            expected,
+            actual,
+            envelope,
+            kind="invalid_comparison_policy",
+            position=position,
+            error=error,
+        )
 
     if envelope.baseline_manifest_hash != expected.manifest_hash:
         mismatch = _mismatch(
@@ -234,7 +260,32 @@ def compare_bundles(
         )
         return ComparisonReport(expected.case_key, actual.case_key, (mismatch,))
 
+    if policy.baseline_manifest_hash != expected.manifest_hash:
+        mismatch = _mismatch(
+            kind="policy_baseline_mismatch",
+            case_key=actual.case_key,
+            request_id=_BUNDLE_REQUEST_ID,
+            position="baseline_manifest_hash",
+            expected=expected.manifest_hash,
+            actual=policy.baseline_manifest_hash,
+            envelope=envelope,
+        )
+        return ComparisonReport(expected.case_key, actual.case_key, (mismatch,))
+
+    if policy.tolerance_envelope_hash != envelope.manifest_hash:
+        mismatch = _mismatch(
+            kind="policy_envelope_mismatch",
+            case_key=actual.case_key,
+            request_id=_BUNDLE_REQUEST_ID,
+            position="tolerance_envelope_hash",
+            expected=policy.tolerance_envelope_hash,
+            actual=envelope.manifest_hash,
+            envelope=envelope,
+        )
+        return ComparisonReport(expected.case_key, actual.case_key, (mismatch,))
+
     mismatches: list[ComparisonMismatch] = []
+    performance_identity_valid = True
 
     # Code and revision are deliberately allowed to differ. All inputs and the
     # hardware/environment identities that make comparison meaningful are not.
@@ -242,6 +293,7 @@ def compare_bundles(
         expected_hash = expected.provenance[key]
         actual_hash = actual.provenance[key]
         if expected_hash != actual_hash:
+            performance_identity_valid = False
             mismatches.append(
                 _mismatch(
                     kind="provenance_mismatch",
@@ -264,6 +316,7 @@ def compare_bundles(
         expected_value = getattr(expected.case_key, field_name)
         actual_value = getattr(actual.case_key, field_name)
         if expected_value != actual_value:
+            performance_identity_valid = False
             mismatches.append(
                 _mismatch(
                     kind="case_key_mismatch",
@@ -279,6 +332,7 @@ def compare_bundles(
     expected_request_ids = set(expected.observations)
     actual_request_ids = set(actual.observations)
     if expected_request_ids != actual_request_ids:
+        performance_identity_valid = False
         mismatches.append(
             _mismatch(
                 kind="request_set_mismatch",
@@ -492,63 +546,67 @@ def compare_bundles(
             )
         )
 
-    median_metrics = (
-        ("startup_seconds", False),
-        ("latency_seconds", False),
-        ("throughput_tokens_per_second", True),
-    )
-    for metric_name, higher_is_better in median_metrics:
-        expected_samples = getattr(expected.performance, metric_name)
-        actual_samples = getattr(actual.performance, metric_name)
-        if bool(expected_samples) != bool(actual_samples):
-            mismatches.append(
-                _mismatch(
-                    kind="performance_shape_mismatch",
-                    case_key=actual.case_key,
-                    request_id=_BUNDLE_REQUEST_ID,
-                    position=f"performance.{metric_name}",
-                    expected=len(expected_samples),
-                    actual=len(actual_samples),
-                    envelope=envelope,
-                )
+    if expected.performance.procedure_hash != actual.performance.procedure_hash:
+        performance_identity_valid = False
+        mismatches.append(
+            _mismatch(
+                kind="performance_identity_mismatch",
+                case_key=actual.case_key,
+                request_id=_BUNDLE_REQUEST_ID,
+                position="performance.procedure_hash",
+                expected=expected.performance.procedure_hash,
+                actual=actual.performance.procedure_hash,
+                envelope=envelope,
             )
-            continue
-        if not expected_samples:
-            continue
-        expected_median = _median(expected_samples)
-        actual_median = _median(actual_samples)
-        if higher_is_better:
-            regressed = actual_median < expected_median * THROUGHPUT_FLOOR_RATIO
-        else:
-            regressed = actual_median > expected_median * PERFORMANCE_RATIO_LIMIT
-        if regressed:
-            mismatches.append(
-                _mismatch(
-                    kind="performance_regression",
-                    case_key=actual.case_key,
-                    request_id=_BUNDLE_REQUEST_ID,
-                    position=f"performance.{metric_name}.median",
-                    expected=expected_median,
-                    actual=actual_median,
-                    envelope=envelope,
-                )
-            )
+        )
 
-    for metric_name in ("peak_allocated_bytes", "peak_reserved_bytes"):
-        expected_value = getattr(expected.performance, metric_name)
-        actual_value = getattr(actual.performance, metric_name)
-        if actual_value > expected_value * PERFORMANCE_RATIO_LIMIT:
-            mismatches.append(
-                _mismatch(
-                    kind="performance_regression",
-                    case_key=actual.case_key,
-                    request_id=_BUNDLE_REQUEST_ID,
-                    position=f"performance.{metric_name}",
-                    expected=expected_value,
-                    actual=actual_value,
-                    envelope=envelope,
+    # Ratios are evidence only when case, provenance, placement, and benchmark
+    # procedure identities all match. Identity mismatches above remain failures.
+    if performance_identity_valid:
+        median_metrics = (
+            ("startup_seconds", False),
+            ("latency_seconds", False),
+            ("throughput_tokens_per_second", True),
+        )
+        for metric_name, higher_is_better in median_metrics:
+            expected_median = _median(getattr(expected.performance, metric_name))
+            actual_median = _median(getattr(actual.performance, metric_name))
+            if higher_is_better:
+                regressed = (
+                    actual_median < expected_median * THROUGHPUT_FLOOR_RATIO
                 )
-            )
+            else:
+                regressed = (
+                    actual_median > expected_median * PERFORMANCE_RATIO_LIMIT
+                )
+            if regressed:
+                mismatches.append(
+                    _mismatch(
+                        kind="performance_regression",
+                        case_key=actual.case_key,
+                        request_id=_BUNDLE_REQUEST_ID,
+                        position=f"performance.{metric_name}.median",
+                        expected=expected_median,
+                        actual=actual_median,
+                        envelope=envelope,
+                    )
+                )
+
+        for metric_name in ("peak_allocated_bytes", "peak_reserved_bytes"):
+            expected_value = max(getattr(expected.performance, metric_name))
+            actual_value = max(getattr(actual.performance, metric_name))
+            if actual_value > expected_value * PERFORMANCE_RATIO_LIMIT:
+                mismatches.append(
+                    _mismatch(
+                        kind="performance_regression",
+                        case_key=actual.case_key,
+                        request_id=_BUNDLE_REQUEST_ID,
+                        position=f"performance.{metric_name}.maximum",
+                        expected=expected_value,
+                        actual=actual_value,
+                        envelope=envelope,
+                    )
+                )
 
     return ComparisonReport(
         expected_case_key=expected.case_key,
