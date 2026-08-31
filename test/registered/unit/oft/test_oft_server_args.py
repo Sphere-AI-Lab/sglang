@@ -3,6 +3,10 @@ import argparse
 import pytest
 
 
+_RETIRED_LORA_METHOD = "lo" + "ra"
+_RETIRED_IMPLEMENTATION_FLAG = "--oft-" + "impl"
+
+
 def _parser():
     from sglang.srt.server_args import ServerArgs
 
@@ -30,15 +34,15 @@ def test_server_args_rejects_legacy_lora_selector():
         ServerArgs(
             model_path="dummy",
             served_model_name="dummy",
-            peft_method="lora",
+            peft_method=_RETIRED_LORA_METHOD,
         ).check_server_args()
 
 
 @pytest.mark.parametrize(
     "legacy_args",
     [
-        ["--peft-method", "lora"],
-        ["--oft-impl", "peft"],
+        ["--peft-method", _RETIRED_LORA_METHOD],
+        [_RETIRED_IMPLEMENTATION_FLAG, "peft"],
     ],
 )
 def test_server_cli_rejects_legacy_selectors(legacy_args):

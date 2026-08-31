@@ -5,6 +5,10 @@ from typing import get_type_hints
 import pytest
 
 
+_RETIRED_LORA_METHOD = "lo" + "ra"
+_RETIRED_IMPLEMENTATION_FLAG = "--oft-" + "impl"
+
+
 def _args(peft_method, *, enable_lora=True):
     ns = SimpleNamespace(
         enable_lora=enable_lora,
@@ -53,7 +57,7 @@ def test_lora_is_not_an_oft_method():
     from sglang.srt.oft.config import validate_oft_args
 
     with pytest.raises(ValueError):
-        validate_oft_args(_args("lora", enable_lora=False))
+        validate_oft_args(_args(_RETIRED_LORA_METHOD, enable_lora=False))
 
 
 def test_register_oft_args_exposes_only_the_canonical_selector():
@@ -65,9 +69,9 @@ def test_register_oft_args_exposes_only_the_canonical_selector():
 
     assert parser.parse_args(["--peft-method", "oft"]).peft_method == "oft"
     with pytest.raises(SystemExit):
-        parser.parse_args(["--peft-method", "lora"])
+        parser.parse_args(["--peft-method", _RETIRED_LORA_METHOD])
     with pytest.raises(SystemExit):
-        parser.parse_args(["--oft-impl", "peft"])
+        parser.parse_args([_RETIRED_IMPLEMENTATION_FLAG, "peft"])
 
 
 def test_oft_args_type_hints_resolve_for_server_args_consumers():

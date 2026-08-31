@@ -159,6 +159,51 @@ class TestStagingCoexistsWithMultiTenancy(unittest.TestCase):
         self.assertTrue((pool.slot(f"R:{TARGET_MODULE}", 0, 1) == slot_1_before).all())
 
 
+class TestStreamedOFTUnload(unittest.TestCase):
+    def test_unload_restores_identity_and_forgets_the_active_version(self):
+        from sglang.srt.oft.oft_registry import OFTRef
+        from sglang.srt.oft.mem_pool import EMPTY_SLOT
+
+        manager = _manager()
+        pool = manager.memory_pool
+        uid = "adapter-a"
+        slot_id = 2
+        ref = OFTRef(
+            adapter_id=uid,
+            adapter_name="policy",
+            adapter_path="__tensor__",
+            adapter_version=7,
+        )
+        manager.configs[uid] = MagicMock()
+        manager.refs[uid] = ref
+        pool.uid_to_buffer_id[uid] = slot_id
+        pool.buffer_id_to_uid[slot_id] = uid
+        pool._active_versions[uid] = 7
+        pool.R_buffer[TARGET_MODULE][0][slot_id].zero_()
+        expert_module = SimpleNamespace(
+            w13_oft_r=torch.ones(1),
+            w2_oft_r=torch.ones(1),
+        )
+        manager._moe_modules = {0: expert_module}
+
+        result = manager.unload_streamed_adapter(ref)
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertNotIn(uid, manager.configs)
+        self.assertNotIn(uid, manager.refs)
+        self.assertNotIn(uid, pool.uid_to_buffer_id)
+        self.assertIs(pool.buffer_id_to_uid[slot_id], EMPTY_SLOT)
+        self.assertIsNone(pool.active_version_for(uid))
+        identity = torch.eye(BLOCK_SIZE).expand_as(
+            pool.R_buffer[TARGET_MODULE][0][slot_id]
+        )
+        self.assertTrue(
+            torch.equal(pool.R_buffer[TARGET_MODULE][0][slot_id], identity)
+        )
+        self.assertIsNone(expert_module.w13_oft_r)
+        self.assertIsNone(expert_module.w2_oft_r)
+
+
 def _manager_for_pool_construction(max_ofts_per_batch=4):
     """Attributes OFTManager.__init__/init_state would have set before
     calling init_memory_pool -- built directly (object.__new__, no real

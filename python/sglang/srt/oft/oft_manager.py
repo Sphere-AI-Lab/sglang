@@ -390,13 +390,25 @@ class OFTManager(AdapterManager):
         since streamed adapters have no OFTAdapter object.
         """
         try:
+            buffer_id = self.memory_pool.uid_to_buffer_id.get(oft_ref.adapter_id)
+            if buffer_id is not None:
+                # Restore the base-model passthrough before making this slot
+                # available for reuse. A zero OFT matrix is not identity and
+                # would silently corrupt a base request routed through it.
+                self.memory_pool.reset_buffer_slot_to_identity(buffer_id)
+                # The non-staged streamed MoE path binds expert rotations
+                # directly on each FusedMoE module rather than in this slot.
+                # Clear those global bindings before base traffic resumes.
+                self._clear_expert_oft()
             if oft_ref.adapter_id in self.configs:
                 del self.configs[oft_ref.adapter_id]
             if oft_ref.adapter_id in self.refs:
                 del self.refs[oft_ref.adapter_id]
+            active_versions = getattr(self.memory_pool, "_active_versions", None)
+            if active_versions is not None:
+                active_versions.pop(oft_ref.adapter_id, None)
             # Clean up buffer slot mapping
-            if oft_ref.adapter_id in self.memory_pool.uid_to_buffer_id:
-                buffer_id = self.memory_pool.uid_to_buffer_id[oft_ref.adapter_id]
+            if buffer_id is not None:
                 del self.memory_pool.uid_to_buffer_id[oft_ref.adapter_id]
                 self.memory_pool.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
         except Exception as e:
