@@ -205,16 +205,22 @@ class AdapterRegistry:
         else:
             raise TypeError("name must be either a string or a list of strings.")
 
-    async def _acquire_refs(
+    def _lookup_refs_for_admission(
         self, name: Union[str, List[Optional[str]]]
-    ) -> Union[Optional[AdapterRef], List[Optional[AdapterRef]]]:
-        """Atomically snapshot the matching AdapterRef(s) and start tracking
-        usage, in one lock acquisition (unlike acquire(), which only returns
-        ids and requires a separate call for version)."""
+    ) -> List[Optional[AdapterRef]]:
+        """Lookup refs, handling both str and list inputs, normalizing to list output."""
+        if isinstance(name, str):
+            names = [name]
+        elif isinstance(name, list):
+            names = name
+        else:
+            raise TypeError("name must be either a string or a list of strings.")
 
-        def _lookup(n: Optional[str]) -> Optional[AdapterRef]:
+        refs = []
+        for n in names:
             if n is None:
-                return None
+                refs.append(None)
+                continue
             ref = self._registry.get(n)
             if ref is None:
                 raise ValueError(
@@ -222,16 +228,13 @@ class AdapterRegistry:
                     f"Loaded adapters: {self._registry.keys()}."
                 )
             self._registry.move_to_end(n)
-            return ref
+            refs.append(ref)
+        return refs
 
-        if isinstance(name, str) or name is None:
-            async with self._registry_lock.writer_lock:
-                ref = _lookup(name)
-            if ref is not None:
-                await self._counters[ref.adapter_id].increment(notify_all=False)
-            return ref
-        async with self._registry_lock.writer_lock:
-            refs = [_lookup(n) for n in name]
+    async def _increment_ref_counters(
+        self, refs: List[Optional[AdapterRef]]
+    ) -> None:
+        """Increment usage counters for non-None refs."""
         await asyncio.gather(
             *[
                 self._counters[ref.adapter_id].increment(notify_all=False)
@@ -239,7 +242,21 @@ class AdapterRegistry:
                 if ref is not None
             ]
         )
-        return refs
+
+    async def _acquire_refs(
+        self, name: Union[str, List[Optional[str]]]
+    ) -> List[Optional[AdapterRef]]:
+        """Atomically snapshot the matching AdapterRef(s) and start tracking usage.
+
+        Lookup, version snapshot, and counter increment are one atomic admission
+        step. An unload cannot remove the adapter between them.
+        """
+        # Lookup, version snapshot, and counter increment are one atomic
+        # admission step. An unload cannot remove the adapter between them.
+        async with self._registry_lock.writer_lock:
+            refs = self._lookup_refs_for_admission(name)
+            await self._increment_ref_counters(refs)
+            return refs
 
     async def acquire_with_version(
         self, name: Union[str, List[Optional[str]]]
@@ -248,14 +265,11 @@ class AdapterRegistry:
         Tuple[List[Optional[str]], List[Optional[int]]],
     ]:
         """Acquire request leases and atomically snapshot ids and versions."""
-        if isinstance(name, str):
-            ref = await self._acquire_refs(name)
-            return (ref.adapter_id if ref else None), (
-                ref.adapter_version if ref else None
-            )
         refs = await self._acquire_refs(name)
-        ids = [ref.adapter_id if ref else None for ref in refs]
-        versions = [ref.adapter_version if ref else None for ref in refs]
+        ids = [ref.adapter_id if ref is not None else None for ref in refs]
+        versions = [ref.adapter_version if ref is not None else None for ref in refs]
+        if isinstance(name, str):
+            return ids[0], versions[0]
         return ids, versions
 
     async def release(self, uid: Union[str, List[str]]):

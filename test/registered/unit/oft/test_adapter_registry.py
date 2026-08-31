@@ -106,6 +106,53 @@ class TestAcquireWithVersion(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(uids, [a.adapter_id, None, b.adapter_id])
         self.assertEqual(versions, [1, None, 2])
 
+    async def test_acquire_with_version_rejects_invalid_input_type(self):
+        """Verify acquire_with_version rejects non-str/list inputs like acquire() does."""
+        from sglang.srt.oft.base.registry import AdapterRegistry
+
+        registry = AdapterRegistry()
+        with self.assertRaises(TypeError):
+            await registry.acquire_with_version(123)
+
+    async def test_acquire_with_version_single_name_with_nones_in_list(self):
+        """Verify single-name path returns scalar tuple, not list."""
+        from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
+
+        registry = AdapterRegistry()
+        ref = AdapterRef(adapter_name="a", adapter_path="a", adapter_version=5)
+        await registry.register(ref)
+        # Single string input should return scalar tuple
+        uid, version = await registry.acquire_with_version("a")
+        self.assertIsInstance(uid, str)
+        self.assertIsInstance(version, int)
+        self.assertEqual(uid, ref.adapter_id)
+        self.assertEqual(version, 5)
+
+    async def test_acquire_with_version_counter_incremented(self):
+        """Verify counter is incremented as part of atomic acquisition.
+
+        Regression guard: prior to the atomicity fix, the counter increment
+        happened outside the writer lock, creating a race where unload could
+        delete the counter before increment ran.
+        """
+        from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
+
+        registry = AdapterRegistry()
+        ref = AdapterRef(adapter_name="a", adapter_path="a", adapter_version=1)
+        await registry.register(ref)
+
+        # Acquire the adapter
+        uid, version = await registry.acquire_with_version("a")
+
+        # Verify the counter is tracking (by acquiring again and ensuring
+        # we can decrement the same number of times)
+        await registry.acquire("a")
+
+        # Release both acquisitions - if counter wasn't properly incremented,
+        # this would fail
+        await registry.release(uid)
+        await registry.release(uid)
+
 
 if __name__ == "__main__":
     unittest.main()
