@@ -1384,9 +1384,10 @@ def test_task8_dynamic_oft_requires_fixture_shape_contract(missing_field):
         ServerSpec(**arguments)
 
 
-def test_task8_internal_oft_control_uses_scheduler_bridge_and_registry_lifecycle():
+def test_task8_internal_oft_control_streams_fixture_and_uses_control_for_unload():
     import asyncio
     from dataclasses import dataclass
+    from types import SimpleNamespace
 
     from adapter_equivalence.server import InternalOFTControl
 
@@ -1433,8 +1434,8 @@ def test_task8_internal_oft_control_uses_scheduler_bridge_and_registry_lifecycle
                 ref = Ref(
                     adapter_id="adapter-id-a",
                     adapter_name=request.adapter_name,
-                    adapter_path=str(request.adapter_config["adapter_path"]),
-                    pinned=bool(request.adapter_config["pinned"]),
+                    adapter_path=request.adapter_name,
+                    pinned=False,
                 )
                 request.adapter_id = ref.adapter_id
                 await self.peft_registry.register(ref)
@@ -1449,6 +1450,7 @@ def test_task8_internal_oft_control_uses_scheduler_bridge_and_registry_lifecycle
         def __init__(self, manager):
             self.loop = Loop()
             self.tokenizer_manager = manager
+            self.server_args = SimpleNamespace(tp_size=2)
             self.serialized = []
             self.weight_update_sessions = []
 
@@ -1466,29 +1468,47 @@ def test_task8_internal_oft_control_uses_scheduler_bridge_and_registry_lifecycle
 
     manager = Manager()
     engine = Engine(manager)
+    fixture_tensors = [("base_model.model.layers.0.self_attn.q_proj.oft_R", object())]
+    fixture_config = {
+        "oft_block_size": 128,
+        "peft_type": "OFT",
+        "target_modules": ["q_proj"],
+    }
+    loaded_paths = []
+    serialized_payloads = []
+
+    def load_fixture(path):
+        loaded_paths.append(path)
+        return fixture_tensors, fixture_config
+
+    def serialize_payload(tensors):
+        serialized_payloads.append(tensors)
+        return b"flattened-oft-payload"
+
     control = InternalOFTControl(
         engine,
         revision_kind="source",
         update_request_type=UpdateRequest,
+        fixture_loader=load_fixture,
+        payload_serializer=serialize_payload,
     )
 
-    assert control.load("policy-a", "/adapters/a", pinned=True).success
+    assert control.load("policy-a", "/adapters/a").success
     assert control.unload("policy-a").success
-    assert engine.serialized == [
-        ([], "adapter_equivalence_oft_control"),
-        ([], "adapter_equivalence_oft_control"),
-    ]
+    assert loaded_paths == ["/adapters/a"]
+    assert serialized_payloads == [fixture_tensors]
+    assert engine.serialized == [([], "adapter_equivalence_oft_control")]
     assert engine.weight_update_sessions == ["begin", "end", "begin", "end"]
     load_request, load_http_request = manager.calls[0]
     assert load_http_request is None
+    assert load_request.serialized_named_tensors == [
+        b"flattened-oft-payload",
+        b"flattened-oft-payload",
+    ]
+    assert load_request.load_format == "oft_adapter"
     assert load_request.adapter_name == "policy-a"
     assert load_request.adapter_id == "adapter-id-a"
-    assert load_request.adapter_config == {
-        "operation": "load",
-        "adapter_name": "policy-a",
-        "adapter_path": "/adapters/a",
-        "pinned": True,
-    }
+    assert load_request.adapter_config == fixture_config
     unload_request, unload_http_request = manager.calls[1]
     assert unload_http_request is None
     assert unload_request.adapter_name is None
@@ -1496,8 +1516,8 @@ def test_task8_internal_oft_control_uses_scheduler_bridge_and_registry_lifecycle
     assert unload_request.adapter_config == {
         "operation": "unload",
         "adapter_name": "policy-a",
-        "adapter_path": "/adapters/a",
-        "pinned": True,
+        "adapter_path": "policy-a",
+        "pinned": False,
     }
     assert manager.peft_registry.refs == {}
     assert manager.peft_registry.waited_for == ["adapter-id-a"]
