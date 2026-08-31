@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import IO, Literal
+from typing import IO, Callable, Literal
 
 from .scenarios import ScenarioContractError
 
@@ -139,6 +139,118 @@ def server_other_args(spec: ServerSpec) -> tuple[str, ...]:
     return tuple(arguments)
 
 
+def engine_kwargs(spec: ServerSpec) -> dict[str, object]:
+    """Translate a server spec into the offline Engine constructor contract."""
+
+    arguments: dict[str, object] = {
+        "model_path": spec.model_path,
+        "base_gpu_id": spec.base_gpu_id,
+        "tp_size": spec.tp_size,
+        "ep_size": spec.ep_size,
+        "disable_cuda_graph": not spec.cuda_graph,
+        "mem_fraction_static": spec.mem_fraction_static,
+        "log_level": "error",
+    }
+    if spec.quantization is not None:
+        arguments["quantization"] = spec.quantization
+    if spec.moe_runner is not None:
+        arguments["moe_runner_backend"] = spec.moe_runner
+
+    if spec.mode == "legacy_oft":
+        arguments.update(peft_method="oft", oft_impl="peft")
+    elif spec.mode == "canonical_oft":
+        arguments["peft_method"] = "oft"
+        if spec.revision_kind == "source":
+            arguments["oft_impl"] = "sibling"
+    elif spec.mode == "legacy_lora":
+        arguments["peft_method"] = "lora"
+    elif spec.mode == "native_lora":
+        arguments.update(enable_lora=True, enable_lora_staging=True)
+
+    if spec.startup_adapters:
+        values = tuple(
+            f"{name}={path}" for name, path in spec.startup_adapters
+        )
+        key = "lora_paths" if spec.mode == "native_lora" else "peft_paths"
+        arguments[key] = values
+    return arguments
+
+
+@dataclass(frozen=True)
+class OFTRequestTypes:
+    """Revision-specific OFT request constructors used by the internal shim."""
+
+    load: Callable[..., object]
+    unload: Callable[..., object]
+
+
+def resolve_oft_request_types(revision_kind: str) -> OFTRequestTypes:
+    """Resolve request types without importing removed source modules eagerly."""
+
+    if revision_kind == "source":
+        from sglang.srt.peft.io_types import (
+            LoadOFTAdapterReqInput,
+            UnloadOFTAdapterReqInput,
+        )
+    elif revision_kind == "candidate":
+        from sglang.srt.oft.io_types import (
+            LoadOFTAdapterReqInput,
+            UnloadOFTAdapterReqInput,
+        )
+    else:
+        raise ScenarioContractError(f"unknown revision kind: {revision_kind}")
+    return OFTRequestTypes(LoadOFTAdapterReqInput, UnloadOFTAdapterReqInput)
+
+
+class InternalOFTControl:
+    """Drive the unchanged source's real OFT manager when HTTP routes are absent."""
+
+    def __init__(
+        self,
+        engine: object,
+        *,
+        revision_kind: str,
+        request_types: OFTRequestTypes | None = None,
+    ) -> None:
+        if revision_kind not in {"source", "candidate"}:
+            raise ScenarioContractError(f"unknown revision kind: {revision_kind}")
+        self.engine = engine
+        self.request_types = request_types or resolve_oft_request_types(
+            revision_kind
+        )
+
+    def _run(self, operation: str, awaitable: object) -> object:
+        result = self.engine.loop.run_until_complete(awaitable)
+        if getattr(result, "success", False) is not True:
+            message = getattr(result, "error_message", None) or "unknown failure"
+            raise ScenarioContractError(f"internal OFT {operation} failed: {message}")
+        return result
+
+    def load(
+        self,
+        adapter_name: str,
+        adapter_path: str,
+        *,
+        pinned: bool = False,
+    ) -> object:
+        request = self.request_types.load(
+            adapter_name=adapter_name,
+            adapter_path=adapter_path,
+            pinned=pinned,
+        )
+        return self._run(
+            "load",
+            self.engine.tokenizer_manager.load_oft_adapter(request, None),
+        )
+
+    def unload(self, adapter_name: str) -> object:
+        request = self.request_types.unload(adapter_name=adapter_name)
+        return self._run(
+            "unload",
+            self.engine.tokenizer_manager.unload_oft_adapter(request, None),
+        )
+
+
 def launch_server(
     spec: ServerSpec,
     *,
@@ -159,6 +271,20 @@ def launch_server(
         return_stdout_stderr=streams,
         device="cuda",
     )
+
+
+def launch_engine(spec: ServerSpec):
+    """Launch the offline Engine so test-only internal controls stay in-process."""
+
+    from sglang.srt.entrypoints.engine import Engine
+
+    return Engine(**engine_kwargs(spec))
+
+
+def stop_engine(engine: object) -> None:
+    """Shut down an offline Engine and all scheduler subprocesses it owns."""
+
+    engine.shutdown()
 
 
 def stop_server(process: object) -> None:
