@@ -1188,3 +1188,102 @@ def test_task8_only_unchanged_source_legacy_startup_can_be_unsupported():
         match="startup failure is not eligible for legacy-source classification",
     ):
         classify_startup_failure("candidate", "legacy_oft", traceback)
+
+
+def test_task8_server_launch_arguments_are_deterministic():
+    from adapter_equivalence.server import ServerSpec, server_other_args
+
+    spec = ServerSpec(
+        revision_kind="candidate",
+        model_path="/models/qwen3-30b-fp8",
+        mode="canonical_oft",
+        port=31000,
+        tp_size=4,
+        ep_size=4,
+        cuda_graph=False,
+        quantization="fp8",
+        moe_runner="triton",
+        startup_adapters=(
+            ("policy-a", "/adapters/a"),
+            ("policy-b", "/adapters/b"),
+        ),
+    )
+
+    assert server_other_args(spec) == (
+        "--base-gpu-id",
+        "1",
+        "--tp-size",
+        "4",
+        "--ep-size",
+        "4",
+        "--quantization",
+        "fp8",
+        "--moe-runner-backend",
+        "triton",
+        "--disable-cuda-graph",
+        "--peft-method",
+        "oft",
+        "--peft-paths",
+        "policy-a=/adapters/a",
+        "policy-b=/adapters/b",
+        "--mem-fraction-static",
+        "0.8",
+        "--log-level",
+        "error",
+    )
+
+
+def test_task8_lifecycle_executor_records_the_frozen_state_machine():
+    from adapter_equivalence.scenarios import (
+        LifecycleStep,
+        execute_lifecycle,
+        lifecycle_steps,
+    )
+
+    steps = lifecycle_steps("native_lora")
+    selected = {step.name: step for step in steps}
+    assert selected["base.initial"] == LifecycleStep(
+        "base.initial", "generate", prompt_id="factual"
+    )
+    assert selected["dynamic.load"] == LifecycleStep(
+        "dynamic.load", "load", adapter="policy-a"
+    )
+    assert selected["mixed.base-a-b"] == LifecycleStep(
+        "mixed.base-a-b", "mixed_batch", prompt_id="batch-8"
+    )
+    assert selected["concurrent.stream"] == LifecycleStep(
+        "concurrent.stream", "concurrent", prompt_id="batch-8", stream=True
+    )
+    assert selected["stage.v2"] == LifecycleStep(
+        "stage.v2", "stage", adapter="policy-a", version="2"
+    )
+    assert selected["reject.invalid-config"] == LifecycleStep(
+        "reject.invalid-config",
+        "reject_invalid_config",
+        adapter="policy-a",
+        version="3",
+    )
+    assert selected["restart.same-manifest"] == LifecycleStep(
+        "restart.same-manifest", "restart", prompt_id="factual"
+    )
+
+    initial = _observation()
+
+    class RecordingExecutor:
+        def __init__(self):
+            self.seen = []
+
+        def execute(self, step):
+            self.seen.append(step)
+            if step.name in (
+                "base.initial",
+                "dynamic.post-unload-base",
+            ):
+                return initial
+            return replace(initial, adapter_state={"transition": step.name})
+
+    executor = RecordingExecutor()
+    observations = execute_lifecycle("native_lora", executor)
+
+    assert tuple(observations) == tuple(step.name for step in steps)
+    assert executor.seen == list(steps)
