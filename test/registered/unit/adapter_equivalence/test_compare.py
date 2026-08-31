@@ -1384,57 +1384,163 @@ def test_task8_dynamic_oft_requires_fixture_shape_contract(missing_field):
         ServerSpec(**arguments)
 
 
-def test_task8_internal_oft_control_calls_real_manager_contract():
+def test_task8_internal_oft_control_uses_scheduler_bridge_and_registry_lifecycle():
     import asyncio
     from dataclasses import dataclass
-    from types import SimpleNamespace
 
-    from adapter_equivalence.server import (
-        InternalOFTControl,
-        OFTRequestTypes,
-    )
+    from adapter_equivalence.server import InternalOFTControl
 
     @dataclass
-    class LoadRequest:
+    class Ref:
+        adapter_id: str
         adapter_name: str
         adapter_path: str
-        pinned: bool = False
+        pinned: bool
 
     @dataclass
-    class UnloadRequest:
-        adapter_name: str
+    class UpdateRequest:
+        serialized_named_tensors: list[bytes]
+        load_format: str
+        flush_cache: bool
+        adapter_config: dict[str, object]
+        adapter_name: str | None
+        adapter_id: str | None
+
+    class Registry:
+        def __init__(self):
+            self.refs = {}
+            self.waited_for = []
+
+        async def register(self, ref):
+            self.refs[ref.adapter_name] = ref
+
+        async def unregister(self, name):
+            return self.refs.pop(name).adapter_id
+
+        async def wait_for_unload(self, adapter_id):
+            self.waited_for.append(adapter_id)
 
     class Manager:
         def __init__(self):
             self.calls = []
+            self.peft_registry = Registry()
+            self.peft_ref_cache = {}
+            self.peft_update_lock = asyncio.Lock()
 
-        async def load_oft_adapter(self, request, http_request):
-            self.calls.append(("load", request, http_request))
-            return SimpleNamespace(success=True, error_message=None)
-
-        async def unload_oft_adapter(self, request, http_request):
-            self.calls.append(("unload", request, http_request))
-            return SimpleNamespace(success=True, error_message=None)
+        async def update_weights_from_tensor(self, request, http_request):
+            self.calls.append((request, http_request))
+            if request.adapter_name is not None:
+                ref = Ref(
+                    adapter_id="adapter-id-a",
+                    adapter_name=request.adapter_name,
+                    adapter_path=str(request.adapter_config["adapter_path"]),
+                    pinned=bool(request.adapter_config["pinned"]),
+                )
+                request.adapter_id = ref.adapter_id
+                await self.peft_registry.register(ref)
+                self.peft_ref_cache[ref.adapter_name] = ref
+            return True, "ok"
 
     class Loop:
         def run_until_complete(self, awaitable):
             return asyncio.run(awaitable)
 
+    class Engine:
+        def __init__(self, manager):
+            self.loop = Loop()
+            self.tokenizer_manager = manager
+            self.serialized = []
+
+        def _serialize_tensors_per_rank(self, tensors, load_format):
+            self.serialized.append((tensors, load_format))
+            return [b"empty-control-payload"]
+
     manager = Manager()
-    engine = SimpleNamespace(loop=Loop(), tokenizer_manager=manager)
+    engine = Engine(manager)
     control = InternalOFTControl(
         engine,
         revision_kind="source",
-        request_types=OFTRequestTypes(LoadRequest, UnloadRequest),
+        update_request_type=UpdateRequest,
     )
 
     assert control.load("policy-a", "/adapters/a", pinned=True).success
     assert control.unload("policy-a").success
+    assert engine.serialized == [
+        ([], "adapter_equivalence_oft_control"),
+        ([], "adapter_equivalence_oft_control"),
+    ]
+    load_request, load_http_request = manager.calls[0]
+    assert load_http_request is None
+    assert load_request.adapter_name == "policy-a"
+    assert load_request.adapter_id == "adapter-id-a"
+    assert load_request.adapter_config == {
+        "operation": "load",
+        "adapter_name": "policy-a",
+        "adapter_path": "/adapters/a",
+        "pinned": True,
+    }
+    unload_request, unload_http_request = manager.calls[1]
+    assert unload_http_request is None
+    assert unload_request.adapter_name is None
+    assert unload_request.adapter_id == "adapter-id-a"
+    assert unload_request.adapter_config == {
+        "operation": "unload",
+        "adapter_name": "policy-a",
+        "adapter_path": "/adapters/a",
+        "pinned": True,
+    }
+    assert manager.peft_registry.refs == {}
+    assert manager.peft_registry.waited_for == ["adapter-id-a"]
+    assert manager.peft_ref_cache == {}
+
+
+@pytest.mark.parametrize("operation", ["load", "unload"])
+def test_task8_internal_oft_bridge_dispatches_to_real_manager(operation):
+    from dataclasses import dataclass
+    from types import SimpleNamespace
+
+    from adapter_equivalence.server import _dispatch_internal_oft_control
+
+    @dataclass
+    class Ref:
+        adapter_id: str
+        adapter_name: str
+        adapter_path: str
+        pinned: bool
+
+    class OFTManager:
+        def __init__(self):
+            self.calls = []
+
+        def load_oft_adapter(self, ref):
+            self.calls.append(("load", ref))
+            return SimpleNamespace(success=True, error_message="")
+
+        def unload_oft_adapter(self, ref):
+            self.calls.append(("unload", ref))
+            return SimpleNamespace(success=True, error_message="")
+
+    manager = OFTManager()
+    runner = SimpleNamespace(
+        server_args=SimpleNamespace(peft_method="oft"),
+        oft_manager=manager,
+    )
+    result = _dispatch_internal_oft_control(
+        runner,
+        adapter_config={
+            "operation": operation,
+            "adapter_name": "policy-a",
+            "adapter_path": "/adapters/a",
+            "pinned": False,
+        },
+        adapter_id="adapter-id-a",
+        ref_type=Ref,
+    )
+
+    assert result == (True, "")
     assert manager.calls == [
         (
-            "load",
-            LoadRequest("policy-a", "/adapters/a", pinned=True),
-            None,
-        ),
-        ("unload", UnloadRequest("policy-a"), None),
+            operation,
+            Ref("adapter-id-a", "policy-a", "/adapters/a", False),
+        )
     ]
