@@ -134,10 +134,18 @@ async def resolve_peft_path(tm, obj):
                 f"Got PEFT adapter that has never been loaded: {adapter_path}\n"
                 f"All loaded adapters: {tm.peft_ref_cache.keys()}."
             )
+        ref = tm.peft_ref_cache[adapter_path]
+        if not ref.reloadable:
+            raise ValueError(
+                f"OFT adapter '{adapter_path}' was loaded dynamically (via "
+                "tensors/distributed) and was evicted from the registry; it "
+                "has no on-disk artifact to reload from and must be "
+                "re-loaded via a fresh load_oft_adapter_from_tensors/"
+                "_from_distributed call."
+            )
         if tm.peft_kind == "oft":
             from sglang.srt.peft.io_types import LoadOFTAdapterReqInput
 
-            ref = tm.peft_ref_cache[adapter_path]
             logger.info(f"Reloading evicted adapter: {adapter_path}")
             load_result = await tm.load_oft_adapter(
                 LoadOFTAdapterReqInput(
@@ -153,10 +161,9 @@ async def resolve_peft_path(tm, obj):
                     f"{load_result.error_message}"
                 )
 
-    adapter_id = await tm.peft_registry.acquire(path)
+    adapter_id, adapter_version = await tm.peft_registry.acquire_with_version(path)
     # Set the request-side id/version fields the scheduler reads.
     obj.adapter_id = adapter_id
-    adapter_version = await tm.peft_registry.get_version_by_id(adapter_id)
     obj.adapter_version = adapter_version
     _propagate_id_to_cached_sub_objs(obj, field="adapter_id", resolved=adapter_id)
     # The version needs the same propagation as the id: batched sub-objects

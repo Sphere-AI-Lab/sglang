@@ -1,0 +1,287 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""Unit tests for the native OFT adapter-loading tokenizer-manager handlers
+(``load_oft_adapter_from_tensors``/``_from_distributed``/``unload_oft_adapter``),
+mirroring test/registered/unit/lora/test_lora_upsert.py and
+test/registered/unit/lora/test_lora_lease.py's mocked-TokenizerManager
+approach. Uses a real OFTRegistry (not a mock) so the registry lock, LRU
+eviction loop, and id/version bookkeeping are actually exercised -- only the
+scheduler-facing communicator is mocked.
+"""
+
+import asyncio
+import unittest
+from unittest.mock import AsyncMock, MagicMock, Mock
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.managers.io_struct import (
+    LoadOFTAdapterFromDistributedReqInput,
+    LoadOFTAdapterFromTensorsReqInput,
+    OFTUpdateOutput,
+    UnloadOFTAdapterReqInput,
+)
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.oft.oft_registry import OFTRef, OFTRegistry
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+CONFIG_DICT = {"target_modules": ["q_proj"], "r": 8}
+
+
+def _make_communicator(preloaded: dict = None) -> AsyncMock:
+    """Fan-out communicator stub: for a load request, echoes back a
+    loaded_adapters map merging any preloaded entries with this request's own
+    (name -> id), mimicking the scheduler reporting the full resident set;
+    for an unload request only success matters to the caller."""
+    preloaded = dict(preloaded or {})
+
+    async def _side_effect(obj):
+        if isinstance(obj, UnloadOFTAdapterReqInput):
+            return [OFTUpdateOutput(success=True)]
+        merged = dict(preloaded)
+        merged[obj.adapter_name] = obj.adapter_id
+        return [OFTUpdateOutput(success=True, loaded_adapters=merged)]
+
+    return AsyncMock(side_effect=_side_effect)
+
+
+def _make_tokenizer_manager(
+    peft_method: str = "oft",
+    oft_impl: str = "sibling",
+    max_loaded_ofts=None,
+) -> TokenizerManager:
+    """TokenizerManager with only the fields the OFT handler path reads."""
+    tm = TokenizerManager.__new__(TokenizerManager)
+    tm.server_args = MagicMock()
+    tm.server_args.peft_method = peft_method
+    tm.server_args.oft_impl = oft_impl
+    tm.server_args.max_loaded_ofts = max_loaded_ofts
+    tm.auto_create_handle_loop = Mock()
+    tm.peft_update_lock = asyncio.Lock()
+    tm.peft_registry = OFTRegistry()
+    tm.peft_ref_cache = {}
+    tm.update_oft_adapter_communicator = _make_communicator()
+    return tm
+
+
+def _make_tensors_req(
+    adapter_name: str = "a", upsert: bool = False, pinned: bool = False
+) -> LoadOFTAdapterFromTensorsReqInput:
+    return LoadOFTAdapterFromTensorsReqInput(
+        adapter_name=adapter_name,
+        config_dict=CONFIG_DICT,
+        serialized_named_tensors=[],
+        pinned=pinned,
+        upsert=upsert,
+    )
+
+
+def _make_distributed_req(
+    adapter_name: str = "a", upsert: bool = False, pinned: bool = False
+) -> LoadOFTAdapterFromDistributedReqInput:
+    return LoadOFTAdapterFromDistributedReqInput(
+        adapter_name=adapter_name,
+        config_dict=CONFIG_DICT,
+        names=[],
+        dtypes=[],
+        shapes=[],
+        pinned=pinned,
+        upsert=upsert,
+    )
+
+
+class TestFreshLoadRegisters(CustomTestCase):
+    def test_from_tensors_fresh_load_registers(self):
+        tm = _make_tokenizer_manager()
+
+        obj = _make_tensors_req("a")
+        result = asyncio.run(tm.load_oft_adapter_from_tensors(obj))
+
+        self.assertTrue(result.success)
+        self.assertIsNotNone(obj.adapter_id)
+        self.assertEqual(tm.peft_registry.num_registered_ofts, 1)
+        self.assertEqual(
+            tm.peft_registry.get_all_adapters()["a"].adapter_id, obj.adapter_id
+        )
+        self.assertIs(tm.peft_ref_cache["a"], tm.peft_registry.get_all_adapters()["a"])
+
+    def test_from_distributed_fresh_load_registers(self):
+        tm = _make_tokenizer_manager()
+
+        obj = _make_distributed_req("a")
+        result = asyncio.run(tm.load_oft_adapter_from_distributed(obj))
+
+        self.assertTrue(result.success)
+        self.assertIsNotNone(obj.adapter_id)
+        self.assertEqual(tm.peft_registry.num_registered_ofts, 1)
+        self.assertEqual(tm.peft_ref_cache["a"].adapter_id, obj.adapter_id)
+
+
+class TestUpsertReusesId(CustomTestCase):
+    def test_from_distributed_upsert_reuses_existing_id(self):
+        tm = _make_tokenizer_manager()
+        existing = OFTRef(
+            adapter_name="a", adapter_path="__distributed__", reloadable=False
+        )
+        asyncio.run(tm.peft_registry.register(existing))
+
+        obj = _make_distributed_req("a", upsert=True)
+        result = asyncio.run(tm.load_oft_adapter_from_distributed(obj))
+
+        self.assertTrue(result.success)
+        self.assertEqual(obj.adapter_id, existing.adapter_id)
+        # Refreshed in place, not re-registered as a second entry.
+        self.assertEqual(tm.peft_registry.num_registered_ofts, 1)
+        self.assertEqual(tm.peft_ref_cache["a"].adapter_id, existing.adapter_id)
+
+    def test_from_tensors_upsert_reuses_existing_id(self):
+        # Unlike LoRA's from_tensors route (which rejects upsert outright),
+        # OFT's from_tensors handler resolves upsert the same way
+        # from_distributed does -- this pins that intentional behavior.
+        tm = _make_tokenizer_manager()
+        existing = OFTRef(
+            adapter_name="a", adapter_path="__tensor__", reloadable=False
+        )
+        asyncio.run(tm.peft_registry.register(existing))
+
+        obj = _make_tensors_req("a", upsert=True)
+        result = asyncio.run(tm.load_oft_adapter_from_tensors(obj))
+
+        self.assertTrue(result.success)
+        self.assertEqual(obj.adapter_id, existing.adapter_id)
+        self.assertEqual(tm.peft_registry.num_registered_ofts, 1)
+
+    def test_non_upsert_duplicate_fails(self):
+        tm = _make_tokenizer_manager()
+        asyncio.run(
+            tm.peft_registry.register(
+                OFTRef(adapter_name="a", adapter_path="__tensor__")
+            )
+        )
+
+        result = asyncio.run(
+            tm.load_oft_adapter_from_tensors(_make_tensors_req("a", upsert=False))
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("already exists", result.error_message)
+
+
+class TestLRUEviction(CustomTestCase):
+    def test_eviction_fires_when_max_loaded_ofts_exceeded(self):
+        tm = _make_tokenizer_manager(max_loaded_ofts=1)
+        old_ref = OFTRef(adapter_name="old", adapter_path="/old")
+        asyncio.run(tm.peft_registry.register(old_ref))
+        tm.peft_ref_cache["old"] = old_ref
+        tm.update_oft_adapter_communicator = _make_communicator(
+            {"old": old_ref.adapter_id}
+        )
+
+        result = asyncio.run(
+            tm.load_oft_adapter_from_tensors(_make_tensors_req("new"))
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(tm.peft_registry.num_registered_ofts, 1)
+        registered = tm.peft_registry.get_all_adapters()
+        self.assertNotIn("old", registered)
+        self.assertIn("new", registered)
+        # The eviction loop must scrub the evicted name from the reported
+        # loaded_adapters map, or the caller reports a since-unloaded adapter
+        # as still resident.
+        self.assertNotIn("old", result.loaded_adapters)
+        self.assertIn("new", result.loaded_adapters)
+        # EVICT (LRU) must keep the ref_cache entry so a disk-backed adapter
+        # can still be implicitly reloaded later -- mirrors LoRA's
+        # _unload_lora_adapter_locked contract.
+        self.assertIn("old", tm.peft_ref_cache)
+
+    def test_no_eviction_when_under_limit(self):
+        tm = _make_tokenizer_manager(max_loaded_ofts=2)
+        old_ref = OFTRef(adapter_name="old", adapter_path="/old")
+        asyncio.run(tm.peft_registry.register(old_ref))
+        tm.peft_ref_cache["old"] = old_ref
+        tm.update_oft_adapter_communicator = _make_communicator(
+            {"old": old_ref.adapter_id}
+        )
+
+        result = asyncio.run(
+            tm.load_oft_adapter_from_tensors(_make_tensors_req("new"))
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(tm.peft_registry.num_registered_ofts, 2)
+        self.assertIn("old", tm.peft_registry.get_all_adapters())
+
+
+class TestUnloadDeleteVsEvictSemantics(CustomTestCase):
+    def test_explicit_unload_drops_ref_cache_entry(self):
+        tm = _make_tokenizer_manager()
+        ref = OFTRef(adapter_name="a", adapter_path="/x")
+        asyncio.run(tm.peft_registry.register(ref))
+        tm.peft_ref_cache["a"] = ref
+
+        result = asyncio.run(
+            tm.unload_oft_adapter(UnloadOFTAdapterReqInput(adapter_name="a"))
+        )
+
+        self.assertTrue(result.success)
+        self.assertNotIn("a", tm.peft_ref_cache)
+        self.assertEqual(tm.peft_registry.num_registered_ofts, 0)
+
+
+class TestWrongPeftConfigRejected(CustomTestCase):
+    """The native OFT RPC handlers must reject loudly -- before touching the
+    lock or the communicator -- unless the engine actually booted with
+    --peft-method oft --oft-impl sibling."""
+
+    def test_load_from_tensors_rejects_wrong_peft_method(self):
+        tm = _make_tokenizer_manager(peft_method="lora")
+
+        result = asyncio.run(tm.load_oft_adapter_from_tensors(_make_tensors_req()))
+
+        self.assertFalse(result.success)
+        self.assertIn("--peft-method oft", result.error_message)
+        tm.update_oft_adapter_communicator.assert_not_awaited()
+
+    def test_load_from_distributed_rejects_wrong_oft_impl(self):
+        tm = _make_tokenizer_manager(oft_impl="staged")
+
+        result = asyncio.run(
+            tm.load_oft_adapter_from_distributed(_make_distributed_req())
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("--oft-impl sibling", result.error_message)
+        tm.update_oft_adapter_communicator.assert_not_awaited()
+
+    def test_unload_rejects_wrong_peft_method(self):
+        tm = _make_tokenizer_manager(peft_method=None)
+
+        result = asyncio.run(
+            tm.unload_oft_adapter(UnloadOFTAdapterReqInput(adapter_name="a"))
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("Native OFT adapter loading requires", result.error_message)
+        tm.update_oft_adapter_communicator.assert_not_awaited()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
