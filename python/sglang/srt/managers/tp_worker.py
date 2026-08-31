@@ -32,8 +32,11 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    LoadOFTAdapterFromDistributedReqInput,
+    LoadOFTAdapterFromTensorsReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
+    UnloadOFTAdapterReqInput,
     UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -306,6 +309,36 @@ class BaseTpWorker(ABC):
             recv_req.config_dict,
             recv_req.group_name,
             recv_req.added_tokens_config,
+            upsert=recv_req.upsert,
+        )
+        return result
+
+    def unload_oft_adapter(self, recv_req: UnloadOFTAdapterReqInput):
+        result = self.model_runner.unload_oft_adapter(recv_req.to_ref())
+        return result
+
+    def load_oft_adapter_from_tensors(
+        self, recv_req: LoadOFTAdapterFromTensorsReqInput
+    ):
+        data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
+        result = self.model_runner.load_oft_adapter_from_tensors(
+            recv_req.to_ref(),
+            data,
+            recv_req.config_dict,
+            upsert=recv_req.upsert,
+        )
+        return result
+
+    def load_oft_adapter_from_distributed(
+        self, recv_req: LoadOFTAdapterFromDistributedReqInput
+    ):
+        result = self.model_runner.load_oft_adapter_from_distributed(
+            recv_req.to_ref(),
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.config_dict,
+            recv_req.group_name,
             upsert=recv_req.upsert,
         )
         return result
