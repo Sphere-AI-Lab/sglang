@@ -388,6 +388,20 @@ class WeightUpdater:
     ):
         """Receive and stage a native LoRA or canonical OFT payload."""
         model_runner = self.get_model_runner()
+        use_native_lora = (
+            model_runner.server_args.enable_lora_staging
+            and load_format == "lora_adapter"
+        )
+        use_oft = (
+            getattr(model_runner.server_args, "peft_method", None) == "oft"
+            and load_format == "oft_adapter"
+        )
+        if not (use_native_lora or use_oft):
+            return False, (
+                "adapter staging requires native LoRA staging with "
+                "load_format=lora_adapter or canonical OFT with "
+                "load_format=oft_adapter"
+            )
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
@@ -413,10 +427,7 @@ class WeightUpdater:
             for handle in handles:
                 handle.wait()
 
-            if (
-                model_runner.server_args.enable_lora_staging
-                and load_format == "lora_adapter"
-            ):
+            if use_native_lora:
                 if payload_metadata is not None:
                     tensors = reconstruct_adapter_staging(tensors, payload_metadata)
                 result = model_runner.lora_manager.stage_adapter(
@@ -456,8 +467,14 @@ class WeightUpdater:
     ):
         """Activate the exact native LoRA or canonical OFT version."""
         model_runner = self.get_model_runner()
+        use_native_lora = model_runner.server_args.enable_lora_staging
+        use_oft = getattr(model_runner.server_args, "peft_method", None) == "oft"
+        if not (use_native_lora or use_oft):
+            return False, (
+                "adapter activation requires native LoRA staging or canonical OFT"
+            )
         try:
-            if model_runner.server_args.enable_lora_staging:
+            if use_native_lora:
                 result = model_runner.lora_manager.activate_adapter(
                     adapter_name,
                     int(adapter_version),
