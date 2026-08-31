@@ -59,3 +59,5 @@ Task 3: Ruling (supersedes the generated-dense-NVFP4 and ModelOpt/PTQ rulings ab
 Task 3: direct-model TDD update complete in bid-100 Condor job `17497109.0`: accepted RED was 3 focused failures in 0.53s against the old local-NVFP4 behavior; GREEN was the full focused file, 28 passed in 0.67s. Static compilation and JSON/JSONL parsing passed in job `17497087.0`. The authoritative Slurm files exactly match tested bundle SHA-256 `6c08836763484603e945e756dd4d83f063fd342c420b548ef4fabe7ed9adad2f`.
 
 Task 3: all six checkpoints are promoted at immutable revision paths. Dense FP8 manifest hash is `2555ca55f5e0cb2c58e3014c8356c01660aeeaffe2b9388186ea2036008c9762`; dense NVFP4 manifest hash is `d009978597b1a807de5c479562e1f2dbed7d4038861250ed8d67762473caa5c3`. The integrated all-six real-checkpoint preflight passed in bid-100 Condor job `17497109.0`; manifest SHA-256 is `6823ad50ef71880f4b0e60e14a151c0c3209b4028a420bb664a83a17d36d5e7e`, with evidence under `20260831T092125Z-126d11/precision-downloads`.
+
+Task 3: complete (commit `86fd769df`, self-review clean; focused suite 28 passed; all-six real-checkpoint preflight passed)
