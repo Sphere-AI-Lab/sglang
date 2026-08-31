@@ -1,5 +1,6 @@
 import argparse
 from types import SimpleNamespace
+from typing import get_type_hints
 
 import pytest
 
@@ -67,3 +68,11 @@ def test_register_oft_args_exposes_only_the_canonical_selector():
         parser.parse_args(["--peft-method", "lora"])
     with pytest.raises(SystemExit):
         parser.parse_args(["--oft-impl", "peft"])
+
+
+def test_oft_args_type_hints_resolve_for_server_args_consumers():
+    """Catch forward references that break ServerArgs declaration handling."""
+    from sglang.srt.oft.config import OFTArgs
+
+    hints = get_type_hints(OFTArgs, include_extras=True)
+    assert "peft_paths" in hints
