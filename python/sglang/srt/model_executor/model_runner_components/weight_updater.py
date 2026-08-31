@@ -437,6 +437,23 @@ class WeightUpdater:
                     return False, result.error_message
                 return True, "Succeeded to stage adapter online."
 
+            if (
+                model_runner.server_args.oft_impl == "staged"
+                and load_format == "oft_adapter"
+            ):
+                if payload_metadata is not None:
+                    tensors = peft.reconstruct_oft_staging(tensors, payload_metadata)
+                result = model_runner.oft_manager.stage_adapter(
+                    tensors,
+                    adapter_config,
+                    adapter_name,
+                    int(adapter_version),
+                    adapter_id=adapter_id,
+                )
+                if not result.success:
+                    return False, result.error_message
+                return True, "Succeeded to stage adapter online."
+
             result = peft.stage_adapter(
                 model_runner,
                 load_format,
@@ -476,6 +493,16 @@ class WeightUpdater:
             model_runner = self.get_model_runner()
             if getattr(model_runner.server_args, "enable_lora_staging", False):
                 result = model_runner.lora_manager.activate_adapter(
+                    adapter_name,
+                    int(adapter_version),
+                    adapter_id=adapter_id,
+                )
+                if not result.success:
+                    return False, result.error_message
+                return True, "Succeeded to activate adapter version."
+
+            if model_runner.server_args.oft_impl == "staged":
+                result = model_runner.oft_manager.activate_adapter(
                     adapter_name,
                     int(adapter_version),
                     adapter_id=adapter_id,

@@ -28,7 +28,7 @@ def _mint_ref(tm, name):
     streamed adapters). The OFT ref class follows --oft-impl so minted refs
     match the registry built in init_tokenizer_peft."""
     if tm.peft_kind == "oft":
-        if tm.server_args.oft_impl == "sibling":
+        if tm.server_args.oft_impl in ("sibling", "staged"):
             from sglang.srt.oft.oft_registry import OFTRef
         else:
             from sglang.srt.peft.oft.oft_registry import OFTRef
@@ -61,7 +61,7 @@ def init_tokenizer_peft(tm):
         # Registry class follows --oft-impl (byte-identical twins); its ctor
         # asserts the refs are its own OFTRef class, which validate_peft_args
         # normalized with the same dispatch.
-        if tm.server_args.oft_impl == "sibling":
+        if tm.server_args.oft_impl in ("sibling", "staged"):
             from sglang.srt.oft.oft_registry import OFTRegistry
         else:
             from sglang.srt.peft.oft.oft_registry import OFTRegistry

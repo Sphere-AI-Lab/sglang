@@ -77,23 +77,38 @@ def maybe_init_peft_manager(
         _init_lora_manager(model_runner, server_args)
 
 
+def _get_oft_manager_class(server_args: "ServerArgs"):
+    """Resolve the OFTManager class for ``server_args.oft_impl``, mirroring
+    ``ModelRunner._get_lora_manager_class``'s pattern for OFT's third choice.
+
+    Imported lazily: OFTManager pulls in vocab_parallel_embedding ->
+    communicator -> forward_batch_info, which forms an import cycle when a
+    module in that chain imports this façade at module scope (e.g.
+    forward_batch_info). Deferring keeps ``peft.integration`` light to import.
+    """
+    if server_args.oft_impl == "staged":
+        from sglang.srt.oft.staged_manager import StagedOFTManager
+
+        return StagedOFTManager
+    if server_args.oft_impl == "sibling":
+        from sglang.srt.oft.oft_manager import OFTManager
+
+        return OFTManager
+    from sglang.srt.peft.oft.oft_manager import OFTManager
+
+    return OFTManager
+
+
 def _init_oft_manager(model_runner: "ModelRunner", server_args: "ServerArgs") -> None:
     """Body of the former ``ModelRunner.init_oft_manager``."""
-    # Imported lazily: OFTManager pulls in vocab_parallel_embedding ->
-    # communicator -> forward_batch_info, which forms an import cycle when a
-    # module in that chain imports this façade at module scope (e.g.
-    # forward_batch_info). Deferring keeps ``peft.integration`` light to import.
-    if getattr(server_args, "oft_impl", "sibling") == "sibling":
-        from sglang.srt.oft.oft_manager import OFTManager
-    else:
-        from sglang.srt.peft.oft.oft_manager import OFTManager
+    OFTManager = _get_oft_manager_class(server_args)
 
     # Runtime witness for the A/B parity work: every boot names the stack that
     # actually serves, so "which implementation ran" is in the log, not inferred.
     logger.info(
         "OFT implementation: %s (oft_impl=%s)",
         OFTManager.__module__,
-        getattr(server_args, "oft_impl", "sibling"),
+        server_args.oft_impl,
     )
 
     model_runner.oft_manager = OFTManager(

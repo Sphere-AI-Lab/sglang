@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -473,6 +474,204 @@ class TestActivateUpdatesManagerBookkeeping(unittest.TestCase):
         self.assertIn("adapter-a", manager.adapters)
         self.assertEqual(manager.configs["adapter-a"].block_size, BLOCK_SIZE)
         self.assertEqual(manager.adapters["adapter-a"].block_size, BLOCK_SIZE)
+
+
+class TestOFTManagerClassSelection(unittest.TestCase):
+    """Mirrors test_lora_staging_control.py's TestStagingFlagAndSelection for
+    OFT's third oft_impl choice: _get_oft_manager_class (peft/integration.py)
+    is the construction-site helper model_runner.py's maybe_init_peft_manager
+    ultimately calls through, and must resolve all three oft_impl choices to
+    the right manager class."""
+
+    def test_selects_staged_manager_when_oft_impl_is_staged(self):
+        from sglang.srt.oft.staged_manager import StagedOFTManager
+        from sglang.srt.peft.integration import _get_oft_manager_class
+
+        server_args = SimpleNamespace(oft_impl="staged")
+
+        self.assertIs(_get_oft_manager_class(server_args), StagedOFTManager)
+
+    def test_keeps_sibling_manager_when_oft_impl_is_sibling(self):
+        from sglang.srt.oft.oft_manager import OFTManager
+        from sglang.srt.peft.integration import _get_oft_manager_class
+
+        server_args = SimpleNamespace(oft_impl="sibling")
+
+        self.assertIs(_get_oft_manager_class(server_args), OFTManager)
+
+    def test_falls_back_to_the_peft_manager_for_the_peft_impl(self):
+        from sglang.srt.peft.integration import _get_oft_manager_class
+        from sglang.srt.peft.oft.oft_manager import OFTManager as PeftOFTManager
+
+        server_args = SimpleNamespace(oft_impl="peft")
+
+        self.assertIs(_get_oft_manager_class(server_args), PeftOFTManager)
+
+
+class TestWeightUpdaterStagedRouting(unittest.TestCase):
+    """Mirrors test_lora_staging_control.py's TestWeightUpdaterRouting for the
+    new oft_impl == "staged" branch: WeightUpdater.stage_adapter /
+    activate_adapter_version must dispatch directly to model_runner.oft_manager
+    (StagedOFTManager) and propagate its OFTUpdateOutput.success/error_message,
+    the same shape the native-LoRA branch already uses a few lines above.
+
+    Regression this guards: StagedOFTManager.stage_adapter/activate_adapter
+    return an OFTUpdateOutput(success=False, ...) WITHOUT raising, unlike the
+    plain OFTManager it replaces (which raises on failure and relied on the
+    caller's try/except). Before this branch existed, a staged failure fell
+    through to peft.stage_adapter/peft.activate_adapter, which return that
+    same unwrapped result -- and the generic fallback path here only checks
+    `result is peft.NOT_HANDLED`, never `.success` -- so a real staging/
+    activation failure would have been reported as
+    (True, "Succeeded to ..."). These tests fail on that regression.
+    """
+
+    def _updater(self, runner):
+        from unittest.mock import Mock, sentinel
+
+        return SimpleNamespace(
+            _model_update_group={"sync": sentinel.process_group},
+            device="cpu",
+            get_model_runner=Mock(return_value=runner),
+        )
+
+    def _stage_kwargs(self, **overrides):
+        values = dict(
+            names=["__flattened__"],
+            dtypes=[torch.float32],
+            shapes=[(2,)],
+            group_name="sync",
+            load_format="oft_adapter",
+            adapter_config={"target_modules": ["q_proj"], "oft_block_size": 4},
+            adapter_name="policy",
+            adapter_id="id-a",
+            adapter_version="8",
+            payload_metadata=None,
+            double_buffer=True,
+        )
+        values.update(overrides)
+        return values
+
+    def test_staged_stage_forwards_args_and_returns_manager_failure(self):
+        from sglang.srt.model_executor.model_runner_components import (
+            weight_updater as weight_updater_module,
+        )
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            WeightUpdater,
+        )
+
+        runner = MagicMock()
+        runner.server_args.enable_lora_staging = False
+        runner.server_args.oft_impl = "staged"
+        runner.oft_manager.stage_adapter.return_value = SimpleNamespace(
+            success=False, error_message="staged stage rejected"
+        )
+        updater = self._updater(runner)
+
+        with (
+            patch.object(torch.distributed, "broadcast", return_value=MagicMock()),
+            patch.object(weight_updater_module.peft, "stage_adapter") as fallback,
+        ):
+            result = WeightUpdater.stage_adapter(updater, **self._stage_kwargs())
+
+        self.assertEqual(result, (False, "staged stage rejected"))
+        call = runner.oft_manager.stage_adapter.call_args
+        self.assertEqual([name for name, _ in call.args[0]], ["__flattened__"])
+        self.assertEqual(
+            call.args[1:], (self._stage_kwargs()["adapter_config"], "policy", 8)
+        )
+        self.assertEqual(call.kwargs, {"adapter_id": "id-a"})
+        fallback.assert_not_called()
+
+    def test_non_staged_stage_keeps_peft_fallback(self):
+        from unittest.mock import sentinel
+
+        from sglang.srt.model_executor.model_runner_components import (
+            weight_updater as weight_updater_module,
+        )
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            WeightUpdater,
+        )
+
+        runner = MagicMock()
+        runner.server_args.enable_lora_staging = False
+        runner.server_args.oft_impl = "sibling"
+        updater = self._updater(runner)
+
+        with (
+            patch.object(torch.distributed, "broadcast", return_value=MagicMock()),
+            patch.object(
+                weight_updater_module.peft,
+                "stage_adapter",
+                return_value=sentinel.peft_result,
+            ) as fallback,
+        ):
+            result = WeightUpdater.stage_adapter(updater, **self._stage_kwargs())
+
+        self.assertEqual(result, (True, "Succeeded to stage adapter online."))
+        fallback.assert_called_once()
+        runner.oft_manager.stage_adapter.assert_not_called()
+
+    def test_staged_activation_forwards_id_and_returns_manager_failure(self):
+        from sglang.srt.model_executor.model_runner_components import (
+            weight_updater as weight_updater_module,
+        )
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            WeightUpdater,
+        )
+
+        runner = MagicMock()
+        runner.server_args.enable_lora_staging = False
+        runner.server_args.oft_impl = "staged"
+        runner.oft_manager.activate_adapter.return_value = SimpleNamespace(
+            success=False, error_message="staged activation rejected"
+        )
+        updater = self._updater(runner)
+
+        with patch.object(weight_updater_module.peft, "activate_adapter") as fallback:
+            result = WeightUpdater.activate_adapter_version(
+                updater,
+                adapter_name="policy",
+                adapter_id="id-a",
+                adapter_version="8",
+            )
+
+        self.assertEqual(result, (False, "staged activation rejected"))
+        runner.oft_manager.activate_adapter.assert_called_once_with(
+            "policy", 8, adapter_id="id-a"
+        )
+        fallback.assert_not_called()
+
+    def test_non_staged_activation_keeps_peft_fallback(self):
+        from unittest.mock import sentinel
+
+        from sglang.srt.model_executor.model_runner_components import (
+            weight_updater as weight_updater_module,
+        )
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            WeightUpdater,
+        )
+
+        runner = MagicMock()
+        runner.server_args.enable_lora_staging = False
+        runner.server_args.oft_impl = "sibling"
+        updater = self._updater(runner)
+
+        with patch.object(
+            weight_updater_module.peft,
+            "activate_adapter",
+            return_value=sentinel.peft_result,
+        ) as fallback:
+            result = WeightUpdater.activate_adapter_version(
+                updater,
+                adapter_name="policy",
+                adapter_id="id-a",
+                adapter_version="8",
+            )
+
+        self.assertEqual(result, (True, "Succeeded to activate adapter version."))
+        fallback.assert_called_once_with(runner, "policy", 8)
+        runner.oft_manager.activate_adapter.assert_not_called()
 
 
 class TestOFTStagingBackendIsSymmetric(unittest.TestCase):

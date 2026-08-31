@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 OFT_BACKEND_CHOICES = ["triton", "torch_native"]
 OFT_TYPE_CHOICES = ["oft", "canonical_oft"]
-OFT_IMPL_CHOICES = ["peft", "sibling"]
+OFT_IMPL_CHOICES = ["peft", "sibling", "staged"]
 
 
 @dataclass(kw_only=True)
@@ -71,9 +71,11 @@ class PEFTArgs:
     # 2026-08-29: default is "sibling" = srt/oft (the srt/lora-shaped mirror),
     # after the equivalence gate passed bitwise on the full parity matrix.
     # "peft" = srt/peft/oft, kept intact as the rollback lever and frozen
-    # reference. The tokenizer-side registry/ref classes follow this flag too
-    # (byte-identical twins; dispatched in validate_peft_args and
-    # peft/tokenizer_hooks.py).
+    # reference. "staged" = srt/oft's StagedOFTManager, an explicit
+    # stage/activate transaction on top of the same srt/oft family (async-RL
+    # weight sync; see srt/oft/staged_manager.py). The tokenizer-side
+    # registry/ref classes follow this flag too (byte-identical twins;
+    # dispatched in validate_peft_args and peft/tokenizer_hooks.py).
     oft_impl: A[str, NS("lora")] = "sibling"
     oft_dtype: A[Optional[str], NS("lora")] = None
     # Single global signal for split(canonical)-vs-fused OFT (attention qkv,
@@ -220,7 +222,9 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         choices=OFT_IMPL_CHOICES,
         help="Which OFT implementation serves for peft_method='oft'. "
         "'sibling' = srt/oft (default since the 2026-08-29 cutover); "
-        "'peft' = srt/peft/oft (rollback lever / frozen reference).",
+        "'peft' = srt/peft/oft (rollback lever / frozen reference); "
+        "'staged' = srt/oft's StagedOFTManager (explicit stage/activate "
+        "transaction for async-RL weight sync).",
     )
 
 def validate_peft_args(server_args) -> None:
@@ -299,8 +303,9 @@ def validate_peft_args(server_args) -> None:
         # Refs must be the class family of the serving implementation: the
         # sibling registry's ctor asserts its own OFTRef type (a byte-identical
         # twin of the peft one), and both the tokenizer-side registry and the
-        # worker-side manager are built from these refs.
-        if server_args.oft_impl == "sibling":
+        # worker-side manager are built from these refs. "staged" serves via
+        # StagedOFTManager (srt/oft), the same OFTRef family as "sibling".
+        if server_args.oft_impl in ("sibling", "staged"):
             from sglang.srt.oft.oft_registry import OFTRef as _ImplOFTRef
         else:
             _ImplOFTRef = OFTRef
