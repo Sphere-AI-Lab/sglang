@@ -2,13 +2,9 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
-
-maybe_stub_sgl_kernel()
-
-from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
+from sglang.srt.oft import tokenizer_hooks
 
 
 def _state(adapter_path="policy-a", adapter_id="adapter-id-a"):
@@ -17,18 +13,19 @@ def _state(adapter_path="policy-a", adapter_id="adapter-id-a"):
         adapter_id=adapter_id,
         rid="request-a",
     )
-    return ReqState([], False, asyncio.Event(), obj, Mock())
+    return SimpleNamespace(obj=obj, oft_lease_released=False)
 
 
 def test_task8_oft_lease_is_released_exactly_once():
-    manager = TokenizerManager.__new__(TokenizerManager)
-    manager.peft_kind = "oft"
-    manager.peft_registry = SimpleNamespace(release=AsyncMock())
+    manager = SimpleNamespace(
+        peft_kind="oft",
+        peft_registry=SimpleNamespace(release=AsyncMock()),
+    )
     state = _state()
 
     async def run():
         for _ in range(3):
-            manager._finalize_oft_lease(state)
+            tokenizer_hooks.finalize_oft_lease(manager, state)
         await asyncio.sleep(0)
 
     asyncio.run(run())
@@ -38,13 +35,14 @@ def test_task8_oft_lease_is_released_exactly_once():
 
 
 def test_task8_oft_pre_acquire_failure_releases_nothing():
-    manager = TokenizerManager.__new__(TokenizerManager)
-    manager.peft_kind = "oft"
-    manager.peft_registry = SimpleNamespace(release=AsyncMock())
+    manager = SimpleNamespace(
+        peft_kind="oft",
+        peft_registry=SimpleNamespace(release=AsyncMock()),
+    )
     state = _state(adapter_id=None)
 
     async def run():
-        manager._finalize_oft_lease(state)
+        tokenizer_hooks.finalize_oft_lease(manager, state)
         await asyncio.sleep(0)
 
     asyncio.run(run())
