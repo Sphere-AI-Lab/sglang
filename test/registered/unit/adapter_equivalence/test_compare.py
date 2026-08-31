@@ -1287,3 +1287,87 @@ def test_task8_lifecycle_executor_records_the_frozen_state_machine():
 
     assert tuple(observations) == tuple(step.name for step in steps)
     assert executor.seen == list(steps)
+
+
+def test_task8_offline_engine_kwargs_preserve_source_oft_selection():
+    from adapter_equivalence.server import ServerSpec, engine_kwargs
+
+    spec = ServerSpec(
+        revision_kind="source",
+        model_path="/models/qwen3-4b",
+        mode="canonical_oft",
+        port=31001,
+        tp_size=1,
+        ep_size=1,
+        cuda_graph=True,
+        startup_adapters=(("policy-a", "/adapters/a"),),
+    )
+
+    assert engine_kwargs(spec) == {
+        "base_gpu_id": 1,
+        "disable_cuda_graph": False,
+        "ep_size": 1,
+        "log_level": "error",
+        "mem_fraction_static": 0.8,
+        "model_path": "/models/qwen3-4b",
+        "oft_impl": "sibling",
+        "peft_method": "oft",
+        "peft_paths": ("policy-a=/adapters/a",),
+        "tp_size": 1,
+    }
+
+
+def test_task8_internal_oft_control_calls_real_manager_contract():
+    import asyncio
+    from dataclasses import dataclass
+    from types import SimpleNamespace
+
+    from adapter_equivalence.server import (
+        InternalOFTControl,
+        OFTRequestTypes,
+    )
+
+    @dataclass
+    class LoadRequest:
+        adapter_name: str
+        adapter_path: str
+        pinned: bool = False
+
+    @dataclass
+    class UnloadRequest:
+        adapter_name: str
+
+    class Manager:
+        def __init__(self):
+            self.calls = []
+
+        async def load_oft_adapter(self, request, http_request):
+            self.calls.append(("load", request, http_request))
+            return SimpleNamespace(success=True, error_message=None)
+
+        async def unload_oft_adapter(self, request, http_request):
+            self.calls.append(("unload", request, http_request))
+            return SimpleNamespace(success=True, error_message=None)
+
+    class Loop:
+        def run_until_complete(self, awaitable):
+            return asyncio.run(awaitable)
+
+    manager = Manager()
+    engine = SimpleNamespace(loop=Loop(), tokenizer_manager=manager)
+    control = InternalOFTControl(
+        engine,
+        revision_kind="source",
+        request_types=OFTRequestTypes(LoadRequest, UnloadRequest),
+    )
+
+    assert control.load("policy-a", "/adapters/a", pinned=True).success
+    assert control.unload("policy-a").success
+    assert manager.calls == [
+        (
+            "load",
+            LoadRequest("policy-a", "/adapters/a", pinned=True),
+            None,
+        ),
+        ("unload", UnloadRequest("policy-a"), None),
+    ]
