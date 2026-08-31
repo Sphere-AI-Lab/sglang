@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 from sglang.srt.arg_groups.arg_utils import A, NS
+from sglang.srt.oft.oft_registry import OFTRef
 
 logger = logging.getLogger(__name__)
 
