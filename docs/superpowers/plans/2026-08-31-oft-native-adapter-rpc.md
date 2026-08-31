@@ -739,6 +739,32 @@ In `python/sglang/srt/peft/tokenizer_hooks.py`'s `resolve_peft_path`, the block 
 
 (This replaces the existing `if tm.peft_kind == "oft":` check — insert the new `ref`/`reloadable` guard between the existing `adapter_path not in tm.peft_ref_cache` check and the existing `if tm.peft_kind == "oft":` line; read the surrounding function body first since the existing code already assigns `ref = tm.peft_ref_cache[adapter_path]` slightly later — reuse that assignment rather than duplicating it, adjust order accordingly.)
 
+- [ ] **Step 5b: Close `resolve_peft_path`'s id+version TOCTOU gap (per spec, "AdapterRegistry extension" section)**
+
+`resolve_peft_path` currently resolves the adapter id and version as two
+separate calls under two separate lock acquisitions:
+
+```python
+    adapter_id = await tm.peft_registry.acquire(path)
+    ...
+    adapter_version = await tm.peft_registry.get_version_by_id(adapter_id)
+```
+
+(`python/sglang/srt/peft/tokenizer_hooks.py:156` and `:159`, with the
+`obj.adapter_id = adapter_id` / `_propagate_id_to_cached_sub_objs` calls
+in between). Replace both calls with Task 1's new atomic primitive:
+
+```python
+    adapter_id, adapter_version = await tm.peft_registry.acquire_with_version(path)
+```
+
+placed where the original `acquire()` call was; delete the now-redundant
+`get_version_by_id` call. Everything else in the function (the
+`obj.adapter_id = adapter_id` assignment, both
+`_propagate_id_to_cached_sub_objs` calls) stays unchanged — only the
+resolution of `adapter_id`/`adapter_version` themselves changes from two
+non-atomic calls to one atomic call.
+
 - [ ] **Step 6: Write handler unit tests with a mocked communicator**
 
 Create `test/registered/unit/managers/test_oft_native_handlers.py` mirroring whatever test file (if any) covers `load_lora_adapter_from_tensors`'s handler logic with a mocked `TokenizerManager` — search first: `grep -rln "load_lora_adapter_from_tensors" test/registered/unit/` — if one exists, model this file on it directly (same mocking approach for `update_oft_adapter_communicator`, `peft_registry`, `peft_ref_cache`, `peft_update_lock`); if none exists, write a minimal `unittest.IsolatedAsyncioTestCase` that constructs a bare object with just the attributes these methods read (`server_args`, `peft_registry`, `peft_ref_cache`, `peft_update_lock`, `update_oft_adapter_communicator` as an `AsyncMock`), covering: fresh load succeeds and registers; upsert reuses id; LRU eviction fires when `max_loaded_ofts` exceeded; wrong `peft_method`/`oft_impl` rejects with a clear error.
