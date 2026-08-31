@@ -7,9 +7,9 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.platforms import current_platform
 from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
@@ -25,7 +25,9 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
+    from sglang.kernels.ops.attention.rope import (
+        FusedSetKVBufferArg,  # For type check-only
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +42,7 @@ _is_musa = is_musa()
 _is_mps = is_mps()
 
 if _is_cuda:
-    from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
+    from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
 
 if _is_npu:
     import torch_npu
@@ -73,7 +75,7 @@ if _is_xpu:
     from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
 
 
-class RotaryEmbedding(MultiPlatformOp):
+class RotaryEmbedding(BaseFusedOp):
     """Original rotary positional embedding."""
 
     def __init__(
@@ -107,10 +109,10 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_mps)
             and not (current_platform.is_out_of_tree())
         ):
-            # rotary_embedding from sglang.jit_kernel.rope and vllm._custom_ops has the same implementation.
+            # rotary_embedding from sglang.kernels.ops.attention.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
             if _is_cuda:
-                from sglang.jit_kernel.rope import rotary_embedding
+                from sglang.kernels.ops.attention.rope import rotary_embedding
             elif _is_hip:
                 from sgl_kernel import rotary_embedding
             else:

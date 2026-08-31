@@ -33,7 +33,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -126,9 +126,16 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_parallel().tp_size
-        if is_npu() and get_server_args().speculative_draft_model_quantization is None:
+        if is_npu() and get_spec().speculative_draft_model_quantization is None:
             quant_config = None
         self.quant_config = quant_config
+
+        # The draft's own gate: its quantization can differ from the
+        # target's, and the decoder below reads the ACTIVE decision while it
+        # builds. Also sets num_fused_shared_experts, which drives the
+        # inherited loader's shared-expert remap.
+        self.num_fused_shared_experts = 0
+        self.determine_num_fused_shared_experts()
 
         self.model = Glm4MoeModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -138,12 +145,28 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
         self.num_fused_shared_experts = (
-            0 if get_server_args().disable_shared_experts_fusion else 1
+            0 if get_exec().moe.disable_shared_experts_fusion else 1
+        )
+
+        # Weight loading mappings (must match parent for load_weights to work)
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
 
         # Weight loading mappings (must match parent for load_weights to work)

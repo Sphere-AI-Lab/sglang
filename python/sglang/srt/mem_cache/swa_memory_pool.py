@@ -57,19 +57,22 @@ class SWAKVPool(BaseSWAKVPool):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        self.swa_kv_pool = token_to_kv_pool_class(
-            size=size_swa,
-            dtype=dtype,
-            layer_num=self.swa_layer_nums,
-            **kwargs,
-        )
-        kwargs.pop("swa_head_num", None)
-        kwargs.pop("swa_head_dim", None)
-        kwargs.pop("swa_v_head_dim", None)
+        full_pool_kwargs = kwargs.copy()
+        full_pool_kwargs.pop("swa_head_num", None)
+        full_pool_kwargs.pop("swa_head_dim", None)
+        full_pool_kwargs.pop("swa_v_head_dim", None)
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
             dtype=dtype,
             layer_num=self.full_layer_nums,
+            allocation_label="Full",
+            **full_pool_kwargs,
+        )
+        self.swa_kv_pool = token_to_kv_pool_class(
+            size=size_swa,
+            dtype=dtype,
+            layer_num=self.swa_layer_nums,
+            allocation_label="SWA",
             **kwargs,
         )
         # {layer_id: (index, is_swa_layer)}
@@ -83,7 +86,7 @@ class SWAKVPool(BaseSWAKVPool):
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
         logger.info(
-            f"SWAKVPool mem usage: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
+            f"SWAKVPool {'VA upper bound' if self.post_capture_active else 'mem usage'}: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
         )
 
     @property
@@ -156,6 +159,15 @@ class SWAKVPool(BaseSWAKVPool):
             return self.swa_kv_pool.get_value_buffer(layer_id_pool)
         else:
             return self.full_kv_pool.get_value_buffer(layer_id_pool)
+
+    def get_v_head_dim(self):
+        # Read off the full-attention sub-pool: TritonAttnBackend asks for this on
+        # the mambaish path, where a global layer id is not guaranteed to be a
+        # full-attention layer. Uses start_layer for pipeline parallelism, matching
+        # HybridLinearKVPool.
+        return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[
+            -1
+        ]
 
     def get_kv_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)

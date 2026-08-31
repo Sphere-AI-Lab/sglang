@@ -58,9 +58,9 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_forward,
     get_parallel,
-    get_server_args,
     get_stream,
 )
 from sglang.srt.true_on_policy import (
@@ -105,7 +105,7 @@ class SDARMoeSparseMoeBlock(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -127,7 +127,7 @@ class SDARMoeSparseMoeBlock(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.num_experts + get_server_args().ep_num_redundant_experts
+                config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
 
@@ -555,7 +555,7 @@ class SDARMoeForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:

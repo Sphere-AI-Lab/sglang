@@ -1,8 +1,15 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import zmq
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.req_time_stats import real_time
 from sglang.srt.platforms import current_platform
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.rust_server import RustServer
 
 
 class IdleSleeper:
@@ -28,6 +35,36 @@ class IdleSleeper:
 
     def maybe_sleep(self):
         self.poller.poll(1000)
+        if (
+            self.empty_cache_interval > 0
+            and real_time() - self.last_empty_time > self.empty_cache_interval
+        ):
+            self.last_empty_time = real_time()
+            if self.can_empty_cache is None or self.can_empty_cache():
+                current_platform.empty_cache()
+
+
+class RustServerIdleSleeper:
+    """Idle sleeper for the embedded Rust server.
+
+    The Rust ingress is an in-process request ring, not a zmq socket.
+    Instead park directly on the ring: ``wait_ingress`` blocks until
+    a request is pushed — the request ring wakes the parked thread
+    the instant a producer pushes, so there's no added latency for real
+    requests — or the timeout elapses.
+    """
+
+    def __init__(
+        self, rust_server: RustServer, timeout_ms: int = 1000, can_empty_cache=None
+    ):
+        self.rust_server = rust_server
+        self.timeout_ms = timeout_ms
+        self.last_empty_time = real_time()
+        self.can_empty_cache = can_empty_cache
+        self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
+
+    def maybe_sleep(self):
+        self.rust_server.wait_ingress(self.timeout_ms)
         if (
             self.empty_cache_interval > 0
             and real_time() - self.last_empty_time > self.empty_cache_interval

@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import logging
 import threading
+from contextlib import contextmanager
 from typing import Callable, List, Optional
 
 import ray
@@ -32,9 +34,24 @@ from sglang.srt.entrypoints.engine import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.ray.scheduler_actor import SchedulerActor
+from sglang.srt.runtime_context import configured_pp_size, get_parallel
 from sglang.srt.server_args import PortArgs, ServerArgs
 
 logger = logging.getLogger(__name__)
+
+_caller_placement_group: contextvars.ContextVar[Optional[PlacementGroup]] = (
+    contextvars.ContextVar("sglang_ray_caller_placement_group", default=None)
+)
+
+
+@contextmanager
+def _placement_group_context(placement_group: Optional[PlacementGroup]):
+    """Expose launch-only state while Engine synchronously starts schedulers."""
+    token = _caller_placement_group.set(placement_group)
+    try:
+        yield
+    finally:
+        _caller_placement_group.reset(token)
 
 
 @dataclasses.dataclass
@@ -107,9 +124,9 @@ def _compute_world_size(server_args: ServerArgs) -> int:
 
     Normal: dp_size * tp_size * pp_size; DP attention: tp_size * pp_size.
     """
-    if server_args.enable_dp_attention:
-        return server_args.tp_size * server_args.pp_size
-    return server_args.dp_size * server_args.tp_size * server_args.pp_size
+    if get_parallel().enable_dp_attention:
+        return server_args.tp_size * configured_pp_size()
+    return get_parallel().dp_size * server_args.tp_size * configured_pp_size()
 
 
 def _resolve_bundle_indices(pg: PlacementGroup, world_size: int) -> List[int]:
@@ -175,6 +192,22 @@ def _validate_custom_placement_group(pg: PlacementGroup, world_size: int) -> Non
         )
 
 
+def get_scheduler_actor_name(
+    *,
+    rank0_node_ip: str,
+    dp_rank: int,
+    pp_rank: int,
+    tp_rank: int,
+    pg_id_hex: str,
+    bundle_idx: int,
+) -> str:
+    return (
+        f"sglang_scheduler_node{rank0_node_ip}"
+        f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
+        f"_pg{pg_id_hex}_bundle{bundle_idx}"
+    )
+
+
 def _create_scheduler_actor(
     pg: PlacementGroup,
     bundle_idx: int,
@@ -200,14 +233,25 @@ def _create_scheduler_actor(
         server_args, tp_rank
     )
 
+    rdt = server_args.enable_rdt_weight_sync
+
     return SchedulerActor.options(
         num_cpus=0,
         num_gpus=1,
-        name=(
-            f"sglang_scheduler_node{rank0_node_ip}"
-            f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
-            f"_pg{pg.id.hex()[:8]}_bundle{bundle_idx}"
+        # run_event_loop() blocks one thread for the actor's lifetime; leave a spare
+        # for pull_weights, which the trainer calls while generation is paused.
+        max_concurrency=2 if rdt else 1,
+        name=get_scheduler_actor_name(
+            rank0_node_ip=rank0_node_ip,
+            dp_rank=dp_rank,
+            pp_rank=pp_rank,
+            tp_rank=tp_rank,
+            pg_id_hex=pg.id.hex()[:8],
+            bundle_idx=bundle_idx,
         ),
+        # SchedulerActor calls set_device() with the absolute id from
+        # get_accelerator_ids(), which is only valid if Ray leaves the mask alone.
+        runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             placement_group=pg,
             placement_group_bundle_index=bundle_idx,
@@ -227,15 +271,19 @@ def _create_scheduler_actor(
 
 
 class RayEngine(Engine):
-    """Engine using Ray actors for scheduler processes."""
+    """Engine using Ray actors for scheduler processes.
 
-    def __init__(self, **kwargs):
-        placement_group = kwargs.pop("placement_group", None)
+    Same constructor kwargs as :class:`Engine`, plus ``placement_group`` (a Ray
+    PlacementGroup handle, not a ServerArgs field).
+    """
+
+    def __init__(self, *, placement_group: Optional[PlacementGroup] = None, **kwargs):
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
-        server_args = ServerArgs(**kwargs)
-        server_args.override("ray.placement_group", placement_group=placement_group)
-        super().__init__(server_args=server_args)
+        # The context is read while super().__init__() launches the subprocesses,
+        # which need the group to schedule the scheduler actors onto.
+        with _placement_group_context(placement_group):
+            super().__init__(server_args=ServerArgs(**kwargs))
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
@@ -259,17 +307,18 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
-        pg = server_args.placement_group or ray.util.get_current_placement_group()
+        placement_group = _caller_placement_group.get()
+        pg = placement_group or ray.util.get_current_placement_group()
         if pg is None:
             from ray.util.placement_group import (
                 placement_group as create_placement_group,
             )
 
-            if server_args.enable_dp_attention:
-                total_gpus = server_args.tp_size * server_args.pp_size
+            if get_parallel().enable_dp_attention:
+                total_gpus = server_args.tp_size * configured_pp_size()
             else:
                 total_gpus = (
-                    server_args.dp_size * server_args.tp_size * server_args.pp_size
+                    get_parallel().dp_size * server_args.tp_size * configured_pp_size()
                 )
 
             nnodes = server_args.nnodes
@@ -288,7 +337,7 @@ class RayEngine(Engine):
             )
             ray.get(pg.ready())
 
-        is_custom_pg = server_args.placement_group is not None
+        is_custom_pg = placement_group is not None
         nnodes = server_args.nnodes
         world_size = _compute_world_size(server_args)
 
@@ -311,7 +360,7 @@ class RayEngine(Engine):
             rank0_bundle_idx = int(indices_str.split(",")[0]) if indices_str else 0
             rank0_node_ip = _get_bundle_node_ip(pg, rank0_bundle_idx)
 
-        if server_args.dp_size == 1:
+        if get_parallel().dp_size == 1:
             dist_init_addr = f"{rank0_node_ip}:{port_args.nccl_port}"
             logger.info(f"dist_init_addr: {dist_init_addr}")
 
@@ -329,7 +378,7 @@ class RayEngine(Engine):
                     pp_range, tp_range, pp_per_node, tp_per_node = (
                         _calculate_rank_ranges(
                             nnodes,
-                            server_args.pp_size,
+                            configured_pp_size(),
                             server_args.tp_size,
                             node_rank=node_idx,
                         )
@@ -401,7 +450,7 @@ class RayEngine(Engine):
                 actor.run_event_loop.remote() for actor in scheduler_actors
             ]
 
-            def wait_for_completion():
+            def block_until_scheduler_exits():
                 try:
                     ray.get(event_loop_refs)
                 except Exception as e:
@@ -410,7 +459,7 @@ class RayEngine(Engine):
             return (
                 RaySchedulerInitResult(
                     scheduler_infos=scheduler_infos,
-                    wait_for_completion=wait_for_completion,
+                    block_until_scheduler_exits=block_until_scheduler_exits,
                     scheduler_actors=scheduler_actors,
                 ),
                 None,
@@ -424,6 +473,7 @@ class RayEngine(Engine):
                     pg,
                     bundle_for_node,
                     rank0_node_ip,
+                    is_custom_pg,
                 ),
                 None,
             )
@@ -436,23 +486,26 @@ class RayEngine(Engine):
         pg,
         bundle_for_node: Optional[List[int]],
         rank0_node_ip: str,
+        is_custom_pg: bool = False,
     ) -> RaySchedulerInitResult:
         """Launch DP schedulers via RayDataParallelController."""
         from sglang.srt.ray.data_parallel_controller import (
             RayDataParallelController,
         )
 
-        if server_args.enable_dp_attention:
+        if get_parallel().enable_dp_attention:
             # DP attention folds DP into TP — total GPUs = tp_size * pp_size
-            total_gpus = server_args.tp_size * server_args.pp_size
+            total_gpus = server_args.tp_size * configured_pp_size()
         else:
-            total_gpus = server_args.dp_size * server_args.tp_size * server_args.pp_size
+            total_gpus = (
+                get_parallel().dp_size * server_args.tp_size * configured_pp_size()
+            )
         gpus_per_node = total_gpus // server_args.nnodes
         logger.info(
             f"Ray DP cluster: {server_args.nnodes} nodes, "
-            f"{gpus_per_node} GPUs/node, dp_size={server_args.dp_size}, "
-            f"tp_size={server_args.tp_size}, pp_size={server_args.pp_size}, "
-            f"enable_dp_attention={server_args.enable_dp_attention}"
+            f"{gpus_per_node} GPUs/node, dp_size={get_parallel().dp_size}, "
+            f"tp_size={server_args.tp_size}, pp_size={configured_pp_size()}, "
+            f"enable_dp_attention={get_parallel().enable_dp_attention}"
         )
 
         # Set dist_init_addr on server_args so PortArgs.init_new() can compute
@@ -461,16 +514,10 @@ class RayEngine(Engine):
             server_args,
             dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
         )
-        # dataclasses.replace only copies declared fields; placement_group is
-        # a dynamic attribute that must be manually appended after the rebuild.
-        dp_server_args.override(
-            "ray.placement_group", placement_group=server_args.placement_group
-        )
-
         # Create the DP controller in-process. This blocks until all actors
         # are initialized and their event loops have started.
         controller = RayDataParallelController(
-            dp_server_args, port_args, pg, bundle_for_node, rank0_node_ip
+            dp_server_args, port_args, pg, bundle_for_node, rank0_node_ip, is_custom_pg
         )
 
         # Start the DP controller's event loop in a daemon thread.
@@ -484,12 +531,13 @@ class RayEngine(Engine):
             {
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                "startup_time": controller.startup_time,
             }
         ]
 
         event_loop_refs = controller.event_loop_refs
 
-        def wait_for_completion():
+        def block_until_scheduler_exits():
             try:
                 ray.get(event_loop_refs)
             except Exception as e:
@@ -497,6 +545,6 @@ class RayEngine(Engine):
 
         return RaySchedulerInitResult(
             scheduler_infos=scheduler_infos,
-            wait_for_completion=wait_for_completion,
+            block_until_scheduler_exits=block_until_scheduler_exits,
             scheduler_actors=controller.scheduler_actors,
         )
