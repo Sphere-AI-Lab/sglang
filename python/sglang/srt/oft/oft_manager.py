@@ -438,7 +438,16 @@ class OFTManager(AdapterManager):
         buffer slot to stage into first, so once eviction has happened,
         that adapter is gone regardless of how the subsequent commit turns
         out. That residual case is called out explicitly in the returned
-        error message rather than left silent."""
+        error message rather than left silent -- and without the cleanup
+        call in the commit-failure branch below, the NEW adapter's own
+        `ref` would also have been left looking valid and resident (its
+        buffer/config registration already committed to self.refs/
+        self.configs/memory_pool.uid_to_buffer_id before the write is
+        attempted) despite its buffer's contents being partially written or
+        undefined -- a silently wrong-serving-results failure mode, worse
+        than the disclosed evicted-adapter one. `unload_streamed_adapter(ref)`
+        undoes that registration on commit failure so the phantom ref is
+        never left resident."""
         from sglang.srt.oft.streamed_weight_loader import (
             _commit_streamed_oft_tensor_groups,
             _resolve_streamed_oft_tensor_groups,
@@ -525,6 +534,12 @@ class OFTManager(AdapterManager):
                 ref.adapter_id,
             )
             if not success:
+                # Undo the registration/mark_used above: without this, refs/
+                # configs/uid_to_buffer_id would still list `ref` as valid
+                # and resident, pointing at a buffer whose contents are now
+                # partially written or undefined -- silently wrong serving
+                # results, not just a clear failure.
+                self.unload_streamed_adapter(ref)
                 if evicted_name is not None:
                     error_message = (
                         f"adapter '{evicted_name}' was evicted to make room, "

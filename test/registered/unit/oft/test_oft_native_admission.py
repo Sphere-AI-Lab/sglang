@@ -329,6 +329,37 @@ class TestValidateBeforeEvict(unittest.TestCase):
         self.assertIn("OOM during Cayley precompute", result.error_message)
         # The eviction genuinely happened (validation had already passed).
         self.assertNotIn("resident", mgr.refs)
+        # And the NEW adapter must not be left as a phantom resident ref
+        # either: register_streamed_adapter + mark_used already ran before
+        # commit failed, so without cleanup it would look valid/resident
+        # while its buffer's contents are undefined.
+        self.assertNotIn(new_ref.adapter_id, mgr.refs)
+        self.assertNotIn(new_ref.adapter_id, mgr.configs)
+        self.assertNotIn(new_ref.adapter_id, mgr.memory_pool.uid_to_buffer_id)
+
+    def test_commit_failure_does_not_leave_phantom_resident_ref(self):
+        """Even with no eviction involved (pool has room), a commit failure
+        must not leave the new adapter's ref/config/buffer-mapping
+        registered as if it had succeeded."""
+        mgr = _make_manager(max_ofts_per_batch=2)
+        new_ref = _make_ref("new_adapter")
+        with patch(
+            "sglang.srt.oft.streamed_weight_loader._resolve_streamed_oft_tensor_groups",
+            return_value=(("fused", {}, {}, []), ""),
+        ), patch(
+            "sglang.srt.oft.streamed_weight_loader._commit_streamed_oft_tensor_groups",
+            return_value=(False, "OOM during Cayley precompute"),
+        ):
+            result = mgr.load_adapter_from_tensors(new_ref, [], CONFIG_DICT)
+
+        self.assertFalse(result.success)
+        self.assertIn("OOM during Cayley precompute", result.error_message)
+        self.assertNotIn("evicted", result.error_message)  # no eviction happened
+        self.assertNotIn(new_ref.adapter_id, mgr.refs)
+        self.assertNotIn(new_ref.adapter_id, mgr.configs)
+        self.assertNotIn(new_ref.adapter_id, mgr.memory_pool.uid_to_buffer_id)
+        # The slot it briefly occupied is back to empty, not phantom-owned.
+        self.assertEqual(mgr.memory_pool.buffer_id_to_uid[0], EMPTY_SLOT)
 
 
 class TestResolveCommitSplit(unittest.TestCase):
