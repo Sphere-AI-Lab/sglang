@@ -47,7 +47,7 @@ class TestShapeKeyOftVariantField(unittest.TestCase):
 
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -199,6 +199,83 @@ class TestResolveRecordOftVariantGraph(unittest.TestCase):
             DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
                 server_args, model_config
             )
+        )
+
+
+class TestCaptureOneStreamOftKwargSubclassCompat(unittest.TestCase):
+    """Regression guard (Critical bug found in review): _capture_one_stream
+    used to pass oft_variant=oft_variant to capture_one_shape
+    unconditionally, even when oft_variant is None -- the default /
+    no-dual-capture case, true for every server today and every non-OFT
+    server always. Four real DecodeCudaGraphRunner subclasses
+    (EAGLEDraftCudaGraphRunner, FrozenKVMTPCudaGraphRunner,
+    MultiLayerEagleDraftExtendCudaGraphRunner,
+    EagleDraftExtendCudaGraphRunner -- see speculative/*.py) override
+    capture_one_shape with a narrower signature (no oft_variant parameter,
+    no **kwargs) and none of them run DecodeCudaGraphRunner.__init__ or
+    override _capture_one_stream, so they all hit this same call and
+    crashed with "TypeError: capture_one_shape() got an unexpected keyword
+    argument 'oft_variant'". Fix: only include oft_variant in the kwargs
+    passed to capture_one_shape when it is not None.
+
+    This drives the REAL DecodeCudaGraphRunner._capture_one_stream (not a
+    hand-rolled reimplementation) against a minimal stand-in whose
+    capture_one_shape signature is copied verbatim from
+    EAGLEDraftCudaGraphRunner.capture_one_shape
+    (speculative/eagle_draft_cuda_graph_runner.py:324-330) -- with
+    record_oft_variant_graph/dsa_dual_graph/record_nolora_graph
+    deliberately left unset, matching how these subclasses never run
+    DecodeCudaGraphRunner.__init__ and so never set them (getattr(...,
+    False) is always False for them)."""
+
+    class _EagleLikeStandIn:
+        # capture_bs/compile_bs/captured_req_width/model_runner: the minimal
+        # state _capture_one_stream reads before dispatching to
+        # capture_one_shape. compile_bs=[] keeps torch_compile_decoration.
+        # patch_model's disabled (yield model.forward) branch, so no real
+        # torch.compile / model is needed.
+        capture_bs = [1]
+        compile_bs = []
+        captured_req_width = 1
+        model_runner = SimpleNamespace(
+            device="cpu",
+            gpu_id=0,
+            model=SimpleNamespace(forward=lambda *a, **k: None),
+            tp_group=None,
+        )
+
+        def __init__(self):
+            self.calls = []
+
+        # Signature copied verbatim from
+        # EAGLEDraftCudaGraphRunner.capture_one_shape -- no oft_variant, no
+        # **kwargs.
+        def capture_one_shape(
+            self,
+            size,
+            forward,
+            stream_idx=None,
+            variant_label=None,
+        ):
+            self.calls.append((size, forward, stream_idx, variant_label))
+
+    def _run(self):
+        runner = self._EagleLikeStandIn()
+        with patch(
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_parallel",
+            return_value=SimpleNamespace(tp_rank=1),
+        ), patch(
+            "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
+            "get_available_gpu_memory",
+            return_value=0.0,
+        ):
+            DecodeCudaGraphRunner._capture_one_stream(runner, stream_idx=None)
+        return runner
+
+    def test_no_dual_capture_subclass_without_oft_kwarg_support_does_not_crash(self):
+        runner = self._run()
+        self.assertEqual(
+            runner.calls, [(1, runner.model_runner.model.forward, None, None)]
         )
 
 

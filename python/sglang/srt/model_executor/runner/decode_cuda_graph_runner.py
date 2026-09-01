@@ -1256,13 +1256,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             num_tokens=bs * self.captured_req_width,
                             tp_group=self.model_runner.tp_group,
                         ) as forward:
+                            # Subclasses like EAGLEDraftCudaGraphRunner reuse
+                            # this capture() but don't run
+                            # DecodeCudaGraphRunner.__init__ (so oft_variant
+                            # is always None for them) and override
+                            # capture_one_shape with a narrower signature
+                            # that has neither an oft_variant parameter nor
+                            # **kwargs. Only pass oft_variant when it is not
+                            # None (i.e. when record_oft_variant_graph is
+                            # actually enabled), so those overrides keep
+                            # receiving exactly the call they always did.
+                            oft_kwargs = (
+                                {"oft_variant": oft_variant}
+                                if oft_variant is not None
+                                else {}
+                            )
                             if dsa_variant is None:
                                 self.capture_one_shape(
                                     bs,
                                     forward,
                                     stream_idx,
                                     variant_label,
-                                    oft_variant=oft_variant,
+                                    **oft_kwargs,
                                 )
                             else:
                                 self.capture_one_shape(
@@ -1271,7 +1286,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                                     stream_idx,
                                     variant_label,
                                     dsa_variant,
-                                    oft_variant=oft_variant,
+                                    **oft_kwargs,
                                 )
         _set_capture_dsa_variant(None)
         _set_capture_oft_variant(None)
