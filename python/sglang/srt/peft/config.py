@@ -400,6 +400,64 @@ def validate_peft_args(server_args) -> None:
                 peft_target_modules.discard("embed_tokens")
                 peft_target_modules.discard("lm_head")
 
+        # OFT is not decode-CUDA-graph-safe either, but only for one specific
+        # configuration: dynamically-loaded adapters served via the native-RPC
+        # ("sibling") implementation, when MoE expert modules are targeted (same
+        # gate_up_proj/gate_proj/up_proj/down_proj check
+        # OFTManager._install_moe_oft_wrappers and OFTMemoryPool.
+        # _declare_expert_groups already use to decide whether expert-OFT
+        # buffers exist at all). In the plain native-RPC pool, buffer slot 0
+        # (memory_pool.active_idx) is permanently reserved by the boot-time
+        # base-request registration, so a real dynamically-loaded adapter can
+        # never occupy it -- meaning OFTManager._compute_moe_multi_tenant_
+        # slot_ids always takes its general, per-token multi-tenant branch for
+        # any real adapter. That branch allocates a FRESH routing tensor on
+        # every prepare_oft_batch call, which has no pointer stability across
+        # CUDA-graph capture and replay (prepare_oft_batch runs outside the
+        # capture region -- see decode_cuda_graph_runner.py's
+        # maybe_prepare_peft_batch/maybe_prepare_replay_batch calls): a
+        # captured decode graph replays against the stale capture-time
+        # tensor, silently applying an unrelated adapter's rotation (or
+        # identity) instead of erroring. Same class of failure as the OFT
+        # prefill-graph freeze above. The dense OFT path is unaffected (its
+        # own per-token weight_indices mechanism is a different,
+        # already-correct code path), and oft_impl="staged" is unaffected too
+        # (its double-buffer activate() copies real adapter data in place
+        # into active_idx, so the single-adapter fast path stays genuinely
+        # correct under decode-graph replay there). A real fix needs the
+        # persistent-buffer + dual-capture mechanism designed in
+        # docs/superpowers/plans/2026-09-01-oft-moe-cuda-graph-dual-capture.md;
+        # until that lands, disable decode CUDA graphs for this configuration
+        # rather than silently serve wrong rotations under replay.
+        moe_expert_target_modules = {
+            "gate_up_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        } & (peft_target_modules or set())
+        if (
+            server_args.oft_impl == "sibling"
+            and moe_expert_target_modules
+            and server_args.cuda_graph_config is not None
+        ):
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            if server_args.cuda_graph_config.decode.backend != Backend.DISABLED:
+                logger.warning(
+                    "peft_method=oft with oft_impl=sibling targeting MoE expert "
+                    "modules %s is incompatible with decode CUDA graphs (the "
+                    "per-token multi-tenant adapter-routing tensor has no "
+                    "pointer stability across CUDA-graph capture/replay -> "
+                    "decode-graph replay can silently apply the wrong "
+                    "adapter's rotation); disabling the decode CUDA graph "
+                    "(was backend=%s). See docs/superpowers/plans/"
+                    "2026-09-01-oft-moe-cuda-graph-dual-capture.md for the "
+                    "real fix (persistent routing buffer + dual capture).",
+                    sorted(moe_expert_target_modules),
+                    server_args.cuda_graph_config.decode.backend,
+                )
+                server_args.cuda_graph_config.decode.backend = Backend.DISABLED
+
         # Ensure sufficient information is provided for OFT initialization.
         assert peft_paths or (
             server_args.max_oft_block_size and peft_target_modules

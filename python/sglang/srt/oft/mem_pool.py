@@ -698,6 +698,39 @@ class OFTMemoryPool(AdapterMemPool):
                 split_count=split_count,
             )
 
+    def _acquire_buffer_slot(
+        self, cur_uids: Set[Optional[str]], refs: Dict[str, OFTRef]
+    ) -> int:
+        """Disk-loaded-adapter (``--peft-paths``) admission path: the lazy
+        per-batch slot acquisition ``prepare_oft_batch`` below calls.
+
+        Wraps the base ``AdapterMemPool._acquire_buffer_slot`` (empty-slot-
+        then-LRU-eviction bookkeeping) to ALSO identity-fill the acquired
+        slot, hoisting the same ``reset_buffer_slot_to_identity`` call the
+        native-RPC admission path (``OFTManager.load_adapter_from_tensors``)
+        already makes after its own ``allocate_buffer_slot_with_eviction``
+        (Task 4b) so both admission paths share it instead of duplicating
+        the call. Without this, a disk-loaded adapter's fresh (or evicted-
+        and-reused) buffer slot keeps whatever the expert-OFT groups
+        (``w13_oft_r``/``w1_oft_r``/``w3_oft_r``/``w2_oft_r``) already held --
+        uninitialized ``torch.empty`` garbage on a never-used slot, or a
+        PRIOR occupant's stale rotation on an evicted one -- because
+        ``load_oft_weight_to_buffer`` below never touches those groups at
+        all, only the dense ``R_buffer``/embedding buffers. A token routed to
+        this slot under the multi-tenant MoE path would then read garbage or
+        an unrelated adapter's rotation instead of a safe identity one.
+
+        Calling the full (dense-covering) ``reset_buffer_slot_to_identity``
+        here, not just the expert-only fill, is harmless: ``load_oft_weight_
+        to_buffer`` unconditionally overwrites every dense buffer it touches
+        right after this returns (real weights, or identity for modules the
+        adapter doesn't cover), so the extra identity pass over those
+        buffers is redundant work, not a behavior change.
+        """
+        buffer_id = super()._acquire_buffer_slot(cur_uids, refs)
+        self.reset_buffer_slot_to_identity(buffer_id)
+        return buffer_id
+
     def prepare_oft_batch(
         self,
         cur_uids: Set[Optional[str]],

@@ -401,11 +401,21 @@ def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
         # KNOWN LIMITATION: this branch is chosen HERE, on the Python side, so
         # under a replayed decode CUDA graph it is frozen at whatever was true
         # at capture time, and slot_ids itself is a fresh per-call allocation
-        # with no pointer stability across capture/replay. Multi-tenant MoE OFT
-        # therefore needs --disable-cuda-graph; see the full write-up on
-        # OFTManager._compute_moe_multi_tenant_slot_ids. Single-adapter (the
-        # slot_ids-is-None path below) is unaffected: it reads the persistent,
-        # in-place-updated pool buffers, so decode graphs stay correct for it.
+        # with no pointer stability across capture/replay -- see the full
+        # write-up on OFTManager._compute_moe_multi_tenant_slot_ids.
+        # validate_peft_args (peft/config.py) now disables decode CUDA graphs
+        # at boot whenever this is reachable (OFT dynamically targets MoE
+        # experts via oft_impl=sibling), so this branch never actually runs
+        # under a replayed decode graph in a correctly-configured server. The
+        # slot_ids-is-None path below (reading the persistent, in-place-
+        # updated pool buffers) is NOT a safe-under-decode-graphs escape
+        # hatch here: in the plain native-RPC pool a real adapter can never
+        # land at active_idx, so slot_ids is None only when zero real
+        # adapters are resident at all -- the moment one real MoE-target
+        # adapter loads, this branch (not the slot_ids-is-None one) is what
+        # runs. Real fix (persistent buffer + dual capture, restoring both a
+        # genuinely fast single-adapter path and CUDA-graph-safe multi-
+        # tenancy): the 2026-09-01-oft-moe-cuda-graph-dual-capture plan.
         slot_ids = getattr(layer, "_oft_moe_multi_tenant_slot_ids", None)
         if slot_ids is not None:
             all_slots_attr = (

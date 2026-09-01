@@ -28,7 +28,7 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
-from sglang.srt.oft.mem_pool import OFTMemoryPool
+from sglang.srt.oft.mem_pool import EMPTY_SLOT, OFTMemoryPool
 from sglang.srt.oft.oft_manager import OFTManager
 from sglang.srt.oft.streamed_weight_loader import (
     _commit_streamed_oft_tensor_groups,
@@ -323,6 +323,51 @@ class TestExpertOFTWritePath(CustomTestCase):
         self._load_into_slot(tm, 1, payload_layer1_only)
         self._assert_slot_is_identity(pool, 1, layer_id=0)
         self._assert_slot_matches(pool, 1, expected_layer1_only)
+
+    def test_disk_admission_path_identity_fills_expert_oft_groups(self):
+        """Final-review I3 regression: the disk-loaded-adapter (--peft-paths)
+        admission path -- OFTMemoryPool._acquire_buffer_slot, called from
+        prepare_oft_batch for every uid not yet resident -- must
+        identity-fill the expert-OFT groups for the slot it hands back.
+        Before this fix, only the native-RPC admission path
+        (allocate_buffer_slot_with_eviction -> reset_buffer_slot_to_identity)
+        did this: a disk-loaded adapter's buffer slot kept whatever
+        uninitialized torch.empty (a never-used slot) or a prior evicted
+        occupant's stale rotation (a reused slot) the expert-OFT groups
+        already held -- silently wrong rotation applied to any token routed
+        there under the multi-tenant MoE path, instead of a safe identity
+        passthrough."""
+        tm, pool = self._make_pool_and_manager_double()
+
+        # (a) A never-used slot must come back identity from
+        # _acquire_buffer_slot itself, not uninitialized torch.empty garbage.
+        buffer_id = pool._acquire_buffer_slot(cur_uids=set(), refs={})
+        self._assert_slot_is_identity(pool, buffer_id, layer_id=0)
+        self._assert_slot_is_identity(pool, buffer_id, layer_id=1)
+
+        # Give this slot a real (non-identity) MoE-target rotation --
+        # mirrors what a disk-loaded adapter's weights look like once
+        # load_oft_weight_to_buffer (or, here, the same underlying write
+        # helper this file's other tests already drive) has run.
+        payload, expected = _expert_oft_payload(seed=6)
+        self._load_into_slot(tm, buffer_id, payload)
+        self._assert_slot_matches(pool, buffer_id, expected)
+
+        # (b) Evict this occupant (as unloading/reassigning a disk adapter's
+        # slot would) and re-acquire the same slot for a brand-new occupant.
+        # The previous occupant's real, non-identity rotation must not leak
+        # through -- it must come back identity again, not stale data. This
+        # is the "existing single-adapter disk-loaded path" regression
+        # check: reuse of an evicted slot must still behave safely.
+        pool.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
+        reacquired_id = pool._acquire_buffer_slot(cur_uids=set(), refs={})
+        self.assertEqual(
+            reacquired_id,
+            buffer_id,
+            "test fixture bug: expected the freed slot to be reacquired",
+        )
+        self._assert_slot_is_identity(pool, buffer_id, layer_id=0)
+        self._assert_slot_is_identity(pool, buffer_id, layer_id=1)
 
 
 if __name__ == "__main__":

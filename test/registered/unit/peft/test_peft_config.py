@@ -10,6 +10,9 @@ def _args(
     max_loaded_ofts=None,
     max_ofts_per_batch=2,
     peft_paths=None,
+    peft_target_modules=None,
+    oft_impl="sibling",
+    cuda_graph_config=None,
 ):
     ns = SimpleNamespace(
         enable_lora=enable_lora,
@@ -19,7 +22,7 @@ def _args(
             if peft_paths is not None
             else (["/models/adapter"] if peft_method is not None else None)
         ),
-        peft_target_modules=None,
+        peft_target_modules=peft_target_modules,
         max_oft_block_size=None,
         max_ofts_per_batch=max_ofts_per_batch,
         max_loaded_ofts=max_loaded_ofts,
@@ -29,8 +32,8 @@ def _args(
         max_oft_chunk_size=16,
         peft_double_buffer=False,
         speculative_algorithm=None,
-        cuda_graph_config=None,
-        oft_impl="sibling",
+        cuda_graph_config=cuda_graph_config,
+        oft_impl=oft_impl,
     )
     # Stand-in for ServerArgs._late_resolution: validate_peft_args writes its
     # normalized peft_paths/peft_target_modules through this (real ServerArgs
@@ -125,3 +128,96 @@ def test_peft_paths_count_must_not_exceed_max_loaded_ofts():
                 peft_paths=["/models/a", "/models/b", "/models/c", "/models/d"],
             )
         )
+
+
+def _cuda_graph_config(*, decode_backend):
+    """Build a real CudaGraphConfig with the given decode backend (prefill
+    is left DISABLED so it never interferes with the decode-specific
+    assertions below)."""
+    from sglang.srt.model_executor.cuda_graph_config import (
+        Backend,
+        CudaGraphConfig,
+        PhaseConfig,
+    )
+
+    return CudaGraphConfig(
+        decode=PhaseConfig(backend=decode_backend),
+        prefill=PhaseConfig(backend=Backend.DISABLED),
+    )
+
+
+def test_moe_target_oft_sibling_disables_decode_cuda_graph():
+    """Final-review C1 fix: in the plain native-RPC ("sibling") pool, buffer
+    slot 0 (memory_pool.active_idx) is permanently reserved by the boot-time
+    base-request registration, so a real dynamically-loaded adapter can never
+    occupy it -- OFTManager._compute_moe_multi_tenant_slot_ids therefore
+    always takes its per-token multi-tenant branch for any real MoE-target
+    adapter, and that branch's routing tensor has no pointer stability across
+    CUDA-graph capture/replay. validate_peft_args must disable decode CUDA
+    graphs for exactly this configuration (oft_impl=sibling + MoE expert
+    target modules)."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.peft.config import validate_peft_args
+
+    args = _args(
+        "oft",
+        enable_lora=False,
+        peft_target_modules=["gate_proj", "up_proj", "down_proj"],
+        oft_impl="sibling",
+        cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
+    )
+    validate_peft_args(args)
+    assert args.cuda_graph_config.decode.backend == Backend.DISABLED
+
+
+def test_dense_target_oft_leaves_decode_cuda_graph_enabled():
+    """Negative case: OFT targeting only dense modules (no MoE experts) must
+    not trip the MoE-specific decode-graph guard -- the dense path has its
+    own, different, already-correct per-token CUDA-graph mechanism
+    (weight_indices via oft.utils.generate_sequence_lengths)."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.peft.config import validate_peft_args
+
+    args = _args(
+        "oft",
+        enable_lora=False,
+        peft_target_modules=["o_proj"],
+        oft_impl="sibling",
+        cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
+    )
+    validate_peft_args(args)
+    assert args.cuda_graph_config.decode.backend == Backend.FULL
+
+
+def test_moe_target_oft_staged_impl_leaves_decode_cuda_graph_enabled():
+    """Negative case: oft_impl=staged's double-buffer activate() copies real
+    adapter data in place into memory_pool.active_idx, so the single-adapter
+    fast path stays genuinely correct under decode-graph replay there -- the
+    guard is specific to the plain native-RPC ("sibling") pool and must not
+    fire for staged."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.peft.config import validate_peft_args
+
+    args = _args(
+        "oft",
+        enable_lora=False,
+        peft_target_modules=["gate_proj", "up_proj", "down_proj"],
+        oft_impl="staged",
+        cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
+    )
+    validate_peft_args(args)
+    assert args.cuda_graph_config.decode.backend == Backend.FULL
+
+
+def test_non_oft_server_leaves_decode_cuda_graph_enabled():
+    """Negative case: peft_method=None (OFT disabled entirely) must never
+    trip the MoE decode-graph guard."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.peft.config import validate_peft_args
+
+    args = _args(
+        None,
+        cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
+    )
+    validate_peft_args(args)
+    assert args.cuda_graph_config.decode.backend == Backend.FULL

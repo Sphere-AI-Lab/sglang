@@ -1,11 +1,27 @@
 """End-to-end GPU test: MoE expert-OFT multi-tenancy (this plan's Task 5).
 
-1. test_fast_path_unchanged_with_one_moe_adapter: regression guard -- a
-   single MoE-target OFT adapter resident must still have its rotation
+1. test_lone_resident_moe_adapter_applies_correct_rotation: regression guard
+   -- a single MoE-target OFT adapter resident must still have its rotation
    actually applied (this plan's Tasks 1-4b touch the exact decision/read
    path a lone MoE-target adapter goes through, so this catches a
    regression there even without a pre-recorded baseline: a real, working
-   rotation must differ from the unrotated base model).
+   rotation must differ from the unrotated base model). NOTE: despite the
+   name this test used to have, this does NOT exercise the pool's single-
+   slot "fast path" (``_compute_moe_multi_tenant_slot_ids`` returning
+   ``None``) -- this test's own ``_generate()`` base-model call runs FIRST
+   and claims buffer slot 0 (``active_idx``) for the base/``None`` request,
+   so the adapter loaded afterward always lands at slot >= 1 and every
+   generate() call below actually exercises the general multi-tenant read
+   path. Genuine fast-path coverage (0 real adapters resident) is exercised
+   implicitly by every test's own base-model ``_generate()`` call in this
+   file; a "real single adapter actually taking the fast path" scenario is
+   currently impossible in this pool configuration (see final-review C1: a
+   real dynamically-loaded adapter can never occupy buffer slot 0/active_idx
+   in the plain native-RPC pool, so decode CUDA graphs are disabled for this
+   configuration entirely -- ``peft/config.py``'s ``validate_peft_args``)
+   and will get direct coverage once the ``2026-09-01-oft-moe-cuda-graph-
+   dual-capture`` follow-up plan restores a working fast path for real
+   adapters.
 2. test_two_moe_adapters_apply_correctly: the actual fix -- two
    concurrently-resident MoE-target OFT adapters, each must produce output
    matching what that adapter alone would produce, not a shared/clobbered
@@ -196,14 +212,22 @@ class TestMoeMultiTenantEndToEnd(CustomTestCase):
             results.append((text, logprobs))
         return results[0], results[1]
 
-    def test_fast_path_unchanged_with_one_moe_adapter(self):
+    def test_lone_resident_moe_adapter_applies_correct_rotation(self):
+        """A single resident MoE-target OFT adapter's rotation must still
+        apply correctly. NOTE: this is NOT fast-path coverage -- the
+        ``_generate()`` call below issues a base (adapter_name=None) request
+        FIRST, which claims buffer slot 0 (active_idx) for the base/None
+        request, so the adapter loaded afterward lands at slot >= 1 and this
+        test actually exercises the general multi-tenant read path (see the
+        module docstring's NOTE for why a real single-adapter fast-path
+        scenario is currently impossible in this pool configuration)."""
         print(
             "[Test]Testing that a single resident MoE-target OFT adapter's "
-            "rotation still applies correctly (fast-path regression guard)..."
+            "rotation applies correctly..."
         )
         base_text, base_logprobs = self._generate()
 
-        name = "fast_path_single_adapter"
+        name = "lone_resident_adapter"
         result = self.engine.load_oft_adapter_from_tensors(
             adapter_name=name,
             tensors=_expert_named_tensors(seed=1),
@@ -224,9 +248,9 @@ class TestMoeMultiTenantEndToEnd(CustomTestCase):
             "Generation with a single resident MoE-target OFT adapter "
             "produced IDENTICAL per-token logprobs to the unadapted base "
             "output -- its expert-OFT rotation was silently skipped. This "
-            "is the fast-path regression guard for this plan's Tasks "
-            "1-4b: the single-adapter code path must remain correct even "
-            "though every other change in this plan targets the "
+            "is a regression guard for this plan's Tasks 1-4b: the "
+            "single-adapter code path must remain correct even though "
+            "every other change in this plan targets the "
             ">1-resident-adapter case.",
         )
 

@@ -503,16 +503,43 @@ class OFTManager(AdapterManager):
         undoes that registration on commit failure so the phantom ref is
         never left resident.
 
-        KNOWN LIMITATION: multi-tenant serving is only correct for
-        dense-target-module adapters. If two concurrently-resident adapters
-        both carry MoE/expert OFT weights, they silently share state
-        (`apply_streamed_expert_oft` writes onto module-level
-        `moe.w13_oft_r`/`w1_oft_r`/`w3_oft_r`/`w2_oft_r`, not a per-adapter
-        slot) because `FusedMoEWithOFT.forward` has no per-token
-        adapter-routing mechanism, unlike the dense path (`prepare_oft_batch`'s
-        `weight_indices`) or LoRA's MoE path (`token_lora_mapping`). See
-        `apply_streamed_expert_oft`'s docstring for why `slot_idx` alone
-        doesn't fix this."""
+        MoE expert-target adapters (the ``2026-09-01-moe-expert-oft-multi-
+        tenancy`` plan): multiple concurrently-resident adapters loaded
+        through this path CAN both carry MoE/expert OFT weights and each get
+        its own correct rotation. Each adapter's expert-OFT weights write
+        into its OWN buffer slot (`apply_streamed_expert_oft`'s `slot_idx`,
+        threaded through from this method's `buffer_id`), and
+        `FusedMoEWithOFT.forward` (`oft_moe_runners.py`) now has a real
+        per-token adapter-routing mechanism (`OFTManager.
+        _compute_moe_multi_tenant_slot_ids`, mirroring the dense path's
+        `weight_indices` and LoRA's MoE `token_lora_mapping`) that selects
+        each token's own adapter's rotation out of the per-slot buffers.
+
+        REMAINING CAVEAT: decode-CUDA-graph replay is disabled for any
+        server where this is reachable -- `validate_peft_args`
+        (`peft/config.py`) unconditionally disables decode CUDA graphs at
+        boot whenever OFT dynamically targets MoE experts via this
+        (`oft_impl=sibling`) native-RPC path, because the per-token routing
+        tensor `_compute_moe_multi_tenant_slot_ids` builds has no pointer
+        stability across CUDA-graph capture/replay (see that method's own
+        docstring for the full mechanism). This is a real, disclosed, but
+        temporary restriction -- lifted for good by the
+        `2026-09-01-oft-moe-cuda-graph-dual-capture` follow-up plan's
+        persistent routing buffer + dual-capture mechanism, not by anything
+        in this method.
+
+        SEPARATE, NARROWER CAVEAT for disk-loaded (`--peft-paths`) adapters:
+        the lazy per-batch admission path (`OFTMemoryPool.prepare_oft_batch`
+        -> `_acquire_buffer_slot` -> `load_oft_weight_to_buffer`) never
+        writes expert-OFT weights into a disk adapter's slot at all (it only
+        loads the dense `R_buffer`/embedding buffers) -- a disk-loaded
+        adapter's expert-OFT rotation therefore never applies, though its
+        slot is correctly identity-filled on admission (not uninitialized
+        memory), so a disk adapter resident alongside a real MoE-target
+        adapter loaded through THIS method reads a safe identity rotation,
+        never garbage or another adapter's weights. This is a pre-existing,
+        accepted limitation of the disk path specifically, unrelated to the
+        decode-CUDA-graph caveat above."""
         from sglang.srt.oft.streamed_weight_loader import (
             _commit_streamed_oft_tensor_groups,
             _resolve_streamed_oft_tensor_groups,
@@ -751,47 +778,72 @@ class OFTManager(AdapterManager):
         multi-tenant branch is touched, so the single-adapter fast path pays
         only the existing set comprehension.
 
-        KNOWN LIMITATION -- multi-tenant MoE OFT is not yet safe under
-        CUDA-graph-REPLAYED DECODE. Run multi-tenant MoE workloads with
-        ``--disable-cuda-graph``. Eager decode, all prefill/extend (OFT already
-        disables prefill graphs, see ``peft/config.py``), and the
-        single-adapter path under decode graphs are all unaffected and correct.
+        KNOWN LIMITATION (CURRENT STATE, post final-review Fix 1) -- multi-
+        tenant MoE OFT is not yet safe under CUDA-graph-REPLAYED DECODE, so
+        ``validate_peft_args`` (``peft/config.py``) DISABLES decode CUDA
+        graphs at boot -- unconditionally, not just as operator guidance --
+        whenever OFT dynamically targets MoE experts via the native-RPC
+        ("sibling") implementation. That guard is what actually keeps this
+        function's output safe under replay; nothing in this function itself
+        changes when decode graphs are on or off.
 
-        Why: the tensor returned here has no pointer stability across capture
-        and replay. ``prepare_oft_batch`` runs OUTSIDE the capture region
-        (``decode_cuda_graph_runner.py`` calls it via
-        ``peft.maybe_prepare_peft_batch`` before ``backend.capture_one``, and
-        again via ``peft.maybe_prepare_replay_batch`` in ``replay_prepare``),
-        and allocates a fresh tensor on every call. The capture-time tensor is
-        moreover still referenced by ``self._moe_multi_tenant_slot_ids`` and by
-        every ``moe._oft_moe_multi_tenant_slot_ids`` when the replay-time one is
-        built, so the allocator cannot reuse its block and the replay tensor is
-        GUARANTEED a different address. A graph that captured the multi-slot
-        rotation kernel therefore replays it against the stale capture-time
-        buffer -- silently applying the wrong (capture-time) routing rather than
-        erroring. Same class of failure as the OFT prefill-graph freeze already
-        documented in ``peft/config.py``.
+        Why decode graphs are unsafe here: the tensor returned here has no
+        pointer stability across capture and replay. ``prepare_oft_batch``
+        runs OUTSIDE the capture region (``decode_cuda_graph_runner.py``
+        calls it via ``peft.maybe_prepare_peft_batch`` before
+        ``backend.capture_one``, and again via ``peft.maybe_prepare_replay_
+        batch`` in ``replay_prepare``), and allocates a fresh tensor on every
+        call. The capture-time tensor is moreover still referenced by
+        ``self._moe_multi_tenant_slot_ids`` and by every ``moe._oft_moe_
+        multi_tenant_slot_ids`` when the replay-time one is built, so the
+        allocator cannot reuse its block and the replay tensor is GUARANTEED
+        a different address. A graph that captured the multi-slot rotation
+        kernel therefore replays it against the stale capture-time buffer --
+        silently applying the wrong (capture-time) routing rather than
+        erroring. Same class of failure as the OFT prefill-graph freeze
+        already documented in ``peft/config.py``.
 
-        This is a NEW combination, not a regression: expert-OFT multi-tenancy
-        did not exist before this feature, and the MoE expert-OFT path has never
-        had CUDA-graph test coverage (``test_oft_staged_update.py`` does cover
-        OFT with and without decode graphs, but on a DENSE model, so it never
-        reaches the expert rotation). Nothing that previously worked stops
-        working.
+        This is WORSE than "a new combination without coverage": in the
+        plain native-RPC pool, buffer slot 0 (``self.memory_pool.active_idx``)
+        is permanently reserved by the boot-time base-request registration,
+        so a real dynamically-loaded adapter can NEVER occupy it -- meaning
+        this function's fast-path condition above (the ``distinct_real_slots
+        == {active_idx}`` check, added to fix a DIFFERENT, real correctness
+        bug: a single real adapter resident off ``active_idx`` silently
+        reading identity) can now never be satisfied by any real adapter.
+        For EAGER forward passes this is simply correct (and was always
+        necessary once adapters stopped accidentally landing at
+        ``active_idx``): every real single-adapter batch takes the general
+        per-token kernel, at a real, measured-ish performance cost relative
+        to this plan's own original non-goal that the single/no-adapter path
+        stay fast (see the perf note below). But for CUDA-GRAPH DECODE it
+        made an existing, previously-relied-upon case actively wrong: a graph
+        captured with 0 real adapters (correctly fast-pathing) would replay
+        against a real single adapter (now always on the general path)
+        using the captured single-slot kernel -- silently applying identity
+        instead of that adapter's rotation. Fix 1 (the boot-time decode-graph
+        disable above) closes that regression by removing decode graphs from
+        this configuration entirely, rather than leaving it silently wrong.
 
-        A real fix needs one of two things, both of which reach into the
-        decode-graph-runner layer and are deliberately out of scope here:
-        a per-batch decode-graph-eligibility hook (skip graphs only while
-        multi-tenancy is actually active), or LoRA's dual-capture pattern
-        (``model_executor/runner_utils/capture_mode.py``'s
-        ``_capture_lora_variant``: capture both a single-slot and a multi-slot
-        variant and select at replay). Simply forcing the multi-tenant branch
-        during capture -- LoRA's ``get_is_capture_mode()`` trick -- does NOT
-        work here: LoRA can do it because its MoE kernels early-exit on GPU on
-        an all-zero ``adapter_enabled`` and read persistent in-place-updated
-        buffers, whereas this tensor is freshly allocated per call and the
-        multi-slot rotation kernel has no cheap-skip path (it costs ~2x the
-        single-slot kernel at decode shapes).
+        Perf note (measured, not deeply investigated -- see the
+        ``2026-09-01-oft-moe-cuda-graph-dual-capture`` follow-up plan for the
+        real fix): losing the fast path means any real MoE-target adapter
+        under ``oft_impl=sibling`` now always pays the general kernel's cost
+        in eager mode too, not just under (now-disabled) decode graphs.
+        Microbenchmarking ``apply_oft_rotation_triton`` vs.
+        ``apply_oft_rotation_triton_multi_slot`` directly (bypassing the
+        rest of the forward pass) at this plan's own tiny synthetic-model
+        shapes (block_size=32, ~8 blocks/token, 4 experts) showed the two
+        within noise of each other (~1.0x) across token counts from 1 to
+        512 -- at that scale the kernels are launch-overhead-bound, not
+        compute-bound, so losing ``tl.dot`` barely registers. Task 4's own
+        earlier estimate (larger, more realistic block/expert counts, where
+        compute rather than launch overhead dominates) put the multi-slot
+        kernel at roughly 2-8x the single-slot kernel's cost; this was not
+        re-measured at that scale here. Real fix: the follow-up plan's
+        persistent per-token routing buffer + LoRA-style dual capture, which
+        restores both a genuinely fast single-adapter path AND CUDA-graph-
+        safe multi-tenant decode -- out of scope for this fix wave.
         """
         distinct_real_slots = {idx for idx in weight_indices if idx != 0}
         if not distinct_real_slots:
@@ -809,7 +861,22 @@ class OFTManager(AdapterManager):
                 f"(forward_mode={forward_batch.forward_mode})"
             )
         per_request_slots = torch.tensor(weight_indices, dtype=torch.long, device=device)
-        return per_request_slots.repeat_interleave(tokens_per_request.to(torch.long))
+        # output_size=... avoids a device-to-host sync that repeat_interleave
+        # would otherwise need to determine its own output size from a CUDA
+        # `repeats` tensor -- forward_batch.input_ids.shape[0] is exactly the
+        # total token count this forward call processes (one entry per
+        # decode/idle request, per draft token under target-verify, per
+        # extend token under extend/mixed -- the same per-request counts
+        # generate_sequence_lengths above already sums to that total), so
+        # it's available without a new sync. This also upgrades the
+        # tokens_per_request/weight_indices length check above from a
+        # per-request-count invariant into an ADDITIONAL torch-enforced
+        # total-token-count invariant: repeat_interleave raises if the sum of
+        # tokens_per_request doesn't match output_size.
+        return per_request_slots.repeat_interleave(
+            tokens_per_request.to(torch.long),
+            output_size=forward_batch.input_ids.shape[0],
+        )
 
     def _push_moe_multi_tenant_slot_ids(self) -> None:
         """Make this batch's MoE multi-tenancy decision visible to every
