@@ -409,6 +409,96 @@ class OFTManager(AdapterManager):
             )
         return self.create_oft_update_result(success=True)
 
+    def load_adapter_from_tensors(
+        self, ref: OFTRef, named_tensors, config_dict: dict, *, upsert: bool = False
+    ) -> "OFTUpdateOutput":
+        """Native-RPC admission path: like _ensure_streaming_oft_adapter_slot,
+        but multi-tenant (no single-active restriction) since this serves
+        the new native load_oft_adapter_from_tensors RPC, not the legacy
+        srt/peft streamed path. Capacity is still bounded by
+        max_ofts_per_batch via the memory pool's own admission."""
+        from sglang.srt.oft.streamed_weight_loader import _write_streamed_oft_tensors
+
+        try:
+            block_size = config_dict.get("oft_block_size", 32)
+            max_block_size = self.memory_pool.max_oft_block_size
+            if block_size != max_block_size:
+                return self._make_update_result(
+                    success=False,
+                    error_message=(
+                        f"OFT adapter '{ref.adapter_name}' has block_size="
+                        f"{block_size}, but the server pool is allocated for "
+                        f"--max-oft-block-size={max_block_size}; smaller or "
+                        "mixed block sizes are unsupported."
+                    ),
+                )
+
+            existing_id = None
+            for ref_id, existing_ref in list(self.refs.items()):
+                if existing_ref.adapter_name == ref.adapter_name:
+                    existing_id = ref_id
+                    break
+            if existing_id is not None:
+                if not upsert:
+                    return self._make_update_result(
+                        success=False,
+                        error_message=(
+                            f"OFT adapter '{ref.adapter_name}' is already "
+                            "loaded; pass upsert=True to refresh it in place."
+                        ),
+                    )
+                self.unload_streamed_adapter(self.refs[existing_id])
+
+            buffer_id = self.memory_pool.allocate_buffer_slot()
+            self.memory_pool.reset_buffer_slot_to_identity(buffer_id)
+            result = self.register_streamed_adapter(ref, buffer_id, config_dict)
+            if not result.success:
+                return result
+
+            success, error_message = _write_streamed_oft_tensors(
+                self,
+                named_tensors,
+                buffer_id,
+                block_size,
+                ref.adapter_name,
+                ref.adapter_id,
+            )
+            if not success:
+                return self._make_update_result(
+                    success=False, error_message=error_message
+                )
+        except Exception as e:
+            return self._make_update_result(success=False, error_message=str(e))
+        return self._make_update_result(success=True)
+
+    def load_adapter_from_distributed(
+        self,
+        ref: OFTRef,
+        names,
+        dtypes,
+        shapes,
+        config_dict: dict,
+        group_name: str,
+        weight_updater,
+        *,
+        upsert: bool = False,
+    ) -> "OFTUpdateOutput":
+        """Receives the adapter's tensors over the process group via the
+        model runner's WeightUpdater, then delegates to
+        load_adapter_from_tensors for admission."""
+        try:
+            tensors = weight_updater.receive_weights_from_distributed(
+                names, dtypes, shapes, group_name
+            )
+        except Exception as e:
+            return self._make_update_result(
+                success=False,
+                error_message=f"Failed to receive OFT adapter weights: {e}.",
+            )
+        return self.load_adapter_from_tensors(
+            ref, tensors, config_dict, upsert=upsert
+        )
+
     def validate_oft_batch(self, adapter_ids: set[Optional[str]]) -> bool:
         return self.validate_batch(adapter_ids)
 

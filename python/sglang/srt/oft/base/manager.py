@@ -9,8 +9,8 @@ from sglang.srt.utils import replace_submodule
 class AdapterManager:
     """Generic lifecycle/utility methods for adapter managers. Originally
     intended to be shared with LoRA (several method docstrings below still
-    describe LoRA-specific behavior for that reason), but LoRAManager evolved
-    independently and does not subclass this -- today only OFTManager does."""
+    describe LoRA-specific behavior), but LoRAManager evolved independently
+    and does not subclass this -- today only OFTManager does."""
 
     # ------------------------------------------------------------------ #
     #  Hooks — subclasses must implement these to specialize the generic

@@ -390,8 +390,6 @@ def load_streamed_oft_adapter(
     adapter_name: str,
     adapter_id: str | None = None,
 ) -> tuple[bool, str]:
-    from sglang.srt.layers.utils import get_layer_id
-
     assert adapter_config is not None, "adapter_config is required for oft_adapter"
     assert adapter_name is not None, "adapter_name is required for oft_adapter"
 
@@ -405,8 +403,36 @@ def load_streamed_oft_adapter(
     except (RuntimeError, ValueError) as exc:
         return False, str(exc)
 
-    memory_pool = model_runner.oft_manager.memory_pool
-    oft_modules = model_runner.oft_manager.adapter_modules
+    return _write_streamed_oft_tensors(
+        model_runner.oft_manager,
+        named_tensors,
+        buffer_id,
+        block_size,
+        adapter_name,
+        adapter_id,
+    )
+
+
+def _write_streamed_oft_tensors(
+    oft_manager,
+    named_tensors: List[Tuple[str, torch.Tensor]],
+    buffer_id: int,
+    block_size: int,
+    adapter_name: str,
+    adapter_id: str | None,
+) -> tuple[bool, str]:
+    """Write already-admitted tensors into buffer_id's R_buffer slots.
+
+    Shared by the legacy single-active streamed path (`load_streamed_oft_adapter`,
+    which admits the slot via `_ensure_streaming_oft_adapter_slot` before calling
+    this) and the native multi-tenant admission path
+    (`OFTManager.load_adapter_from_tensors`, which admits its own slot and calls
+    this directly).
+    """
+    from sglang.srt.layers.utils import get_layer_id
+
+    memory_pool = oft_manager.memory_pool
+    oft_modules = oft_manager.adapter_modules
     if os.getenv("ORBIT_LOG_WEIGHT_SYNC", "").strip().lower() not in {"", "0", "false", "no"}:
         samples = []
         max_abs = 0.0
@@ -451,7 +477,6 @@ def load_streamed_oft_adapter(
         )
     )
     if dsv4_expert_chunk:
-        oft_manager = model_runner.oft_manager
         has_dsv4_moe = False  # fork DeepSeekV4 model dropped (Task 2b)
         has_fused_moe = bool(oft_manager._find_fused_moe_modules())
         if has_fused_moe and not has_dsv4_moe:
@@ -551,9 +576,7 @@ def load_streamed_oft_adapter(
         return False, f"Unresolved OFT tensor names: {shown}{more}"
 
     if fused_expert_chunk:
-        model_runner.oft_manager.apply_streamed_expert_oft(
-            fused_expert_chunk, block_size
-        )
+        oft_manager.apply_streamed_expert_oft(fused_expert_chunk, block_size)
     if dsv4_expert_chunk:
         # Fork DeepSeekV4 model was dropped (Task 2b); DSV4-named expert OFT
         # adapters are converted onto FusedMoE above. Reaching here means no
