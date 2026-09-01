@@ -133,6 +133,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    LoadOFTAdapterFromDistributedReqInput,
+    LoadOFTAdapterFromTensorsReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
@@ -145,6 +147,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UnloadOFTAdapterReqInput,
     UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -1702,6 +1705,43 @@ async def unload_lora_adapter(
 ):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/load_oft_adapter_from_tensors", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def load_oft_adapter_from_tensors(
+    obj: Annotated[LoadOFTAdapterFromTensorsReqInput, Body()], request: Request
+):
+    """Load a new OFT adapter from tensors without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_oft_adapter_from_tensors(
+        obj, request
+    )
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/load_oft_adapter_from_distributed", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def load_oft_adapter_from_distributed(
+    obj: Annotated[LoadOFTAdapterFromDistributedReqInput, Body()], request: Request
+):
+    """Load a new OFT adapter broadcast over a process group without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_oft_adapter_from_distributed(
+        obj, request
+    )
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/unload_oft_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def unload_oft_adapter(
+    obj: Annotated[UnloadOFTAdapterReqInput, Body()], request: Request
+):
+    """Unload an OFT adapter without re-launching the server."""
+    result = await _global_state.tokenizer_manager.unload_oft_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
