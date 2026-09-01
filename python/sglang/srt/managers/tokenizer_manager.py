@@ -533,7 +533,12 @@ def _append_scoring_suffix(
     return combined_ids
 
 
-class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+from sglang.srt.oft.tokenizer_mixin import OFTTokenizerMixin
+
+
+class TokenizerManager(
+    TokenizerControlMixin, TokenizerManagerScoreMixin, OFTTokenizerMixin
+):
     """TokenizerManager is a process that tokenizes the text."""
 
     @property

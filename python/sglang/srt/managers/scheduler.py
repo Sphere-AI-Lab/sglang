@@ -1602,6 +1602,15 @@ class Scheduler(
         )
 
     def init_request_dispatcher(self):
+        # Resolved here rather than at module scope: oft.io_types imports
+        # managers.io_struct, which is the cycle io_struct.__getattr__ avoids.
+        from sglang.srt.oft.io_types import (
+            LoadOFTAdapterReqInput as _LoadOFTAdapterReqInput,
+        )
+        from sglang.srt.oft.io_types import (
+            UnloadOFTAdapterReqInput as _UnloadOFTAdapterReqInput,
+        )
+
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
@@ -1708,6 +1717,8 @@ class Scheduler(
                     self.load_lora_adapter_from_distributed,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (_LoadOFTAdapterReqInput, self.load_oft_adapter),
+                (_UnloadOFTAdapterReqInput, self.unload_oft_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
@@ -5006,6 +5017,18 @@ class Scheduler(
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
+        return result
+
+    def load_oft_adapter(self, recv_req):
+        """In-place loading of an OFT adapter. Mirrors load_lora_adapter()."""
+
+        result = self.tp_worker.load_oft_adapter(recv_req)
+        return result
+
+    def unload_oft_adapter(self, recv_req):
+        """Unload the OFT adapter. Mirrors unload_lora_adapter()."""
+
+        result = self.tp_worker.unload_oft_adapter(recv_req)
         return result
 
     def init_weights_send_group_for_remote_instance(

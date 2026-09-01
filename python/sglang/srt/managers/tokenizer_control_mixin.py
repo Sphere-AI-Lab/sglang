@@ -173,7 +173,15 @@ class TokenizerControlMixin:
 
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
         dispatch_pairs = []
-        for spec in _COMMUNICATOR_SPECS:
+        # Canonical OFT IPC types are resolved lazily: sglang.srt.oft.io_types
+        # imports managers.io_struct, so a module-level import here would close
+        # the very cycle that io_struct.__getattr__ exists to avoid.
+        from sglang.srt.oft.io_types import OFTUpdateOutput
+
+        self._communicator_specs = list(_COMMUNICATOR_SPECS) + [
+            ("update_oft_adapter", OFTUpdateOutput),
+        ]
+        for spec in self._communicator_specs:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
             comm = FanOutCommunicator(
@@ -197,7 +205,7 @@ class TokenizerControlMixin:
         else:
             control_fan_out = worker_count
 
-        for spec in _COMMUNICATOR_SPECS:
+        for spec in getattr(self, "_communicator_specs", _COMMUNICATOR_SPECS):
             getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
 
         self.get_internal_state_communicator.set_fan_out(control_fan_out)

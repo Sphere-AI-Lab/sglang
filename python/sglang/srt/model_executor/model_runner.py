@@ -1365,6 +1365,27 @@ class ModelRunner:
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
         return self.lora_manager.unload_lora_adapter(lora_ref)
 
+    def load_oft_adapter(self, oft_ref):
+        """Load an OFT adapter dynamically. Mirrors load_lora_adapter().
+
+        The body lives in oft.integration so the OFT provider stays self-contained;
+        this method restores the transport entry point that srt/oft shipped without.
+        """
+        from sglang.srt.oft import integration as _oft
+
+        return _oft.maybe_load_adapter(self, oft_ref)
+
+    def unload_oft_adapter(self, oft_ref):
+        """Unload an OFT adapter. Mirrors unload_lora_adapter().
+
+        Note the OFT-specific semantics preserved in the provider: unloading must
+        reset the slot to identity (a zeroed rotation is not a no-op, unlike a
+        zeroed additive LoRA delta) and clear streamed MoE expert bindings.
+        """
+        from sglang.srt.oft import integration as _oft
+
+        return _oft.maybe_unload_adapter(self, oft_ref)
+
     @property
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""

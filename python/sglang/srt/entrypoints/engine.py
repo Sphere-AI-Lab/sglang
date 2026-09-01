@@ -385,6 +385,7 @@ class Engine(EngineScoreMixin, EngineBase):
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
+        adapter_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         require_reasoning: bool = False,
         return_hidden_states: Union[
@@ -432,6 +433,7 @@ class Engine(EngineScoreMixin, EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            adapter_path=adapter_path,
             custom_logit_processor=custom_logit_processor,
             require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
@@ -500,6 +502,7 @@ class Engine(EngineScoreMixin, EngineBase):
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
+        adapter_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         require_reasoning: bool = False,
         return_hidden_states: Union[
@@ -547,6 +550,7 @@ class Engine(EngineScoreMixin, EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            adapter_path=adapter_path,
             require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
@@ -580,6 +584,7 @@ class Engine(EngineScoreMixin, EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+        adapter_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         embed_override_token_id: Optional[int] = None,
         embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
@@ -596,6 +601,7 @@ class Engine(EngineScoreMixin, EngineBase):
             video_data=video_data,
             dimensions=dimensions,
             lora_path=lora_path,
+            adapter_path=adapter_path,
             embed_override_token_id=embed_override_token_id,
             embed_overrides=embed_overrides,
             external_trace_header=external_trace_header,
@@ -613,6 +619,7 @@ class Engine(EngineScoreMixin, EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+        adapter_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         embed_override_token_id: Optional[int] = None,
         embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
@@ -631,6 +638,7 @@ class Engine(EngineScoreMixin, EngineBase):
             video_data=video_data,
             dimensions=dimensions,
             lora_path=lora_path,
+            adapter_path=adapter_path,
             embed_override_token_id=embed_override_token_id,
             embed_overrides=embed_overrides,
             external_trace_header=external_trace_header,
@@ -1607,6 +1615,40 @@ class Engine(EngineScoreMixin, EngineBase):
 
         return self.loop.run_until_complete(
             self.tokenizer_manager.unload_lora_adapter(obj, None)
+        )
+
+    def load_oft_adapter(
+        self, adapter_name: str, adapter_path: str, pinned: bool = False
+    ):
+        """Load an OFT adapter without re-launching the engine.
+
+        Mirrors load_lora_adapter(). OFT previously had no public adapter
+        lifecycle API -- adapters could only be supplied at startup via
+        --peft-paths -- so this restores parity with LoRA.
+        """
+        from sglang.srt.oft.io_types import LoadOFTAdapterReqInput
+
+        obj = LoadOFTAdapterReqInput(
+            adapter_name=adapter_name, adapter_path=adapter_path, pinned=pinned
+        )
+
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_oft_adapter(obj, None)
+        )
+
+    def unload_oft_adapter(self, adapter_name: str):
+        """Unload an OFT adapter without re-launching the engine.
+
+        Mirrors unload_lora_adapter(). The OFT-specific semantics (resetting the
+        rotation slot to identity, clearing streamed MoE expert bindings) are
+        preserved in the provider -- only the transport mirrors LoRA.
+        """
+        from sglang.srt.oft.io_types import UnloadOFTAdapterReqInput
+
+        obj = UnloadOFTAdapterReqInput(adapter_name=adapter_name)
+
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.unload_oft_adapter(obj, None)
         )
 
     async def async_load_lora_adapter(

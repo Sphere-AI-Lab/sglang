@@ -236,6 +236,14 @@ class BaseTpWorker(ABC):
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
 
+    def load_oft_adapter(self, recv_req):
+        result = self.model_runner.load_oft_adapter(recv_req.to_ref())
+        return result
+
+    def unload_oft_adapter(self, recv_req):
+        result = self.model_runner.unload_oft_adapter(recv_req.to_ref())
+        return result
+
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ):

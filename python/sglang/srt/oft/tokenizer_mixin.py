@@ -3,8 +3,8 @@
 ``OFTTokenizerMixin`` holds the dedicated OFT async handlers moved
 verbatim out of ``sglang.srt.managers.tokenizer_communicator_mixin``.
 ``TokenizerManager`` mixes this in as a base class, so the bodies below
-resolve ``self.server_args``, ``self.oft_registry``, ``self.oft_update_lock``,
-``self.oft_ref_cache``, and ``self.update_oft_adapter_communicator`` at
+resolve ``self.server_args``, ``self.peft_registry``, ``self.peft_update_lock``,
+``self.peft_ref_cache``, and ``self.update_oft_adapter_communicator`` at
 runtime exactly as before.
 """
 
@@ -39,13 +39,13 @@ class OFTTokenizerMixin:
         obj: UnloadOFTAdapterReqInput,
     ) -> UnloadOFTAdapterReqOutput:
         assert (
-            self.oft_update_lock.locked()
-        ), "self.oft_update_lock must be locked in order for self._unload_oft_adapter_locked() to be called"
+            self.peft_update_lock.locked()
+        ), "self.peft_update_lock must be locked in order for self._unload_oft_adapter_locked() to be called"
 
-        adapter_id = await self.oft_registry.unregister(obj.adapter_name)
+        adapter_id = await self.peft_registry.unregister(obj.adapter_name)
         obj.adapter_id = adapter_id
 
-        await self.oft_registry.wait_for_unload(adapter_id)
+        await self.peft_registry.wait_for_unload(adapter_id)
         result = (await self.update_oft_adapter_communicator(obj))[0]
 
         return result
@@ -72,7 +72,7 @@ class OFTTokenizerMixin:
                 obj.adapter_path,
             )
 
-            async with self.oft_update_lock:
+            async with self.peft_update_lock:
                 new_adapter = OFTRef(
                     adapter_name=obj.adapter_name,
                     adapter_path=obj.adapter_path,
@@ -83,8 +83,8 @@ class OFTTokenizerMixin:
                 result = (await self.update_oft_adapter_communicator(obj))[0]
 
                 if result.success:
-                    await self.oft_registry.register(new_adapter)
-                    self.oft_ref_cache[obj.adapter_name] = new_adapter
+                    await self.peft_registry.register(new_adapter)
+                    self.peft_ref_cache[obj.adapter_name] = new_adapter
 
                 return result
         except ValueError as e:
@@ -114,7 +114,7 @@ class OFTTokenizerMixin:
                 obj.adapter_name,
             )
 
-            async with self.oft_update_lock:
+            async with self.peft_update_lock:
                 new_adapter = OFTRef(
                     adapter_name=obj.adapter_name,
                     adapter_path="__tensor__",
@@ -124,8 +124,8 @@ class OFTTokenizerMixin:
                 result = (await self.update_oft_adapter_communicator(obj))[0]
 
                 if result.success:
-                    await self.oft_registry.register(new_adapter)
-                    self.oft_ref_cache[obj.adapter_name] = new_adapter
+                    await self.peft_registry.register(new_adapter)
+                    self.peft_ref_cache[obj.adapter_name] = new_adapter
 
                 return result
         except ValueError as e:
@@ -159,7 +159,7 @@ class OFTTokenizerMixin:
                 obj.adapter_name,
             )
 
-            async with self.oft_update_lock:
+            async with self.peft_update_lock:
                 return await self._unload_oft_adapter_locked(obj)
         except ValueError as e:
             return UnloadOFTAdapterReqOutput(success=False, error_message=str(e))
