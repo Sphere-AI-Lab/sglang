@@ -1150,7 +1150,7 @@ class ShardRunner:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="smoke_matrix.py",
+        prog="run_case.py",
         description="Run one adapter-lifecycle shard against an in-process SGLang Engine.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -1240,7 +1240,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", default=False,
                         help="Resolve and print the plan; launch nothing.")
     parser.add_argument("--log-name", default=None,
-                        help="Log filename inside run_dir (default smoke_matrix-<run-id>.jsonl)")
+                        help="Log filename inside run_dir (default run-case-<run-id>.jsonl)")
     parser.add_argument(
         "--engine-kwarg", action="append", type=parse_engine_kwarg, default=[],
         metavar="KEY=JSON",
@@ -1259,7 +1259,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_dir = Path(args.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    log_name = args.log_name or f"smoke_matrix-{args.run_id}.jsonl"
+    log_name = args.log_name or f"run-case-{args.run_id}.jsonl"
     emit_target = Emitter(run_dir / log_name)
     emit = emit_target.emit
 

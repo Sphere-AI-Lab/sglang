@@ -9,15 +9,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "manual"))
 
 from adapter_equivalence.compare import compare_bundles
 
-# Imported rather than re-spelled: these are the retired CLI/key spellings the
-# frozen source still uses, assembled from fragments in server.py so that
-# test/registered/unit/oft/test_no_legacy_peft.py's source scan stays strict.
-# Importing them also ties this assertion to the harness it is checking.
-from adapter_equivalence.server import (
-    _LEGACY_IMPL_FLAG,
-    _LEGACY_IMPL_KEY,
-    _LEGACY_LORA_VALUE,
-)
+# The retired CLI/key spellings the frozen source still uses, assembled from
+# fragments so that test/registered/unit/oft/test_no_legacy_peft.py's source
+# scan stays strict.
+#
+# Spelled INDEPENDENTLY here rather than imported from adapter_equivalence.server:
+# test_task8_source_and_candidate_mode_arguments_are_frozen exists to freeze
+# that contract, so it has to fail when server.py's constants change. Importing
+# them would put the same value on both sides of the assertion and the test
+# would pass no matter what server.py said.
+_LEGACY_IMPL_FLAG = "--" + "oft-impl"
+_LEGACY_IMPL_KEY = "oft" + "_impl"
+_LEGACY_LORA_VALUE = "lo" + "ra"
 from adapter_equivalence.schema import (
     PROVENANCE_HASH_KEYS,
     SCHEMA_VERSION,
