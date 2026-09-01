@@ -773,29 +773,52 @@ class OFTManager(AdapterManager):
         so it stays one entry per request there too).
 
         Returns None only when the fast (single-slot) read path is actually
-        SAFE: no real adapter is referenced at all, or exactly one real
-        adapter is referenced AND it is resident at
-        ``self.memory_pool.active_idx`` -- the ONE slot
-        ``oft_moe_runners.py``'s fast path (``slot_ids is None``) ever reads
-        (a module attribute bound once, at boot, to the pool's active_idx
-        view -- never rebound afterward for the plain native-RPC manager,
-        since ``apply_streamed_expert_oft`` now always writes a real
-        adapter's OWN ``buffer_id`` slot, per Task 4b's fix, rather than
-        ``active_idx``). A single real adapter resident at any OTHER slot
-        still needs the general per-token tensor built below, even though
-        only one adapter is present: skipping it would have the fast path
-        silently read ``active_idx``'s data (identity, or an unrelated
+        SAFE: no real adapter is referenced at all (this carve-out applies
+        regardless of ``use_cuda_graph``), or -- in EAGER MODE ONLY
+        (``not use_cuda_graph``) -- exactly one real adapter is referenced
+        AND it is resident at ``self.memory_pool.active_idx`` -- the ONE
+        slot ``oft_moe_runners.py``'s fast path (``slot_ids is None``) ever
+        reads (a module attribute bound once, at boot, to the pool's
+        active_idx view -- never rebound afterward for the plain native-RPC
+        manager, since ``apply_streamed_expert_oft`` now always writes a
+        real adapter's OWN ``buffer_id`` slot, per Task 4b's fix, rather
+        than ``active_idx``). A single real adapter resident at any OTHER
+        slot still needs the general per-token tensor built below, even
+        though only one adapter is present: skipping it would have the fast
+        path silently read ``active_idx``'s data (identity, or an unrelated
         adapter) instead of that adapter's own rotation. Building the
         general tensor for that case is only ever a performance cost, never
         a correctness one -- Task 4's own correctness oracle proved the
         general multi-slot kernel reproduces the single-slot kernel's output
         exactly when only one real slot's data actually matters, just
-        slower (no ``tl.dot``). In the plain native-RPC pool, slot 0
-        (``self.memory_pool.active_idx``) is permanently reserved for the
-        boot-time base/identity registration, so a real adapter can NEVER
-        actually land there -- meaning EVERY batch with at least one real
-        adapter takes the general per-token path today, not just batches
-        with 2+ distinct adapters.
+        slower (no ``tl.dot``). In the plain native-RPC ("sibling") pool,
+        slot 0 (``self.memory_pool.active_idx``) is permanently reserved for
+        the boot-time base/identity registration, so a real adapter can
+        NEVER actually land there -- meaning EVERY batch with at least one
+        real adapter takes the general per-token path today, not just
+        batches with 2+ distinct adapters.
+
+        WHY THE ``active_idx`` CARVE-OUT IS EAGER-ONLY: under
+        ``--peft-double-buffer`` (``oft_impl="staged"``), ``active_idx`` is
+        NOT permanently reserved the way it is for the plain sibling pool --
+        a staged adapter's ``activate()`` genuinely registers it AT
+        ``active_idx`` (``OFTMemoryPool``), so a resident staged adapter can
+        legitimately satisfy ``distinct_real_slots == {active_idx}``. That
+        is still safe in EAGER mode: this function's own direct read is
+        consistent with what ``oft_moe_runners.py``'s fast path reads. It is
+        NOT safe under CUDA-GRAPH REPLAY: the host-side graph-variant
+        selector (``decode_cuda_graph_runner.py``'s ``_resolve_oft_variant``)
+        decides purely from whether ANY real adapter is present, with no
+        visibility into which slot it occupies -- it selects the
+        general-kernel ("oft_multi") graph for this exact single-staged-
+        adapter-at-active_idx case. If this function instead returned None
+        here (skipping the persistent-buffer write below), the replayed
+        general kernel would read stale/unwritten buffer contents --
+        silently wrong rotation. So under ``use_cuda_graph=True``, ANY real
+        adapter present -- regardless of which slot -- always builds and
+        writes the general per-token tensor, matching the host's own
+        "any real adapter -> general path" criterion exactly; only the
+        zero-real-adapter case still returns None under CUDA-graph replay.
 
         This check is global (whole batch, not per MoE layer) -- see this
         plan's Task 1 design note for why that is a deliberate, still-correct
@@ -854,7 +877,12 @@ class OFTManager(AdapterManager):
         if not capturing_multi:
             if not distinct_real_slots:
                 return None
-            if distinct_real_slots == {self.memory_pool.active_idx}:
+            # Eager-mode-only fast path -- see the docstring's "WHY THE
+            # active_idx CARVE-OUT IS EAGER-ONLY" section for why this must
+            # NOT apply under use_cuda_graph=True.
+            if not use_cuda_graph and distinct_real_slots == {
+                self.memory_pool.active_idx
+            }:
                 return None
 
         device = forward_batch.input_ids.device

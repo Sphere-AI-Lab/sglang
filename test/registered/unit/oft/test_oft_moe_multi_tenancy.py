@@ -826,6 +826,101 @@ class TestPersistentSlotIdsBufferAndCaptureForcing(unittest.TestCase):
                 use_cuda_graph=True,
             )
 
+    def test_staged_double_buffer_active_idx_adapter_forces_general_tensor_under_cuda_graph(
+        self,
+    ):
+        """Regression (independently-verified review finding on this task's
+        own commit): under --peft-double-buffer (oft_impl="staged"),
+        active_idx is NOT permanently reserved the way it is for the plain
+        sibling pool -- a staged adapter's activate() genuinely registers it
+        AT active_idx (mem_pool.py). So a single resident staged adapter can
+        legitimately satisfy distinct_real_slots == {active_idx}.
+
+        The host-side graph-variant selector
+        (decode_cuda_graph_runner.py's _resolve_oft_variant) decides purely
+        from whether ANY real adapter is present, with no visibility into
+        which slot it occupies -- for this exact scenario it selects the
+        general-kernel ("oft_multi") graph. Before this fix, this function
+        still returned None here (the active_idx fast path applied
+        regardless of use_cuda_graph), so the persistent buffer was never
+        written and the replayed general kernel would read stale/unwritten
+        contents -- silent wrong rotation. This pins that use_cuda_graph=True
+        always builds and writes the general tensor for ANY real adapter,
+        regardless of which slot it is in, matching the host's own "any real
+        adapter -> general path" criterion exactly."""
+        buffer = torch.full((8,), -1, dtype=torch.long)
+        # active_idx=1: mirrors the staged/double-buffer pool (mem_pool.py),
+        # where active_idx is not the permanently-reserved 0 of the plain
+        # sibling pool.
+        tm = self._make_tm(buffer=buffer, active_idx=1)
+        # One real adapter, resident exactly AT active_idx.
+        weight_indices = [1, 1]
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            weight_indices,
+            _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=2, batch_size=2),
+            use_cuda_graph=True,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.data_ptr(), buffer.data_ptr())
+        self.assertTrue(torch.equal(result, torch.tensor([1, 1], dtype=torch.long)))
+
+    def test_staged_double_buffer_active_idx_adapter_still_fast_paths_in_eager_mode(
+        self,
+    ):
+        """Negative partner of the case above: the identical staged/
+        active_idx scenario in EAGER mode (use_cuda_graph=False) must still
+        return None -- this function's own direct read there is consistent
+        with what oft_moe_runners.py's fast path reads, so the fix above
+        must not regress the already-working staged eager case."""
+        tm = self._make_tm(
+            buffer=torch.full((8,), -1, dtype=torch.long), active_idx=1
+        )
+        weight_indices = [1, 1]
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            weight_indices,
+            _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=2, batch_size=2),
+            use_cuda_graph=False,
+        )
+        self.assertIsNone(result)
+
+
+class TestInitCudaGraphBatchInfoAllocatesSlotIdsBuffer(unittest.TestCase):
+    """The persistent buffer's sizing (max_bs_in_cuda_graph *
+    num_tokens_per_bs) is the one line the whole CUDA-graph mechanism depends
+    on; exercise the real init_cuda_graph_batch_info method rather than only
+    ever injecting a hand-built buffer via a test fixture."""
+
+    def _make_tm(self):
+        tm = SimpleNamespace()
+        tm.device = torch.device("cpu")
+        tm.oft_backend = SimpleNamespace(
+            init_cuda_graph_batch_info=lambda **kwargs: None
+        )
+        tm.init_cuda_graph_batch_info = MethodType(
+            OFTManager.init_cuda_graph_batch_info, tm
+        )
+        return tm
+
+    def test_buffer_shape_dtype_device_match_max_bs_times_tokens_per_bs(self):
+        tm = self._make_tm()
+        tm.init_cuda_graph_batch_info(max_bs_in_cuda_graph=4, num_tokens_per_bs=3)
+
+        self.assertIsNotNone(tm._moe_cg_slot_ids_buffer)
+        self.assertEqual(tm._moe_cg_slot_ids_buffer.shape, (12,))
+        self.assertEqual(tm._moe_cg_slot_ids_buffer.dtype, torch.long)
+        self.assertEqual(tm._moe_cg_slot_ids_buffer.device, torch.device("cpu"))
+        self.assertTrue(torch.equal(
+            tm._moe_cg_slot_ids_buffer, torch.zeros(12, dtype=torch.long)
+        ))
+        self.assertEqual(tm.max_bs_in_cuda_graph, 4)
+
+    def test_decode_bs_1_token_per_bs(self):
+        """Plain decode: num_tokens_per_bs=1 (see
+        BaseOFTBackend.init_cuda_graph_batch_info's docstring)."""
+        tm = self._make_tm()
+        tm.init_cuda_graph_batch_info(max_bs_in_cuda_graph=8, num_tokens_per_bs=1)
+        self.assertEqual(tm._moe_cg_slot_ids_buffer.shape, (8,))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
