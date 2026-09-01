@@ -217,15 +217,21 @@ class TestMakeOftInvokeMultiTenantBranch(unittest.TestCase):
     def test_invoke_uses_multi_tenant_path_when_slot_ids_present(self):
         from sglang.srt.oft import oft_moe_runners
 
+        # Real tensor (not object()) so the multi-tenant call site's B.shape[0]
+        # (num_experts, mirroring _oft_prerotate's own convention) is valid;
+        # dim 0 matches _oft_w13_oft_r_all_slots's expert axis (dim 1) below.
+        w13_weight = torch.zeros(2, 8, 8)
+        slot_ids = torch.tensor([1, 2], dtype=torch.long)
+        oft_r_all_slots = torch.zeros(3, 2, 1, 4, 4)
         layer = SimpleNamespace(
-            w13_weight=object(),
+            w13_weight=w13_weight,
             w2_weight=object(),
             w13_oft_r=torch.zeros(2, 1, 4, 4),
             w1_oft_r=None,
             w3_oft_r=None,
             w2_oft_r=None,
-            _oft_moe_multi_tenant_slot_ids=torch.tensor([1, 2], dtype=torch.long),
-            _oft_w13_oft_r_all_slots=torch.zeros(3, 2, 1, 4, 4),
+            _oft_moe_multi_tenant_slot_ids=slot_ids,
+            _oft_w13_oft_r_all_slots=oft_r_all_slots,
         )
         real_invoke = unittest.mock.Mock()
         invoke = oft_moe_runners.make_oft_invoke(layer, real_invoke)
@@ -242,6 +248,131 @@ class TestMakeOftInvokeMultiTenantBranch(unittest.TestCase):
             )
             mock_multi.assert_called_once()
             mock_single.assert_not_called()
+            call = mock_multi.call_args
+            self.assertIs(call.args[1], oft_r_all_slots)
+            self.assertIs(call.args[2], slot_ids)
+            self.assertEqual(call.args[-2], w13_weight.shape[0])
+            self.assertEqual(call.args[-1], 32)
+
+    def test_invoke_uses_multi_tenant_path_for_down_projection(self):
+        """Down-projection (w2) sub-case of the inline branch: the fused
+        w13/gate-up sub-case above does not exercise is_gate_up=False, which
+        selects a different attribute (_oft_w2_oft_r_all_slots)."""
+        from sglang.srt.oft import oft_moe_runners
+
+        w2_weight = torch.zeros(2, 8, 8)
+        slot_ids = torch.tensor([1, 2], dtype=torch.long)
+        oft_r_all_slots = torch.zeros(3, 2, 1, 4, 4)
+        layer = SimpleNamespace(
+            w13_weight=object(),
+            w2_weight=w2_weight,
+            w13_oft_r=None,
+            w1_oft_r=None,
+            w3_oft_r=None,
+            w2_oft_r=torch.zeros(2, 1, 4, 4),
+            _oft_moe_multi_tenant_slot_ids=slot_ids,
+            _oft_w2_oft_r_all_slots=oft_r_all_slots,
+        )
+        real_invoke = unittest.mock.Mock()
+        invoke = oft_moe_runners.make_oft_invoke(layer, real_invoke)
+
+        A = torch.zeros(2, 8)
+        with patch.object(
+            oft_moe_runners, "_oft_prerotate_multi_tenant"
+        ) as mock_multi, patch.object(oft_moe_runners, "_oft_prerotate") as mock_single:
+            mock_multi.return_value = (A, A, None, None, None, None, None)
+            invoke(
+                A, layer.w2_weight, None, A, None, None, None,
+                None, None, None, None, None, None, 1,
+                {"BLOCK_SIZE_M": 32},
+            )
+            mock_multi.assert_called_once()
+            mock_single.assert_not_called()
+            call = mock_multi.call_args
+            self.assertIs(call.args[1], oft_r_all_slots)
+            self.assertIs(call.args[2], slot_ids)
+            self.assertEqual(call.args[-2], w2_weight.shape[0])
+
+    def test_invoke_raises_clear_error_when_all_slots_missing(self):
+        """Guards the crash scenario: a legacy-fused static adapter loaded at
+        boot leaves _oft_w13_oft_r_all_slots unbound
+        (_init_identity_expert_oft_for_cuda_graph's short-circuit branch never
+        sets it -- see oft_manager.py), so if multi-tenancy later activates for
+        this layer, the direct attribute access must not surface as a bare
+        AttributeError on the forward-pass hot path."""
+        from sglang.srt.oft import oft_moe_runners
+
+        w13_weight = torch.zeros(2, 8, 8)
+        layer = SimpleNamespace(
+            w13_weight=w13_weight,
+            w2_weight=object(),
+            w13_oft_r=torch.zeros(2, 1, 4, 4),
+            w1_oft_r=None,
+            w3_oft_r=None,
+            w2_oft_r=None,
+            _oft_moe_multi_tenant_slot_ids=torch.tensor([1, 2], dtype=torch.long),
+            # _oft_w13_oft_r_all_slots intentionally absent.
+        )
+        real_invoke = unittest.mock.Mock()
+        invoke = oft_moe_runners.make_oft_invoke(layer, real_invoke)
+
+        A = torch.zeros(2, 8)
+        with self.assertRaises(RuntimeError):
+            invoke(
+                A, layer.w13_weight, None, A, None, None, None,
+                None, None, None, None, None, None, 1,
+                {"BLOCK_SIZE_M": 32},
+            )
+
+
+class TestRunGateUpSplitMultiTenantBranch(unittest.TestCase):
+    def test_selects_w1_or_w3_all_slots_per_half(self):
+        """No existing test exercises _run_gate_up_split's multi-tenant
+        branch: guards that the w1 half selects _oft_w1_oft_r_all_slots and
+        the w3 half selects _oft_w3_oft_r_all_slots, not the other way
+        around or a stale single-tenant fallback."""
+        from sglang.srt.oft import oft_moe_runners
+
+        num_experts, N, K = 2, 16, 8
+        B = torch.zeros(num_experts, N, K)
+        slot_ids = torch.tensor([1, 2], dtype=torch.long)
+        w1_all_slots = torch.zeros(3, num_experts, 1, 4, 4)
+        w3_all_slots = torch.zeros(3, num_experts, 1, 4, 4)
+        layer = SimpleNamespace(
+            w13_weight=B,
+            w2_weight=object(),
+            w13_oft_r=None,
+            w1_oft_r=torch.zeros(num_experts, 1, 4, 4),
+            w3_oft_r=torch.zeros(num_experts, 1, 4, 4),
+            w2_oft_r=None,
+            _oft_moe_multi_tenant_slot_ids=slot_ids,
+            _oft_w1_oft_r_all_slots=w1_all_slots,
+            _oft_w3_oft_r_all_slots=w3_all_slots,
+        )
+        real_invoke = unittest.mock.Mock()
+        invoke = oft_moe_runners.make_oft_invoke(layer, real_invoke)
+
+        total_tokens = 2
+        A = torch.zeros(total_tokens, K)
+        C = torch.zeros(total_tokens, N)
+
+        with patch.object(
+            oft_moe_runners, "_oft_prerotate_multi_tenant"
+        ) as mock_multi:
+            mock_multi.return_value = (A, C[:, : N // 2], None, None, None, None, None)
+            invoke(
+                A, B, None, C, None, None, None,
+                None, None, None, None, None, None, 1,
+                {"BLOCK_SIZE_M": 32}, compute_type=torch.float32,
+            )
+
+        self.assertEqual(mock_multi.call_count, 2)
+        gate_call, up_call = mock_multi.call_args_list
+        self.assertIs(gate_call.args[1], w1_all_slots)
+        self.assertIs(gate_call.args[2], slot_ids)
+        self.assertEqual(gate_call.args[-2], num_experts)
+        self.assertIs(up_call.args[1], w3_all_slots)
+        self.assertIs(up_call.args[2], slot_ids)
 
 
 if __name__ == "__main__":

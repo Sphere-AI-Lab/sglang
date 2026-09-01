@@ -244,10 +244,7 @@ def _run_gate_up_split(
                 num_tokens_post_padded,
                 # the gate-up GEMM's own top_k (rotation collapses it to 1)
                 top_k,
-                # num_local_experts lives at dim 1 of the all-slots buffer
-                # (dim 0 is the slot axis) -- same value b_half.shape[0]
-                # gives in the single-tenant path, without requiring B itself.
-                oft_r_all_slots.shape[1],
+                b_half.shape[0],
                 config["BLOCK_SIZE_M"],
             )
         else:
@@ -403,11 +400,22 @@ def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
 
         slot_ids = getattr(layer, "_oft_moe_multi_tenant_slot_ids", None)
         if slot_ids is not None:
-            oft_r_all_slots = (
-                layer._oft_w13_oft_r_all_slots
-                if is_gate_up
-                else layer._oft_w2_oft_r_all_slots
+            all_slots_attr = (
+                "_oft_w13_oft_r_all_slots" if is_gate_up else "_oft_w2_oft_r_all_slots"
             )
+            oft_r_all_slots = getattr(layer, all_slots_attr, None)
+            if oft_r_all_slots is None:
+                # A legacy-fused static adapter loaded at boot short-circuits
+                # _init_identity_expert_oft_for_cuda_graph before it binds this
+                # attribute (see oft_manager.py), so it can be legitimately
+                # absent even with multi-tenancy active elsewhere. Fail loud
+                # rather than let a bare AttributeError hit the forward-pass
+                # hot path.
+                raise RuntimeError(
+                    f"Multi-tenant expert OFT is active for this layer but "
+                    f"{all_slots_attr} is not bound (unsupported layer "
+                    "configuration for multi-tenancy)"
+                )
             a, c, tw, ti, sti, ei, ntpp = _oft_prerotate_multi_tenant(
                 A,
                 oft_r_all_slots,
@@ -419,10 +427,7 @@ def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
                 expert_ids,
                 num_tokens_post_padded,
                 top_k,
-                # num_local_experts lives at dim 1 of the all-slots buffer
-                # (dim 0 is the slot axis) -- same value B.shape[0] gives in
-                # the single-tenant path, without requiring B itself.
-                oft_r_all_slots.shape[1],
+                B.shape[0],
                 config["BLOCK_SIZE_M"],
             )
         else:
