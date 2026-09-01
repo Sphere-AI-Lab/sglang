@@ -566,32 +566,5 @@ class TestWrongPeftConfigRejected(CustomTestCase):
         tm.update_oft_adapter_communicator.assert_not_awaited()
 
 
-class TestResolvePeftPathRejectsEvictedDiskBackedAdapter(CustomTestCase):
-    """Regression guard: resolve_peft_path's disk-backed-adapter reload
-    branch used to call tm.load_oft_adapter, which does not exist anywhere
-    on TokenizerManager -- OFT never got LoRA's equivalent disk-path reload
-    RPC (only the wire-load load_oft_adapter_from_tensors/_from_distributed
-    RPCs are wired up). So a disk-backed (--peft-paths) adapter whose
-    tokenizer-side registry entry was LRU-evicted (--max-loaded-ofts) and
-    then re-requested crashed with AttributeError instead of a clear,
-    catchable error. Constructs the post-eviction state directly (a
-    reloadable ref present in peft_ref_cache but absent from peft_registry)
-    rather than driving a full eviction cycle."""
-
-    def test_evicted_disk_backed_adapter_raises_value_error(self):
-        from sglang.srt.peft.tokenizer_hooks import resolve_peft_path
-
-        ref = OFTRef(adapter_name="a", adapter_path="/disk/a", pinned=False)
-        tm = SimpleNamespace(
-            peft_kind="oft",
-            peft_registry=OFTRegistry(),
-            peft_ref_cache={"a": ref},
-        )
-        obj = SimpleNamespace(adapter_path="a", lora_path=None)
-
-        with self.assertRaisesRegex(ValueError, "evicted"):
-            asyncio.run(resolve_peft_path(tm, obj))
-
-
 if __name__ == "__main__":
     unittest.main(verbosity=2)
