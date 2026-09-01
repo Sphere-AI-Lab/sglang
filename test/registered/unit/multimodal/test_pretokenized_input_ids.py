@@ -28,6 +28,16 @@ class TestPretokenizedInputIdExpansion(unittest.TestCase):
             ],
         )
 
+    def test_expands_adjacent_compact_placeholders(self):
+        self.assertEqual(
+            BaseMultimodalProcessor._expand_input_ids(
+                [10, self.placeholder, self.placeholder, 11],
+                [3, 2],
+                self.placeholder,
+            ),
+            [10, *([self.placeholder] * 5), 11],
+        )
+
     def test_preserves_hf_processor_expanded_placeholder_runs(self):
         expanded = [
             10,

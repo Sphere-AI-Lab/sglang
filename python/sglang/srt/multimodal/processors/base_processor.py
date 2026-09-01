@@ -1553,6 +1553,22 @@ class BaseMultimodalProcessor(ABC):
         if placeholder_token_id is None:
             raise ValueError("placeholder_token_id is not set for this processor")
 
+        # Preserve the original compact contract before interpreting contiguous
+        # placeholders as an already-expanded image run. Compact placeholders
+        # may be adjacent when two images have no text token between them.
+        if sum(token_id == placeholder_token_id for token_id in original_ids) == len(
+            counts
+        ):
+            rebuilt: List[int] = []
+            next_image_idx = 0
+            for token_id in original_ids:
+                if token_id == placeholder_token_id:
+                    rebuilt.extend([placeholder_token_id] * counts[next_image_idx])
+                    next_image_idx += 1
+                else:
+                    rebuilt.append(token_id)
+            return rebuilt
+
         rebuilt: List[int] = []
         next_image_idx = 0
         token_idx = 0
