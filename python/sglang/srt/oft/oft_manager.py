@@ -567,6 +567,23 @@ class OFTManager(AdapterManager):
                             "loaded; pass upsert=True to refresh it in place."
                         ),
                     )
+                if existing_id in self.adapters:
+                    # existing_id is disk-backed (--peft-paths): register_streamed_adapter
+                    # below would overwrite self.refs[existing_id]/self.configs[existing_id]
+                    # with the new wire-loaded ref while leaving self.adapters[existing_id]
+                    # (the old CPU-side OFTAdapter) behind, stale -- silently corrupting
+                    # num_pinned accounting and later disk-vs-streamed unload dispatch.
+                    # Migrating a disk-backed identity into a wire-loaded one isn't
+                    # supported; reject instead of attempting it.
+                    return self._make_update_result(
+                        success=False,
+                        error_message=(
+                            f"OFT adapter '{ref.adapter_name}' is currently loaded "
+                            "from disk (--peft-paths) and cannot be converted to a "
+                            "wire-loaded adapter via upsert. Use a different adapter "
+                            "name for the wire-loaded adapter."
+                        ),
+                    )
                 self._unload_streamed_adapter_if_not_disk_backed(
                     self.refs[existing_id], context="upsert"
                 )
