@@ -176,22 +176,19 @@ async def resolve_peft_path(tm, obj):
                 "_from_distributed call."
             )
         if tm.peft_kind == "oft":
-            from sglang.srt.peft.io_types import LoadOFTAdapterReqInput
-
-            logger.info(f"Reloading evicted adapter: {adapter_path}")
-            load_result = await tm.load_oft_adapter(
-                LoadOFTAdapterReqInput(
-                    adapter_name=ref.adapter_name, adapter_path=ref.adapter_path, pinned=ref.pinned
-                )
+            # ref.reloadable is True here, meaning this is a disk-backed
+            # (--peft-paths) adapter whose registry entry was LRU-evicted --
+            # unlike LoRA, OFT has no wired-up disk-path reload RPC (only the
+            # wire-load load_oft_adapter_from_tensors/_from_distributed RPCs
+            # exist), so it cannot yet implicitly reload it here.
+            raise ValueError(
+                f"OFT adapter '{adapter_path}' was dynamically evicted from "
+                "the tokenizer-side registry (--max-loaded-ofts) and OFT "
+                "does not yet support implicitly reloading a disk-backed "
+                "adapter from its on-disk artifact at request time (unlike "
+                "LoRA's equivalent path); this adapter must be reloaded "
+                "explicitly."
             )
-            if (
-                not load_result.success
-                and "already loaded" not in load_result.error_message
-            ):
-                raise ValueError(
-                    f"Failed to implicitly load OFT adapter {adapter_path}: "
-                    f"{load_result.error_message}"
-                )
 
     adapter_id, adapter_version = await tm.peft_registry.acquire_with_version(path)
     # Set the request-side id/version fields the scheduler reads.
