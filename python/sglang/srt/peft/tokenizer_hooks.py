@@ -188,3 +188,26 @@ async def maybe_resolve_peft_path(tm, obj):
             tm.peft_kind,
         )
         tm._logged_peft_base_only_request = True
+
+
+def finalize_peft_lease(tm, state) -> None:
+    """Release the request's peft (OFT) adapter lease exactly once, however it
+    terminates: normal finish, scheduler abort echo (queued / tokenizer-held /
+    disagg), status-code abort, or a failed dispatch. Mirrors
+    TokenizerManager._finalize_lora_lease exactly, for the single-active
+    peft_registry path: without this release, peft_registry.wait_for_unload
+    (called by unload_oft_adapter and the max_loaded_ofts LRU-eviction loop)
+    would block forever on any adapter that ever served a request.
+
+    ``adapter_id`` lives only on GenerateReqInput (peft has no embedding
+    support, see generate_request's isinstance guard), hence the getattr
+    instead of direct attribute access -- state.obj may be an
+    EmbeddingReqInput, which never declares the field.
+    """
+    if state is None or state.peft_lease_released:
+        return
+    adapter_id = getattr(state.obj, "adapter_id", None)
+    if adapter_id is None or tm.peft_registry is None:
+        return
+    state.peft_lease_released = True
+    asyncio.create_task(tm.peft_registry.release(adapter_id))
