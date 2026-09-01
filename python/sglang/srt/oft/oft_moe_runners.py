@@ -398,6 +398,14 @@ def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
             A = dequant_fp8_block_triton(A, A_scale, out_dtype=C.dtype)
             A_scale = None
 
+        # KNOWN LIMITATION: this branch is chosen HERE, on the Python side, so
+        # under a replayed decode CUDA graph it is frozen at whatever was true
+        # at capture time, and slot_ids itself is a fresh per-call allocation
+        # with no pointer stability across capture/replay. Multi-tenant MoE OFT
+        # therefore needs --disable-cuda-graph; see the full write-up on
+        # OFTManager._compute_moe_multi_tenant_slot_ids. Single-adapter (the
+        # slot_ids-is-None path below) is unaffected: it reads the persistent,
+        # in-place-updated pool buffers, so decode graphs stay correct for it.
         slot_ids = getattr(layer, "_oft_moe_multi_tenant_slot_ids", None)
         if slot_ids is not None:
             all_slots_attr = (

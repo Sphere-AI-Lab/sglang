@@ -740,6 +740,48 @@ class OFTManager(AdapterManager):
         ``spec_info`` and the ``extend_seq_lens`` pair. Nothing outside the
         multi-tenant branch is touched, so the single-adapter fast path pays
         only the existing set comprehension.
+
+        KNOWN LIMITATION -- multi-tenant MoE OFT is not yet safe under
+        CUDA-graph-REPLAYED DECODE. Run multi-tenant MoE workloads with
+        ``--disable-cuda-graph``. Eager decode, all prefill/extend (OFT already
+        disables prefill graphs, see ``peft/config.py``), and the
+        single-adapter path under decode graphs are all unaffected and correct.
+
+        Why: the tensor returned here has no pointer stability across capture
+        and replay. ``prepare_oft_batch`` runs OUTSIDE the capture region
+        (``decode_cuda_graph_runner.py`` calls it via
+        ``peft.maybe_prepare_peft_batch`` before ``backend.capture_one``, and
+        again via ``peft.maybe_prepare_replay_batch`` in ``replay_prepare``),
+        and allocates a fresh tensor on every call. The capture-time tensor is
+        moreover still referenced by ``self._moe_multi_tenant_slot_ids`` and by
+        every ``moe._oft_moe_multi_tenant_slot_ids`` when the replay-time one is
+        built, so the allocator cannot reuse its block and the replay tensor is
+        GUARANTEED a different address. A graph that captured the multi-slot
+        rotation kernel therefore replays it against the stale capture-time
+        buffer -- silently applying the wrong (capture-time) routing rather than
+        erroring. Same class of failure as the OFT prefill-graph freeze already
+        documented in ``peft/config.py``.
+
+        This is a NEW combination, not a regression: expert-OFT multi-tenancy
+        did not exist before this feature, and the MoE expert-OFT path has never
+        had CUDA-graph test coverage (``test_oft_staged_update.py`` does cover
+        OFT with and without decode graphs, but on a DENSE model, so it never
+        reaches the expert rotation). Nothing that previously worked stops
+        working.
+
+        A real fix needs one of two things, both of which reach into the
+        decode-graph-runner layer and are deliberately out of scope here:
+        a per-batch decode-graph-eligibility hook (skip graphs only while
+        multi-tenancy is actually active), or LoRA's dual-capture pattern
+        (``model_executor/runner_utils/capture_mode.py``'s
+        ``_capture_lora_variant``: capture both a single-slot and a multi-slot
+        variant and select at replay). Simply forcing the multi-tenant branch
+        during capture -- LoRA's ``get_is_capture_mode()`` trick -- does NOT
+        work here: LoRA can do it because its MoE kernels early-exit on GPU on
+        an all-zero ``adapter_enabled`` and read persistent in-place-updated
+        buffers, whereas this tensor is freshly allocated per call and the
+        multi-slot rotation kernel has no cheap-skip path (it costs ~2x the
+        single-slot kernel at decode shapes).
         """
         distinct_real_slots = {idx for idx in weight_indices if idx != 0}
         if len(distinct_real_slots) <= 1:
