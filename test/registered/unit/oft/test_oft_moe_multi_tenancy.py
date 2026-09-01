@@ -63,5 +63,30 @@ class TestMoeMultiTenancyDecision(unittest.TestCase):
         self.assertIsNotNone(result)
 
 
+class TestPushSlotIdsOntoMoeModules(unittest.TestCase):
+    def _make_tm_with_one_moe_module(self):
+        moe = SimpleNamespace()
+        tm = SimpleNamespace()
+        tm._moe_multi_tenant_slot_ids = None
+        tm._find_fused_moe_modules = lambda: {0: moe}
+        tm._push_moe_multi_tenant_slot_ids = MethodType(
+            OFTManager._push_moe_multi_tenant_slot_ids, tm
+        )
+        return tm, moe
+
+    def test_pushes_none_when_no_multi_tenancy(self):
+        tm, moe = self._make_tm_with_one_moe_module()
+        tm._moe_multi_tenant_slot_ids = None
+        tm._push_moe_multi_tenant_slot_ids()
+        self.assertIsNone(moe._oft_moe_multi_tenant_slot_ids)
+
+    def test_pushes_tensor_when_multi_tenant(self):
+        tm, moe = self._make_tm_with_one_moe_module()
+        slot_ids = torch.tensor([1, 2, 1], dtype=torch.long)
+        tm._moe_multi_tenant_slot_ids = slot_ids
+        tm._push_moe_multi_tenant_slot_ids()
+        self.assertIs(moe._oft_moe_multi_tenant_slot_ids, slot_ids)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

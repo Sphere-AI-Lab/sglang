@@ -722,6 +722,14 @@ class OFTManager(AdapterManager):
             return None
         return torch.tensor(weight_indices, dtype=torch.long, device=device)
 
+    def _push_moe_multi_tenant_slot_ids(self) -> None:
+        """Make this batch's MoE multi-tenancy decision visible to every
+        resident FusedMoE module, read live by oft_moe_runners.make_oft_invoke
+        on every kernel-invoker call -- same self-gating pattern as
+        moe.w13_oft_r etc."""
+        for moe in self._find_fused_moe_modules().values():
+            moe._oft_moe_multi_tenant_slot_ids = self._moe_multi_tenant_slot_ids
+
     def prepare_oft_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all oft modules
         bs = forward_batch.batch_size
@@ -755,6 +763,7 @@ class OFTManager(AdapterManager):
         self._moe_multi_tenant_slot_ids = self._compute_moe_multi_tenant_slot_ids(
             weight_indices, device=forward_batch.input_ids.device
         )
+        self._push_moe_multi_tenant_slot_ids()
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.oft_backend.prepare_oft_batch(
@@ -1289,6 +1298,13 @@ class OFTManager(AdapterManager):
                                 self.memory_pool.active_view(attr, layer_id),
                             )
                             initialized = True
+                    # Bind full-buffer views for multi-tenant access (read by Task 3).
+                    moe._oft_w1_oft_r_all_slots = self.memory_pool._groups.get(
+                        "w1_oft_r", {}
+                    ).get(layer_id)
+                    moe._oft_w3_oft_r_all_slots = self.memory_pool._groups.get(
+                        "w3_oft_r", {}
+                    ).get(layer_id)
                     # Split buffers supersede the legacy fused buffer.
                     moe.w13_oft_r = None
                 else:
@@ -1308,6 +1324,10 @@ class OFTManager(AdapterManager):
                     moe.w13_oft_r = self.memory_pool.active_view(
                         "w13_oft_r", layer_id
                     )
+                    # Bind full-buffer view for multi-tenant access (read by Task 3).
+                    moe._oft_w13_oft_r_all_slots = self.memory_pool._groups.get(
+                        "w13_oft_r", {}
+                    ).get(layer_id)
                     initialized = True
 
             if init_w2 and getattr(moe, "w2_oft_r", None) is None:
@@ -1322,6 +1342,10 @@ class OFTManager(AdapterManager):
                     self.memory_pool.slot("w2_oft_r", layer_id, self.memory_pool.active_idx)
                 )
                 moe.w2_oft_r = self.memory_pool.active_view("w2_oft_r", layer_id)
+                # Bind full-buffer view for multi-tenant access (read by Task 3).
+                moe._oft_w2_oft_r_all_slots = self.memory_pool._groups.get(
+                    "w2_oft_r", {}
+                ).get(layer_id)
                 initialized = True
 
         if initialized:
