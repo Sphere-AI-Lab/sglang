@@ -198,6 +198,68 @@ class TestLoRARegistryRegisterOrReuse(CustomTestCase):
                 registry.refresh(LoRARef(lora_name="a", lora_path="__tensor__"))
             )
 
+    def test_bump_version_advances_past_existing_on_reuse(self):
+        # Regression: an upsert reuse used to never touch ``version``, so the
+        # radix cache key (extended with lora_version) never changed across
+        # an in-place weight refresh of the same adapter name.
+        registry = LoRARegistry()
+        asyncio.run(
+            registry.register(LoRARef(lora_name="a", lora_path="/x", version=5))
+        )
+
+        candidate = LoRARef(lora_name="a", lora_path="__distributed__")
+        resolved, reused = asyncio.run(
+            registry.register_or_reuse(candidate, True, bump_version=True)
+        )
+
+        self.assertTrue(reused)
+        self.assertEqual(resolved.version, 6)
+
+    def test_bump_version_advances_again_from_new_baseline(self):
+        # A second successive upsert must bump from the freshly-committed
+        # version, not reset to a fixed constant.
+        registry = LoRARegistry()
+        existing = LoRARef(lora_name="a", lora_path="/x", version=5)
+        asyncio.run(registry.register(existing))
+
+        resolved_1, _ = asyncio.run(
+            registry.register_or_reuse(
+                LoRARef(lora_name="a", lora_path="__distributed__"),
+                True,
+                bump_version=True,
+            )
+        )
+        self.assertEqual(resolved_1.version, 6)
+        asyncio.run(registry.refresh(resolved_1))
+
+        resolved_2, _ = asyncio.run(
+            registry.register_or_reuse(
+                LoRARef(lora_name="a", lora_path="__distributed__"),
+                True,
+                bump_version=True,
+            )
+        )
+        self.assertEqual(resolved_2.version, 7)
+
+    def test_without_bump_version_keeps_callers_explicit_version(self):
+        # The native staged double-buffer protocol manages its own version
+        # numbering explicitly and must NOT have it overwritten here -- it
+        # calls register_or_reuse without bump_version, so a caller-supplied
+        # version (even one that doesn't equal existing.version + 1) must
+        # come back unchanged.
+        registry = LoRARegistry()
+        asyncio.run(
+            registry.register(LoRARef(lora_name="a", lora_path="/x", version=1))
+        )
+
+        candidate = LoRARef(lora_name="a", lora_path="__distributed__", version=9)
+        resolved, reused = asyncio.run(
+            registry.register_or_reuse(candidate, True, preserve_pinned=True)
+        )
+
+        self.assertTrue(reused)
+        self.assertEqual(resolved.version, 9)
+
 
 class TestUpsertRollback(CustomTestCase):
     """A failed load/upsert must not leave a live adapter half-updated."""
@@ -451,6 +513,30 @@ class TestLoadFromDistributedUpsert(CustomTestCase):
         registered = tm.lora_registry.get_all_adapters()["a"]
         self.assertEqual(registered.lora_id, existing.lora_id)
         self.assertTrue(registered.pinned)
+
+    def test_upsert_bumps_registry_version(self):
+        # Regression: load_lora_adapter_from_distributed's upsert path never
+        # set a version on its fresh LoRARef, so register_or_reuse carried
+        # the default 0 through every refresh -- the radix cache key
+        # (extended with lora_version) never changed across an in-place
+        # weight update of the same adapter name.
+        tm = _make_tokenizer_manager()
+        existing = LoRARef(lora_name="a", lora_path="__distributed__", version=3)
+        asyncio.run(tm.lora_registry.register(existing))
+
+        obj = _make_distributed_req(upsert=True)
+        result = asyncio.run(tm.load_lora_adapter_from_distributed(obj))
+
+        self.assertTrue(result.success)
+        registered = tm.lora_registry.get_all_adapters()["a"]
+        self.assertEqual(registered.version, 4)
+
+        # A second successive upsert bumps again from the new baseline, not
+        # back to a fixed constant.
+        obj2 = _make_distributed_req(upsert=True)
+        result2 = asyncio.run(tm.load_lora_adapter_from_distributed(obj2))
+        self.assertTrue(result2.success)
+        self.assertEqual(tm.lora_registry.get_all_adapters()["a"].version, 5)
 
     def test_failed_backend_load_keeps_registry_untouched(self):
         tm = _make_tokenizer_manager()
