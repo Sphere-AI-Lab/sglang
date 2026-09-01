@@ -157,16 +157,16 @@ def _cuda_graph_config(*, decode_backend):
     )
 
 
-def test_moe_target_oft_sibling_disables_decode_cuda_graph():
-    """Final-review C1 fix: in the plain native-RPC ("sibling") pool, buffer
-    slot 0 (memory_pool.active_idx) is permanently reserved by the boot-time
-    base-request registration, so a real dynamically-loaded adapter can never
-    occupy it -- OFTManager._compute_moe_multi_tenant_slot_ids therefore
-    always takes its per-token multi-tenant branch for any real MoE-target
-    adapter, and that branch's routing tensor has no pointer stability across
-    CUDA-graph capture/replay. validate_peft_args must disable decode CUDA
-    graphs for exactly this configuration (oft_impl=sibling + MoE expert
-    target modules + a model that actually has MoE layers)."""
+def test_moe_target_oft_sibling_with_zero_capacity_disables_decode_cuda_graph():
+    """Task 4b (2026-09-01-oft-moe-cuda-graph-dual-capture): the dual-capture
+    mechanism (Tasks 1-4 of that plan) makes decode CUDA graphs safe for
+    oft_impl=sibling + MoE-expert targeting whenever
+    decode_cuda_graph_runner.py's _resolve_record_oft_variant_graph would
+    engage it -- but that mechanism only engages when effective per-batch
+    adapter capacity (max_ofts_per_batch - 1) is >= 1. At capacity == 0
+    (max_ofts_per_batch == 1), dual-capture never engages (only the single
+    fast-path graph is captured), so this guard must still disable decode
+    CUDA graphs for exactly this configuration."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.peft.config import validate_peft_args
 
@@ -177,9 +177,39 @@ def test_moe_target_oft_sibling_disables_decode_cuda_graph():
         oft_impl="sibling",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
         model_has_moe=True,
+        max_ofts_per_batch=1,
     )
     validate_peft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.DISABLED
+
+
+def test_moe_target_oft_sibling_with_real_capacity_keeps_decode_cuda_graph_enabled():
+    """Task 4b (2026-09-01-oft-moe-cuda-graph-dual-capture): relaxation of the
+    guard above. Once effective per-batch adapter capacity
+    (max_ofts_per_batch - 1) is >= 1 -- the same threshold
+    decode_cuda_graph_runner.py's _resolve_record_oft_variant_graph uses to
+    decide whether to capture the dual (no-real-adapter / any-real-adapter)
+    decode graphs -- that mechanism handles the per-token multi-tenant
+    routing tensor's pointer stability correctly across CUDA-graph
+    capture/replay, so this guard must no longer disable decode CUDA graphs
+    for this configuration. Regression guard: before this fix, the guard
+    disabled decode graphs unconditionally whenever oft_impl=sibling targeted
+    MoE experts on an MoE model, making Tasks 1-4's whole mechanism dead code
+    in production."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.peft.config import validate_peft_args
+
+    args = _args(
+        "oft",
+        enable_lora=False,
+        peft_target_modules=["gate_proj", "up_proj", "down_proj"],
+        oft_impl="sibling",
+        cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
+        model_has_moe=True,
+        max_ofts_per_batch=2,
+    )
+    validate_peft_args(args)
+    assert args.cuda_graph_config.decode.backend == Backend.FULL
 
 
 def test_dense_target_oft_leaves_decode_cuda_graph_enabled():

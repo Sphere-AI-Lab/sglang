@@ -462,11 +462,18 @@ def validate_peft_args(server_args) -> None:
         # already-correct code path), and oft_impl="staged" is unaffected too
         # (its double-buffer activate() copies real adapter data in place
         # into active_idx, so the single-adapter fast path stays genuinely
-        # correct under decode-graph replay there). A real fix needs the
-        # persistent-buffer + dual-capture mechanism designed in
-        # docs/superpowers/plans/2026-09-01-oft-moe-cuda-graph-dual-capture.md;
-        # until that lands, disable decode CUDA graphs for this configuration
-        # rather than silently serve wrong rotations under replay.
+        # correct under decode-graph replay there). The
+        # 2026-09-01-oft-moe-cuda-graph-dual-capture plan's Tasks 1-4 added
+        # the persistent-buffer + dual-capture mechanism that makes this
+        # configuration safe under decode-graph replay -- but only when it
+        # actually engages: decode_cuda_graph_runner.py's
+        # _resolve_record_oft_variant_graph gates it on effective per-batch
+        # adapter capacity (max_ofts_per_batch - 1) being >= 1, i.e. at least
+        # one real (non-base) adapter buffer slot existing at all. Below that
+        # (max_ofts_per_batch == 1), dual-capture never engages -- only the
+        # single fast-path graph is captured -- so this guard must keep
+        # disabling decode CUDA graphs for that residual case rather than
+        # silently serve wrong rotations under replay.
         moe_expert_target_modules = {
             "gate_up_proj",
             "gate_proj",
@@ -480,24 +487,35 @@ def validate_peft_args(server_args) -> None:
         ):
             from sglang.srt.model_executor.cuda_graph_config import Backend
 
+            # Effective per-batch adapter capacity (buffer slot 0 is always
+            # reserved for the base/identity placeholder). Checked before the
+            # expensive _model_has_moe_layers call below, mirroring
+            # _resolve_record_oft_variant_graph's own capacity check exactly.
+            effective_oft_capacity = server_args.max_ofts_per_batch - 1
+
             # _model_has_moe_layers last: it resolves (and caches) the model
             # config, so servers whose decode graphs are already disabled --
-            # and every non-MoE-targeting server above -- never pay for it.
+            # and every non-MoE-targeting or sufficient-capacity server
+            # above -- never pay for it.
             if (
                 server_args.cuda_graph_config.decode.backend != Backend.DISABLED
+                and effective_oft_capacity < 1
                 and _model_has_moe_layers(server_args)
             ):
                 logger.warning(
                     "peft_method=oft with oft_impl=sibling targeting MoE expert "
-                    "modules %s is incompatible with decode CUDA graphs (the "
-                    "per-token multi-tenant adapter-routing tensor has no "
-                    "pointer stability across CUDA-graph capture/replay -> "
-                    "decode-graph replay can silently apply the wrong "
-                    "adapter's rotation); disabling the decode CUDA graph "
-                    "(was backend=%s). See docs/superpowers/plans/"
-                    "2026-09-01-oft-moe-cuda-graph-dual-capture.md for the "
-                    "real fix (persistent routing buffer + dual capture).",
+                    "modules %s is incompatible with decode CUDA graphs at "
+                    "--max-ofts-per-batch=%s (effective per-batch adapter "
+                    "capacity %s < 1, so the dual-capture mechanism in "
+                    "docs/superpowers/plans/"
+                    "2026-09-01-oft-moe-cuda-graph-dual-capture.md never "
+                    "engages and only the single fast-path graph is "
+                    "captured); disabling the decode CUDA graph (was "
+                    "backend=%s). Increase --max-ofts-per-batch to >= 2 to "
+                    "keep decode CUDA graphs enabled for this configuration.",
                     sorted(moe_expert_target_modules),
+                    server_args.max_ofts_per_batch,
+                    effective_oft_capacity,
                     server_args.cuda_graph_config.decode.backend,
                 )
                 server_args.cuda_graph_config.decode.backend = Backend.DISABLED
