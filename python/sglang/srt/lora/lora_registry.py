@@ -311,10 +311,6 @@ class LoRARegistry:
         """
         async with self._registry_lock.reader_lock:
             for lora_name, lora_ref in self._registry.items():
-                # Evicting a non-reloadable (wire-loaded) adapter is always
-                # destructive: there is no artifact to reload it from.
-                if not lora_ref.reloadable:
-                    continue
                 if exclude_pinned and lora_ref.pinned:
                     continue
                 return lora_name
