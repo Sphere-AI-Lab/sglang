@@ -446,10 +446,14 @@ def validate_peft_args(server_args) -> None:
         #
         # In the plain native-RPC pool, buffer slot 0
         # (memory_pool.active_idx) is permanently reserved by the boot-time
-        # base-request registration, so a real dynamically-loaded adapter can
-        # never occupy it -- meaning OFTManager._compute_moe_multi_tenant_
-        # slot_ids always takes its general, per-token multi-tenant branch for
-        # any real adapter. That branch allocates a FRESH routing tensor on
+        # base-request registration -- AdapterMemPool._acquire_buffer_slot
+        # (oft/base/mem_pool.py) now excludes uid=None from its eviction
+        # candidates outright (mirroring allocate_buffer_slot_with_eviction's
+        # own protection; Task 4b review fix), so a real dynamically-loaded
+        # adapter can genuinely never occupy it -- meaning
+        # OFTManager._compute_moe_multi_tenant_slot_ids always takes its
+        # general, per-token multi-tenant branch for any real adapter. That
+        # branch allocates a FRESH routing tensor on
         # every prepare_oft_batch call, which has no pointer stability across
         # CUDA-graph capture and replay (prepare_oft_batch runs outside the
         # capture region -- see decode_cuda_graph_runner.py's

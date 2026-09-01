@@ -216,7 +216,10 @@ def test_dense_target_oft_leaves_decode_cuda_graph_enabled():
     """Negative case: OFT targeting only dense modules (no MoE experts) must
     not trip the MoE-specific decode-graph guard -- the dense path has its
     own, different, already-correct per-token CUDA-graph mechanism
-    (weight_indices via oft.utils.generate_sequence_lengths)."""
+    (weight_indices via oft.utils.generate_sequence_lengths). max_ofts_per_
+    batch=1 (effective capacity 0) so the capacity term alone (which by
+    itself would WANT to disable) can't be what's keeping this enabled --
+    the target-module check must be what's actually doing it."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.peft.config import validate_peft_args
 
@@ -226,6 +229,7 @@ def test_dense_target_oft_leaves_decode_cuda_graph_enabled():
         peft_target_modules=["o_proj"],
         oft_impl="sibling",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
+        max_ofts_per_batch=1,
     )
     validate_peft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.FULL
@@ -245,7 +249,9 @@ def test_dense_model_targeting_mlp_module_names_keeps_decode_cuda_graph(
     cost real throughput and stripped decode-graph coverage from
     test/registered/rl/test_oft_load_from_tensor.py (dense Qwen3-0.6B,
     peft_target_modules=["down_proj"], sibling, decode graphs enabled)
-    without failing anything."""
+    without failing anything. max_ofts_per_batch=1 (effective capacity 0) so
+    the capacity term alone (which by itself would WANT to disable) can't be
+    what's keeping this enabled -- the model_has_moe=False check must be."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.peft.config import validate_peft_args
 
@@ -256,6 +262,7 @@ def test_dense_model_targeting_mlp_module_names_keeps_decode_cuda_graph(
         oft_impl="sibling",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
         model_has_moe=False,
+        max_ofts_per_batch=1,
     )
     validate_peft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.FULL
@@ -266,7 +273,9 @@ def test_moe_target_oft_staged_impl_leaves_decode_cuda_graph_enabled():
     adapter data in place into memory_pool.active_idx, so the single-adapter
     fast path stays genuinely correct under decode-graph replay there -- the
     guard is specific to the plain native-RPC ("sibling") pool and must not
-    fire for staged."""
+    fire for staged. max_ofts_per_batch=1 (effective capacity 0) so the
+    capacity term alone (which by itself would WANT to disable for sibling)
+    can't be what's keeping this enabled -- oft_impl=staged must be."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.peft.config import validate_peft_args
 
@@ -279,6 +288,7 @@ def test_moe_target_oft_staged_impl_leaves_decode_cuda_graph_enabled():
         # Real MoE model: oft_impl=staged is the ONLY reason the guard must
         # not fire here.
         model_has_moe=True,
+        max_ofts_per_batch=1,
     )
     validate_peft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.FULL

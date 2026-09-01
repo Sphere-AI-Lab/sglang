@@ -683,6 +683,66 @@ class TestAcquireBufferSlotExcludesNonReloadable(unittest.TestCase):
         self.assertEqual(buffer_id, 1)
 
 
+class TestAcquireBufferSlotNeverEvictsBasePlaceholder(unittest.TestCase):
+    """Critical fix (Task 4b review): AdapterMemPool._acquire_buffer_slot's
+    candidate-building loop only DEPRIORITIZED uid=None (preferring to evict
+    a real adapter over the base placeholder when both were candidates), it
+    never EXCLUDED None outright -- unlike its sibling
+    allocate_buffer_slot_with_eviction, which already has `if uid is None:
+    continue` (oft/mem_pool.py). Whenever every OTHER resident real adapter
+    was pinned, non-reloadable, or already referenced by the current batch
+    (cur_uids), None became the only remaining candidate and got evicted --
+    reachable at ANY capacity (not just a pool full of only the base slot),
+    an ordinary multi-tenant admission scenario, not an edge case. Once a
+    real adapter lands at buffer slot 0 (self.active_idx),
+    OFTManager._compute_moe_multi_tenant_slot_ids's slot-index-based check
+    (idx != 0) treats it identically to "no real adapter", so its per-token
+    CUDA-graph persistent buffer is never refreshed for that batch -- while
+    the host's own uid-based replay selector (_resolve_oft_variant) still
+    selects the general "oft_multi" graph, replaying stale routing data:
+    silently applying the wrong adapter's rotation. Exactly the failure mode
+    the whole 2026-09-01-oft-moe-cuda-graph-dual-capture plan exists to
+    prevent, made reachable in production by Task 4b's own relaxation of
+    peft/config.py's decode-CUDA-graph guard for capacity >= 1 sibling
+    MoE-target deployments."""
+
+    def test_base_placeholder_never_evicted_when_all_other_residents_are_referenced(
+        self,
+    ):
+        # Reviewer's repro: capacity 3 (max_adapters_per_batch=3), None@0,
+        # A@1, D1@2 all resident; a batch referencing {A, D1, D2} needs a
+        # slot for the new adapter D2. A and D1 are excluded as candidates
+        # because they're in cur_uids -- before the fix, None was the only
+        # remaining candidate and got evicted (D2 would silently land at
+        # slot 0/active_idx). Must now raise instead.
+        pool = _make_base_pool(max_adapters_per_batch=3)
+        refs = {
+            "A": _make_ref("A", pinned=False, reloadable=True),
+            "D1": _make_ref("D1", pinned=False, reloadable=True),
+        }
+        pool.uid_to_buffer_id = {None: 0, "A": 1, "D1": 2}
+        pool.buffer_id_to_uid = [None, "A", "D1"]
+        with self.assertRaises(ValueError):
+            pool._acquire_buffer_slot(cur_uids={"A", "D1", "D2"}, refs=refs)
+        # The base/identity placeholder must still be resident at slot 0.
+        self.assertIn(None, pool.uid_to_buffer_id)
+        self.assertEqual(pool.buffer_id_to_uid[0], None)
+
+    def test_real_adapter_still_evicted_normally_ahead_of_base_placeholder(self):
+        # Sanity: the fix must not be over-broad -- a genuinely evictable
+        # (unpinned, reloadable, not-in-cur_uids) real adapter is still
+        # evicted normally even though None is nominally also present.
+        pool = _make_base_pool(max_adapters_per_batch=2)
+        refs = {"evict_me": _make_ref("evict_me", pinned=False, reloadable=True)}
+        pool.uid_to_buffer_id = {None: 0, "evict_me": 1}
+        pool.buffer_id_to_uid = [None, "evict_me"]
+        pool.eviction_policy.mark_used("evict_me")
+        buffer_id = pool._acquire_buffer_slot(cur_uids={"new_adapter"}, refs=refs)
+        self.assertEqual(buffer_id, 1)
+        self.assertNotIn("evict_me", pool.uid_to_buffer_id)
+        self.assertIn(None, pool.uid_to_buffer_id)
+
+
 class TestNumPinnedBookkeeping(unittest.TestCase):
     """I6 fix: register_streamed_adapter/unload_streamed_adapter must keep
     num_pinned in sync for pinned wire-loaded adapters -- previously

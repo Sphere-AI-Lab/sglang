@@ -537,18 +537,21 @@ class OFTManager(AdapterManager):
         `weight_indices` and LoRA's MoE `token_lora_mapping`) that selects
         each token's own adapter's rotation out of the per-slot buffers.
 
-        REMAINING CAVEAT: decode-CUDA-graph replay is disabled for any
-        server where this is reachable -- `validate_peft_args`
-        (`peft/config.py`) unconditionally disables decode CUDA graphs at
-        boot whenever OFT dynamically targets MoE experts via this
-        (`oft_impl=sibling`) native-RPC path, because the per-token routing
-        tensor `_compute_moe_multi_tenant_slot_ids` builds has no pointer
-        stability across CUDA-graph capture/replay (see that method's own
-        docstring for the full mechanism). This is a real, disclosed, but
-        temporary restriction -- lifted for good by the
-        `2026-09-01-oft-moe-cuda-graph-dual-capture` follow-up plan's
-        persistent routing buffer + dual-capture mechanism, not by anything
-        in this method.
+        REMAINING CAVEAT: the `2026-09-01-oft-moe-cuda-graph-dual-capture`
+        plan's persistent routing buffer + dual-capture mechanism (Tasks
+        1-4, plus its Task 4b relaxation of `validate_peft_args`'s decode-
+        CUDA-graph guard in `peft/config.py`) makes decode-CUDA-graph replay
+        safe for this (`oft_impl=sibling`) native-RPC path targeting MoE
+        experts, PROVIDED the mechanism actually engages:
+        `decode_cuda_graph_runner.py`'s `_resolve_record_oft_variant_graph`
+        requires effective per-batch adapter capacity
+        (`max_ofts_per_batch - 1`) to be >= 1. At `max_ofts_per_batch == 1`
+        (no real adapter buffer slot exists at all), dual-capture never
+        engages and `validate_peft_args` still disables decode CUDA graphs
+        for that residual configuration -- not because the per-token routing
+        tensor `_compute_moe_multi_tenant_slot_ids` builds is unsafe there
+        (see that method's own docstring for the full mechanism), but
+        because there is no dual-capture to make it safe in the first place.
 
         SEPARATE, NARROWER CAVEAT for disk-loaded (`--peft-paths`) adapters:
         the lazy per-batch admission path (`OFTMemoryPool.prepare_oft_batch`

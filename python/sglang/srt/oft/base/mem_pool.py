@@ -151,10 +151,24 @@ class AdapterMemPool:
             uid = self.buffer_id_to_uid[buffer_id]
             if uid in cur_uids:
                 continue
-            if uid is not None:
-                ref = refs.get(uid)
-                if ref and (ref.pinned or not ref.reloadable):
-                    continue
+            if uid is None:
+                # The base/identity placeholder is never an eviction
+                # candidate here -- mirrors allocate_buffer_slot_with_
+                # eviction's own protection (oft/mem_pool.py). Without this,
+                # whenever every OTHER resident adapter is pinned,
+                # non-reloadable, or already referenced by cur_uids, None
+                # would be the only remaining candidate and get evicted --
+                # reachable at ANY capacity (not just a pool full of only the
+                # base slot), letting a real adapter silently take over
+                # buffer slot 0 (self.active_idx). Task 4b review fix: this
+                # is unsafe for MoE-target OFT under CUDA-graph replay (see
+                # peft/config.py's decode-CUDA-graph guard and oft_manager.
+                # py's _compute_moe_multi_tenant_slot_ids, which both rely on
+                # slot 0 never holding a real adapter).
+                continue
+            ref = refs.get(uid)
+            if ref and (ref.pinned or not ref.reloadable):
+                continue
             candidates.add(uid)
 
         if not candidates:
@@ -165,13 +179,7 @@ class AdapterMemPool:
                 "than max_adapters_per_batch."
             )
 
-        # Prefer evicting adapters over base model (None)
-        non_none_candidates = candidates - {None}
-        candidates_to_use = (
-            non_none_candidates if non_none_candidates else candidates
-        )
-
-        victim_uid = self.eviction_policy.select_victim(candidates_to_use)
+        victim_uid = self.eviction_policy.select_victim(candidates)
         victim_buffer_id = self.uid_to_buffer_id[victim_uid]
         self.uid_to_buffer_id.pop(victim_uid)
         self.eviction_policy.remove(victim_uid)
