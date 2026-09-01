@@ -549,8 +549,20 @@ class OFTManager(AdapterManager):
                 # configs/uid_to_buffer_id would still list `ref` as valid
                 # and resident, pointing at a buffer whose contents are now
                 # partially written or undefined -- silently wrong serving
-                # results, not just a clear failure.
-                self.unload_streamed_adapter(ref)
+                # results, not just a clear failure. Check the result like
+                # the evicted-adapter cleanup above does: this is a
+                # best-effort cleanup inside an already-failing path, so we
+                # still return the original commit error either way, but a
+                # cleanup failure must be visible (logged), not swallowed --
+                # that would defeat the exact guarantee this call exists for.
+                cleanup_result = self.unload_streamed_adapter(ref)
+                if not cleanup_result.success:
+                    logger.error(
+                        "Failed to clean up OFT adapter '%s' after a failed "
+                        "commit: %s",
+                        ref.adapter_name,
+                        cleanup_result.error_message,
+                    )
                 if evicted_name is not None:
                     error_message = (
                         f"adapter '{evicted_name}' was evicted to make room, "

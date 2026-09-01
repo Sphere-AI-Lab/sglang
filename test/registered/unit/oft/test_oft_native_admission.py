@@ -336,6 +336,11 @@ class TestValidateBeforeEvict(unittest.TestCase):
         self.assertNotIn(new_ref.adapter_id, mgr.refs)
         self.assertNotIn(new_ref.adapter_id, mgr.configs)
         self.assertNotIn(new_ref.adapter_id, mgr.memory_pool.uid_to_buffer_id)
+        # LRU tracking must be cleaned up too, not just the residency maps --
+        # otherwise it's a slow leak across repeated failed loads.
+        self.assertNotIn(
+            new_ref.adapter_id, mgr.memory_pool.eviction_policy.access_order
+        )
 
     def test_commit_failure_does_not_leave_phantom_resident_ref(self):
         """Even with no eviction involved (pool has room), a commit failure
@@ -360,6 +365,9 @@ class TestValidateBeforeEvict(unittest.TestCase):
         self.assertNotIn(new_ref.adapter_id, mgr.memory_pool.uid_to_buffer_id)
         # The slot it briefly occupied is back to empty, not phantom-owned.
         self.assertEqual(mgr.memory_pool.buffer_id_to_uid[0], EMPTY_SLOT)
+        self.assertNotIn(
+            new_ref.adapter_id, mgr.memory_pool.eviction_policy.access_order
+        )
 
 
 class TestResolveCommitSplit(unittest.TestCase):
