@@ -16,6 +16,9 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.oft.oft_manager import OFTManager
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _forward_batch(
@@ -436,6 +439,81 @@ class TestMakeOftInvokeMultiTenantBranch(unittest.TestCase):
             self.assertIs(call.args[1], oft_r_all_slots)
             self.assertIs(call.args[2], slot_ids)
             self.assertEqual(call.args[-2], w2_weight.shape[0])
+
+    def test_down_projection_expands_slot_ids_by_router_topk(self):
+        """Regression: the down GEMM's A is the gate-up output, already
+        expanded to num_tokens*router_topk rows, but slot_ids arrives with one
+        entry per ORIGINAL token. Handing it over unexpanded made the whole
+        feature raise ValueError("slot_ids has N entries, expected M") for any
+        router_topk > 1 -- i.e. for every realistic MoE model, since top_k=1 is
+        the unusual case. Rows are token-major (row = token*router_topk + k).
+        """
+        from sglang.srt.oft import oft_moe_runners
+
+        num_tokens, router_topk = 3, 2
+        w2_weight = torch.zeros(2, 8, 8)
+        slot_ids = torch.tensor([1, 2, 1], dtype=torch.long)
+        oft_r_all_slots = torch.zeros(3, 2, 1, 4, 4)
+        layer = SimpleNamespace(
+            w13_weight=object(),
+            w2_weight=w2_weight,
+            w13_oft_r=None,
+            w1_oft_r=None,
+            w3_oft_r=None,
+            w2_oft_r=torch.zeros(2, 1, 4, 4),
+            _oft_moe_multi_tenant_slot_ids=slot_ids,
+            _oft_w2_oft_r_all_slots=oft_r_all_slots,
+        )
+        invoke = oft_moe_runners.make_oft_invoke(layer, unittest.mock.Mock())
+
+        A = torch.zeros(num_tokens * router_topk, 8)
+        with patch.object(oft_moe_runners, "_oft_prerotate_multi_tenant") as mock_multi:
+            mock_multi.return_value = (A, A, None, None, None, None, None)
+            invoke(
+                A, layer.w2_weight, None, A, None, None, None,
+                None, None, None, None, None, None, 1,
+                {"BLOCK_SIZE_M": 32},
+                router_topk=router_topk,
+            )
+            passed_slot_ids = mock_multi.call_args.args[2]
+        self.assertEqual(passed_slot_ids.shape[0], A.shape[0])
+        self.assertTrue(
+            torch.equal(
+                passed_slot_ids, torch.tensor([1, 1, 2, 2, 1, 1], dtype=torch.long)
+            )
+        )
+
+    def test_gate_up_slot_ids_are_not_expanded(self):
+        """Negative partner of the case above: the gate-up GEMM's A is
+        (num_tokens, K) and it is invoked with the real top_k, so the rotation
+        kernel does the expansion itself. Expanding here too would double-count
+        and is what the is_down guard exists to prevent."""
+        from sglang.srt.oft import oft_moe_runners
+
+        w13_weight = torch.zeros(2, 8, 8)
+        slot_ids = torch.tensor([1, 2, 1], dtype=torch.long)
+        oft_r_all_slots = torch.zeros(3, 2, 1, 4, 4)
+        layer = SimpleNamespace(
+            w13_weight=w13_weight,
+            w2_weight=object(),
+            w13_oft_r=torch.zeros(2, 1, 4, 4),
+            w1_oft_r=None,
+            w3_oft_r=None,
+            w2_oft_r=None,
+            _oft_moe_multi_tenant_slot_ids=slot_ids,
+            _oft_w13_oft_r_all_slots=oft_r_all_slots,
+        )
+        invoke = oft_moe_runners.make_oft_invoke(layer, unittest.mock.Mock())
+
+        A = torch.zeros(3, 8)
+        with patch.object(oft_moe_runners, "_oft_prerotate_multi_tenant") as mock_multi:
+            mock_multi.return_value = (A, A, None, None, None, None, None)
+            invoke(
+                A, layer.w13_weight, None, A, None, None, None,
+                None, None, None, None, None, None, 2,
+                {"BLOCK_SIZE_M": 32},
+            )
+            self.assertIs(mock_multi.call_args.args[2], slot_ids)
 
     def test_invoke_raises_clear_error_when_all_slots_missing(self):
         """Guards the crash scenario: a legacy-fused static adapter loaded at

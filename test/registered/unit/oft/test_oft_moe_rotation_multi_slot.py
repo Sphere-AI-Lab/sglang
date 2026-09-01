@@ -181,6 +181,26 @@ class TestMultiSlotRotationMatchesSingleSlotPerAdapter(unittest.TestCase):
             num_slots=3,
         )
 
+    def test_down_gemm_shape_with_pre_expanded_slot_ids(self):
+        # The down (w2) GEMM's shape: its A is the gate-up output, already
+        # expanded to num_tokens*router_topk rows in token-major order, and it
+        # is invoked with top_k=1 -- so the kernel expands nothing and every
+        # row carries its own slot. oft_moe_runners pre-expands slot_ids with
+        # repeat_interleave(router_topk) for exactly this call.
+        router_topk = 2
+        per_token_slots = torch.tensor(
+            [1, 2, 1, 0, 2, 2, 0, 1], dtype=torch.long, device="cuda"
+        )
+        self._assert_matches_isolated_single_slot_runs(
+            num_tokens=per_token_slots.numel() * router_topk,
+            hidden=64,
+            num_experts=4,
+            top_k=1,
+            bs=16,
+            num_slots=3,
+            slot_ids=per_token_slots.repeat_interleave(router_topk),
+        )
+
     def test_many_tokens_spanning_multiple_blocks_with_padding(self):
         # More tokens than one BLOCK_M, uneven per-expert counts (so
         # moe_align_block_size emits padded rows), and top_k > 1.

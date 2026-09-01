@@ -424,6 +424,32 @@ def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
                     f"{all_slots_attr} is not bound (unsupported layer "
                     "configuration for multi-tenancy)"
                 )
+            # slot_ids arrives with one entry per ORIGINAL token, which is what
+            # the gate-up GEMM wants: its A is (num_tokens, K) and it is invoked
+            # with the real top_k, so the rotation kernel does the top_k
+            # expansion itself.
+            #
+            # The DOWN GEMM is the other shape. Its A is the gate-up output,
+            # already expanded to num_tokens * router_topk rows in TOKEN-MAJOR
+            # order (row = token * router_topk + k -- see fused_moe.py's
+            # `intermediate_cache1[: num_tokens * topk].view(num_tokens, topk, N)`
+            # and `intermediate_cache3 = torch.empty((num_tokens, topk, ...))`),
+            # and it is invoked with top_k=1, so the kernel expands nothing.
+            # slot_ids must therefore arrive already per-row. `router_topk` is
+            # threaded into kw at that call site for exactly this purpose.
+            #
+            # Not handled: `down_moe_use_tma` lays A out expert-SORTED and
+            # block-padded (`c_sorted=down_moe_use_tma` on the gate-up GEMM), so
+            # row != token * router_topk + k and A gains padding rows. That
+            # layout already breaks the pre-existing single-slot down rotation
+            # (which indexes A[sorted_ids] the same token-major way), so it is
+            # out of scope here rather than newly broken; it is opt-in via
+            # USE_TMA in a tuned down config. apply_oft_rotation_triton_multi_slot's
+            # own length check rejects it loudly instead of mis-rotating,
+            # because the padded A has more rows than the expansion produces.
+            router_topk = kw.get("router_topk", 1)
+            if is_down and router_topk != 1:
+                slot_ids = slot_ids.repeat_interleave(router_topk)
             a, c, tw, ti, sti, ei, ntpp = _oft_prerotate_multi_tenant(
                 A,
                 oft_r_all_slots,
