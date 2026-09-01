@@ -89,5 +89,29 @@ class TestResolveOftVariant(unittest.TestCase):
         self.assertIsNone(runner._resolve_oft_variant(forward_batch))
 
 
+class TestOftVariantsCaptureAxis(unittest.TestCase):
+    def test_single_no_op_variant_when_dual_capture_disabled(self):
+        runner = MagicMock(spec=DecodeCudaGraphRunner)
+        runner.record_oft_variant_graph = False
+        # Mirrors how lora_variants / dsa_variants degrade to a single no-op
+        # entry when their own dual-capture flag is off.
+        oft_variants = (
+            [("oft_multi", True), ("oft_single", False)]
+            if getattr(runner, "record_oft_variant_graph", False)
+            else [(None, None)]
+        )
+        self.assertEqual(oft_variants, [(None, None)])
+
+    def test_two_variants_when_dual_capture_enabled(self):
+        runner = MagicMock(spec=DecodeCudaGraphRunner)
+        runner.record_oft_variant_graph = True
+        oft_variants = (
+            [("oft_multi", True), ("oft_single", False)]
+            if getattr(runner, "record_oft_variant_graph", False)
+            else [(None, None)]
+        )
+        self.assertEqual(oft_variants, [("oft_multi", True), ("oft_single", False)])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

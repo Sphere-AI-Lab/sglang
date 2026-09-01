@@ -92,6 +92,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_dsa_variant,
     _set_capture_lora_variant,
+    _set_capture_oft_variant,
     model_capture_mode,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
@@ -281,6 +282,58 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "dispatch on max_kv_len vs index_topk=%d.",
                 self.dsa_index_topk,
             )
+
+        # --- OFT MoE-expert dual-graph capture -------------------------
+        # OFT MoE-expert dual-graph capture: single-slot (today's fast path)
+        # and multi-slot (per-token routing) variants, selected at replay by
+        # how many distinct adapters are actually resident. Opt-in: a server
+        # without OFT, or with no more than one possible resident MoE-target
+        # adapter, captures only the single-slot variant it already did
+        # before this feature existed -- zero extra cost.
+        #
+        # Three real-config checks, mirroring dsa_dual_graph's own
+        # real-config-check model above:
+        #   1. OFT is actually enabled (--peft-method oft).
+        #   2. It targets MoE expert modules -- the same
+        #      gate_up_proj/gate_proj/up_proj/down_proj set and HF-config
+        #      per-token-expert-count probe peft/config.py's
+        #      validate_peft_args already uses to decide whether this
+        #      server has expert-OFT buffers at all.
+        #   3. Effective per-batch adapter capacity (max_ofts_per_batch - 1;
+        #      buffer slot 0 is always reserved for the base/identity
+        #      placeholder, see OFTMemoryPool) allows more than one real
+        #      resident adapter.
+        self.record_oft_variant_graph = False
+        if model_runner.server_args.peft_method == "oft":
+            peft_target_modules = set(
+                model_runner.server_args.peft_target_modules or ()
+            )
+            targets_moe_experts = bool(
+                {"gate_up_proj", "gate_proj", "up_proj", "down_proj"}
+                & peft_target_modules
+            )
+            model_has_moe_layers = any(
+                hasattr(model_runner.model_config.hf_text_config, attr)
+                for attr in (
+                    "num_experts_per_tok",
+                    "num_experts_per_token",
+                    "top_k_experts",
+                    "moe_top_k",
+                    "moe_topk",
+                )
+            )
+            effective_oft_capacity = model_runner.server_args.max_ofts_per_batch - 1
+            if (
+                targets_moe_experts
+                and model_has_moe_layers
+                and effective_oft_capacity > 1
+            ):
+                self.record_oft_variant_graph = True
+                logger.info(
+                    "[dense-decode] OFT MoE-expert dual-graph enabled: capturing "
+                    "single-slot + multi-slot decode graphs; dispatch on the "
+                    "batch's distinct resident adapter count."
+                )
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
@@ -1141,6 +1194,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variants = (
             ["dense", "sparse"] if getattr(self, "dsa_dual_graph", False) else [None]
         )
+        # OFT MoE-expert dual-graph: capture a multi-slot (per-token routing)
+        # and a single-slot (today's fast path) variant, selected at replay by
+        # how many distinct adapters are actually resident. getattr default:
+        # same reasoning as dsa_variants above -- subclasses that don't run
+        # DecodeCudaGraphRunner.__init__ never set record_oft_variant_graph.
+        oft_variants = (
+            [("oft_multi", True), ("oft_single", False)]
+            if getattr(self, "record_oft_variant_graph", False)
+            else [(None, None)]
+        )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1156,21 +1219,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for dsa_variant in dsa_variants:
                     _set_capture_dsa_variant(dsa_variant)
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        if dsa_variant is None:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label
-                            )
-                        else:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label, dsa_variant
-                            )
+                    for oft_variant, _oft_variant_has_multi in oft_variants:
+                        _set_capture_oft_variant(oft_variant)
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.captured_req_width,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            if dsa_variant is None:
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                    variant_label,
+                                    oft_variant=oft_variant,
+                                )
+                            else:
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                    variant_label,
+                                    dsa_variant,
+                                    oft_variant=oft_variant,
+                                )
         _set_capture_dsa_variant(None)
+        _set_capture_oft_variant(None)
 
     def capture_one_shape(
         self,
@@ -1179,6 +1254,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         dsa_variant: Optional[str] = None,
+        oft_variant: Optional[str] = None,
     ):
         num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
@@ -1283,6 +1359,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                     dsa_variant,
+                    oft_variant=oft_variant,
                 )
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
