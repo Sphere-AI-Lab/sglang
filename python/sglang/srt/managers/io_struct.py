@@ -59,6 +59,7 @@ from sglang.srt.managers.schedule_batch import (
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
@@ -2517,6 +2518,70 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
     LoadLoRAAdapterFromTensorsReqOutput
 ) = LoadLoRAAdapterFromDistributedReqOutput = LoRAUpdateOutput
+
+
+class UnloadOFTAdapterReqInput(BaseReq, kw_only=True):
+    adapter_name: str
+    adapter_id: Optional[str] = None
+
+    def to_ref(self) -> OFTRef:
+        return OFTRef(adapter_id=self.adapter_id, adapter_name=self.adapter_name)
+
+
+class LoadOFTAdapterFromTensorsReqInput(BaseReq, kw_only=True):
+    adapter_name: str
+    # The PEFT adapter_config.json, already JSON.
+    config_dict: Dict[str, Any]
+    # One serialized copy of the adapter tensors per TP rank; each rank
+    # deserializes only its own copy.
+    serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
+    pinned: bool = False
+    adapter_id: Optional[str] = None
+    load_format: Optional[str] = None
+    # If already loaded, refresh weights in place instead of failing.
+    upsert: bool = False
+
+    def to_ref(self) -> OFTRef:
+        return OFTRef(
+            adapter_id=self.adapter_id,
+            adapter_name=self.adapter_name,
+            adapter_path="__tensor__",
+            pinned=self.pinned,
+            reloadable=False,
+        )
+
+
+class LoadOFTAdapterFromDistributedReqInput(BaseReq, kw_only=True):
+    adapter_name: str
+    config_dict: Dict[str, Any]
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    group_name: str = "weight_update_group"
+    pinned: bool = False
+    adapter_id: Optional[str] = None
+    # If already loaded, refresh weights in place instead of failing.
+    upsert: bool = False
+
+    def to_ref(self) -> OFTRef:
+        return OFTRef(
+            adapter_id=self.adapter_id,
+            adapter_name=self.adapter_name,
+            adapter_path="__distributed__",
+            pinned=self.pinned,
+            reloadable=False,
+        )
+
+
+class OFTUpdateOutput(BaseReq, kw_only=True):
+    success: bool
+    error_message: Optional[str] = None
+    loaded_adapters: Optional[Dict[str, Union[str, OFTRef]]] = None
+
+
+LoadOFTAdapterReqOutput = UnloadOFTAdapterReqOutput = (
+    LoadOFTAdapterFromTensorsReqOutput
+) = LoadOFTAdapterFromDistributedReqOutput = OFTUpdateOutput
 
 
 class BlockReqType(Enum):

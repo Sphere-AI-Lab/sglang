@@ -15,8 +15,8 @@
 
 import asyncio
 from collections import OrderedDict
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from dataclasses import dataclass, field, replace
+from typing import Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
 from sglang.srt.utils import ConcurrentCounter
@@ -26,9 +26,10 @@ from sglang.srt.utils.aio_rwlock import RWLock
 @dataclass(frozen=True)
 class AdapterRef:
     """Generic adapter-reference record. Originally intended to be shared with
-    LoRA, but LoRARef evolved independently as its own ``msgspec.Struct`` --
-    today only OFTRef subclasses this. Holds the unified adapter identity;
-    AdapterRegistry accesses adapters only through these members.
+    LoRA (see the historical note in git blame), but LoRARef evolved
+    independently as its own msgspec.Struct — today only OFTRef subclasses
+    this. Holds the unified adapter identity; AdapterRegistry accesses
+    adapters only through these members.
 
     The unique ``adapter_id`` eliminates conflicts from reused names/paths and can
     be used to generate deterministic cache keys (e.g. radix cache)."""
@@ -38,6 +39,10 @@ class AdapterRef:
     adapter_path: Optional[str] = None
     pinned: Optional[bool] = None
     adapter_version: int = 1
+    # False for adapters whose weights arrived over the wire (no on-disk
+    # artifact to reload from): they must never be LRU-evicted nor
+    # implicitly reloaded. Mirrors LoRARef.reloadable exactly.
+    reloadable: bool = True
 
     def __post_init__(self):
         if self.adapter_id is None:
@@ -47,12 +52,12 @@ class AdapterRef:
 
 
 class AdapterRegistry:
-    """
-    The central registry to keep track of available adapters and ongoing adapter requests.
+    """The central registry to keep track of available adapters and ongoing adapter requests.
 
     The `AdapterRegistry` resides in the tokenizer manager process and acts as the single source of truth for all
     available adapters. It supports concurrent inference and dynamic adapter updates through a two-phase
     update / eventual consistency model between the tokenizer manager process and the scheduler processes.
+    OFT's registry base (see ``OFTRegistry`` for subclass-specific behavior).
     """
 
     def __init__(self, adapters: Optional[List[AdapterRef]] = None):
@@ -116,6 +121,60 @@ class AdapterRegistry:
             self._register_adapter(ref)
             return old_ref.adapter_id if old_ref is not None else None
 
+    async def resolve_or_reuse(
+        self,
+        ref: AdapterRef,
+        upsert: bool = False,
+        *,
+        preserve_pinned: bool = False,
+    ) -> Tuple[AdapterRef, bool]:
+        """Resolve which identity a load request should use.
+
+        Returns ``(ref, reused)``. With ``upsert`` and a same-name adapter
+        already registered, the returned ref adopts the existing
+        ``adapter_id`` (``reused=True``) so the backend refreshes that
+        adapter in place; otherwise ``ref`` is returned unchanged
+        (``reused=False``). Nothing is registered here: the caller commits
+        the resolved ref with ``register``/``refresh`` once the backend load
+        succeeded, keeping failed loads invisible to the registry.
+
+        Also bumps ``adapter_version`` past the existing entry's on reuse:
+        the radix cache key is extended with the adapter's version (see
+        ``maybe_extend_extra_key``), so KV produced under the old weights
+        must live under a different key than requests arriving after this
+        in-place refresh -- otherwise a prompt re-served after an upsert
+        could silently return output computed with the stale, pre-upsert
+        weights via a cached KV prefix.
+        """
+        if not upsert:
+            return ref, False
+        async with self._registry_lock.reader_lock:
+            existing = self._registry.get(ref.adapter_name)
+            if existing is None:
+                return ref, False
+            updates = {
+                "adapter_id": existing.adapter_id,
+                "adapter_version": existing.adapter_version + 1,
+            }
+            if preserve_pinned:
+                updates["pinned"] = existing.pinned
+            return replace(ref, **updates), True
+
+    async def refresh(self, ref: AdapterRef):
+        """Replace a registered adapter's ref after a successful upsert.
+
+        Keeps the id (asserted) while adopting the new path/pinned metadata,
+        and counts as a use for LRU ordering.
+        """
+        async with self._registry_lock.writer_lock:
+            existing = self._registry.get(ref.adapter_name)
+            assert existing is not None and existing.adapter_id == ref.adapter_id, (
+                f"refresh() must target a registered adapter with the same "
+                f"adapter_id; got {ref}, registered: {existing}"
+            )
+            self._registry[ref.adapter_name] = ref
+            self._registry.move_to_end(ref.adapter_name)
+
     async def acquire(self, name: Union[str, List[str]]) -> Union[str, List[str]]:
         """
         Queries registry for adapter IDs based on adapter names and start tracking the usage of the corresponding
@@ -156,6 +215,73 @@ class AdapterRegistry:
             return uids
         else:
             raise TypeError("name must be either a string or a list of strings.")
+
+    def _lookup_refs_for_admission(
+        self, name: Union[str, List[Optional[str]]]
+    ) -> List[Optional[AdapterRef]]:
+        """Lookup refs, handling both str and list inputs, normalizing to list output."""
+        if isinstance(name, str):
+            names = [name]
+        elif isinstance(name, list):
+            names = name
+        else:
+            raise TypeError("name must be either a string or a list of strings.")
+
+        refs = []
+        for n in names:
+            if n is None:
+                refs.append(None)
+                continue
+            ref = self._registry.get(n)
+            if ref is None:
+                raise ValueError(
+                    f"The following requested adapters are not loaded: {n}\n"
+                    f"Loaded adapters: {self._registry.keys()}."
+                )
+            self._registry.move_to_end(n)
+            refs.append(ref)
+        return refs
+
+    async def _increment_ref_counters(
+        self, refs: List[Optional[AdapterRef]]
+    ) -> None:
+        """Increment usage counters for non-None refs."""
+        await asyncio.gather(
+            *[
+                self._counters[ref.adapter_id].increment(notify_all=False)
+                for ref in refs
+                if ref is not None
+            ]
+        )
+
+    async def _acquire_refs(
+        self, name: Union[str, List[Optional[str]]]
+    ) -> List[Optional[AdapterRef]]:
+        """Atomically snapshot the matching AdapterRef(s) and start tracking usage.
+
+        Lookup, version snapshot, and counter increment are one atomic admission
+        step. An unload cannot remove the adapter between them.
+        """
+        # Lookup, version snapshot, and counter increment are one atomic
+        # admission step. An unload cannot remove the adapter between them.
+        async with self._registry_lock.writer_lock:
+            refs = self._lookup_refs_for_admission(name)
+            await self._increment_ref_counters(refs)
+            return refs
+
+    async def acquire_with_version(
+        self, name: Union[str, List[Optional[str]]]
+    ) -> Union[
+        Tuple[Optional[str], Optional[int]],
+        Tuple[List[Optional[str]], List[Optional[int]]],
+    ]:
+        """Acquire request leases and atomically snapshot ids and versions."""
+        refs = await self._acquire_refs(name)
+        ids = [ref.adapter_id if ref is not None else None for ref in refs]
+        versions = [ref.adapter_version if ref is not None else None for ref in refs]
+        if isinstance(name, str):
+            return ids[0], versions[0]
+        return ids, versions
 
     async def release(self, uid: Union[str, List[str]]):
         """

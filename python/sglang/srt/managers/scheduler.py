@@ -157,6 +157,10 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    LoadOFTAdapterFromDistributedReqInput,
+    LoadOFTAdapterFromDistributedReqOutput,
+    LoadOFTAdapterFromTensorsReqInput,
+    LoadOFTAdapterFromTensorsReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -180,6 +184,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UnloadOFTAdapterReqInput,
+    UnloadOFTAdapterReqOutput,
     UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -1656,6 +1662,15 @@ class Scheduler(
                     self.load_lora_adapter_from_distributed,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (
+                    LoadOFTAdapterFromTensorsReqInput,
+                    self.load_oft_adapter_from_tensors,
+                ),
+                (
+                    LoadOFTAdapterFromDistributedReqInput,
+                    self.load_oft_adapter_from_distributed,
+                ),
+                (UnloadOFTAdapterReqInput, self.unload_oft_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
@@ -4982,6 +4997,30 @@ class Scheduler(
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
+        return result
+
+    def load_oft_adapter_from_tensors(
+        self, recv_req: LoadOFTAdapterFromTensorsReqInput
+    ) -> LoadOFTAdapterFromTensorsReqOutput:
+        """In-place loading a new OFT adapter from serialized tensors."""
+
+        result = self.tp_worker.load_oft_adapter_from_tensors(recv_req)
+        return result
+
+    def load_oft_adapter_from_distributed(
+        self, recv_req: LoadOFTAdapterFromDistributedReqInput
+    ) -> LoadOFTAdapterFromDistributedReqOutput:
+        """In-place loading a new OFT adapter broadcast over a process group."""
+
+        result = self.tp_worker.load_oft_adapter_from_distributed(recv_req)
+        return result
+
+    def unload_oft_adapter(
+        self, recv_req: UnloadOFTAdapterReqInput
+    ) -> UnloadOFTAdapterReqOutput:
+        """Unload the OFT adapter."""
+
+        result = self.tp_worker.unload_oft_adapter(recv_req)
         return result
 
     def init_weights_send_group_for_remote_instance(

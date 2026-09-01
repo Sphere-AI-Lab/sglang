@@ -240,6 +240,10 @@ class ReqState:
     # negative, which hangs it just the same (it waits for exactly zero).
     lora_lease_released: bool = False
 
+    # Same idempotency guard as lora_lease_released, for the single-active
+    # peft (OFT) adapter lease released via peft_tokenizer_hooks.finalize_peft_lease.
+    peft_lease_released: bool = False
+
     # For streaming output
     last_output_offset: int = 0
 
@@ -1814,6 +1818,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # already released the lease and deleted the state — the finalizer's
             # idempotency is what prevents the counter from going negative here.
             self._finalize_lora_lease(state)
+            peft_tokenizer_hooks.finalize_peft_lease(self, state)
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -2600,6 +2605,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Mark ongoing LoRA request as finished.
                 self._finalize_lora_lease(state)
+                peft_tokenizer_hooks.finalize_peft_lease(self, state)
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -3341,6 +3347,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # tokenizer-held, and disagg-retracted requests — none of them reach
         # _handle_batch_output, so this is their only lease-release point.
         self._finalize_lora_lease(self.rid_to_state.get(recv_obj.rid))
+        peft_tokenizer_hooks.finalize_peft_lease(
+            self, self.rid_to_state.get(recv_obj.rid)
+        )
         del self.rid_to_state[recv_obj.rid]
 
         state.out_list.append(out)
@@ -3575,6 +3584,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # this rid, and once the state is dropped a late terminal has no release
             # point either — so release the LoRA lease here.
             self._finalize_lora_lease(self.rid_to_state.get(rid))
+            peft_tokenizer_hooks.finalize_peft_lease(self, self.rid_to_state.get(rid))
             self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(

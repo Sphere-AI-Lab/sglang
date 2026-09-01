@@ -462,8 +462,7 @@ class WeightUpdater:
                 adapter_name,
                 # Single-active convention: the tokenizer-registered adapter_id
                 # (== adapter_name == "orbit_oft"); fall back to adapter_name when
-                # the tokenizer supplied none (mirrors
-                # _ensure_streaming_oft_adapter_slot's guard).
+                # the tokenizer supplied none.
                 adapter_id=adapter_id if adapter_id is not None else adapter_name,
                 version=int(adapter_version),
                 payload_metadata=payload_metadata,
@@ -546,24 +545,29 @@ class WeightUpdater:
                 flattened_tensor_bucket_dict=named_tensors
             )
 
+        if load_format == "oft_adapter":
+            # The old srt/peft streamed-loader mechanism (maybe_load_adapter_
+            # format -> load_streamed_oft_adapter) that used to handle this
+            # load_format here has been retired in favor of the native OFT
+            # adapter RPC. Reject explicitly and gracefully -- there is no
+            # try/except anywhere in the scheduler's request-dispatch path
+            # (unlike update_weights_from_distributed's equivalent call),
+            # so letting this fall through to the generic
+            # `else: raise NotImplementedError(...)` below would propagate
+            # uncaught, hit run_scheduler_process's outer `except Exception`,
+            # and SIGQUIT-kill the entire engine process -- the same failure
+            # mode this plan already found and fixed once for
+            # _ensure_streaming_oft_adapter_slot's ValueError.
+            return (
+                False,
+                "load_format='oft_adapter' is no longer supported; use the "
+                "native OFT adapter RPC (load_oft_adapter_from_tensors/"
+                "_from_distributed) instead.",
+            )
+
         # We need to get device after patch otherwise the device would be wrong
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
-
-        # Streamed peft adapter sync (load_format "oft_adapter" / "lora_adapter"):
-        # dispatch to the single-active peft managers; NOT_HANDLED falls through
-        # to the base-weight paths below.
-        result = peft.maybe_load_adapter_format(
-            self.get_model_runner(),
-            load_format,
-            named_tensors,
-            adapter_config,
-            adapter_name,
-            adapter_id,
-            device=infered_device,
-        )
-        if result is not peft.NOT_HANDLED:
-            return result
 
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))

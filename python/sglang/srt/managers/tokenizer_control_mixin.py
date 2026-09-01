@@ -54,7 +54,12 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    LoadOFTAdapterFromDistributedReqInput,
+    LoadOFTAdapterFromDistributedReqOutput,
+    LoadOFTAdapterFromTensorsReqInput,
+    LoadOFTAdapterFromTensorsReqOutput,
     LoRAUpdateOutput,
+    OFTUpdateOutput,
     OpenSessionReqInput,
     ProfileReq,
     ProfileReqOutput,
@@ -76,6 +81,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UnloadOFTAdapterReqInput,
+    UnloadOFTAdapterReqOutput,
     UpdateAdapterFromDistributedReqInput,
     UpdateAdapterFromDistributedReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -88,6 +95,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import (
@@ -139,6 +147,7 @@ _COMMUNICATOR_SPECS = [
     ("begin_weight_update", BeginWeightUpdateReqOutput),
     ("end_weight_update", EndWeightUpdateReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
+    ("update_oft_adapter", OFTUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
@@ -159,6 +168,22 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
         dict.fromkeys(r.error_message for r in failed if r.error_message)
     )
     return LoRAUpdateOutput(
+        success=False,
+        error_message=" | ".join(error_messages),
+        loaded_adapters=failed[0].loaded_adapters,
+    )
+
+
+def _merge_oft_update_results(results: List[OFTUpdateOutput]) -> OFTUpdateOutput:
+    """Merge per-rank replies of an OFT load/unload fan-out into one result.
+    Mirrors _merge_lora_update_results exactly: any rank failing wins."""
+    failed = [r for r in results if not r.success]
+    if not failed:
+        return results[0]
+    error_messages = list(
+        dict.fromkeys(r.error_message for r in failed if r.error_message)
+    )
+    return OFTUpdateOutput(
         success=False,
         error_message=" | ".join(error_messages),
         loaded_adapters=failed[0].loaded_adapters,
@@ -696,7 +721,9 @@ class TokenizerControlMixin:
         # tokenizer-side -> generate 400s with "never been loaded".
         from sglang.srt.peft import tokenizer_hooks as peft_tokenizer_hooks
 
-        await peft_tokenizer_hooks.register_peft_ref(self, obj)
+        newly_registered_peft_ref = await peft_tokenizer_hooks.register_peft_ref(
+            self, obj
+        )
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -714,6 +741,14 @@ class TokenizerControlMixin:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
         message += await peft_tokenizer_hooks.bump_peft_version(self, obj, success)
+        if not success and newly_registered_peft_ref:
+            # The backend load this ref was minted for failed (e.g. the
+            # retired load_format="oft_adapter" path's graceful reject) --
+            # without rolling back, the name stays registered tokenizer-side
+            # with nothing actually resident on the backend, so a later
+            # /generate naming it reaches the GPU-side code instead of
+            # getting a clean "adapter not found" rejection here.
+            await peft_tokenizer_hooks.rollback_peft_ref(self, obj.adapter_name)
 
         return success, message
 
@@ -1082,6 +1117,221 @@ class TokenizerControlMixin:
                 return result
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
+
+    async def load_oft_adapter_from_tensors(
+        self: TokenizerManager,
+        obj: LoadOFTAdapterFromTensorsReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoadOFTAdapterFromTensorsReqOutput:
+        self.auto_create_handle_loop()
+        try:
+            if not (
+                self.server_args.peft_method == "oft"
+                and self.server_args.oft_impl == "sibling"
+            ):
+                raise ValueError(
+                    "Native OFT adapter loading requires --peft-method oft "
+                    "--oft-impl sibling."
+                )
+            obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+                obj.serialized_named_tensors
+            )
+            logger.info(
+                "Start load OFT adapter from tensors. Adapter name=%s",
+                obj.adapter_name,
+            )
+            async with self.peft_update_lock:
+                # Built inline (not via obj.to_ref()): to_ref() passes
+                # obj.adapter_id through explicitly, which is None on a fresh
+                # load and would short-circuit OFTRef's default_factory,
+                # tripping its "adapter_id cannot be None" guard. Mirrors
+                # load_lora_adapter_from_distributed's LoRARef(...) construction.
+                new_ref, reused = await self.peft_registry.resolve_or_reuse(
+                    OFTRef(
+                        adapter_name=obj.adapter_name,
+                        adapter_path="__tensor__",
+                        pinned=obj.pinned,
+                        reloadable=False,
+                    ),
+                    upsert=obj.upsert,
+                )
+                obj.adapter_id = new_ref.adapter_id
+                results = await self.update_oft_adapter_communicator(obj)
+                result = _merge_oft_update_results(results)
+
+                if result.success:
+                    if reused:
+                        await self.peft_registry.refresh(new_ref)
+                    else:
+                        await self.peft_registry.register(new_ref)
+                    self.peft_ref_cache[obj.adapter_name] = new_ref
+                if self.server_args.max_loaded_ofts is not None:
+                    while (
+                        self.peft_registry.num_registered_ofts
+                        > self.server_args.max_loaded_ofts
+                    ):
+                        lru_name = await self.peft_registry.lru_oft_name(
+                            exclude_pinned=True
+                        )
+                        if lru_name is None:
+                            raise ValueError(
+                                "Didn't find any OFT adapters when trying to "
+                                "evict LRU OFT adapter. OFT registry is: "
+                                f"{self.peft_registry.get_all_adapters()}"
+                            )
+                        logger.info(
+                            f"Unloading least recently used OFT adapter '{lru_name}' "
+                            f"(current number of adapters: {self.peft_registry.num_registered_ofts}, "
+                            f"max allowed: {self.server_args.max_loaded_ofts})"
+                        )
+                        unload_result = await self._unload_oft_adapter_locked(
+                            UnloadOFTAdapterReqInput(adapter_name=lru_name)
+                        )
+                        if not unload_result.success:
+                            raise ValueError(
+                                f"Error while unloading LRU OFT adapter "
+                                f"'{lru_name}': {unload_result.error_message}"
+                            )
+                        del result.loaded_adapters[lru_name]
+                return result
+        except ValueError as e:
+            return LoadOFTAdapterFromTensorsReqOutput(
+                success=False, error_message=str(e)
+            )
+
+    async def load_oft_adapter_from_distributed(
+        self: TokenizerManager,
+        obj: LoadOFTAdapterFromDistributedReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoadOFTAdapterFromDistributedReqOutput:
+        self.auto_create_handle_loop()
+        try:
+            if not (
+                self.server_args.peft_method == "oft"
+                and self.server_args.oft_impl == "sibling"
+            ):
+                raise ValueError(
+                    "Native OFT adapter loading requires --peft-method oft "
+                    "--oft-impl sibling."
+                )
+            logger.info(
+                "Start load OFT adapter from distributed. Adapter name=%s, group=%s",
+                obj.adapter_name,
+                obj.group_name,
+            )
+            async with self.peft_update_lock:
+                # See load_oft_adapter_from_tensors: built inline rather than
+                # via obj.to_ref(), which would pass the not-yet-minted
+                # obj.adapter_id (None) straight through and trip OFTRef's
+                # "adapter_id cannot be None" guard instead of minting a
+                # fresh id. Mirrors load_lora_adapter_from_distributed's
+                # LoRARef(...) construction.
+                new_ref, reused = await self.peft_registry.resolve_or_reuse(
+                    OFTRef(
+                        adapter_name=obj.adapter_name,
+                        adapter_path="__distributed__",
+                        pinned=obj.pinned,
+                        reloadable=False,
+                    ),
+                    upsert=obj.upsert,
+                )
+                obj.adapter_id = new_ref.adapter_id
+                # Merge (not [0]): unlike LoRA's from_distributed route, this
+                # handler has no dp_size == 1 guard, so a non-rank-0 failure
+                # must not be silently reported as success.
+                result = _merge_oft_update_results(
+                    await self.update_oft_adapter_communicator(obj)
+                )
+
+                if result.success:
+                    if reused:
+                        await self.peft_registry.refresh(new_ref)
+                    else:
+                        await self.peft_registry.register(new_ref)
+                    self.peft_ref_cache[obj.adapter_name] = new_ref
+                if self.server_args.max_loaded_ofts is not None:
+                    while (
+                        self.peft_registry.num_registered_ofts
+                        > self.server_args.max_loaded_ofts
+                    ):
+                        lru_name = await self.peft_registry.lru_oft_name(
+                            exclude_pinned=True
+                        )
+                        if lru_name is None:
+                            raise ValueError(
+                                "Didn't find any OFT adapters when trying to "
+                                "evict LRU OFT adapter. OFT registry is: "
+                                f"{self.peft_registry.get_all_adapters()}"
+                            )
+                        logger.info(
+                            f"Unloading least recently used OFT adapter '{lru_name}' "
+                            f"(current number of adapters: {self.peft_registry.num_registered_ofts}, "
+                            f"max allowed: {self.server_args.max_loaded_ofts})"
+                        )
+                        unload_result = await self._unload_oft_adapter_locked(
+                            UnloadOFTAdapterReqInput(adapter_name=lru_name)
+                        )
+                        if not unload_result.success:
+                            raise ValueError(
+                                f"Error while unloading LRU OFT adapter "
+                                f"'{lru_name}': {unload_result.error_message}"
+                            )
+                        del result.loaded_adapters[lru_name]
+                return result
+        except ValueError as e:
+            return LoadOFTAdapterFromDistributedReqOutput(
+                success=False, error_message=str(e)
+            )
+
+    async def _unload_oft_adapter_locked(
+        self: TokenizerManager, obj: UnloadOFTAdapterReqInput
+    ) -> UnloadOFTAdapterReqOutput:
+        """Caller must hold peft_update_lock. Unregisters + tells the
+        scheduler to free GPU state; does NOT touch peft_ref_cache (the
+        caller decides evict-vs-delete semantics, mirroring
+        _unload_lora_adapter_locked)."""
+        # Unregister the OFT adapter from the registry to stop new requests
+        # for this adapter from being started.
+        adapter_id = await self.peft_registry.unregister(obj.adapter_name)
+
+        # Initiate the actual unloading operation at the backend processes
+        # only after all ongoing requests using this adapter are finished.
+        await self.peft_registry.wait_for_unload(adapter_id)
+        obj.adapter_id = adapter_id
+        result = _merge_oft_update_results(
+            await self.update_oft_adapter_communicator(obj)
+        )
+
+        return result
+
+    async def unload_oft_adapter(
+        self: TokenizerManager,
+        obj: UnloadOFTAdapterReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> UnloadOFTAdapterReqOutput:
+        self.auto_create_handle_loop()
+        try:
+            if not (
+                self.server_args.peft_method == "oft"
+                and self.server_args.oft_impl == "sibling"
+            ):
+                raise ValueError(
+                    "Native OFT adapter loading requires --peft-method oft "
+                    "--oft-impl sibling."
+                )
+            logger.info(
+                "Start unload OFT adapter. Adapter name=%s",
+                obj.adapter_name,
+            )
+            async with self.peft_update_lock:
+                result = await self._unload_oft_adapter_locked(obj)
+                # Explicit unload is a DELETE: drop the ref_cache entry too
+                # (mirrors unload_lora_adapter's explicit-vs-evict distinction).
+                if result.success:
+                    self.peft_ref_cache.pop(obj.adapter_name, None)
+                return result
+        except ValueError as e:
+            return UnloadOFTAdapterReqOutput(success=False, error_message=str(e))
 
     async def get_weights_by_name(
         self: TokenizerManager,

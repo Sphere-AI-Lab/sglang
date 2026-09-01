@@ -66,22 +66,54 @@ def init_tokenizer_peft(tm):
         )
 
 
-async def register_peft_ref(tm, obj):
+async def register_peft_ref(tm, obj) -> bool:
     """Register-before-dispatch for a streamed peft adapter (LoRA or OFT): mint the
     ref in the active registry and set obj.adapter_id.
 
     Triggered by ``obj.adapter_name`` being set -- orbit populates it only on peft
     adapter loads (update_weights_from_tensor), not on base-weight updates -- so no
     load_format branch is needed.
+
+    Returns True if this call newly minted and registered the ref (the name
+    was not already known to this tokenizer), False if it resolved an
+    existing one. A caller whose backend dispatch can still fail after this
+    returns uses that to decide whether a failure should roll the
+    registration back via ``rollback_peft_ref`` -- otherwise it would
+    incorrectly tear down an adapter that was already loaded and serving
+    before this request.
     """
     if obj.adapter_name is None or tm.peft_registry is None:
-        return
+        return False
     name = obj.adapter_name
-    if name not in tm.peft_ref_cache:
+    newly_registered = name not in tm.peft_ref_cache
+    if newly_registered:
         ref = _mint_ref(tm, name)
         await tm.peft_registry.register(ref)
         tm.peft_ref_cache[name] = ref
     obj.adapter_id = tm.peft_ref_cache[name].adapter_id
+    return newly_registered
+
+
+async def rollback_peft_ref(tm, name):
+    """Undo a ``register_peft_ref`` registration after the backend load it was
+    staged for turned out to fail.
+
+    Only call this when ``register_peft_ref`` reported ``True`` (newly
+    registered) for this same name -- otherwise this would incorrectly tear
+    down an adapter that was already loaded and serving before this request.
+
+    Without this, a failed streamed load (e.g. the retired
+    ``load_format="oft_adapter"`` path's graceful reject) leaves a
+    registered-but-not-actually-resident name behind: a later ``/generate``
+    naming it passes the tokenizer-side registry check and reaches the
+    GPU-side code with no matching adapter there, instead of a clean
+    "adapter not found" rejection.
+    """
+    if tm.peft_registry is None:
+        return
+    adapter_id = await tm.peft_registry.unregister(name)
+    await tm.peft_registry.wait_for_unload(adapter_id)
+    tm.peft_ref_cache.pop(name, None)
 
 
 async def bump_peft_version(tm, obj, success):
@@ -134,10 +166,18 @@ async def resolve_peft_path(tm, obj):
                 f"Got PEFT adapter that has never been loaded: {adapter_path}\n"
                 f"All loaded adapters: {tm.peft_ref_cache.keys()}."
             )
+        ref = tm.peft_ref_cache[adapter_path]
+        if not ref.reloadable:
+            raise ValueError(
+                f"OFT adapter '{adapter_path}' was loaded dynamically (via "
+                "tensors/distributed) and was evicted from the registry; it "
+                "has no on-disk artifact to reload from and must be "
+                "re-loaded via a fresh load_oft_adapter_from_tensors/"
+                "_from_distributed call."
+            )
         if tm.peft_kind == "oft":
             from sglang.srt.peft.io_types import LoadOFTAdapterReqInput
 
-            ref = tm.peft_ref_cache[adapter_path]
             logger.info(f"Reloading evicted adapter: {adapter_path}")
             load_result = await tm.load_oft_adapter(
                 LoadOFTAdapterReqInput(
@@ -153,10 +193,9 @@ async def resolve_peft_path(tm, obj):
                     f"{load_result.error_message}"
                 )
 
-    adapter_id = await tm.peft_registry.acquire(path)
+    adapter_id, adapter_version = await tm.peft_registry.acquire_with_version(path)
     # Set the request-side id/version fields the scheduler reads.
     obj.adapter_id = adapter_id
-    adapter_version = await tm.peft_registry.get_version_by_id(adapter_id)
     obj.adapter_version = adapter_version
     _propagate_id_to_cached_sub_objs(obj, field="adapter_id", resolved=adapter_id)
     # The version needs the same propagation as the id: batched sub-objects
@@ -181,3 +220,26 @@ async def maybe_resolve_peft_path(tm, obj):
             tm.peft_kind,
         )
         tm._logged_peft_base_only_request = True
+
+
+def finalize_peft_lease(tm, state) -> None:
+    """Release the request's peft (OFT) adapter lease exactly once, however it
+    terminates: normal finish, scheduler abort echo (queued / tokenizer-held /
+    disagg), status-code abort, or a failed dispatch. Mirrors
+    TokenizerManager._finalize_lora_lease exactly, for the single-active
+    peft_registry path: without this release, peft_registry.wait_for_unload
+    (called by unload_oft_adapter and the max_loaded_ofts LRU-eviction loop)
+    would block forever on any adapter that ever served a request.
+
+    ``adapter_id`` lives only on GenerateReqInput (peft has no embedding
+    support, see generate_request's isinstance guard), hence the getattr
+    instead of direct attribute access -- state.obj may be an
+    EmbeddingReqInput, which never declares the field.
+    """
+    if state is None or state.peft_lease_released:
+        return
+    adapter_id = getattr(state.obj, "adapter_id", None)
+    if adapter_id is None or tm.peft_registry is None:
+        return
+    state.peft_lease_released = True
+    asyncio.create_task(tm.peft_registry.release(adapter_id))

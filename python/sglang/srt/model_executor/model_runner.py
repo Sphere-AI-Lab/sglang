@@ -1367,6 +1367,44 @@ class ModelRunner:
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
         return self.lora_manager.unload_lora_adapter(lora_ref)
 
+    def load_oft_adapter_from_tensors(
+        self, oft_ref, tensors, config_dict, *, upsert: bool = False
+    ):
+        logger.info(f"OFT adapter loading from tensors starts: {oft_ref}.")
+        result = self.oft_manager.load_adapter_from_tensors(
+            oft_ref, tensors, config_dict, upsert=upsert
+        )
+        logger.info(f"OFT adapter loading from tensors completes: {oft_ref}.")
+        return result
+
+    def load_oft_adapter_from_distributed(
+        self,
+        oft_ref,
+        names,
+        dtypes,
+        shapes,
+        config_dict,
+        group_name,
+        *,
+        upsert: bool = False,
+    ):
+        logger.info(f"OFT adapter loading from distributed starts: {oft_ref}.")
+        result = self.oft_manager.load_adapter_from_distributed(
+            oft_ref,
+            names,
+            dtypes,
+            shapes,
+            config_dict,
+            group_name,
+            self.weight_updater,
+            upsert=upsert,
+        )
+        logger.info(f"OFT adapter loading from distributed completes: {oft_ref}.")
+        return result
+
+    def unload_oft_adapter(self, oft_ref):
+        return self.oft_manager.unload_adapter(oft_ref)
+
     @property
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""

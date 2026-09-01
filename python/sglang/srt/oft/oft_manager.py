@@ -373,12 +373,25 @@ class OFTManager(AdapterManager):
         The buffer slot must already contain the precomputed R matrices.
         """
         try:
+            # Guards against double-counting if this is ever called twice for
+            # the same ref -- mirrors unload_streamed_adapter's symmetric
+            # was_registered guard.
+            was_already_registered = oft_ref.adapter_id in self.refs
             config = OFTConfig.from_dict(config_dict)
             self.configs[oft_ref.adapter_id] = config
             self.refs[oft_ref.adapter_id] = oft_ref
             # Register buffer slot mapping so inference can find this adapter
             self.memory_pool.uid_to_buffer_id[oft_ref.adapter_id] = buffer_id
             self.memory_pool.buffer_id_to_uid[buffer_id] = oft_ref.adapter_id
+            if not was_already_registered:
+                # Keeps num_pinned accurate for pinned adapters loaded over
+                # the wire -- this used to never be counted here, silently
+                # under-counting num_pinned and making validate_new_adapter's
+                # anti-starvation guard (below) and validate_batch's
+                # mem_pool_vacancy arithmetic (base/manager.py) wrong for
+                # pinned wire-loaded adapters. Mirrors AdapterManager.
+                # load_adapter's `self.num_pinned += int(ref.pinned)`.
+                self.num_pinned += int(oft_ref.pinned)
         except Exception as e:
             return self.create_oft_update_result(
                 success=False,
@@ -393,21 +406,278 @@ class OFTManager(AdapterManager):
         since streamed adapters have no OFTAdapter object.
         """
         try:
+            # Snapshot before deleting: was_registered gates the num_pinned
+            # decrement below so a second (idempotent) unload call for the
+            # same ref -- this method already tolerates being called more
+            # than once, via the `in self.configs`/`in self.refs` checks --
+            # can't double-decrement and drive num_pinned negative.
+            was_registered = oft_ref.adapter_id in self.refs
             if oft_ref.adapter_id in self.configs:
                 del self.configs[oft_ref.adapter_id]
             if oft_ref.adapter_id in self.refs:
                 del self.refs[oft_ref.adapter_id]
+            if was_registered:
+                self.num_pinned -= int(oft_ref.pinned)
             # Clean up buffer slot mapping
             if oft_ref.adapter_id in self.memory_pool.uid_to_buffer_id:
                 buffer_id = self.memory_pool.uid_to_buffer_id[oft_ref.adapter_id]
                 del self.memory_pool.uid_to_buffer_id[oft_ref.adapter_id]
                 self.memory_pool.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
+                # Drop LRU tracking too, else the native RPC admission path's
+                # eviction_policy.mark_used(...) calls would leak an entry
+                # per unloaded adapter (harmless for victim selection, since
+                # candidates are scanned from uid_to_buffer_id, but unbounded
+                # growth in a long-running server otherwise).
+                self.memory_pool.eviction_policy.remove(oft_ref.adapter_id)
         except Exception as e:
             return self.create_oft_update_result(
                 success=False,
                 error_message=str(e),
             )
         return self.create_oft_update_result(success=True)
+
+    def _unload_streamed_adapter_if_not_disk_backed(
+        self, oft_ref: OFTRef, *, context: str
+    ) -> "OFTUpdateOutput":
+        """Fully unload ``oft_ref`` via ``unload_streamed_adapter``, unless it
+        has a CPU-side ``OFTAdapter`` entry in ``self.adapters`` -- i.e. it
+        was loaded from disk via ``--peft-paths``, not over the wire.
+
+        ``self.refs``/``self.configs`` are shared by both disk-backed and
+        wire-loaded (streamed) adapters, but only wire-loaded ones lack a
+        ``self.adapters`` entry. Calling ``unload_streamed_adapter`` on a
+        disk-backed adapter would delete its ``configs``/``refs`` entries
+        while leaving ``self.adapters[uid]`` behind and ``num_pinned``
+        un-decremented -- a half-unloaded state that later confuses
+        ``AdapterManager.unload_adapter``'s disk-vs-streamed dispatch (it
+        would find ``adapter_id in self.adapters`` still true but
+        ``configs``/``refs`` already gone). A disk-backed adapter simply
+        losing its GPU buffer slot (already done by the caller, for the
+        eviction case, via ``allocate_buffer_slot_with_eviction``) is fine on
+        its own: it's exactly the same state as any adapter that has never
+        yet been admitted into a batch, and it will be paged back into a
+        fresh slot the next time a batch needs it.
+        """
+        if oft_ref.adapter_id in self.adapters:
+            logger.info(
+                "Freeing the GPU buffer slot of disk-backed OFT adapter "
+                "'%s' (%s) without unloading it -- it remains loaded and "
+                "will be re-admitted into a fresh slot when next "
+                "referenced.",
+                oft_ref.adapter_name,
+                context,
+            )
+            return self._make_update_result(success=True)
+        return self.unload_streamed_adapter(oft_ref)
+
+    def load_adapter_from_tensors(
+        self, ref: OFTRef, named_tensors, config_dict: dict, *, upsert: bool = False
+    ) -> "OFTUpdateOutput":
+        """Native-RPC admission path: multi-tenant (no single-active
+        restriction) since this serves the new native
+        load_oft_adapter_from_tensors RPC, not the (now-retired) legacy
+        srt/peft streamed path. Capacity is still bounded by
+        max_ofts_per_batch via the memory pool's own admission.
+
+        Validates the payload (_resolve_streamed_oft_tensor_groups) BEFORE
+        evicting anything: unlike the legacy single-active path (which only
+        ever replaces the SAME-named adapter), this path can evict a
+        DIFFERENT, unrelated resident adapter to make room, and that
+        adapter has no CPU-side backing to reload from if evicted for
+        nothing. Resolving first means a malformed payload (bad tensor
+        names, unsupported target modules, an unabsorbable DSV4 expert
+        chunk -- the realistic failure modes) is caught while any would-be
+        eviction victim is still intact. The remaining, much narrower risk
+        (a failure inside the actual GPU write/precompute after validation
+        already passed -- e.g. an OOM) is not eliminated: there is no spare
+        buffer slot to stage into first, so once eviction has happened,
+        that adapter is gone regardless of how the subsequent commit turns
+        out. That residual case is called out explicitly in the returned
+        error message rather than left silent -- and without the cleanup
+        call in the commit-failure branch below, the NEW adapter's own
+        `ref` would also have been left looking valid and resident (its
+        buffer/config registration already committed to self.refs/
+        self.configs/memory_pool.uid_to_buffer_id before the write is
+        attempted) despite its buffer's contents being partially written or
+        undefined -- a silently wrong-serving-results failure mode, worse
+        than the disclosed evicted-adapter one. `unload_streamed_adapter(ref)`
+        undoes that registration on commit failure so the phantom ref is
+        never left resident.
+
+        KNOWN LIMITATION: multi-tenant serving is only correct for
+        dense-target-module adapters. If two concurrently-resident adapters
+        both carry MoE/expert OFT weights, they silently share state
+        (`apply_streamed_expert_oft` writes onto module-level
+        `moe.w13_oft_r`/`w1_oft_r`/`w3_oft_r`/`w2_oft_r`, not a per-adapter
+        slot) because `FusedMoEWithOFT.forward` has no per-token
+        adapter-routing mechanism, unlike the dense path (`prepare_oft_batch`'s
+        `weight_indices`) or LoRA's MoE path (`token_lora_mapping`). See
+        `apply_streamed_expert_oft`'s docstring for why `slot_idx` alone
+        doesn't fix this."""
+        from sglang.srt.oft.streamed_weight_loader import (
+            _commit_streamed_oft_tensor_groups,
+            _resolve_streamed_oft_tensor_groups,
+        )
+
+        # The from-tensors RPC entry point deserializes a raw
+        # Dict[str, torch.Tensor] (TpModelWorker._deserialize_own_rank
+        # preserves whatever type the client serialized); the
+        # from-distributed entry point (which delegates into this method)
+        # already hands over List[Tuple[str, torch.Tensor]] from
+        # WeightUpdater.receive_weights_from_distributed. The resolve/commit
+        # helpers (and _partition_expert_oft_tensors inside them) require
+        # the list-of-tuples form and iterate it directly -- normalize once
+        # here so both callers land in the same shape.
+        if isinstance(named_tensors, dict):
+            named_tensors = list(named_tensors.items())
+
+        try:
+            block_size = config_dict.get("oft_block_size", 32)
+            max_block_size = self.memory_pool.max_oft_block_size
+            if block_size != max_block_size:
+                return self._make_update_result(
+                    success=False,
+                    error_message=(
+                        f"OFT adapter '{ref.adapter_name}' has block_size="
+                        f"{block_size}, but the server pool is allocated for "
+                        f"--max-oft-block-size={max_block_size}; smaller or "
+                        "mixed block sizes are unsupported."
+                    ),
+                )
+
+            plan, resolve_error = _resolve_streamed_oft_tensor_groups(
+                self, named_tensors, block_size
+            )
+            if plan is None:
+                return self._make_update_result(
+                    success=False, error_message=resolve_error
+                )
+
+            existing_id = None
+            for ref_id, existing_ref in list(self.refs.items()):
+                if existing_ref.adapter_name == ref.adapter_name:
+                    existing_id = ref_id
+                    break
+            if existing_id is not None:
+                if not upsert:
+                    return self._make_update_result(
+                        success=False,
+                        error_message=(
+                            f"OFT adapter '{ref.adapter_name}' is already "
+                            "loaded; pass upsert=True to refresh it in place."
+                        ),
+                    )
+                if existing_id in self.adapters:
+                    # existing_id is disk-backed (--peft-paths): register_streamed_adapter
+                    # below would overwrite self.refs[existing_id]/self.configs[existing_id]
+                    # with the new wire-loaded ref while leaving self.adapters[existing_id]
+                    # (the old CPU-side OFTAdapter) behind, stale -- silently corrupting
+                    # num_pinned accounting and later disk-vs-streamed unload dispatch.
+                    # Migrating a disk-backed identity into a wire-loaded one isn't
+                    # supported; reject instead of attempting it.
+                    return self._make_update_result(
+                        success=False,
+                        error_message=(
+                            f"OFT adapter '{ref.adapter_name}' is currently loaded "
+                            "from disk (--peft-paths) and cannot be converted to a "
+                            "wire-loaded adapter via upsert. Use a different adapter "
+                            "name for the wire-loaded adapter."
+                        ),
+                    )
+                self._unload_streamed_adapter_if_not_disk_backed(
+                    self.refs[existing_id], context="upsert"
+                )
+
+            buffer_id, evicted_uid = self.memory_pool.allocate_buffer_slot_with_eviction(
+                self.refs
+            )
+            evicted_name = (
+                self.refs[evicted_uid].adapter_name if evicted_uid is not None else None
+            )
+            if evicted_uid is not None:
+                evict_result = self._unload_streamed_adapter_if_not_disk_backed(
+                    self.refs[evicted_uid], context="eviction"
+                )
+                if not evict_result.success:
+                    return evict_result
+            self.memory_pool.reset_buffer_slot_to_identity(buffer_id)
+            result = self.register_streamed_adapter(ref, buffer_id, config_dict)
+            if not result.success:
+                return result
+            # Mark resident immediately (not just on first generate()): this
+            # adapter must be a real eviction_policy.select_victim candidate
+            # from the moment it's admitted, or a later admission-time
+            # eviction attempt could pick among only just-loaded,
+            # never-served adapters and find nothing tracked to select.
+            self.memory_pool.eviction_policy.mark_used(ref.adapter_id)
+
+            success, error_message = _commit_streamed_oft_tensor_groups(
+                self,
+                named_tensors,
+                plan,
+                buffer_id,
+                block_size,
+                ref.adapter_name,
+                ref.adapter_id,
+            )
+            if not success:
+                # Undo the registration/mark_used above: without this, refs/
+                # configs/uid_to_buffer_id would still list `ref` as valid
+                # and resident, pointing at a buffer whose contents are now
+                # partially written or undefined -- silently wrong serving
+                # results, not just a clear failure. Check the result like
+                # the evicted-adapter cleanup above does: this is a
+                # best-effort cleanup inside an already-failing path, so we
+                # still return the original commit error either way, but a
+                # cleanup failure must be visible (logged), not swallowed --
+                # that would defeat the exact guarantee this call exists for.
+                cleanup_result = self.unload_streamed_adapter(ref)
+                if not cleanup_result.success:
+                    logger.error(
+                        "Failed to clean up OFT adapter '%s' after a failed "
+                        "commit: %s",
+                        ref.adapter_name,
+                        cleanup_result.error_message,
+                    )
+                if evicted_name is not None:
+                    error_message = (
+                        f"adapter '{evicted_name}' was evicted to make room, "
+                        f"and the new load also failed: {error_message}"
+                    )
+                return self._make_update_result(
+                    success=False, error_message=error_message
+                )
+        except Exception as e:
+            return self._make_update_result(success=False, error_message=str(e))
+        return self._make_update_result(success=True)
+
+    def load_adapter_from_distributed(
+        self,
+        ref: OFTRef,
+        names,
+        dtypes,
+        shapes,
+        config_dict: dict,
+        group_name: str,
+        weight_updater,
+        *,
+        upsert: bool = False,
+    ) -> "OFTUpdateOutput":
+        """Receives the adapter's tensors over the process group via the
+        model runner's WeightUpdater, then delegates to
+        load_adapter_from_tensors for admission."""
+        try:
+            tensors = weight_updater.receive_weights_from_distributed(
+                names, dtypes, shapes, group_name
+            )
+        except Exception as e:
+            return self._make_update_result(
+                success=False,
+                error_message=f"Failed to receive OFT adapter weights: {e}.",
+            )
+        return self.load_adapter_from_tensors(
+            ref, tensors, config_dict, upsert=upsert
+        )
 
     def validate_oft_batch(self, adapter_ids: set[Optional[str]]) -> bool:
         return self.validate_batch(adapter_ids)
@@ -1185,6 +1455,16 @@ class OFTManager(AdapterManager):
         slot_idx)`` instead, leaving ``moe.w*_oft_r`` untouched so forward
         keeps reading ACTIVE until ``activate()`` flips it.
 
+        NOTE: an explicit ``slot_idx`` only isolates the WRITE; it does not
+        give multi-tenant correctness by itself, since nothing on the read
+        side selects a per-request ``slot_idx`` -- ``FusedMoEWithOFT.forward``
+        always reads the plain ``moe.w*_oft_r`` attribute this writes when
+        ``slot_idx=None``. Using a per-adapter ``slot_idx`` here without a
+        matching per-token routing mechanism in forward would make that
+        adapter's rotation silently never apply, not fix concurrent
+        residency (`StagedOFTManager`'s ``staging_idx`` usage is safe only
+        because exactly one thing is ever active at a time).
+
         Per-layer batched Cayley (one ``precompute_oft_r`` call per
         (layer, proj) covering all experts present in this chunk; no
         cross-layer batching). The buffers are *reused* across chunks within
@@ -1411,10 +1691,9 @@ class OFTManager(AdapterManager):
 
     def _stage_fill(self, named_tensors, config, name, version):
         """Per-method hook for ``AdapterManager.stage_adapter``: partition
-        ``named_tensors`` (raw checkpoint-name tensors -- the SAME format
-        ``load_streamed_oft_adapter`` consumes) into dense vs expert, bake
-        each dense tensor's R via Cayley (mirroring
-        ``load_streamed_oft_adapter``'s dense dispatch, minus its chunking --
+        ``named_tensors`` (raw checkpoint-name tensors) into dense vs expert,
+        bake each dense tensor's R via Cayley (mirroring the streamed dense
+        dispatch in ``streamed_weight_loader.py``, minus its chunking --
         chunking there is a streaming-transport perf optimization for the
         ACTIVE path's multi-RPC sync, not needed for a single-shot stage()
         fill), then write dense into STAGING via ``mem_pool.stage()`` and
@@ -1470,8 +1749,9 @@ class OFTManager(AdapterManager):
 
         # CanonicalOFT: pre-fuse split per-slice q/k/v (gate/up) tensors into
         # one stacked qkv_proj/gate_up_proj tensor when ALL siblings are
-        # present in this call -- mirrors load_streamed_oft_adapter exactly.
-        # Skipped entirely for an expert-only payload (nothing to normalize).
+        # present in this call -- mirrors the streamed dense dispatch in
+        # streamed_weight_loader.py exactly. Skipped entirely for an
+        # expert-only payload (nothing to normalize).
         if dense_named_tensors:
             dense_dict = dict(dense_named_tensors)
             if len(dense_dict) == len(dense_named_tensors):
@@ -1555,8 +1835,7 @@ class OFTManager(AdapterManager):
         from sglang.srt.oft.oft_registry import OFTRef
 
         # Single-active convention: the id IS the name when the tokenizer supplies
-        # none (mirrors _ensure_streaming_oft_adapter_slot). OFTRef rejects a None
-        # adapter_id.
+        # none. OFTRef rejects a None adapter_id.
         if adapter_id is None:
             adapter_id = name
         oft_ref = OFTRef(

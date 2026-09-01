@@ -768,7 +768,19 @@ class OFTMemoryPool(AdapterMemPool):
                 self.lm_head_R_buffer[k][buffer_id] = 0
             return
 
-        assert oft_adapter is not None
+        if oft_adapter is None:
+            # A registry/GPU-pool divergence (e.g. a batch names a uid the
+            # GPU pool no longer has a CPU-side OFTAdapter for -- a wire-
+            # loaded adapter that was, or should never have been, evicted)
+            # slipping through some path not yet foreseen. Raise a clear,
+            # catchable error instead of asserting, so this can never crash
+            # the engine outright.
+            raise ValueError(
+                f"No OFTAdapter available to load for uid={uid!r} into buffer "
+                f"slot {buffer_id}. This uid is resident in the memory pool's "
+                "admission bookkeeping but has no corresponding CPU-side "
+                "adapter to load weights from."
+            )
         block_size = oft_adapter.block_size
 
         # Precompute R from compact weights and load into buffer
@@ -1059,6 +1071,77 @@ class OFTMemoryPool(AdapterMemPool):
             f"slot contents: {{{slot_summary}}}, "
             f"uid_to_buffer_id={dict(self.uid_to_buffer_id)})"
         )
+
+    def allocate_buffer_slot_with_eviction(
+        self, refs: Dict[str, OFTRef]
+    ) -> Tuple[int, Optional[str]]:
+        """Like allocate_buffer_slot, but for the native multi-tenant RPC
+        admission path: if no slot is empty, LRU-evict an unpinned,
+        reloadable resident real adapter to make room, mirroring
+        AdapterMemPool._acquire_buffer_slot's pattern (the lazy per-batch
+        admission path used by disk-loaded adapters) -- except the
+        base/identity slot (uid=None) is never a candidate here (there is no
+        "current batch" context to safely re-admit it into afterwards,
+        unlike _acquire_buffer_slot's caller), and neither is a pinned ref
+        (the caller's explicit "keep this one resident" request) nor a
+        non-reloadable one (an adapter loaded over the wire has no CPU-side
+        artifact to re-page from, so evicting it would be unrecoverable --
+        mirrors the retired streamed path's _make_streamed_ref, which always
+        pinned such adapters for exactly this reason).
+
+        Returns (buffer_id, evicted_uid); evicted_uid is None when an empty
+        slot was found and no eviction was needed.
+
+        Does not change allocate_buffer_slot()'s own behavior: the legacy
+        single-active streamed path calls that method directly and keeps
+        its hard-fail-when-full behavior unchanged.
+        """
+        for buffer_id in range(self.max_ofts_per_batch):
+            if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
+                return buffer_id, None
+
+        candidates: Set[Optional[str]] = set()
+        for uid in self.uid_to_buffer_id:
+            if uid is None:
+                continue
+            ref = refs.get(uid)
+            if ref is not None and (ref.pinned or not ref.reloadable):
+                continue
+            candidates.add(uid)
+
+        if not candidates:
+            raise ValueError(
+                "No available buffer slots for direct OFT loading, and no "
+                "evictable resident adapter to make room for a new one. "
+                "Pinned adapters and adapters loaded over the wire (no "
+                "on-disk artifact to reload from) are never evicted. "
+                f"(max_ofts_per_batch={self.max_ofts_per_batch})"
+            )
+
+        try:
+            victim_uid = self.eviction_policy.select_victim(candidates)
+        except AssertionError:
+            # select_victim asserts if NONE of the candidates were ever
+            # eviction_policy.mark_used(...)'d and None isn't a candidate
+            # (it never is here). OFTManager.load_adapter_from_tensors marks
+            # every adapter used at admission time specifically to avoid
+            # this, but this method shouldn't crash even for a future
+            # caller that doesn't -- fall back to a deterministic choice
+            # among the untracked candidates instead of propagating the
+            # policy's internal "nothing to select" assertion.
+            victim_uid = sorted(candidates, key=lambda uid: (uid is None, uid or ""))[0]
+        victim_buffer_id = self.uid_to_buffer_id.pop(victim_uid)
+        self.eviction_policy.remove(victim_uid)
+        self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
+        logger.info(
+            "Evicting OFT adapter %s from buffer slot %d to admit a new "
+            "adapter via the native RPC path (pool full at "
+            "max_ofts_per_batch=%d).",
+            victim_uid,
+            victim_buffer_id,
+            self.max_ofts_per_batch,
+        )
+        return victim_buffer_id, victim_uid
 
     def reset_buffer_slot_to_identity(self, buffer_id: int):
         """Reset all R buffers for a given slot to block-diagonal identity.

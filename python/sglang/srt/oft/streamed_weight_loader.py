@@ -7,7 +7,6 @@ from typing import Dict, List, Literal, Sequence, Tuple
 
 import torch
 
-from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
@@ -305,137 +304,28 @@ def _flush_oft_group_chunk(
         offset = next_offset
 
 
-def _ensure_streaming_oft_adapter_slot(
-    model_runner,
-    adapter_config: dict,
-    adapter_name: str,
-    adapter_id: str | None,
-) -> tuple[int, int]:
-    # Orbit's IPC OFT sync passes adapter_name but NO adapter_id; for a
-    # single-active adapter the id IS the name (stable across syncs, so the
-    # forward's adapter_path->adapter_id resolution stays valid). OFTRef rejects a
-    # None adapter_id, so default it here rather than crash the streamed path.
-    if adapter_id is None:
-        adapter_id = adapter_name
-    block_size = adapter_config.get("oft_block_size", 32)
-    max_block_size = model_runner.oft_manager.memory_pool.max_oft_block_size
-    if block_size != max_block_size:
-        raise ValueError(
-            f"OFT adapter '{adapter_name}' has block_size={block_size}, but the "
-            f"server pool is allocated for --max-oft-block-size={max_block_size}; "
-            f"smaller or mixed block sizes are unsupported."
-        )
-    other_adapters = sorted(
-        r.adapter_name
-        for r in model_runner.oft_manager.refs.values()
-        if r.adapter_name != adapter_name
-    )
-    if other_adapters:
-        raise ValueError(
-            f"Streamed OFT sync for '{adapter_name}' while other adapters are "
-            f"resident ({other_adapters}) is unsupported: the streamed path "
-            "assumes the single-active slot convention. Hot-swap combined with "
-            "multi-tenant serving lands with the adapter_sync extension."
-        )
-    if (
-        hasattr(model_runner, "_oft_streaming_buffer_id")
-        and model_runner._oft_streaming_name == adapter_name
-    ):
-        return (
-            model_runner._oft_streaming_buffer_id,
-            model_runner._oft_streaming_block_size,
-        )
-
-    existing_id = None
-    # NB: do not reuse `adapter_id` as the loop variable -- it is the id we are
-    # about to register under, and rebinding it here keyed the new OFTRef by
-    # whatever ref happened to be iterated last.
-    for ref_id, ref in list(model_runner.oft_manager.refs.items()):
-        if ref.adapter_name == adapter_name:
-            existing_id = ref_id
-            break
-    if existing_id is not None:
-        old_ref = model_runner.oft_manager.refs[existing_id]
-        model_runner.oft_manager.unload_streamed_adapter(old_ref)
-
-    buffer_id = model_runner.oft_manager.memory_pool.allocate_buffer_slot()
-    model_runner.oft_manager.memory_pool.reset_buffer_slot_to_identity(buffer_id)
-
-    oft_ref = OFTRef(
-        adapter_id=adapter_id,
-        adapter_name=adapter_name,
-        adapter_path=adapter_name,
-        # Pinned: no CPU-side OFTAdapter exists for a streamed adapter, so an
-        # eviction could never be re-paged (see _make_streamed_ref).
-        pinned=True,
-    )
-    result = model_runner.oft_manager.register_streamed_adapter(
-        oft_ref, buffer_id, adapter_config
-    )
-    if not result.success:
-        raise RuntimeError(
-            f"Failed to register OFT adapter: {result.error_message}"
-        )
-
-    model_runner._oft_streaming_buffer_id = buffer_id
-    model_runner._oft_streaming_name = adapter_name
-    model_runner._oft_streaming_block_size = block_size
-    return buffer_id, block_size
-
-
-def load_streamed_oft_adapter(
-    model_runner,
+def _resolve_streamed_oft_tensor_groups(
+    oft_manager,
     named_tensors: List[Tuple[str, torch.Tensor]],
-    adapter_config: dict,
-    adapter_name: str,
-    adapter_id: str | None = None,
-) -> tuple[bool, str]:
+    block_size: int,
+):
+    """Resolve+validate a streamed OFT payload against the current model,
+    WITHOUT touching any buffer slot (no buffer_id needed, nothing mutated).
+
+    Split out of the combined write so the native multi-tenant admission
+    path (OFTManager.load_adapter_from_tensors) can run this BEFORE
+    evicting a resident adapter to make room: realistic failures (bad
+    tensor names, target modules the current model doesn't have, a
+    DSV4-style expert payload with no FusedMoE to absorb it) are caught
+    here, while whatever adapter would otherwise be evicted is still
+    intact. Returns (plan, error_message); plan is None iff error_message
+    is set. plan is (fused_expert_chunk, non_row_groups, row_parallel_groups,
+    direct_writes) for _commit_streamed_oft_tensor_groups.
+    """
     from sglang.srt.layers.utils import get_layer_id
 
-    assert adapter_config is not None, "adapter_config is required for oft_adapter"
-    assert adapter_name is not None, "adapter_name is required for oft_adapter"
-
-    try:
-        buffer_id, block_size = _ensure_streaming_oft_adapter_slot(
-            model_runner,
-            adapter_config,
-            adapter_name,
-            adapter_id,
-        )
-    except (RuntimeError, ValueError) as exc:
-        return False, str(exc)
-
-    memory_pool = model_runner.oft_manager.memory_pool
-    oft_modules = model_runner.oft_manager.adapter_modules
-    if os.getenv("ORBIT_LOG_WEIGHT_SYNC", "").strip().lower() not in {"", "0", "false", "no"}:
-        samples = []
-        max_abs = 0.0
-        total_nonzero = 0
-        for name, tensor in named_tensors:
-            if not torch.is_tensor(tensor):
-                continue
-            detached = tensor.detach()
-            cur_max = float(detached.float().abs().max().item()) if detached.numel() else 0.0
-            cur_mean = float(detached.float().abs().mean().item()) if detached.numel() else 0.0
-            cur_nonzero = int((detached != 0).sum().item())
-            max_abs = max(max_abs, cur_max)
-            total_nonzero += cur_nonzero
-            if len(samples) < 8:
-                samples.append(
-                    f"{name}:shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-                    f"max={cur_max:.3e} mean={cur_mean:.3e} nonzero={cur_nonzero}"
-                )
-        logger.info(
-            "OFT streamed payload adapter=%s adapter_id=%s buffer_id=%s "
-            "tensor_count=%s max_abs=%.6e total_nonzero=%s samples=%s",
-            adapter_name,
-            adapter_id,
-            buffer_id,
-            len(named_tensors),
-            max_abs,
-            total_nonzero,
-            samples,
-        )
+    memory_pool = oft_manager.memory_pool
+    oft_modules = oft_manager.adapter_modules
 
     # MoE expert OFT R cannot share the dense per-layer R_buffer slots
     # (those have no expert dimension and would silently overwrite each
@@ -451,7 +341,6 @@ def load_streamed_oft_adapter(
         )
     )
     if dsv4_expert_chunk:
-        oft_manager = model_runner.oft_manager
         has_dsv4_moe = False  # fork DeepSeekV4 model dropped (Task 2b)
         has_fused_moe = bool(oft_manager._find_fused_moe_modules())
         if has_fused_moe and not has_dsv4_moe:
@@ -474,6 +363,16 @@ def load_streamed_oft_adapter(
                         for expert_weights in layer_chunk.values()
                     ),
                 )
+        if dsv4_expert_chunk:
+            # Fork DeepSeekV4 model was dropped (Task 2b); DSV4-named
+            # expert OFT adapters are converted onto FusedMoE above.
+            # Reaching here means no FusedMoE was available to absorb
+            # them -- a validation failure, not a write failure, so
+            # detect it here rather than after any mutation.
+            return None, (
+                "DSV4-style expert OFT adapter has no FusedMoE target "
+                "(fork DeepSeekV4 model support was removed)"
+            )
 
     # CanonicalOFT: pre-stack per-slice q_proj/k_proj/v_proj (and gate/up)
     # tensors into a single fused ``qkv_proj.oft_R`` (and ``gate_up_proj.oft_R``)
@@ -494,6 +393,7 @@ def load_streamed_oft_adapter(
 
     non_row_groups = {}
     row_parallel_groups = {}
+    direct_writes = []
     unresolved_names = []
 
     for name, tensor in named_tensors:
@@ -535,9 +435,10 @@ def load_streamed_oft_adapter(
                     (layer_id, fused_target, compact_weight, slice_index, split_count)
                 )
         elif "embed_tokens" in name or "lm_head" in name:
-            memory_pool.load_oft_weight_direct(
-                buffer_id, name, tensor, block_size, oft_modules, 0
-            )
+            # Deferred, not written here: this function must not mutate any
+            # buffer slot (see docstring) -- _commit_streamed_oft_tensor_groups
+            # performs the actual write once a buffer_id exists.
+            direct_writes.append((name, tensor))
         elif ".oft_" in name or name.endswith(".oft_R"):
             unresolved_names.append(name)
 
@@ -548,20 +449,66 @@ def load_streamed_oft_adapter(
             if len(unresolved_names) <= 8
             else f", ... (+{len(unresolved_names) - 8} more)"
         )
-        return False, f"Unresolved OFT tensor names: {shown}{more}"
+        return None, f"Unresolved OFT tensor names: {shown}{more}"
+
+    return (fused_expert_chunk, non_row_groups, row_parallel_groups, direct_writes), ""
+
+
+def _commit_streamed_oft_tensor_groups(
+    oft_manager,
+    named_tensors: List[Tuple[str, torch.Tensor]],
+    plan,
+    buffer_id: int,
+    block_size: int,
+    adapter_name: str,
+    adapter_id: str | None,
+) -> tuple[bool, str]:
+    """Write an already-resolved plan (see _resolve_streamed_oft_tensor_groups)
+    into buffer_id's R_buffer slots. named_tensors is the ORIGINAL raw
+    payload, needed only for the diagnostic ORBIT_LOG_WEIGHT_SYNC summary
+    below -- the actual write uses `plan`, not `named_tensors`.
+    """
+    fused_expert_chunk, non_row_groups, row_parallel_groups, direct_writes = plan
+    memory_pool = oft_manager.memory_pool
+    oft_modules = oft_manager.adapter_modules
+
+    if os.getenv("ORBIT_LOG_WEIGHT_SYNC", "").strip().lower() not in {"", "0", "false", "no"}:
+        samples = []
+        max_abs = 0.0
+        total_nonzero = 0
+        for name, tensor in named_tensors:
+            if not torch.is_tensor(tensor):
+                continue
+            detached = tensor.detach()
+            cur_max = float(detached.float().abs().max().item()) if detached.numel() else 0.0
+            cur_mean = float(detached.float().abs().mean().item()) if detached.numel() else 0.0
+            cur_nonzero = int((detached != 0).sum().item())
+            max_abs = max(max_abs, cur_max)
+            total_nonzero += cur_nonzero
+            if len(samples) < 8:
+                samples.append(
+                    f"{name}:shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                    f"max={cur_max:.3e} mean={cur_mean:.3e} nonzero={cur_nonzero}"
+                )
+        logger.info(
+            "OFT streamed payload adapter=%s adapter_id=%s buffer_id=%s "
+            "tensor_count=%s max_abs=%.6e total_nonzero=%s samples=%s",
+            adapter_name,
+            adapter_id,
+            buffer_id,
+            len(named_tensors),
+            max_abs,
+            total_nonzero,
+            samples,
+        )
+
+    for name, tensor in direct_writes:
+        memory_pool.load_oft_weight_direct(
+            buffer_id, name, tensor, block_size, oft_modules, 0
+        )
 
     if fused_expert_chunk:
-        model_runner.oft_manager.apply_streamed_expert_oft(
-            fused_expert_chunk, block_size
-        )
-    if dsv4_expert_chunk:
-        # Fork DeepSeekV4 model was dropped (Task 2b); DSV4-named expert OFT
-        # adapters are converted onto FusedMoE above. Reaching here means no
-        # FusedMoE was available to absorb them.
-        return False, (
-            "DSV4-style expert OFT adapter has no FusedMoE target "
-            "(fork DeepSeekV4 model support was removed)"
-        )
+        oft_manager.apply_streamed_expert_oft(fused_expert_chunk, block_size)
 
     batch_chunk_limit_bytes = _resolve_oft_batch_chunk_limit_bytes()
     # Row-parallel groups go through the SAME chunked flush as everything else.

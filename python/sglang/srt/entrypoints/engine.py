@@ -74,6 +74,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    LoadOFTAdapterFromDistributedReqInput,
+    LoadOFTAdapterFromTensorsReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
     ProfileReq,
@@ -84,6 +86,7 @@ from sglang.srt.managers.io_struct import (
     RpcReqInput,
     RpcReqOutput,
     UnloadLoRAAdapterReqInput,
+    UnloadOFTAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1636,6 +1639,65 @@ class Engine(EngineScoreMixin, EngineBase):
         obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
 
         return await self.tokenizer_manager.unload_lora_adapter(obj, None)
+
+    def load_oft_adapter_from_tensors(
+        self,
+        adapter_name: str,
+        tensors: Union[Dict[str, torch.Tensor], List[SerializedTensorPayload]],
+        config_dict: Dict,
+        load_format: Optional[str] = None,
+        pinned: bool = False,
+        upsert: bool = False,
+    ):
+        serialized_named_tensors = self._serialize_tensors_per_rank(
+            tensors, load_format
+        )
+        req = LoadOFTAdapterFromTensorsReqInput(
+            adapter_name=adapter_name,
+            config_dict=config_dict,
+            serialized_named_tensors=serialized_named_tensors,
+            load_format=load_format,
+            pinned=pinned,
+            upsert=upsert,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_oft_adapter_from_tensors(req, None)
+        )
+
+    def load_oft_adapter_from_distributed(
+        self,
+        adapter_name: str,
+        config_dict: Dict,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "weight_update_group",
+        pinned: bool = False,
+        upsert: bool = False,
+    ):
+        """Load a new OFT adapter whose weights are broadcast over a
+        process group. The weight-update group must already be initialized
+        via `init_weights_update_group`."""
+        req = LoadOFTAdapterFromDistributedReqInput(
+            adapter_name=adapter_name,
+            config_dict=config_dict,
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            pinned=pinned,
+            upsert=upsert,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_oft_adapter_from_distributed(req, None)
+        )
+
+    def unload_oft_adapter(self, adapter_name: str):
+        """Unload an OFT adapter without re-launching the engine."""
+        obj = UnloadOFTAdapterReqInput(adapter_name=adapter_name)
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.unload_oft_adapter(obj, None)
+        )
 
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
