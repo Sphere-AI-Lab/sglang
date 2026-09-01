@@ -253,7 +253,9 @@ class TestManagerSlotIdsFeedTheKernel(unittest.TestCase):
             extend_seq_lens_cpu=extend_seq_lens,
             spec_info=None,
         )
-        slot_ids = tm._compute_moe_multi_tenant_slot_ids(weight_indices, forward_batch)
+        slot_ids = tm._compute_moe_multi_tenant_slot_ids(
+            weight_indices, forward_batch, use_cuda_graph=False
+        )
         self.assertEqual(slot_ids.shape[0], num_tokens)
 
         A = torch.randn(num_tokens, hidden, device=device, dtype=torch.bfloat16)

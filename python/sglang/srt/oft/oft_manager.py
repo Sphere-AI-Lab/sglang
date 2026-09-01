@@ -223,6 +223,11 @@ class OFTManager(AdapterManager):
         # Double-buffer sizing signal (PEFTArgs.peft_double_buffer), threaded
         # into OFTMemoryPool below so it reserves a staging slot iff set.
         self.peft_double_buffer: bool = server_args.peft_double_buffer
+        # Read once here (Task 4's DP-attention guard in
+        # _compute_moe_multi_tenant_slot_ids): --enable-dp-attention's
+        # cross-rank MoE token gathering is not yet supported by the
+        # CUDA-graph multi-tenant OFT path (see that method's docstring).
+        self.enable_dp_attention: bool = server_args.enable_dp_attention
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
@@ -237,6 +242,13 @@ class OFTManager(AdapterManager):
 
         # Per-batch MoE multi-tenancy decision and slot-index tensor
         self._moe_multi_tenant_slot_ids: Optional[torch.Tensor] = None
+        # Persistent, pre-allocated per-token slot-id buffer for CUDA-graph
+        # replay of the multi-tenant MoE OFT path (allocated in
+        # init_cuda_graph_batch_info once max_bs_in_cuda_graph is known).
+        # Gives the captured graph's kernel launch a pointer that stays valid
+        # across every replay -- see _compute_moe_multi_tenant_slot_ids's
+        # docstring for why a fresh tensor per call cannot work under replay.
+        self._moe_cg_slot_ids_buffer: Optional[torch.Tensor] = None
 
         # OFT backend for running orthogonal transform kernels
         logger.info(f"Using {oft_backend} as backend of OFT kernels.")
@@ -275,6 +287,16 @@ class OFTManager(AdapterManager):
         self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
     ):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+        # num_tokens_per_bs is the max per-request token count a captured
+        # decode graph can see (1 for plain decode, the spec draft width for
+        # target-verify -- BaseOFTBackend.init_cuda_graph_batch_info's own
+        # docstring), so this is sized exactly like the runner's own
+        # max_num_token = max_bs * captured_req_width.
+        self._moe_cg_slot_ids_buffer = torch.zeros(
+            max_bs_in_cuda_graph * num_tokens_per_bs,
+            dtype=torch.long,
+            device=self.device,
+        )
         self.oft_backend.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
@@ -724,7 +746,10 @@ class OFTManager(AdapterManager):
         )
 
     def _compute_moe_multi_tenant_slot_ids(
-        self, weight_indices: list, forward_batch: ForwardBatch
+        self,
+        weight_indices: list,
+        forward_batch: ForwardBatch,
+        use_cuda_graph: bool,
     ) -> "Optional[torch.Tensor]":
         """Decide whether this batch needs the multi-tenant MoE OFT path, and
         if so build its PER-TOKEN adapter-slot tensor.
@@ -765,7 +790,12 @@ class OFTManager(AdapterManager):
         a correctness one -- Task 4's own correctness oracle proved the
         general multi-slot kernel reproduces the single-slot kernel's output
         exactly when only one real slot's data actually matters, just
-        slower (no ``tl.dot``).
+        slower (no ``tl.dot``). In the plain native-RPC pool, slot 0
+        (``self.memory_pool.active_idx``) is permanently reserved for the
+        boot-time base/identity registration, so a real adapter can NEVER
+        actually land there -- meaning EVERY batch with at least one real
+        adapter takes the general per-token path today, not just batches
+        with 2+ distinct adapters.
 
         This check is global (whole batch, not per MoE layer) -- see this
         plan's Task 1 design note for why that is a deliberate, still-correct
@@ -778,78 +808,54 @@ class OFTManager(AdapterManager):
         multi-tenant branch is touched, so the single-adapter fast path pays
         only the existing set comprehension.
 
-        KNOWN LIMITATION (CURRENT STATE, post final-review Fix 1) -- multi-
-        tenant MoE OFT is not yet safe under CUDA-graph-REPLAYED DECODE, so
-        ``validate_peft_args`` (``peft/config.py``) DISABLES decode CUDA
-        graphs at boot -- unconditionally, not just as operator guidance --
-        whenever OFT dynamically targets MoE experts via the native-RPC
-        ("sibling") implementation. That guard is what actually keeps this
-        function's output safe under replay; nothing in this function itself
-        changes when decode graphs are on or off.
+        CUDA-GRAPH REPLAY (the ``use_cuda_graph`` parameter): a captured
+        graph's kernel launch holds a pointer to whatever address existed at
+        capture time, so a fresh tensor allocated on every eager call cannot
+        be read correctly on replay. Two mechanisms fix that, mirroring the
+        existing LoRA/DSA dual-capture pattern:
 
-        Why decode graphs are unsafe here: the tensor returned here has no
-        pointer stability across capture and replay. ``prepare_oft_batch``
-        runs OUTSIDE the capture region (``decode_cuda_graph_runner.py``
-        calls it via ``peft.maybe_prepare_peft_batch`` before
-        ``backend.capture_one``, and again via ``peft.maybe_prepare_replay_
-        batch`` in ``replay_prepare``), and allocates a fresh tensor on every
-        call. The capture-time tensor is moreover still referenced by
-        ``self._moe_multi_tenant_slot_ids`` and by every ``moe._oft_moe_
-        multi_tenant_slot_ids`` when the replay-time one is built, so the
-        allocator cannot reuse its block and the replay tensor is GUARANTEED
-        a different address. A graph that captured the multi-slot rotation
-        kernel therefore replays it against the stale capture-time buffer --
-        silently applying the wrong (capture-time) routing rather than
-        erroring. Same class of failure as the OFT prefill-graph freeze
-        already documented in ``peft/config.py``.
+        1. Capture-time forcing -- the capture-time dummy batch always
+           carries 0 real adapters, which would otherwise always satisfy the
+           first early-return above, so only the single-slot kernel would
+           ever get captured. ``get_capture_oft_variant() == "oft_multi"``
+           (set by ``decode_cuda_graph_runner.py``'s ``oft_variants`` capture
+           axis) bypasses BOTH early-returns above, forcing the general
+           per-token tensor to be built for that variant regardless of what
+           ``distinct_real_slots`` naturally evaluates to.
+        2. Persistent buffer -- when ``use_cuda_graph`` is True, the
+           returned (non-None) tensor is a VIEW into
+           ``self._moe_cg_slot_ids_buffer`` (allocated once by
+           ``init_cuda_graph_batch_info``), written IN PLACE -- never
+           reassigned -- so the graph's captured pointer stays valid across
+           every replay. Mirrors ``LoRABackend._add_moe_lora_info``'s
+           ``moe_cg_buffers`` discipline: read the persistent buffer (or
+           build a fresh eager tensor when not replaying a graph), then
+           always write into whichever tensor was resolved. When
+           ``use_cuda_graph`` is False (eager), behaves exactly as before: a
+           fresh tensor.
 
-        This is WORSE than "a new combination without coverage": in the
-        plain native-RPC pool, buffer slot 0 (``self.memory_pool.active_idx``)
-        is permanently reserved by the boot-time base-request registration,
-        so a real dynamically-loaded adapter can NEVER occupy it -- meaning
-        this function's fast-path condition above (the ``distinct_real_slots
-        == {active_idx}`` check, added to fix a DIFFERENT, real correctness
-        bug: a single real adapter resident off ``active_idx`` silently
-        reading identity) can now never be satisfied by any real adapter.
-        For EAGER forward passes this is simply correct (and was always
-        necessary once adapters stopped accidentally landing at
-        ``active_idx``): every real single-adapter batch takes the general
-        per-token kernel, at a real, measured-ish performance cost relative
-        to this plan's own original non-goal that the single/no-adapter path
-        stay fast (see the perf note below). But for CUDA-GRAPH DECODE it
-        made an existing, previously-relied-upon case actively wrong: a graph
-        captured with 0 real adapters (correctly fast-pathing) would replay
-        against a real single adapter (now always on the general path)
-        using the captured single-slot kernel -- silently applying identity
-        instead of that adapter's rotation. Fix 1 (the boot-time decode-graph
-        disable above) closes that regression by removing decode graphs from
-        this configuration entirely, rather than leaving it silently wrong.
-
-        Perf note (measured, not deeply investigated -- see the
-        ``2026-09-01-oft-moe-cuda-graph-dual-capture`` follow-up plan for the
-        real fix): losing the fast path means any real MoE-target adapter
-        under ``oft_impl=sibling`` now always pays the general kernel's cost
-        in eager mode too, not just under (now-disabled) decode graphs.
-        Microbenchmarking ``apply_oft_rotation_triton`` vs.
-        ``apply_oft_rotation_triton_multi_slot`` directly (bypassing the
-        rest of the forward pass) at this plan's own tiny synthetic-model
-        shapes (block_size=32, ~8 blocks/token, 4 experts) showed the two
-        within noise of each other (~1.0x) across token counts from 1 to
-        512 -- at that scale the kernels are launch-overhead-bound, not
-        compute-bound, so losing ``tl.dot`` barely registers. Task 4's own
-        earlier estimate (larger, more realistic block/expert counts, where
-        compute rather than launch overhead dominates) put the multi-slot
-        kernel at roughly 2-8x the single-slot kernel's cost; this was not
-        re-measured at that scale here. Real fix: the follow-up plan's
-        persistent per-token routing buffer + LoRA-style dual capture, which
-        restores both a genuinely fast single-adapter path AND CUDA-graph-
-        safe multi-tenant decode -- out of scope for this fix wave.
+        ``--enable-dp-attention`` is NOT supported by this CUDA-graph path
+        yet: it all-gathers MoE tokens across DP ranks (see LoRA's own
+        ``get_gathered_moe_num_tokens`` for the mechanism this would need to
+        mirror), which this per-rank persistent buffer's sizing
+        (``max_bs_in_cuda_graph * num_tokens_per_bs``, local tokens only)
+        does not account for. Raises ``RuntimeError`` rather than silently
+        truncating or overrunning the buffer; lifting this restriction is
+        out of scope for this first cut (see the
+        ``2026-09-01-oft-moe-cuda-graph-dual-capture`` plan's Global
+        Constraints).
         """
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_oft_variant,
+        )
+
+        capturing_multi = get_capture_oft_variant() == "oft_multi"
         distinct_real_slots = {idx for idx in weight_indices if idx != 0}
-        if not distinct_real_slots:
-            return None
-        if distinct_real_slots == {self.memory_pool.active_idx}:
-            return None
+        if not capturing_multi:
+            if not distinct_real_slots:
+                return None
+            if distinct_real_slots == {self.memory_pool.active_idx}:
+                return None
 
         device = forward_batch.input_ids.device
         tokens_per_request = generate_sequence_lengths(forward_batch, device=device)
@@ -874,7 +880,36 @@ class OFTManager(AdapterManager):
         # catchable error on CUDA -- it is a device-side assert that poisons
         # the context and kills the engine process. The sync costs less than
         # that.
-        return per_request_slots.repeat_interleave(tokens_per_request.to(torch.long))
+        expanded = per_request_slots.repeat_interleave(tokens_per_request.to(torch.long))
+
+        if not use_cuda_graph:
+            return expanded
+
+        if self.enable_dp_attention:
+            raise RuntimeError(
+                "Multi-tenant MoE OFT CUDA-graph replay does not support "
+                "--enable-dp-attention yet: its cross-rank token gathering is "
+                "not reflected in this per-rank persistent buffer's sizing "
+                "(max_bs_in_cuda_graph * num_tokens_per_bs, local tokens "
+                "only). See the 2026-09-01-oft-moe-cuda-graph-dual-capture "
+                "plan's Global Constraints."
+            )
+        assert self._moe_cg_slot_ids_buffer is not None, (
+            "_compute_moe_multi_tenant_slot_ids called with use_cuda_graph="
+            "True before init_cuda_graph_batch_info allocated the persistent "
+            "slot_ids buffer."
+        )
+        num_tokens = expanded.shape[0]
+        if num_tokens > self._moe_cg_slot_ids_buffer.shape[0]:
+            raise RuntimeError(
+                f"Multi-tenant MoE OFT CUDA-graph buffer holds "
+                f"{self._moe_cg_slot_ids_buffer.shape[0]} token slots, but "
+                f"this batch needs {num_tokens} -- this should have been "
+                "caught by the runner's own use_cuda_graph eligibility check "
+                "before reaching here."
+            )
+        self._moe_cg_slot_ids_buffer[:num_tokens].copy_(expanded)
+        return self._moe_cg_slot_ids_buffer[:num_tokens]
 
     def _push_moe_multi_tenant_slot_ids(self) -> None:
         """Make this batch's MoE multi-tenancy decision visible to every
@@ -917,7 +952,7 @@ class OFTManager(AdapterManager):
         # the MoE slot tensor is expanded to per-token there; weight_indices
         # itself stays per-request for the dense backend call below.
         self._moe_multi_tenant_slot_ids = self._compute_moe_multi_tenant_slot_ids(
-            weight_indices, forward_batch
+            weight_indices, forward_batch, use_cuda_graph=use_cuda_graph
         )
         self._push_moe_multi_tenant_slot_ids()
         # Do in-place updates when CUDA graph is enabled and the batch forward mode

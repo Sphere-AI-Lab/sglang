@@ -73,7 +73,7 @@ class TestMoeMultiTenancyDecision(unittest.TestCase):
         tm = self._make_tm()
         weight_indices = [0, 0, 0]
         result = tm._compute_moe_multi_tenant_slot_ids(
-            weight_indices, SimpleNamespace()
+            weight_indices, SimpleNamespace(), use_cuda_graph=False
         )
         self.assertIsNone(result)
 
@@ -84,7 +84,7 @@ class TestMoeMultiTenancyDecision(unittest.TestCase):
         tm = self._make_tm(active_idx=2)
         weight_indices = [2, 2, 0, 2, 0]
         result = tm._compute_moe_multi_tenant_slot_ids(
-            weight_indices, SimpleNamespace()
+            weight_indices, SimpleNamespace(), use_cuda_graph=False
         )
         self.assertIsNone(result)
 
@@ -105,6 +105,7 @@ class TestMoeMultiTenancyDecision(unittest.TestCase):
         result = tm._compute_moe_multi_tenant_slot_ids(
             weight_indices,
             _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=5, batch_size=5),
+            use_cuda_graph=False,
         )
         self.assertIsNotNone(result)
         self.assertTrue(
@@ -117,6 +118,7 @@ class TestMoeMultiTenancyDecision(unittest.TestCase):
         result = tm._compute_moe_multi_tenant_slot_ids(
             weight_indices,
             _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=5, batch_size=5),
+            use_cuda_graph=False,
         )
         self.assertIsNotNone(result)
         self.assertEqual(result.dtype, torch.long)
@@ -131,6 +133,7 @@ class TestMoeMultiTenancyDecision(unittest.TestCase):
         result = tm._compute_moe_multi_tenant_slot_ids(
             weight_indices,
             _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=3, batch_size=3),
+            use_cuda_graph=False,
         )
         self.assertIsNotNone(result)
 
@@ -174,6 +177,7 @@ class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
                 batch_size=len(weight_indices),
                 extend_seq_lens=extend_seq_lens,
             ),
+            use_cuda_graph=False,
         )
         self.assertEqual(result.shape[0], sum(extend_seq_lens))
         self.assertEqual(result.dtype, torch.long)
@@ -190,6 +194,7 @@ class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
         result = tm._compute_moe_multi_tenant_slot_ids(
             weight_indices,
             _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=3, batch_size=3),
+            use_cuda_graph=False,
         )
         self.assertTrue(torch.equal(result, torch.tensor([1, 2, 1], dtype=torch.long)))
 
@@ -218,6 +223,7 @@ class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
         result = tm._compute_moe_multi_tenant_slot_ids(
             weight_indices,
             _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=3, batch_size=4),
+            use_cuda_graph=False,
         )
         self.assertTrue(
             torch.equal(result, torch.tensor([1, 1, 1, 0], dtype=torch.long))
@@ -239,6 +245,7 @@ class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
                 batch_size=len(weight_indices),
                 extend_seq_lens=extend_seq_lens,
             ),
+            use_cuda_graph=False,
         )
         self.assertTrue(
             torch.equal(result, torch.tensor([1, 1, 1, 1, 1, 2], dtype=torch.long))
@@ -256,6 +263,7 @@ class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
                 batch_size=2,
                 draft_token_num=4,
             ),
+            use_cuda_graph=False,
         )
         self.assertTrue(
             torch.equal(
@@ -276,6 +284,7 @@ class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
                     batch_size=3,
                     extend_seq_lens=[4, 1],
                 ),
+                use_cuda_graph=False,
             )
 
 
@@ -662,6 +671,160 @@ class TestRunGateUpSplitMultiTenantBranch(unittest.TestCase):
         self.assertEqual(gate_call.args[-2], num_experts)
         self.assertIs(up_call.args[1], w3_all_slots)
         self.assertIs(up_call.args[2], slot_ids)
+
+
+class TestPersistentSlotIdsBufferAndCaptureForcing(unittest.TestCase):
+    """Task 4 (2026-09-01-oft-moe-cuda-graph-dual-capture): capture-time
+    forcing via ``get_capture_oft_variant()`` and the persistent CUDA-graph
+    ``slot_ids`` buffer's in-place-write discipline, mirroring
+    ``LoRABackend._add_moe_lora_info``'s ``moe_cg_buffers`` handling exactly
+    (read the persistent buffer when ``use_cuda_graph``, else build a fresh
+    eager tensor; always WRITE into whichever tensor was resolved, never
+    reassign the buffer object itself)."""
+
+    def _make_tm(
+        self,
+        *,
+        max_bs_in_cuda_graph=4,
+        buffer=None,
+        active_idx=0,
+        enable_dp_attention=False,
+    ):
+        tm = SimpleNamespace()
+        tm.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+        tm._moe_cg_slot_ids_buffer = buffer
+        tm.memory_pool = SimpleNamespace(active_idx=active_idx)
+        tm.enable_dp_attention = enable_dp_attention
+        tm._compute_moe_multi_tenant_slot_ids = MethodType(
+            OFTManager._compute_moe_multi_tenant_slot_ids, tm
+        )
+        return tm
+
+    def test_capture_forcing_bypasses_no_real_adapter_early_return(self):
+        """Capture-time dummy batches always carry 0 real adapters (every
+        weight_indices entry is 0), which naturally satisfies the function's
+        FIRST early-return (``not distinct_real_slots``). Capturing the
+        "oft_multi" variant must force the general per-token tensor to be
+        built anyway -- otherwise the "oft_multi" graph would capture the
+        single-slot fast-path kernel, which is exactly the bug this task
+        fixes (a real multi-adapter batch would then replay against a
+        captured kernel that never learned to read per-token slot ids)."""
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            _set_capture_oft_variant,
+        )
+
+        self.addCleanup(_set_capture_oft_variant, None)
+        _set_capture_oft_variant("oft_multi")
+
+        tm = self._make_tm(buffer=torch.full((8,), -1, dtype=torch.long))
+        weight_indices = [0, 0]
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            weight_indices,
+            _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=2, batch_size=2),
+            use_cuda_graph=True,
+        )
+        self.assertIsNotNone(result)
+        self.assertTrue(torch.equal(result, torch.tensor([0, 0], dtype=torch.long)))
+
+    def test_capture_forcing_bypasses_active_idx_early_return(self):
+        """The SECOND early-return (a single real adapter resident exactly
+        at ``active_idx``) must also be bypassed while capturing
+        "oft_multi", not just the first one."""
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            _set_capture_oft_variant,
+        )
+
+        self.addCleanup(_set_capture_oft_variant, None)
+        _set_capture_oft_variant("oft_multi")
+
+        tm = self._make_tm(
+            buffer=torch.full((8,), -1, dtype=torch.long), active_idx=2
+        )
+        weight_indices = [2, 2]
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            weight_indices,
+            _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=2, batch_size=2),
+            use_cuda_graph=True,
+        )
+        self.assertIsNotNone(result)
+        self.assertTrue(torch.equal(result, torch.tensor([2, 2], dtype=torch.long)))
+
+    def test_use_cuda_graph_writes_into_persistent_buffer_in_place(self):
+        buffer = torch.full((8,), -1, dtype=torch.long)
+        tm = self._make_tm(buffer=buffer)
+        weight_indices = [1, 2]  # two distinct real slots -- genuinely multi
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            weight_indices,
+            _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=2, batch_size=2),
+            use_cuda_graph=True,
+        )
+        self.assertIsNotNone(result)
+        # The RETURNED tensor must be a view/slice of the SAME buffer object,
+        # not a fresh allocation -- this is the whole point of the fix.
+        self.assertEqual(result.data_ptr(), buffer.data_ptr())
+        self.assertTrue(torch.equal(result, torch.tensor([1, 2], dtype=torch.long)))
+
+    def test_eager_path_unaffected_still_returns_fresh_tensor(self):
+        tm = self._make_tm(buffer=torch.full((8,), -1, dtype=torch.long))
+        weight_indices = [1, 2]
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            weight_indices,
+            _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=2, batch_size=2),
+            use_cuda_graph=False,
+        )
+        self.assertIsNotNone(result)
+        self.assertNotEqual(result.data_ptr(), tm._moe_cg_slot_ids_buffer.data_ptr())
+
+    def test_dp_attention_enabled_raises_instead_of_silently_wrong(self):
+        """--enable-dp-attention gathers MoE tokens across DP ranks, which
+        this per-rank persistent buffer's sizing does not account for
+        (explicitly out of scope for this first cut). Must raise a clear
+        error rather than silently truncating or overrunning the buffer."""
+        tm = self._make_tm(
+            buffer=torch.full((8,), -1, dtype=torch.long), enable_dp_attention=True
+        )
+        weight_indices = [1, 2]
+        with self.assertRaises(RuntimeError):
+            tm._compute_moe_multi_tenant_slot_ids(
+                weight_indices,
+                _forward_batch(
+                    forward_mode=ForwardMode.DECODE, num_tokens=2, batch_size=2
+                ),
+                use_cuda_graph=True,
+            )
+
+    def test_buffer_capacity_exceeded_raises(self):
+        """The persistent buffer is sized by the runner as
+        max_bs_in_cuda_graph * num_tokens_per_bs, which should always be an
+        upper bound on what actually reaches here; a batch that needs more
+        tokens than the buffer holds must raise loudly rather than silently
+        writing out of bounds via copy_."""
+        tm = self._make_tm(buffer=torch.full((2,), -1, dtype=torch.long))
+        weight_indices = [1, 2, 1]
+        with self.assertRaises(RuntimeError):
+            tm._compute_moe_multi_tenant_slot_ids(
+                weight_indices,
+                _forward_batch(
+                    forward_mode=ForwardMode.DECODE, num_tokens=3, batch_size=3
+                ),
+                use_cuda_graph=True,
+            )
+
+    def test_missing_buffer_raises_clear_assertion(self):
+        """use_cuda_graph=True should never reach here before
+        init_cuda_graph_batch_info has allocated the persistent buffer;
+        guard with a clear assertion rather than a bare AttributeError deep
+        inside the in-place write below."""
+        tm = self._make_tm(buffer=None)
+        weight_indices = [1, 2]
+        with self.assertRaises(AssertionError):
+            tm._compute_moe_multi_tenant_slot_ids(
+                weight_indices,
+                _forward_batch(
+                    forward_mode=ForwardMode.DECODE, num_tokens=2, batch_size=2
+                ),
+                use_cuda_graph=True,
+            )
 
 
 if __name__ == "__main__":
