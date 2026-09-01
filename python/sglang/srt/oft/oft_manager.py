@@ -32,7 +32,11 @@ from sglang.srt.oft.layers import BaseLayerWithOFT, get_oft_layer
 from sglang.srt.oft.oft import OFTAdapter
 from sglang.srt.oft.oft_config import OFTConfig
 from sglang.srt.oft.oft_registry import OFTRef
-from sglang.srt.oft.mem_pool import EMPTY_SLOT, OFTMemoryPool
+from sglang.srt.oft.mem_pool import (
+    EMPTY_SLOT,
+    OFTMemoryPool,
+    _fill_expert_oft_identity,
+)
 from sglang.srt.oft.utils import (
     generate_sequence_lengths,
     get_normalized_target_modules,
@@ -112,15 +116,6 @@ def _first_expert_oft_tensor(ew_dict, name: str):
         if tensor is not None:
             return tensor
     return None
-
-
-def _fill_expert_oft_identity(buffer: torch.Tensor) -> None:
-    buffer.zero_()
-    if buffer.numel() == 0:
-        return
-    block_size = buffer.shape[-1]
-    eye = torch.eye(block_size, dtype=buffer.dtype, device=buffer.device)
-    buffer[...] = eye
 
 
 def _expert_oft_buffer_desc(buffer: Optional[torch.Tensor]) -> str:

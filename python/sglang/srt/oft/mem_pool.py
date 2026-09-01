@@ -144,6 +144,28 @@ def _fill_identity(buffer_view: torch.Tensor, block_size: int) -> None:
     buffer_view[:, :block_size, :block_size] = eye
 
 
+def _fill_expert_oft_identity(buffer: torch.Tensor) -> None:
+    """Fill an expert-OFT R buffer view with identity (OFT passthrough).
+
+    Expert-OFT groups (``w13_oft_r``/``w1_oft_r``/``w3_oft_r``/``w2_oft_r``)
+    have no max-block-size padding concept unlike the dense ``_fill_identity``
+    above -- ``buffer.shape[-1]`` (the block dim) IS the block size, so the
+    whole trailing (block_size, block_size) sub-matrix is set to eye, not just
+    a top-left sub-block. Moved here (from ``oft_manager.py``) so this module
+    -- which already owns ``_fill_identity``, the dense equivalent -- can call
+    it from ``reset_buffer_slot_to_identity`` without a circular import
+    (``oft_manager.py`` imports from this module, not the reverse);
+    ``oft_manager.py`` re-imports it under the same name for its own
+    boot-time ``active_idx`` fill.
+    """
+    buffer.zero_()
+    if buffer.numel() == 0:
+        return
+    block_size = buffer.shape[-1]
+    eye = torch.eye(block_size, dtype=buffer.dtype, device=buffer.device)
+    buffer[...] = eye
+
+
 def _write_oft_r_block(
     buffer_slot: torch.Tensor,
     r: torch.Tensor,
@@ -1160,6 +1182,21 @@ class OFTMemoryPool(AdapterMemPool):
             _fill_identity(self.embedding_R_buffer[k][buffer_id], bs)
         for k in self.lm_head_R_buffer:
             _fill_identity(self.lm_head_R_buffer[k][buffer_id], bs)
+
+        # Expert-OFT groups (w13_oft_r / w1_oft_r / w3_oft_r / w2_oft_r) are
+        # NOT covered by the R_buffer loop above (_declare_expert_groups
+        # registers them separately in self._groups) and were never reset
+        # per-slot before -- only slot active_idx ever got identity-filled,
+        # at boot (_init_identity_expert_oft_for_cuda_graph). Without this, a
+        # token whose adapter has no MoE weights for a layer (or a freshly
+        # (re)assigned slot before any real weights are written) reads
+        # uninitialized torch.empty memory here instead of identity.
+        for group_name in ("w13_oft_r", "w1_oft_r", "w3_oft_r", "w2_oft_r"):
+            groups = self._groups.get(group_name)
+            if groups is None:
+                continue
+            for tensor in groups.values():
+                _fill_expert_oft_identity(tensor[buffer_id])
 
     def get_tensor(self, target_module: str, layer_id: int) -> torch.Tensor:
         """Get the R buffer tensor for a given module and layer."""
