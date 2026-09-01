@@ -218,8 +218,10 @@ def test_dense_target_oft_leaves_decode_cuda_graph_enabled():
     own, different, already-correct per-token CUDA-graph mechanism
     (weight_indices via oft.utils.generate_sequence_lengths). max_ofts_per_
     batch=1 (effective capacity 0) so the capacity term alone (which by
-    itself would WANT to disable) can't be what's keeping this enabled --
-    the target-module check must be what's actually doing it."""
+    itself would WANT to disable) can't be what's keeping this enabled, and
+    model_has_moe=True so _model_has_moe_layers alone can't either -- the
+    target-module check ({"o_proj"} has no MoE-expert overlap) must be what's
+    actually doing it."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.peft.config import validate_peft_args
 
@@ -230,6 +232,7 @@ def test_dense_target_oft_leaves_decode_cuda_graph_enabled():
         oft_impl="sibling",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
         max_ofts_per_batch=1,
+        model_has_moe=True,
     )
     validate_peft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.FULL

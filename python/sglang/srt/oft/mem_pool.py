@@ -1134,11 +1134,12 @@ class OFTMemoryPool(AdapterMemPool):
         admission path: if no slot is empty, LRU-evict an unpinned,
         reloadable resident real adapter to make room, mirroring
         AdapterMemPool._acquire_buffer_slot's pattern (the lazy per-batch
-        admission path used by disk-loaded adapters) -- except the
-        base/identity slot (uid=None) is never a candidate here (there is no
-        "current batch" context to safely re-admit it into afterwards,
-        unlike _acquire_buffer_slot's caller), and neither is a pinned ref
-        (the caller's explicit "keep this one resident" request) nor a
+        admission path used by disk-loaded adapters) -- including that
+        pattern's own protection of the base/identity slot (uid=None), which
+        is never a candidate in either path (Task 4b review fix made
+        _acquire_buffer_slot's protection unconditional, matching this
+        method's own from the start), and neither is a pinned ref (the
+        caller's explicit "keep this one resident" request) nor a
         non-reloadable one (an adapter loaded over the wire has no CPU-side
         artifact to re-page from, so evicting it would be unrecoverable --
         mirrors the retired streamed path's _make_streamed_ref, which always

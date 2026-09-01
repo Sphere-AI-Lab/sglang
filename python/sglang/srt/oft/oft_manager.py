@@ -374,11 +374,20 @@ class OFTManager(AdapterManager):
             )
 
         # Ensure pinned OFT adapters does not exceed maximal limit or cause starvation.
-        if oft_ref.pinned and self.num_pinned >= self.max_ofts_per_batch - 1:
+        # Buffer slot 0 is permanently reserved for the base/identity
+        # placeholder and never available to real adapters (Task 4b review
+        # fix to AdapterMemPool._acquire_buffer_slot), so only
+        # max_ofts_per_batch - 1 real slots ever exist. The bound below
+        # reserves one more of those for unpinned adapters (max_ofts_per_
+        # batch - 2 pinned max) -- previously max_ofts_per_batch - 1 pinned
+        # adapters were allowed, which could now claim every real slot and
+        # leave zero room for any unpinned one.
+        if oft_ref.pinned and self.num_pinned >= self.max_ofts_per_batch - 2:
             raise ValueError(
-                f"Failed to load OFT adapter {oft_ref.adapter_name} as a pinned adapter. It is not allowed to pin all slots "
-                "in the OFT memory pool to avoid starvation for unpinned adapters and base models. Please increase your "
-                "`--max-ofts-per-batch` or load it as unpinned OFT adapters."
+                f"Failed to load OFT adapter {oft_ref.adapter_name} as a pinned adapter. It is not allowed to pin all "
+                "real slots in the OFT memory pool (buffer slot 0 is reserved for the base/identity placeholder) to "
+                "avoid starvation for unpinned adapters. Please increase your `--max-ofts-per-batch` or load it as "
+                "unpinned OFT adapters."
             )
 
     def register_streamed_adapter(
@@ -965,10 +974,17 @@ class OFTManager(AdapterManager):
         for i, uid in enumerate(forward_batch.adapter_ids):
             # Mirrors upstream LoRAManager.prepare_lora_batch: a uid with no
             # resident slot keeps weight_indices[i] = 0 rather than raising.
-            # Real requests are always resident (fetch_new_ofts runs first);
-            # the CUDA-graph replay path pads adapter_ids with None WITHOUT a
-            # fetch, so an evicted base slot lands here. Those padded rows are
-            # discarded, so slot 0's contents are immaterial for them.
+            # Real requests are always resident (fetch_new_ofts runs first).
+            # The CUDA-graph replay path pads adapter_ids with None WITHOUT a
+            # fetch too, but that padding no longer reaches this `continue`
+            # branch at all: the base/identity placeholder (uid=None) is now
+            # permanently resident (AdapterMemPool._acquire_buffer_slot never
+            # evicts it, Task 4b review fix), so a padded None row resolves
+            # normally via its own always-registered slot 0 below -- slot 0's
+            # contents are immaterial for those rows regardless, since
+            # they're discarded downstream. This branch is now reachable only
+            # by a genuinely un-fetched real uid, which should not occur in
+            # practice.
             if uid not in self.memory_pool.uid_to_buffer_id:
                 continue
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)

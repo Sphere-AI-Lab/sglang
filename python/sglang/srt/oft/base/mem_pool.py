@@ -176,7 +176,13 @@ class AdapterMemPool:
                 "No available buffer slots found. Please ensure the number of "
                 "active (pinned) adapters and adapters loaded over the wire "
                 "(no on-disk artifact to reload from, never evicted) is less "
-                "than max_adapters_per_batch."
+                "than max_adapters_per_batch. This can also happen when the "
+                "current batch itself references more distinct real (non-"
+                "None) adapters than max_adapters_per_batch - 1 (buffer slot "
+                "0 is always reserved for the base/identity placeholder, "
+                "never a candidate here) -- callers should reject or defer "
+                "such a batch at admission time (see AdapterManager."
+                "validate_batch) rather than let it reach here."
             )
 
         victim_uid = self.eviction_policy.select_victim(candidates)
