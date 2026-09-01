@@ -10,6 +10,7 @@ logic.
 import unittest
 from types import MethodType, SimpleNamespace
 from unittest import mock
+from unittest.mock import patch
 
 import torch
 
@@ -210,6 +211,37 @@ class TestFullBufferBindingsInCudaGraphInit(unittest.TestCase):
         self.assertIsNone(moe._oft_w1_oft_r_all_slots)
         # w3 should still work (it's registered).
         self.assertIs(moe._oft_w3_oft_r_all_slots, w3_tensor)
+
+
+class TestMakeOftInvokeMultiTenantBranch(unittest.TestCase):
+    def test_invoke_uses_multi_tenant_path_when_slot_ids_present(self):
+        from sglang.srt.oft import oft_moe_runners
+
+        layer = SimpleNamespace(
+            w13_weight=object(),
+            w2_weight=object(),
+            w13_oft_r=torch.zeros(2, 1, 4, 4),
+            w1_oft_r=None,
+            w3_oft_r=None,
+            w2_oft_r=None,
+            _oft_moe_multi_tenant_slot_ids=torch.tensor([1, 2], dtype=torch.long),
+            _oft_w13_oft_r_all_slots=torch.zeros(3, 2, 1, 4, 4),
+        )
+        real_invoke = unittest.mock.Mock()
+        invoke = oft_moe_runners.make_oft_invoke(layer, real_invoke)
+
+        A = torch.zeros(2, 8)
+        with patch.object(
+            oft_moe_runners, "_oft_prerotate_multi_tenant"
+        ) as mock_multi, patch.object(oft_moe_runners, "_oft_prerotate") as mock_single:
+            mock_multi.return_value = (A, A, None, None, None, None, None)
+            invoke(
+                A, layer.w13_weight, None, A, None, None, None,
+                None, None, None, None, None, None, 1,
+                {"BLOCK_SIZE_M": 32},
+            )
+            mock_multi.assert_called_once()
+            mock_single.assert_not_called()
 
 
 if __name__ == "__main__":

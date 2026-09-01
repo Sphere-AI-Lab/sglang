@@ -97,6 +97,61 @@ def _oft_prerotate(
     )
 
 
+def _oft_prerotate_multi_tenant(
+    A,
+    oft_r_all_slots,
+    slot_ids,
+    C,
+    topk_weights,
+    topk_ids,
+    sorted_token_ids,
+    expert_ids,
+    num_tokens_post_padded,
+    top_k,
+    num_experts,
+    block_size_m,
+):
+    """Multi-tenant sibling of _oft_prerotate: selects each token's own
+    adapter's R-block (via slot_ids) instead of applying one shared R to
+    the whole batch. Only exercised when >=2 distinct adapters carrying
+    MoE OFT weights are resident in the current forward batch (see
+    OFTManager._compute_moe_multi_tenant_slot_ids); the single-adapter
+    fast path (_oft_prerotate) is completely unaffected by this function's
+    existence.
+    """
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    from sglang.srt.oft.triton_ops import apply_oft_rotation_triton_multi_slot
+
+    A = apply_oft_rotation_triton_multi_slot(
+        A,
+        oft_r_all_slots,
+        slot_ids,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        block_m=block_size_m,
+    )
+    C = C.reshape(-1, 1, C.shape[-1])
+    topk_weights = topk_weights.reshape(-1, 1)
+    topk_ids = topk_ids.reshape(-1, 1)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size_m, num_experts
+    )
+    return (
+        A,
+        C,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    )
+
+
 def _assert_unquantized(kw):
     """The split/canonical gate-up path is BF16-only. Was the caller-side guard
     in ``_fused_moe_kernel_sequence``; lives here now so the upstream file keeps
@@ -151,6 +206,7 @@ def _run_gate_up_split(
     c_sorted = kw.get("c_sorted", False)
     filter_expert = kw.get("filter_expert", True)
     compute_type = kw["compute_type"]
+    slot_ids = getattr(layer, "_oft_moe_multi_tenant_slot_ids", None)
 
     for half_slice, oft_r in (
         (slice(None, N // 2), w1_oft_r),
@@ -162,28 +218,61 @@ def _run_gate_up_split(
             dtype=A.dtype,
         )
         b_half = B[:, half_slice, :].contiguous()
-        (
-            a_in,
-            c_in,
-            tw,
-            ti,
-            sti,
-            ei,
-            ntpp,
-        ) = _oft_prerotate(
-            A,
-            oft_r,
-            half_cache,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            # the gate-up GEMM's own top_k (rotation collapses it to 1)
-            top_k,
-            b_half.shape[0],
-            config["BLOCK_SIZE_M"],
-        )
+        if slot_ids is not None:
+            oft_r_all_slots = (
+                layer._oft_w1_oft_r_all_slots
+                if oft_r is w1_oft_r
+                else layer._oft_w3_oft_r_all_slots
+            )
+            (
+                a_in,
+                c_in,
+                tw,
+                ti,
+                sti,
+                ei,
+                ntpp,
+            ) = _oft_prerotate_multi_tenant(
+                A,
+                oft_r_all_slots,
+                slot_ids,
+                half_cache,
+                topk_weights,
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                # the gate-up GEMM's own top_k (rotation collapses it to 1)
+                top_k,
+                # num_local_experts lives at dim 1 of the all-slots buffer
+                # (dim 0 is the slot axis) -- same value b_half.shape[0]
+                # gives in the single-tenant path, without requiring B itself.
+                oft_r_all_slots.shape[1],
+                config["BLOCK_SIZE_M"],
+            )
+        else:
+            (
+                a_in,
+                c_in,
+                tw,
+                ti,
+                sti,
+                ei,
+                ntpp,
+            ) = _oft_prerotate(
+                A,
+                oft_r,
+                half_cache,
+                topk_weights,
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                # the gate-up GEMM's own top_k (rotation collapses it to 1)
+                top_k,
+                b_half.shape[0],
+                config["BLOCK_SIZE_M"],
+            )
         real_invoke(
             a_in,
             b_half,
@@ -312,19 +401,44 @@ def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
             A = dequant_fp8_block_triton(A, A_scale, out_dtype=C.dtype)
             A_scale = None
 
-        a, c, tw, ti, sti, ei, ntpp = _oft_prerotate(
-            A,
-            oft_r,
-            C,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            top_k,
-            B.shape[0],
-            config["BLOCK_SIZE_M"],
-        )
+        slot_ids = getattr(layer, "_oft_moe_multi_tenant_slot_ids", None)
+        if slot_ids is not None:
+            oft_r_all_slots = (
+                layer._oft_w13_oft_r_all_slots
+                if is_gate_up
+                else layer._oft_w2_oft_r_all_slots
+            )
+            a, c, tw, ti, sti, ei, ntpp = _oft_prerotate_multi_tenant(
+                A,
+                oft_r_all_slots,
+                slot_ids,
+                C,
+                topk_weights,
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                top_k,
+                # num_local_experts lives at dim 1 of the all-slots buffer
+                # (dim 0 is the slot axis) -- same value B.shape[0] gives in
+                # the single-tenant path, without requiring B itself.
+                oft_r_all_slots.shape[1],
+                config["BLOCK_SIZE_M"],
+            )
+        else:
+            a, c, tw, ti, sti, ei, ntpp = _oft_prerotate(
+                A,
+                oft_r,
+                C,
+                topk_weights,
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                top_k,
+                B.shape[0],
+                config["BLOCK_SIZE_M"],
+            )
         # The rotation collapses top_k -> 1 for this GEMM. The down GEMM already
         # ran at top_k=1; kw's own `router_topk` (the ORIGINAL topk) passes
         # through untouched, as the combine path requires.
