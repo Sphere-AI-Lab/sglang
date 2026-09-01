@@ -750,6 +750,81 @@ git commit -m "feat(oft): add per-token-slot-selectable MoE OFT rotation kernel"
 
 ---
 
+## Task 4b: Fix the expert-OFT streamed-weight write path to write into the adapter's actual buffer slot
+
+**Added after Task 4's formal review, not in the original plan** — the reviewer, asked to independently verify this plan's "fallback to identity for tokens whose adapter has no MoE weights" Global Constraint, traced the actual write path and found it never worked for the plan's own primary (dynamically-loaded) scenario: every adapter's real expert-OFT weights land at a single fixed slot (`active_idx`) regardless of which buffer slot the adapter was actually assigned, so the read-side multi-slot mechanism Tasks 1-4 built has no correct per-adapter data to select between in production. This is not deferrable like the CUDA-graph limitation (Task 4's own docs commit) — it blocks the plan's core deliverable in eager execution, its primary scenario, not just a secondary execution mode.
+
+**Files:**
+- Modify: `python/sglang/srt/oft/streamed_weight_loader.py` (`_commit_streamed_oft_tensor_groups`, ~line 511)
+- Modify: `python/sglang/srt/oft/mem_pool.py` (`OFTMemoryPool.reset_buffer_slot_to_identity`, ~lines 1146-1162)
+- Test: `test/registered/unit/oft/test_oft_moe_multi_tenancy.py` (extend) and/or a new GPU test under `test/registered/rl/` if the controller's dispatch says so
+
+**Interfaces:**
+- Consumes: `apply_streamed_expert_oft(self, expert_tensors, block_size, slot_idx=None)` (already exists, `oft_manager.py:1575`) — its `slot_idx is not None` branch already correctly resolves `self.memory_pool.slot(group_name, layer_id, slot_idx)` via its internal `_resolve_expert_buffer` helper; this task only needs to make the ONE caller that currently omits `slot_idx` pass it. `_fill_expert_oft_identity` (already exists, used at boot for `active_idx`) — reuse it, do not write a new identity-fill helper.
+- Produces: no new public interface — this closes an existing, already-designed-for gap in the write path that Tasks 1-4's read-side mechanism depends on.
+
+**Two fixes, both required:**
+
+1. **Thread the adapter's actual buffer slot through to the expert-OFT write.** In `_commit_streamed_oft_tensor_groups` (`streamed_weight_loader.py`), `buffer_id` is already in scope at the call site (used for logging immediately above, and passed to the dense-path `memory_pool.load_oft_weight_direct(buffer_id, ...)` call right before it). Change:
+
+   ```python
+   if fused_expert_chunk:
+       oft_manager.apply_streamed_expert_oft(fused_expert_chunk, block_size)
+   ```
+
+   to:
+
+   ```python
+   if fused_expert_chunk:
+       oft_manager.apply_streamed_expert_oft(fused_expert_chunk, block_size, slot_idx=buffer_id)
+   ```
+
+   Read the surrounding function first to confirm `buffer_id`'s exact name/scope hasn't shifted, and confirm this doesn't change behavior for any caller that relies on the legacy `slot_idx=None` (single-active, non-multi-tenant) semantics — check `apply_streamed_expert_oft`'s docstring and other callers (if any) before assuming this is the only call site that needs updating.
+
+2. **Identity-fill every slot of the expert-OFT buffer groups, not just `active_idx`**, so a token whose resident adapter has no MoE-target weights for a given layer reads a safe identity rotation instead of uninitialized memory, and a reused (evicted-then-reassigned) slot doesn't leak a previous adapter's rotation into a new adapter that doesn't touch that layer. Extend `OFTMemoryPool.reset_buffer_slot_to_identity` (which the docstring already states is "run on every dynamic adapter load," i.e. exactly when a slot is (re)assigned to an adapter) to also reset the expert-OFT groups, mirroring its existing dense-group loop:
+
+   ```python
+   def reset_buffer_slot_to_identity(self, buffer_id: int) -> None:
+       """Reset all R buffers for a given slot to block-diagonal identity.
+       ...
+       """
+       bs = self.max_oft_block_size
+       for layer_id in range(self.num_layer):
+           for k in self.R_buffer:
+               _fill_identity(self.R_buffer[k][layer_id][buffer_id], bs)
+       for k in self.embedding_R_buffer:
+           _fill_identity(self.embedding_R_buffer[k][buffer_id], bs)
+       for k in self.lm_head_R_buffer:
+           _fill_identity(self.lm_head_R_buffer[k][buffer_id], bs)
+       # Expert-OFT groups (w13_oft_r / w1_oft_r / w3_oft_r / w2_oft_r) are
+       # NOT covered by the R_buffer loop above (_declare_expert_groups
+       # registers them separately) and were never reset per-slot before —
+       # only slot active_idx ever got identity-filled, at boot. Without
+       # this, a token whose adapter has no MoE weights for a layer (or a
+       # freshly (re)assigned slot before any real weights are written)
+       # reads uninitialized torch.empty memory here instead of identity.
+       for group_name in ("w13_oft_r", "w1_oft_r", "w3_oft_r", "w2_oft_r"):
+           groups = self._groups
+           if group_name not in groups:
+               continue
+           for layer_id, tensor in groups[group_name].items():
+               _fill_expert_oft_identity(tensor[buffer_id])
+   ```
+
+   Read the actual current body of `reset_buffer_slot_to_identity` and `_declare_expert_groups`/`self._groups`'s exact structure first — the sketch above is grounded in what the controller read during triage but line numbers and exact attribute names may have shifted; confirm before editing. Confirm `_fill_expert_oft_identity`'s exact signature (it's already used elsewhere in `oft_manager.py` for the boot-time `active_idx` fill) and that it's importable/callable from `mem_pool.py` (it may currently live in `oft_manager.py` — if so, either move it to a shared location both files can import from, or add a thin wrapper in `mem_pool.py`, whichever matches this codebase's existing conventions better; check where `_fill_identity` — the dense equivalent already used in this same function — lives for precedent).
+
+**Testing required:**
+- A test proving fix 1: two adapters loaded dynamically (native RPC), both targeting MoE experts with different weights, confirming each adapter's real weights land in ITS OWN buffer slot (not both at `active_idx`) — read the pool's slot-indexed storage directly and compare against each adapter's expected values.
+- A test proving fix 2: a fresh (or freshly reused) slot's expert-OFT buffers read as identity (a no-op rotation) before any real adapter weights are written to it, and after loading an adapter that does NOT target MoE experts, the slot's expert buffers remain identity (not garbage, not a stale previous occupant's weights).
+- If GPU is available, prefer testing this against the real end-to-end load path (`load_oft_adapter_from_tensors` with real expert-target tensors) rather than calling `apply_streamed_expert_oft`/`reset_buffer_slot_to_identity` in isolation, since the actual bug is in how these are wired together in production, not in either function alone.
+- Run the full existing OFT/PEFT test suite to confirm no regression, especially in existing dense-path and single-adapter expert-OFT tests (`test_oft_load_from_tensor.py` if it covers MoE-target adapters at all).
+
+**Do NOT:**
+- Touch `StagedOFTManager`/the double-buffer stage/activate path — it's out of scope, and `apply_streamed_expert_oft`'s `slot_idx=staging_idx` usage there is a different, already-working caller; do not change its behavior.
+- Touch anything in `oft_moe_runners.py`, `triton_ops/block_rotate.py`, or `FusedMoEWithOFT.forward` — Task 4's read-side work is complete and reviewed; this task is write-side only.
+
+---
+
 ## Task 5: End-to-end wiring verification and fast-path regression guard
 
 **Files:**
