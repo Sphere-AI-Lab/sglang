@@ -402,6 +402,12 @@ class OFTManager(AdapterManager):
                 buffer_id = self.memory_pool.uid_to_buffer_id[oft_ref.adapter_id]
                 del self.memory_pool.uid_to_buffer_id[oft_ref.adapter_id]
                 self.memory_pool.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
+                # Drop LRU tracking too, else the native RPC admission path's
+                # eviction_policy.mark_used(...) calls would leak an entry
+                # per unloaded adapter (harmless for victim selection, since
+                # candidates are scanned from uid_to_buffer_id, but unbounded
+                # growth in a long-running server otherwise).
+                self.memory_pool.eviction_policy.remove(oft_ref.adapter_id)
         except Exception as e:
             return self.create_oft_update_result(
                 success=False,
@@ -418,6 +424,18 @@ class OFTManager(AdapterManager):
         srt/peft streamed path. Capacity is still bounded by
         max_ofts_per_batch via the memory pool's own admission."""
         from sglang.srt.oft.streamed_weight_loader import _write_streamed_oft_tensors
+
+        # The from-tensors RPC entry point deserializes a raw
+        # Dict[str, torch.Tensor] (TpModelWorker._deserialize_own_rank
+        # preserves whatever type the client serialized); the
+        # from-distributed entry point (which delegates into this method)
+        # already hands over List[Tuple[str, torch.Tensor]] from
+        # WeightUpdater.receive_weights_from_distributed. _write_streamed_oft_tensors
+        # (and _partition_expert_oft_tensors inside it) require the
+        # list-of-tuples form and iterate it directly -- normalize once here
+        # so both callers land in the same shape.
+        if isinstance(named_tensors, dict):
+            named_tensors = list(named_tensors.items())
 
         try:
             block_size = config_dict.get("oft_block_size", 32)
@@ -449,11 +467,23 @@ class OFTManager(AdapterManager):
                     )
                 self.unload_streamed_adapter(self.refs[existing_id])
 
-            buffer_id = self.memory_pool.allocate_buffer_slot()
+            buffer_id, evicted_uid = self.memory_pool.allocate_buffer_slot_with_eviction(
+                self.refs
+            )
+            if evicted_uid is not None:
+                evict_result = self.unload_streamed_adapter(self.refs[evicted_uid])
+                if not evict_result.success:
+                    return evict_result
             self.memory_pool.reset_buffer_slot_to_identity(buffer_id)
             result = self.register_streamed_adapter(ref, buffer_id, config_dict)
             if not result.success:
                 return result
+            # Mark resident immediately (not just on first generate()): this
+            # adapter must be a real eviction_policy.select_victim candidate
+            # from the moment it's admitted, or a later admission-time
+            # eviction attempt could pick among only just-loaded,
+            # never-served adapters and find nothing tracked to select.
+            self.memory_pool.eviction_policy.mark_used(ref.adapter_id)
 
             success, error_message = _write_streamed_oft_tensors(
                 self,
