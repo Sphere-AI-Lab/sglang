@@ -193,6 +193,36 @@ class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
         )
         self.assertTrue(torch.equal(result, torch.tensor([1, 2, 1], dtype=torch.long)))
 
+    def test_cuda_graph_padded_decode_batch_expands_to_padded_batch_size(self):
+        """Regression guard: under decode-CUDA-graph replay,
+        ``peft/integration.py``'s ``maybe_prepare_replay_batch`` temporarily
+        sets ``forward_batch.batch_size`` to the padded capture-bucket size and
+        pads ``adapter_ids`` with ``None`` (so ``weight_indices`` is padded
+        too), but leaves ``forward_batch.input_ids`` at the RAW, pre-pad token
+        count. The per-request expansion computed here therefore legitimately
+        sums to the PADDED batch size while ``input_ids.shape[0]`` is the raw
+        one, and this function must never cross-check the two.
+
+        The bug this guards: an intervening "avoid a device-to-host sync"
+        change passed ``input_ids.shape[0]`` as ``repeat_interleave``'s
+        ``output_size``, which turns that legitimate mismatch into a hard
+        failure -- a catchable ``RuntimeError`` on CPU, but an unrecoverable,
+        engine-killing device-side assert on CUDA. Reachable for ANY OFT batch
+        padded to a capture bucket (``oft_impl=staged`` and dense-MLP-target
+        sibling deployments included), not just MoE-target sibling ones.
+        """
+        tm = self._make_tm()
+        # raw_bs=3 real requests padded to capture bucket bs=4; the padded row
+        # carries adapter_id None -> weight_indices 0 (the base/identity slot).
+        weight_indices = [1, 1, 1, 0]
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            weight_indices,
+            _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=3, batch_size=4),
+        )
+        self.assertTrue(
+            torch.equal(result, torch.tensor([1, 1, 1, 0], dtype=torch.long))
+        )
+
     def test_mixed_batch_expands_prefill_and_decode_requests(self):
         tm = self._make_tm()
         # ScheduleBatch.mix_with_running appends a 1 to extend_lens for every

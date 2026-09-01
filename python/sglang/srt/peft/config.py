@@ -229,6 +229,36 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         "transaction for async-RL weight sync).",
     )
 
+
+# Attribute names the MoE architectures in this repo use for their per-token
+# expert count -- the same probe Scheduler.init_moe_gemm_config
+# (managers/scheduler.py) uses to decide whether a model is MoE at all.
+_MOE_EXPERT_COUNT_CONFIG_ATTRS = (
+    "num_experts_per_tok",
+    "num_experts_per_token",
+    "top_k_experts",
+    "moe_top_k",
+    "moe_topk",
+)
+
+
+def _model_has_moe_layers(server_args) -> bool:
+    """Whether the model this server is about to load actually has MoE layers
+    (and therefore FusedMoE modules for expert OFT to wrap).
+
+    The runtime equivalents of this check -- ``OFTMemoryPool.
+    _declare_expert_groups``'s ``if not moe_layers: return`` and
+    ``OFTManager._install_moe_oft_wrappers``'s ``moe_names`` scan -- walk the
+    built module tree, which does not exist yet at server-args validation
+    time. The HF config's per-token expert count is the earliest available
+    signal for the same fact.
+    """
+    return any(
+        hasattr(server_args.get_model_config().hf_text_config, attr)
+        for attr in _MOE_EXPERT_COUNT_CONFIG_ATTRS
+    )
+
+
 def validate_peft_args(server_args) -> None:
     """Validate + normalize OFT server args in place (was check_oft_server_args)."""
     if server_args.peft_method not in (None, "oft"):
@@ -402,11 +432,19 @@ def validate_peft_args(server_args) -> None:
 
         # OFT is not decode-CUDA-graph-safe either, but only for one specific
         # configuration: dynamically-loaded adapters served via the native-RPC
-        # ("sibling") implementation, when MoE expert modules are targeted (same
-        # gate_up_proj/gate_proj/up_proj/down_proj check
+        # ("sibling") implementation, when MoE expert modules are targeted AND
+        # the model actually has MoE layers -- both halves of the same gate
         # OFTManager._install_moe_oft_wrappers and OFTMemoryPool.
-        # _declare_expert_groups already use to decide whether expert-OFT
-        # buffers exist at all). In the plain native-RPC pool, buffer slot 0
+        # _declare_expert_groups use to decide whether expert-OFT buffers exist
+        # at all (their gate_up_proj/gate_proj/up_proj/down_proj target-module
+        # check plus their non-empty FusedMoE scan, which this pre-model-load
+        # check approximates via _model_has_moe_layers above). The names alone
+        # are not enough: a dense model's MLP uses those same names, and
+        # --peft-target-modules=all expands to include them, so checking only
+        # the names would strip decode CUDA graphs from dense deployments that
+        # have no expert-OFT buffers and never take the path below at all.
+        #
+        # In the plain native-RPC pool, buffer slot 0
         # (memory_pool.active_idx) is permanently reserved by the boot-time
         # base-request registration, so a real dynamically-loaded adapter can
         # never occupy it -- meaning OFTManager._compute_moe_multi_tenant_
@@ -442,7 +480,13 @@ def validate_peft_args(server_args) -> None:
         ):
             from sglang.srt.model_executor.cuda_graph_config import Backend
 
-            if server_args.cuda_graph_config.decode.backend != Backend.DISABLED:
+            # _model_has_moe_layers last: it resolves (and caches) the model
+            # config, so servers whose decode graphs are already disabled --
+            # and every non-MoE-targeting server above -- never pay for it.
+            if (
+                server_args.cuda_graph_config.decode.backend != Backend.DISABLED
+                and _model_has_moe_layers(server_args)
+            ):
                 logger.warning(
                     "peft_method=oft with oft_impl=sibling targeting MoE expert "
                     "modules %s is incompatible with decode CUDA graphs (the "

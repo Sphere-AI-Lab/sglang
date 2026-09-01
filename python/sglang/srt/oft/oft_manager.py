@@ -861,22 +861,20 @@ class OFTManager(AdapterManager):
                 f"(forward_mode={forward_batch.forward_mode})"
             )
         per_request_slots = torch.tensor(weight_indices, dtype=torch.long, device=device)
-        # output_size=... avoids a device-to-host sync that repeat_interleave
-        # would otherwise need to determine its own output size from a CUDA
-        # `repeats` tensor -- forward_batch.input_ids.shape[0] is exactly the
-        # total token count this forward call processes (one entry per
-        # decode/idle request, per draft token under target-verify, per
-        # extend token under extend/mixed -- the same per-request counts
-        # generate_sequence_lengths above already sums to that total), so
-        # it's available without a new sync. This also upgrades the
-        # tokens_per_request/weight_indices length check above from a
-        # per-request-count invariant into an ADDITIONAL torch-enforced
-        # total-token-count invariant: repeat_interleave raises if the sum of
-        # tokens_per_request doesn't match output_size.
-        return per_request_slots.repeat_interleave(
-            tokens_per_request.to(torch.long),
-            output_size=forward_batch.input_ids.shape[0],
-        )
+        # Deliberately NO output_size= here, even though passing one would
+        # avoid the device-to-host sync repeat_interleave needs to size its
+        # own output from a CUDA `repeats` tensor: there is no host-side value
+        # that is correct for every batch. forward_batch.input_ids.shape[0]
+        # (the obvious candidate) is the RAW token count, but under
+        # decode-CUDA-graph replay peft/integration.py's
+        # maybe_prepare_replay_batch pads forward_batch.batch_size and
+        # adapter_ids up to the capture-bucket size WITHOUT touching
+        # input_ids, so tokens_per_request (built off batch_size) legitimately
+        # sums to the PADDED count instead. A mismatch there is not a
+        # catchable error on CUDA -- it is a device-side assert that poisons
+        # the context and kills the engine process. The sync costs less than
+        # that.
+        return per_request_slots.repeat_interleave(tokens_per_request.to(torch.long))
 
     def _push_moe_multi_tenant_slot_ids(self) -> None:
         """Make this batch's MoE multi-tenancy decision visible to every

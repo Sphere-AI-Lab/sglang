@@ -13,6 +13,7 @@ def _args(
     peft_target_modules=None,
     oft_impl="sibling",
     cuda_graph_config=None,
+    model_has_moe=False,
 ):
     ns = SimpleNamespace(
         enable_lora=enable_lora,
@@ -39,6 +40,16 @@ def _args(
     # normalized peft_paths/peft_target_modules through this (real ServerArgs
     # is read-only by plain assignment once __post_init__ resolves it).
     ns._late_resolution = lambda source, **fields: ns.__dict__.update(fields)
+    # Stand-in for ServerArgs.get_model_config(): the MoE decode-graph guard
+    # reads hf_text_config's per-token expert count to tell an actual MoE model
+    # from a dense one whose MLP merely uses the same module names.
+    ns.get_model_config = lambda: SimpleNamespace(
+        hf_text_config=(
+            SimpleNamespace(num_experts_per_tok=8)
+            if model_has_moe
+            else SimpleNamespace()
+        )
+    )
     return ns
 
 
@@ -155,7 +166,7 @@ def test_moe_target_oft_sibling_disables_decode_cuda_graph():
     adapter, and that branch's routing tensor has no pointer stability across
     CUDA-graph capture/replay. validate_peft_args must disable decode CUDA
     graphs for exactly this configuration (oft_impl=sibling + MoE expert
-    target modules)."""
+    target modules + a model that actually has MoE layers)."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.peft.config import validate_peft_args
 
@@ -165,6 +176,7 @@ def test_moe_target_oft_sibling_disables_decode_cuda_graph():
         peft_target_modules=["gate_proj", "up_proj", "down_proj"],
         oft_impl="sibling",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
+        model_has_moe=True,
     )
     validate_peft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.DISABLED
@@ -189,6 +201,36 @@ def test_dense_target_oft_leaves_decode_cuda_graph_enabled():
     assert args.cuda_graph_config.decode.backend == Backend.FULL
 
 
+@pytest.mark.parametrize("peft_target_modules", [["down_proj"], ["all"]])
+def test_dense_model_targeting_mlp_module_names_keeps_decode_cuda_graph(
+    peft_target_modules,
+):
+    """Regression guard: the MoE decode-graph guard checked target-module
+    NAMES only, never whether the model has any MoE layer -- so it also fired
+    for dense models, whose MLP uses those very same names
+    (gate_proj/up_proj/down_proj), and for every --peft-target-modules=all
+    deployment (``all`` expands to include them). Those deployments have no
+    expert-OFT buffers at all and never reach the unstable per-token routing
+    path, so they must keep their decode CUDA graphs; silently disabling them
+    cost real throughput and stripped decode-graph coverage from
+    test/registered/rl/test_oft_load_from_tensor.py (dense Qwen3-0.6B,
+    peft_target_modules=["down_proj"], sibling, decode graphs enabled)
+    without failing anything."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.peft.config import validate_peft_args
+
+    args = _args(
+        "oft",
+        enable_lora=False,
+        peft_target_modules=peft_target_modules,
+        oft_impl="sibling",
+        cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
+        model_has_moe=False,
+    )
+    validate_peft_args(args)
+    assert args.cuda_graph_config.decode.backend == Backend.FULL
+
+
 def test_moe_target_oft_staged_impl_leaves_decode_cuda_graph_enabled():
     """Negative case: oft_impl=staged's double-buffer activate() copies real
     adapter data in place into memory_pool.active_idx, so the single-adapter
@@ -204,6 +246,9 @@ def test_moe_target_oft_staged_impl_leaves_decode_cuda_graph_enabled():
         peft_target_modules=["gate_proj", "up_proj", "down_proj"],
         oft_impl="staged",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
+        # Real MoE model: oft_impl=staged is the ONLY reason the guard must
+        # not fire here.
+        model_has_moe=True,
     )
     validate_peft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.FULL
