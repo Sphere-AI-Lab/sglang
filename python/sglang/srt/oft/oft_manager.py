@@ -1276,7 +1276,9 @@ class OFTManager(AdapterManager):
                     # Loaded legacy fused w13 — leave entirely untouched (do NOT
                     # split it, do NOT null it). This short-circuit is the fix:
                     # a loaded legacy adapter must survive regardless of
-                    # oft_type.
+                    # oft_type. Note: _oft_w13_oft_r_all_slots binding is
+                    # intentionally omitted here; legacy-fused multi-tenancy is
+                    # out of scope (canonical_oft split path is the active code path).
                     pass
                 elif w13_is_split:
                     # Pool-backed (mem_pool.py ``_declare_expert_groups``):

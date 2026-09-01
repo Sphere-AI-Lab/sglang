@@ -9,6 +9,7 @@ logic.
 
 import unittest
 from types import MethodType, SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -86,6 +87,129 @@ class TestPushSlotIdsOntoMoeModules(unittest.TestCase):
         tm._moe_multi_tenant_slot_ids = slot_ids
         tm._push_moe_multi_tenant_slot_ids()
         self.assertIs(moe._oft_moe_multi_tenant_slot_ids, slot_ids)
+
+
+class TestFullBufferBindingsInCudaGraphInit(unittest.TestCase):
+    """Test full-buffer binding logic in _init_identity_expert_oft_for_cuda_graph.
+
+    Guards against future edits that might incorrectly bind w1/w3 all-slots
+    in the legacy fused branch (or vice versa), or forget to handle
+    unregistered groups. This is a derived-property test: the branch-specific
+    bindings are prescribed by the oft_type signal, and swapping them is a
+    silent regression.
+    """
+
+    def _make_tm_for_cuda_graph_init(self, oft_type, init_w13=True, init_w2=True):
+        """Create OFTManager stand-in with mocked memory_pool._groups."""
+        # Create distinguishable tensor values per group, each identifiable.
+        w1_tensor = torch.ones(2, 4, dtype=torch.float32) * 0.1
+        w3_tensor = torch.ones(2, 4, dtype=torch.float32) * 0.3
+        w13_tensor = torch.ones(2, 4, dtype=torch.float32) * 0.13
+        w2_tensor = torch.ones(2, 4, dtype=torch.float32) * 0.2
+
+        # Create a minimal MoE module stand-in.
+        moe = SimpleNamespace()
+        moe.hidden_size = 4096
+        moe.intermediate_size_per_partition = 22016
+        moe.w13_oft_r = None  # No pre-loaded legacy adapter.
+        moe.w1_oft_r = None
+        moe.w3_oft_r = None
+        moe.w2_oft_r = None
+
+        # Create a minimal memory_pool stand-in with _groups.
+        memory_pool = SimpleNamespace()
+        memory_pool._groups = {
+            "w1_oft_r": {0: w1_tensor},
+            "w3_oft_r": {0: w3_tensor},
+            "w13_oft_r": {0: w13_tensor},
+            "w2_oft_r": {0: w2_tensor},
+        }
+        memory_pool.active_idx = 0
+        # Mock slot() and active_view() to avoid actual tensor creation.
+        memory_pool.slot = mock.Mock(return_value=torch.zeros(4, 4))
+        memory_pool.active_view = mock.Mock(return_value=torch.zeros(4, 4))
+
+        # Create OFTManager stand-in.
+        tm = SimpleNamespace()
+        tm.oft_type = oft_type
+        tm.target_modules = (
+            {"gate_proj", "up_proj", "down_proj"}
+            if (init_w13 and init_w2)
+            else {"gate_proj", "up_proj"} if init_w13 else {"down_proj"}
+        )
+        tm.max_oft_block_size = 32
+        tm.memory_pool = memory_pool
+        tm._find_fused_moe_modules = lambda: {0: moe}
+
+        # Bind the real method.
+        tm._init_identity_expert_oft_for_cuda_graph = MethodType(
+            OFTManager._init_identity_expert_oft_for_cuda_graph, tm
+        )
+
+        return tm, moe, w1_tensor, w3_tensor, w13_tensor, w2_tensor
+
+    @mock.patch("sglang.srt.oft.oft_manager._fill_expert_oft_identity")
+    def test_split_binds_w1_w3_not_w13(self, mock_fill):
+        """Test canonical_oft (split) branch binds w1/w3 all-slots, not w13."""
+        tm, moe, w1_tensor, w3_tensor, w13_tensor, w2_tensor = (
+            self._make_tm_for_cuda_graph_init("canonical_oft", init_w13=True, init_w2=False)
+        )
+
+        tm._init_identity_expert_oft_for_cuda_graph()
+
+        # Split branch should bind w1/w3, not w13.
+        self.assertIs(moe._oft_w1_oft_r_all_slots, w1_tensor)
+        self.assertIs(moe._oft_w3_oft_r_all_slots, w3_tensor)
+        # w13 should not be set (or be None) in split path.
+        self.assertFalse(hasattr(moe, "_oft_w13_oft_r_all_slots"))
+
+    @mock.patch("sglang.srt.oft.oft_manager._fill_expert_oft_identity")
+    def test_fused_binds_w13_not_w1_w3(self, mock_fill):
+        """Test legacy fused (non-canonical) branch binds w13 all-slots, not w1/w3."""
+        tm, moe, w1_tensor, w3_tensor, w13_tensor, w2_tensor = (
+            self._make_tm_for_cuda_graph_init("oft", init_w13=True, init_w2=False)
+        )
+
+        tm._init_identity_expert_oft_for_cuda_graph()
+
+        # Fused branch should bind w13, not w1/w3.
+        self.assertIs(moe._oft_w13_oft_r_all_slots, w13_tensor)
+        # w1/w3 should not be set (or be None) in fused path.
+        self.assertFalse(hasattr(moe, "_oft_w1_oft_r_all_slots"))
+        self.assertFalse(hasattr(moe, "_oft_w3_oft_r_all_slots"))
+
+    @mock.patch("sglang.srt.oft.oft_manager._fill_expert_oft_identity")
+    def test_w2_binds_in_both_split_and_fused(self, mock_fill):
+        """Test w2 all-slots binding appears in both split and fused branches."""
+        # Test split case.
+        tm_split, moe_split, _, _, _, w2_tensor_split = (
+            self._make_tm_for_cuda_graph_init("canonical_oft", init_w13=True, init_w2=True)
+        )
+        tm_split._init_identity_expert_oft_for_cuda_graph()
+        self.assertIs(moe_split._oft_w2_oft_r_all_slots, w2_tensor_split)
+
+        # Test fused case.
+        tm_fused, moe_fused, _, _, _, w2_tensor_fused = (
+            self._make_tm_for_cuda_graph_init("oft", init_w13=True, init_w2=True)
+        )
+        tm_fused._init_identity_expert_oft_for_cuda_graph()
+        self.assertIs(moe_fused._oft_w2_oft_r_all_slots, w2_tensor_fused)
+
+    @mock.patch("sglang.srt.oft.oft_manager._fill_expert_oft_identity")
+    def test_unregistered_group_yields_none(self, mock_fill):
+        """Test that unregistered groups gracefully yield None."""
+        tm, moe, w1_tensor, w3_tensor, w13_tensor, w2_tensor = (
+            self._make_tm_for_cuda_graph_init("canonical_oft", init_w13=True, init_w2=True)
+        )
+        # Remove w1_oft_r from _groups to simulate an unregistered group.
+        del tm.memory_pool._groups["w1_oft_r"]
+
+        tm._init_identity_expert_oft_for_cuda_graph()
+
+        # Should gracefully return None from .get() instead of raising.
+        self.assertIsNone(moe._oft_w1_oft_r_all_slots)
+        # w3 should still work (it's registered).
+        self.assertIs(moe._oft_w3_oft_r_all_slots, w3_tensor)
 
 
 if __name__ == "__main__":
