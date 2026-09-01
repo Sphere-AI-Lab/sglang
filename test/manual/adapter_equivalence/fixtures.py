@@ -39,6 +39,17 @@ _OFT_TARGET_SUFFIXES = {
     "up_proj",
     "down_proj",
 }
+# Canonical OFT rotates the *input* side of a module, and SGLang's runtime tree
+# exposes only fused modules. A qkv_proj R buffer is sized 3 * num_blocks and
+# load_oft_weight_to_buffer() stacks the split leaves via
+# normalize_merged_oft_weights(), which silently skips a group unless every
+# sibling is present. A q_proj-only adapter is therefore loadable through the
+# streamed path (load_oft_weight_direct -> _runtime_buffer_target_for_name maps a
+# lone leaf to one slice) but NOT as a disk adapter. Require the whole q/k/v group
+# so OFT fixtures are valid on both paths. Declared separately rather than widening
+# _OFT_TARGET_SUFFIXES, because _LORA_REQUIRED_SUFFIXES derives from that set and
+# LoRA must keep k_proj optional.
+_OFT_REQUIRED_SUFFIXES = _OFT_TARGET_SUFFIXES | {"k_proj", "v_proj"}
 _LORA_REQUIRED_SUFFIXES = _OFT_TARGET_SUFFIXES | {"v_proj"}
 _LORA_ALLOWED_SUFFIXES = _LORA_REQUIRED_SUFFIXES | {"k_proj"}
 _DENSE_TARGET = re.compile(
@@ -391,8 +402,8 @@ def build_oft_fixture(
         architecture,
         target_shapes,
         block_size,
-        required_suffixes=_OFT_TARGET_SUFFIXES,
-        allowed_suffixes=_OFT_TARGET_SUFFIXES,
+        required_suffixes=_OFT_REQUIRED_SUFFIXES,
+        allowed_suffixes=_OFT_REQUIRED_SUFFIXES,
     )
     compact_size = block_size * (block_size - 1) // 2
     tensors: dict[str, np.ndarray] = {}
