@@ -1110,6 +1110,11 @@ class TokenizerControlMixin:
                 # With upsert, a same-name adapter keeps its lora_id so the
                 # backend refreshes it in place instead of failing the
                 # duplicate check; otherwise this resolves to a fresh ref.
+                # bump_version so the radix cache key (extended with
+                # lora_version) actually changes across the in-place
+                # refresh -- this route doesn't manage version itself, so
+                # without this every upsert of the same name would be keyed
+                # identically to the pre-upsert weights.
                 new_adapter, reused = await self.lora_registry.register_or_reuse(
                     LoRARef(
                         lora_name=obj.lora_name,
@@ -1118,6 +1123,7 @@ class TokenizerControlMixin:
                         reloadable=False,
                     ),
                     upsert=obj.upsert,
+                    bump_version=True,
                 )
                 obj.lora_id = new_adapter.lora_id
                 result = (await self.update_lora_adapter_communicator(obj))[0]

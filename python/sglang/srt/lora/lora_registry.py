@@ -145,6 +145,7 @@ class LoRARegistry:
         upsert: bool = False,
         *,
         preserve_pinned: bool = False,
+        bump_version: bool = False,
     ) -> Tuple[LoRARef, bool]:
         """Resolve which identity a load request should use.
 
@@ -155,6 +156,18 @@ class LoRARegistry:
         Nothing is registered here: the caller commits the resolved ref with
         ``register`` / ``refresh`` once the backend load succeeded, keeping
         failed loads invisible to the registry.
+
+        With ``bump_version``, the returned ref's ``version`` advances past
+        the existing entry's on reuse (``existing.version + 1``) instead of
+        keeping whatever ``lora_ref`` carries. The radix cache key is
+        extended with this version (see ``_extend_lora_extra_key`` in
+        schedule_batch.py), so KV computed under the pre-upsert weights must
+        live under a different key than requests arriving after this
+        in-place refresh -- otherwise a prompt re-served after an upsert
+        could silently return output computed with the stale weights via a
+        cached KV prefix. Callers that manage their own explicit version
+        numbering (e.g. the native staged double-buffer protocol) must leave
+        this ``False`` so their supplied version is kept verbatim.
         """
         if not upsert:
             return lora_ref, False
@@ -165,6 +178,8 @@ class LoRARegistry:
             updates: Dict[str, object] = {"lora_id": existing.lora_id}
             if preserve_pinned:
                 updates["pinned"] = existing.pinned
+            if bump_version:
+                updates["version"] = existing.version + 1
             return replace(lora_ref, **updates), True
 
     async def refresh(self, lora_ref: LoRARef):
