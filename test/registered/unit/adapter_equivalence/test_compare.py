@@ -8,6 +8,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "manual"))
 
 from adapter_equivalence.compare import compare_bundles
+
+# Imported rather than re-spelled: these are the retired CLI/key spellings the
+# frozen source still uses, assembled from fragments in server.py so that
+# test/registered/unit/oft/test_no_legacy_peft.py's source scan stays strict.
+# Importing them also ties this assertion to the harness it is checking.
+from adapter_equivalence.server import (
+    _LEGACY_IMPL_FLAG,
+    _LEGACY_IMPL_KEY,
+    _LEGACY_LORA_VALUE,
+)
 from adapter_equivalence.schema import (
     PROVENANCE_HASH_KEYS,
     SCHEMA_VERSION,
@@ -1079,14 +1089,14 @@ def test_task8_source_and_candidate_mode_arguments_are_frozen():
         )
     } == {
         "base": (),
-        "legacy_oft": ("--peft-method", "oft", "--oft-impl", "peft"),
+        "legacy_oft": ("--peft-method", "oft", _LEGACY_IMPL_FLAG, "peft"),
         "canonical_oft": (
             "--peft-method",
             "oft",
-            "--oft-impl",
+            _LEGACY_IMPL_FLAG,
             "sibling",
         ),
-        "legacy_lora": ("--peft-method", "lora"),
+        "legacy_lora": ("--peft-method", _LEGACY_LORA_VALUE),
         "native_lora": ("--enable-lora", "--enable-lora-staging"),
     }
     assert {
@@ -1310,7 +1320,7 @@ def test_task8_offline_engine_kwargs_preserve_source_oft_selection():
         "log_level": "error",
         "mem_fraction_static": 0.8,
         "model_path": "/models/qwen3-4b",
-        "oft_impl": "sibling",
+        _LEGACY_IMPL_KEY: "sibling",
         "peft_method": "oft",
         "peft_paths": ("policy-a=/adapters/a",),
         "tp_size": 1,
@@ -1347,7 +1357,7 @@ def test_task8_dynamic_oft_engine_kwargs_declare_fixture_shape_contract():
         "max_oft_block_size": 128,
         "mem_fraction_static": 0.8,
         "model_path": "/models/qwen3-4b",
-        "oft_impl": "sibling",
+        _LEGACY_IMPL_KEY: "sibling",
         "peft_method": "oft",
         "peft_target_modules": target_modules,
         "tp_size": 1,

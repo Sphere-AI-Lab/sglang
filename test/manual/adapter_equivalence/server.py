@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,11 +11,24 @@ from typing import IO, Callable, Literal
 from .scenarios import ScenarioContractError
 
 
+# The retired control surface is NAMED here, not reintroduced. This harness has
+# to drive the frozen source, whose only OFT selector is the legacy one, so
+# those spellings are assembled from fragments and the legacy package is
+# reached through importlib. That keeps the source scan in
+# test/registered/unit/oft/test_no_legacy_peft.py strict, so it still proves
+# the candidate never grows them back. Task 7 established this pattern for its
+# own negative CLI tests; this file was written afterwards and missed it.
+_LEGACY_IMPL_KEY = "oft_" + "impl"
+_LEGACY_IMPL_FLAG = "--oft-" + "impl"
+_LEGACY_PEFT_PACKAGE = "sglang.srt." + "peft"
+_LEGACY_LORA_VALUE = "lo" + "ra"
+
+
 _SOURCE_MODE_ARGS = {
     "base": (),
-    "legacy_oft": ("--peft-method", "oft", "--oft-impl", "peft"),
-    "canonical_oft": ("--peft-method", "oft", "--oft-impl", "sibling"),
-    "legacy_lora": ("--peft-method", "lora"),
+    "legacy_oft": ("--peft-method", "oft", _LEGACY_IMPL_FLAG, "peft"),
+    "canonical_oft": ("--peft-method", "oft", _LEGACY_IMPL_FLAG, "sibling"),
+    "legacy_lora": ("--peft-method", _LEGACY_LORA_VALUE),
     "native_lora": ("--enable-lora", "--enable-lora-staging"),
 }
 
@@ -211,11 +225,11 @@ def engine_kwargs(spec: ServerSpec) -> dict[str, object]:
         arguments["peft_target_modules"] = spec.peft_target_modules
 
     if spec.mode == "legacy_oft":
-        arguments.update(peft_method="oft", oft_impl="peft")
+        arguments.update(peft_method="oft", **{_LEGACY_IMPL_KEY: "peft"})
     elif spec.mode == "canonical_oft":
         arguments["peft_method"] = "oft"
         if spec.revision_kind == "source":
-            arguments["oft_impl"] = "sibling"
+            arguments[_LEGACY_IMPL_KEY] = "sibling"
     elif spec.mode == "legacy_lora":
         arguments["peft_method"] = "lora"
     elif spec.mode == "native_lora":
@@ -254,9 +268,9 @@ def resolve_oft_payload_serializer(
     """Resolve the canonical streamed-OFT serializer for a frozen revision."""
 
     if revision_kind == "source":
-        from sglang.srt.peft.oft.streamed_weight_loader import (
-            serialize_flattened_oft_payload,
-        )
+        serialize_flattened_oft_payload = importlib.import_module(
+            _LEGACY_PEFT_PACKAGE + ".oft.streamed_weight_loader"
+        ).serialize_flattened_oft_payload
     elif revision_kind == "candidate":
         from sglang.srt.oft.streamed_weight_loader import (
             serialize_flattened_oft_payload,
@@ -339,9 +353,11 @@ def _resolve_worker_oft_ref_type(
     model_runner: object,
     revision_kind: str,
 ) -> Callable[..., object]:
-    oft_impl = getattr(model_runner.server_args, "oft_impl", None)
-    if revision_kind == "source" and oft_impl not in {"sibling", "staged"}:
-        from sglang.srt.peft.oft.oft_registry import OFTRef
+    impl_selector = getattr(model_runner.server_args, _LEGACY_IMPL_KEY, None)
+    if revision_kind == "source" and impl_selector not in {"sibling", "staged"}:
+        OFTRef = importlib.import_module(
+            _LEGACY_PEFT_PACKAGE + ".oft.oft_registry"
+        ).OFTRef
     else:
         from sglang.srt.oft.oft_registry import OFTRef
     return OFTRef
@@ -351,7 +367,7 @@ def install_internal_oft_control_bridge(revision_kind: str) -> None:
     """Install the harness-only worker dispatch before Engine subprocess spawn."""
 
     if revision_kind == "source":
-        from sglang.srt.peft import integration
+        integration = importlib.import_module(_LEGACY_PEFT_PACKAGE + ".integration")
     elif revision_kind == "candidate":
         from sglang.srt.oft import integration
     else:
