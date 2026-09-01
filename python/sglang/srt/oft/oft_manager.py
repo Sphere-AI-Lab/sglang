@@ -447,7 +447,18 @@ class OFTManager(AdapterManager):
         undefined -- a silently wrong-serving-results failure mode, worse
         than the disclosed evicted-adapter one. `unload_streamed_adapter(ref)`
         undoes that registration on commit failure so the phantom ref is
-        never left resident."""
+        never left resident.
+
+        KNOWN LIMITATION: multi-tenant serving is only correct for
+        dense-target-module adapters. If two concurrently-resident adapters
+        both carry MoE/expert OFT weights, they silently share state
+        (`apply_streamed_expert_oft` writes onto module-level
+        `moe.w13_oft_r`/`w1_oft_r`/`w3_oft_r`/`w2_oft_r`, not a per-adapter
+        slot) because `FusedMoEWithOFT.forward` has no per-token
+        adapter-routing mechanism, unlike the dense path (`prepare_oft_batch`'s
+        `weight_indices`) or LoRA's MoE path (`token_lora_mapping`). See
+        `apply_streamed_expert_oft`'s docstring for why `slot_idx` alone
+        doesn't fix this."""
         from sglang.srt.oft.streamed_weight_loader import (
             _commit_streamed_oft_tensor_groups,
             _resolve_streamed_oft_tensor_groups,
@@ -1355,6 +1366,16 @@ class OFTManager(AdapterManager):
         and scatters straight into ``self.memory_pool.slot(group, layer,
         slot_idx)`` instead, leaving ``moe.w*_oft_r`` untouched so forward
         keeps reading ACTIVE until ``activate()`` flips it.
+
+        NOTE: an explicit ``slot_idx`` only isolates the WRITE; it does not
+        give multi-tenant correctness by itself, since nothing on the read
+        side selects a per-request ``slot_idx`` -- ``FusedMoEWithOFT.forward``
+        always reads the plain ``moe.w*_oft_r`` attribute this writes when
+        ``slot_idx=None``. Using a per-adapter ``slot_idx`` here without a
+        matching per-token routing mechanism in forward would make that
+        adapter's rotation silently never apply, not fix concurrent
+        residency (`StagedOFTManager`'s ``staging_idx`` usage is safe only
+        because exactly one thing is ever active at a time).
 
         Per-layer batched Cayley (one ``precompute_oft_r`` call per
         (layer, proj) covering all experts present in this chunk; no
