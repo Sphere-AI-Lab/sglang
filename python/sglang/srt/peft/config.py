@@ -70,7 +70,9 @@ class PEFTArgs:
         "If specified, limits the maximum number of OFT adapters loaded in "
         "the tokenizer-side registry at a time (CPU-side bookkeeping — "
         "independent of --max-ofts-per-batch's GPU-resident batch capacity). "
-        "Must be >= --max-ofts-per-batch.",
+        "Must be >= --max-ofts-per-batch - 1 (buffer slot 0 is always "
+        "reserved for the base/identity placeholder, so real per-batch "
+        "adapter capacity is --max-ofts-per-batch - 1).",
         NS("lora"),
     ] = None
     oft_backend: A[str, NS("lora")] = "triton"
@@ -174,7 +176,7 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         "--max-loaded-ofts",
         type=int,
         default=PEFTArgs.max_loaded_ofts,
-        help="If specified, limits the maximum number of OFT adapters loaded in the tokenizer-side registry at a time. The value must be greater than or equal to `--max-ofts-per-batch`.",
+        help="If specified, limits the maximum number of OFT adapters loaded in the tokenizer-side registry at a time. The value must be greater than or equal to `--max-ofts-per-batch - 1` (buffer slot 0 is always reserved for the base/identity placeholder, so real per-batch adapter capacity is `--max-ofts-per-batch - 1`).",
     )
     parser.add_argument(
         "--oft-backend",
@@ -251,9 +253,20 @@ def validate_peft_args(server_args) -> None:
     assert server_args.max_ofts_per_batch > 0, "max_ofts_per_batch must be positive"
 
     if server_args.max_loaded_ofts is not None:
-        assert server_args.max_loaded_ofts >= server_args.max_ofts_per_batch, (
+        # Buffer slot 0 is always reserved for the base/identity placeholder
+        # (see OFTMemoryPool), so real per-batch adapter capacity is
+        # max_ofts_per_batch - 1, not max_ofts_per_batch. Requiring
+        # max_loaded_ofts >= max_ofts_per_batch (the prior bound) let the
+        # minimum legal configuration already overcommit real capacity by
+        # exactly one slot: with wire-loaded (non-reloadable, never-evicted)
+        # adapters, loading max_loaded_ofts of them could then always fail
+        # to admit the last one, since only max_ofts_per_batch - 1 real
+        # slots ever exist.
+        assert server_args.max_loaded_ofts >= server_args.max_ofts_per_batch - 1, (
             "max_loaded_ofts should be greater than or equal to "
-            "max_ofts_per_batch. "
+            "max_ofts_per_batch - 1 (buffer slot 0 is always reserved for "
+            "the base/identity placeholder, so real per-batch adapter "
+            "capacity is max_ofts_per_batch - 1). "
             f"max_loaded_ofts={server_args.max_loaded_ofts}, "
             f"max_ofts_per_batch={server_args.max_ofts_per_batch}"
         )

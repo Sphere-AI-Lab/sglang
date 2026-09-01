@@ -1646,6 +1646,8 @@ class Engine(EngineScoreMixin, EngineBase):
         tensors: Union[Dict[str, torch.Tensor], List[SerializedTensorPayload]],
         config_dict: Dict,
         load_format: Optional[str] = None,
+        pinned: bool = False,
+        upsert: bool = False,
     ):
         serialized_named_tensors = self._serialize_tensors_per_rank(
             tensors, load_format
@@ -1655,6 +1657,8 @@ class Engine(EngineScoreMixin, EngineBase):
             config_dict=config_dict,
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
+            pinned=pinned,
+            upsert=upsert,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.load_oft_adapter_from_tensors(req, None)
@@ -1669,6 +1673,7 @@ class Engine(EngineScoreMixin, EngineBase):
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         pinned: bool = False,
+        upsert: bool = False,
     ):
         """Load a new OFT adapter whose weights are broadcast over a
         process group. The weight-update group must already be initialized
@@ -1681,6 +1686,7 @@ class Engine(EngineScoreMixin, EngineBase):
             shapes=shapes,
             group_name=group_name,
             pinned=pinned,
+            upsert=upsert,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.load_oft_adapter_from_distributed(req, None)

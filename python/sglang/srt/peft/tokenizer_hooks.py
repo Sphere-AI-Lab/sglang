@@ -66,22 +66,54 @@ def init_tokenizer_peft(tm):
         )
 
 
-async def register_peft_ref(tm, obj):
+async def register_peft_ref(tm, obj) -> bool:
     """Register-before-dispatch for a streamed peft adapter (LoRA or OFT): mint the
     ref in the active registry and set obj.adapter_id.
 
     Triggered by ``obj.adapter_name`` being set -- orbit populates it only on peft
     adapter loads (update_weights_from_tensor), not on base-weight updates -- so no
     load_format branch is needed.
+
+    Returns True if this call newly minted and registered the ref (the name
+    was not already known to this tokenizer), False if it resolved an
+    existing one. A caller whose backend dispatch can still fail after this
+    returns uses that to decide whether a failure should roll the
+    registration back via ``rollback_peft_ref`` -- otherwise it would
+    incorrectly tear down an adapter that was already loaded and serving
+    before this request.
     """
     if obj.adapter_name is None or tm.peft_registry is None:
-        return
+        return False
     name = obj.adapter_name
-    if name not in tm.peft_ref_cache:
+    newly_registered = name not in tm.peft_ref_cache
+    if newly_registered:
         ref = _mint_ref(tm, name)
         await tm.peft_registry.register(ref)
         tm.peft_ref_cache[name] = ref
     obj.adapter_id = tm.peft_ref_cache[name].adapter_id
+    return newly_registered
+
+
+async def rollback_peft_ref(tm, name):
+    """Undo a ``register_peft_ref`` registration after the backend load it was
+    staged for turned out to fail.
+
+    Only call this when ``register_peft_ref`` reported ``True`` (newly
+    registered) for this same name -- otherwise this would incorrectly tear
+    down an adapter that was already loaded and serving before this request.
+
+    Without this, a failed streamed load (e.g. the retired
+    ``load_format="oft_adapter"`` path's graceful reject) leaves a
+    registered-but-not-actually-resident name behind: a later ``/generate``
+    naming it passes the tokenizer-side registry check and reaches the
+    GPU-side code with no matching adapter there, instead of a clean
+    "adapter not found" rejection.
+    """
+    if tm.peft_registry is None:
+        return
+    adapter_id = await tm.peft_registry.unregister(name)
+    await tm.peft_registry.wait_for_unload(adapter_id)
+    tm.peft_ref_cache.pop(name, None)
 
 
 async def bump_peft_version(tm, obj, success):

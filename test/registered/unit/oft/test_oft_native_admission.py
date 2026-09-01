@@ -88,12 +88,13 @@ def _make_manager(max_ofts_per_batch=4, max_block_size=BLOCK_SIZE):
     return mgr
 
 
-def _make_ref(name, adapter_id=None, pinned=False):
+def _make_ref(name, adapter_id=None, pinned=False, reloadable=True):
     return OFTRef(
         adapter_id=adapter_id or name,
         adapter_name=name,
         adapter_path=name,
         pinned=pinned,
+        reloadable=reloadable,
     )
 
 
@@ -198,6 +199,46 @@ class TestAllocateBufferSlotWithEviction(unittest.TestCase):
         pool.buffer_id_to_uid = [None]
         with self.assertRaises(ValueError):
             pool.allocate_buffer_slot_with_eviction({})
+
+    def test_non_reloadable_resident_never_evicted(self):
+        # C1 fix: an adapter loaded over the wire (reloadable=False) has no
+        # CPU-side artifact to re-page from, so evicting it is unrecoverable
+        # -- it must never be picked as a victim, mirroring the pinned check.
+        pool = _make_pool(max_ofts_per_batch=1)
+        refs = {"wire_loaded": _make_ref("wire_loaded", reloadable=False)}
+        pool.uid_to_buffer_id = {"wire_loaded": 0}
+        pool.buffer_id_to_uid = ["wire_loaded"]
+        with self.assertRaises(ValueError):
+            pool.allocate_buffer_slot_with_eviction(refs)
+        self.assertIn("wire_loaded", pool.uid_to_buffer_id)  # untouched on failure
+
+    def test_reloadable_preferred_over_non_reloadable_when_both_present(self):
+        pool = _make_pool(max_ofts_per_batch=2)
+        refs = {
+            "wire_loaded": _make_ref("wire_loaded", reloadable=False),
+            "disk_backed": _make_ref("disk_backed", reloadable=True),
+        }
+        pool.uid_to_buffer_id = {"wire_loaded": 0, "disk_backed": 1}
+        pool.buffer_id_to_uid = ["wire_loaded", "disk_backed"]
+        pool.eviction_policy.mark_used("wire_loaded")
+        pool.eviction_policy.mark_used("disk_backed")
+        buffer_id, evicted = pool.allocate_buffer_slot_with_eviction(refs)
+        self.assertEqual(evicted, "disk_backed")
+        self.assertEqual(buffer_id, 1)
+        self.assertIn("wire_loaded", pool.uid_to_buffer_id)
+
+    def test_pool_full_of_only_pinned_and_non_reloadable_raises(self):
+        # No legal victim anywhere in the pool -- must fail cleanly rather
+        # than fall back to evicting one of them unsafely.
+        pool = _make_pool(max_ofts_per_batch=2)
+        refs = {
+            "pinned_one": _make_ref("pinned_one", pinned=True),
+            "wire_loaded": _make_ref("wire_loaded", reloadable=False),
+        }
+        pool.uid_to_buffer_id = {"pinned_one": 0, "wire_loaded": 1}
+        pool.buffer_id_to_uid = ["pinned_one", "wire_loaded"]
+        with self.assertRaises(ValueError):
+            pool.allocate_buffer_slot_with_eviction(refs)
 
     def test_allocate_buffer_slot_itself_still_hard_fails_unchanged(self):
         pool = _make_pool(max_ofts_per_batch=1)
@@ -368,6 +409,167 @@ class TestValidateBeforeEvict(unittest.TestCase):
         self.assertNotIn(
             new_ref.adapter_id, mgr.memory_pool.eviction_policy.access_order
         )
+
+
+class TestEvictionPreservesDiskBackedAdapter(unittest.TestCase):
+    """C1 fix #2: once fix #1 excludes wire-loaded (non-reloadable)
+    residents from eviction candidacy, the only adapters
+    allocate_buffer_slot_with_eviction can ever select as a victim are
+    disk-backed (--peft-paths) ones -- self.refs/self.configs are shared by
+    both kinds, but only disk-backed adapters also have a self.adapters
+    entry. Calling unload_streamed_adapter on such a victim would delete
+    its configs/refs while leaving self.adapters behind and num_pinned
+    un-decremented -- a half-unloaded state. The eviction (and upsert-of-
+    existing-name) call sites must instead only free its buffer slot,
+    leaving the rest of its CPU-side bookkeeping intact so it can be
+    lazily re-admitted into a fresh slot later, exactly like any adapter
+    that simply isn't in the current batch."""
+
+    def test_disk_backed_eviction_victim_keeps_configs_refs_and_adapters(self):
+        # max_ofts_per_batch=1: the disk-backed adapter occupies the only
+        # slot, so admitting the new one MUST evict it (no empty slot to
+        # fall back to first).
+        mgr = _make_manager(max_ofts_per_batch=1)
+        disk_ref = _make_ref("disk_backed", reloadable=True)
+        mgr.refs[disk_ref.adapter_id] = disk_ref
+        mgr.configs[disk_ref.adapter_id] = "disk_cfg"
+        mgr.adapters[disk_ref.adapter_id] = "disk_adapter_object"
+        mgr.memory_pool.uid_to_buffer_id[disk_ref.adapter_id] = 0
+        mgr.memory_pool.buffer_id_to_uid[0] = disk_ref.adapter_id
+        mgr.memory_pool.eviction_policy.mark_used(disk_ref.adapter_id)
+
+        new_ref = _make_ref("wire_new", reloadable=False)
+        with patch(
+            "sglang.srt.oft.streamed_weight_loader._resolve_streamed_oft_tensor_groups",
+            return_value=(("fused", {}, {}, []), ""),
+        ), patch(
+            "sglang.srt.oft.streamed_weight_loader._commit_streamed_oft_tensor_groups",
+            return_value=(True, "Success"),
+        ):
+            result = mgr.load_adapter_from_tensors(new_ref, [], CONFIG_DICT)
+
+        self.assertTrue(result.success, result.error_message)
+        # Lost its GPU buffer slot to the new wire-loaded adapter...
+        self.assertNotIn(disk_ref.adapter_id, mgr.memory_pool.uid_to_buffer_id)
+        # ...but keeps its CPU-side bookkeeping fully intact -- unlike a
+        # wire-loaded victim, which would be fully unloaded (configs/refs
+        # deleted too, since it has nothing else to fall back on).
+        self.assertIn(disk_ref.adapter_id, mgr.refs)
+        self.assertIn(disk_ref.adapter_id, mgr.configs)
+        self.assertIn(disk_ref.adapter_id, mgr.adapters)
+
+    def test_upsert_of_disk_backed_name_keeps_it_registered(self):
+        """Same bug shape at the OTHER call site that can unload a resident
+        ref by name: an upsert naming an already-loaded adapter must not
+        fully unload it if it turns out to be disk-backed."""
+        mgr = _make_manager(max_ofts_per_batch=2)
+        disk_ref = _make_ref("shared_name", reloadable=True)
+        mgr.refs[disk_ref.adapter_id] = disk_ref
+        mgr.configs[disk_ref.adapter_id] = "disk_cfg"
+        mgr.adapters[disk_ref.adapter_id] = "disk_adapter_object"
+        mgr.memory_pool.uid_to_buffer_id[disk_ref.adapter_id] = 0
+        mgr.memory_pool.buffer_id_to_uid[0] = disk_ref.adapter_id
+
+        new_ref = _make_ref("shared_name", adapter_id="new_wire_id", reloadable=False)
+        with patch(
+            "sglang.srt.oft.streamed_weight_loader._resolve_streamed_oft_tensor_groups",
+            return_value=(("fused", {}, {}, []), ""),
+        ), patch(
+            "sglang.srt.oft.streamed_weight_loader._commit_streamed_oft_tensor_groups",
+            return_value=(True, "Success"),
+        ):
+            result = mgr.load_adapter_from_tensors(
+                new_ref, [], CONFIG_DICT, upsert=True
+            )
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertIn(disk_ref.adapter_id, mgr.refs)
+        self.assertIn(disk_ref.adapter_id, mgr.configs)
+        self.assertIn(disk_ref.adapter_id, mgr.adapters)
+
+
+class TestNumPinnedBookkeeping(unittest.TestCase):
+    """I6 fix: register_streamed_adapter/unload_streamed_adapter must keep
+    num_pinned in sync for pinned wire-loaded adapters -- previously
+    register_streamed_adapter never touched it, silently under-counting
+    num_pinned and making validate_new_adapter's anti-starvation guard and
+    validate_batch's mem_pool_vacancy arithmetic (base/manager.py) wrong once
+    pinned OFT adapters became reachable over the wire."""
+
+    def test_register_increments_num_pinned_for_pinned_ref(self):
+        mgr = _make_manager(max_ofts_per_batch=2)
+        ref = _make_ref("pinned_wire", pinned=True, reloadable=False)
+        result = mgr.register_streamed_adapter(ref, 0, CONFIG_DICT)
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(mgr.num_pinned, 1)
+
+    def test_register_does_not_increment_for_unpinned_ref(self):
+        mgr = _make_manager(max_ofts_per_batch=2)
+        ref = _make_ref("unpinned_wire", pinned=False, reloadable=False)
+        result = mgr.register_streamed_adapter(ref, 0, CONFIG_DICT)
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(mgr.num_pinned, 0)
+
+    def test_unload_decrements_num_pinned_for_pinned_ref(self):
+        mgr = _make_manager(max_ofts_per_batch=2)
+        ref = _make_ref("pinned_wire", pinned=True, reloadable=False)
+        mgr.register_streamed_adapter(ref, 0, CONFIG_DICT)
+        self.assertEqual(mgr.num_pinned, 1)
+        result = mgr.unload_streamed_adapter(ref)
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(mgr.num_pinned, 0)
+
+    def test_double_unload_does_not_double_decrement(self):
+        mgr = _make_manager(max_ofts_per_batch=2)
+        ref = _make_ref("pinned_wire", pinned=True, reloadable=False)
+        mgr.register_streamed_adapter(ref, 0, CONFIG_DICT)
+        mgr.unload_streamed_adapter(ref)
+        mgr.unload_streamed_adapter(ref)  # idempotent re-unload
+        self.assertEqual(mgr.num_pinned, 0)
+
+    def test_double_register_does_not_double_increment(self):
+        mgr = _make_manager(max_ofts_per_batch=2)
+        ref = _make_ref("pinned_wire", pinned=True, reloadable=False)
+        mgr.register_streamed_adapter(ref, 0, CONFIG_DICT)
+        mgr.register_streamed_adapter(ref, 0, CONFIG_DICT)
+        self.assertEqual(mgr.num_pinned, 1)
+
+
+class TestGracefulFailureInsteadOfAssert(unittest.TestCase):
+    """C1 fix #3 (defense in depth): a registry/GPU-pool divergence (e.g. a
+    dispatch for an adapter the GPU pool has already evicted) must produce a
+    graceful failure, not a bare AssertionError that can escape uncaught and
+    crash the engine."""
+
+    def test_unload_adapter_missing_config_returns_graceful_failure(self):
+        mgr = _make_manager(max_ofts_per_batch=2)
+        ref = _make_ref("never_loaded")
+        result = mgr.unload_adapter(ref)
+        self.assertFalse(result.success)
+        self.assertIn("not loaded", result.error_message)
+
+    def test_unload_adapter_missing_ref_returns_graceful_failure(self):
+        mgr = _make_manager(max_ofts_per_batch=2)
+        ref = _make_ref("half_present")
+        # configs present but refs missing -- an inconsistent state that
+        # must still fail gracefully, not assert.
+        mgr.configs[ref.adapter_id] = "cfg"
+        result = mgr.unload_adapter(ref)
+        self.assertFalse(result.success)
+        self.assertIn("not loaded", result.error_message)
+
+    def test_load_oft_weight_to_buffer_raises_value_error_for_missing_adapter(self):
+        # A bound-but-unbacked stand-in, mirroring _make_pool's pattern: the
+        # real (unbound) OFTMemoryPool method is bound via MethodType, so
+        # this exercises the actual production code. The oft_adapter=None
+        # check fires before any R_buffer access, so no buffer state is
+        # needed for this branch.
+        pool = SimpleNamespace()
+        pool.load_oft_weight_to_buffer = MethodType(
+            OFTMemoryPool.load_oft_weight_to_buffer, pool
+        )
+        with self.assertRaises(ValueError):
+            pool.load_oft_weight_to_buffer("some_uid", 0, None, [], None, None)
 
 
 class TestResolveCommitSplit(unittest.TestCase):

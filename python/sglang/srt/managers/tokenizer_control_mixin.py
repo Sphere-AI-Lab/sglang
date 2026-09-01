@@ -721,7 +721,9 @@ class TokenizerControlMixin:
         # tokenizer-side -> generate 400s with "never been loaded".
         from sglang.srt.peft import tokenizer_hooks as peft_tokenizer_hooks
 
-        await peft_tokenizer_hooks.register_peft_ref(self, obj)
+        newly_registered_peft_ref = await peft_tokenizer_hooks.register_peft_ref(
+            self, obj
+        )
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -739,6 +741,14 @@ class TokenizerControlMixin:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
         message += await peft_tokenizer_hooks.bump_peft_version(self, obj, success)
+        if not success and newly_registered_peft_ref:
+            # The backend load this ref was minted for failed (e.g. the
+            # retired load_format="oft_adapter" path's graceful reject) --
+            # without rolling back, the name stays registered tokenizer-side
+            # with nothing actually resident on the backend, so a later
+            # /generate naming it reaches the GPU-side code instead of
+            # getting a clean "adapter not found" rejection here.
+            await peft_tokenizer_hooks.rollback_peft_ref(self, obj.adapter_name)
 
         return success, message
 
@@ -1120,6 +1130,10 @@ class TokenizerControlMixin:
             obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
                 obj.serialized_named_tensors
             )
+            logger.info(
+                "Start load OFT adapter from tensors. Adapter name=%s",
+                obj.adapter_name,
+            )
             async with self.peft_update_lock:
                 # Built inline (not via obj.to_ref()): to_ref() passes
                 # obj.adapter_id through explicitly, which is None on a fresh
@@ -1159,6 +1173,11 @@ class TokenizerControlMixin:
                                 "evict LRU OFT adapter. OFT registry is: "
                                 f"{self.peft_registry.get_all_adapters()}"
                             )
+                        logger.info(
+                            f"Unloading least recently used OFT adapter '{lru_name}' "
+                            f"(current number of adapters: {self.peft_registry.num_registered_ofts}, "
+                            f"max allowed: {self.server_args.max_loaded_ofts})"
+                        )
                         unload_result = await self._unload_oft_adapter_locked(
                             UnloadOFTAdapterReqInput(adapter_name=lru_name)
                         )
@@ -1189,6 +1208,11 @@ class TokenizerControlMixin:
                     "Native OFT adapter loading requires --peft-method oft "
                     "--oft-impl sibling."
                 )
+            logger.info(
+                "Start load OFT adapter from distributed. Adapter name=%s, group=%s",
+                obj.adapter_name,
+                obj.group_name,
+            )
             async with self.peft_update_lock:
                 # See load_oft_adapter_from_tensors: built inline rather than
                 # via obj.to_ref(), which would pass the not-yet-minted
@@ -1233,6 +1257,11 @@ class TokenizerControlMixin:
                                 "evict LRU OFT adapter. OFT registry is: "
                                 f"{self.peft_registry.get_all_adapters()}"
                             )
+                        logger.info(
+                            f"Unloading least recently used OFT adapter '{lru_name}' "
+                            f"(current number of adapters: {self.peft_registry.num_registered_ofts}, "
+                            f"max allowed: {self.server_args.max_loaded_ofts})"
+                        )
                         unload_result = await self._unload_oft_adapter_locked(
                             UnloadOFTAdapterReqInput(adapter_name=lru_name)
                         )
@@ -1284,6 +1313,10 @@ class TokenizerControlMixin:
                     "Native OFT adapter loading requires --peft-method oft "
                     "--oft-impl sibling."
                 )
+            logger.info(
+                "Start unload OFT adapter. Adapter name=%s",
+                obj.adapter_name,
+            )
             async with self.peft_update_lock:
                 result = await self._unload_oft_adapter_locked(obj)
                 # Explicit unload is a DELETE: drop the ref_cache entry too

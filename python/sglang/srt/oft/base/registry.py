@@ -137,6 +137,14 @@ class AdapterRegistry:
         (``reused=False``). Nothing is registered here: the caller commits
         the resolved ref with ``register``/``refresh`` once the backend load
         succeeded, keeping failed loads invisible to the registry.
+
+        Also bumps ``adapter_version`` past the existing entry's on reuse:
+        the radix cache key is extended with the adapter's version (see
+        ``maybe_extend_extra_key``), so KV produced under the old weights
+        must live under a different key than requests arriving after this
+        in-place refresh -- otherwise a prompt re-served after an upsert
+        could silently return output computed with the stale, pre-upsert
+        weights via a cached KV prefix.
         """
         if not upsert:
             return ref, False
@@ -144,7 +152,10 @@ class AdapterRegistry:
             existing = self._registry.get(ref.adapter_name)
             if existing is None:
                 return ref, False
-            updates = {"adapter_id": existing.adapter_id}
+            updates = {
+                "adapter_id": existing.adapter_id,
+                "adapter_version": existing.adapter_version + 1,
+            }
             if preserve_pinned:
                 updates["pinned"] = existing.pinned
             return replace(ref, **updates), True

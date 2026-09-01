@@ -170,6 +170,47 @@ class TestUpsertReusesId(CustomTestCase):
         self.assertEqual(obj.adapter_id, existing.adapter_id)
         self.assertEqual(tm.peft_registry.num_registered_ofts, 1)
 
+    def test_from_distributed_upsert_bumps_adapter_version(self):
+        """Regression guard for C2: the native handler's upsert path must
+        bump adapter_version on the registered/cached ref -- otherwise the
+        radix cache key never changes across in-place refreshes and a
+        request could be served from a stale, pre-refresh KV prefix."""
+        tm = _make_tokenizer_manager()
+        existing = OFTRef(
+            adapter_name="a",
+            adapter_path="__distributed__",
+            reloadable=False,
+            adapter_version=1,
+        )
+        asyncio.run(tm.peft_registry.register(existing))
+
+        result = asyncio.run(
+            tm.load_oft_adapter_from_distributed(_make_distributed_req("a", upsert=True))
+        )
+
+        self.assertTrue(result.success)
+        updated = tm.peft_registry.get_all_adapters()["a"]
+        self.assertEqual(updated.adapter_version, existing.adapter_version + 1)
+        self.assertEqual(tm.peft_ref_cache["a"].adapter_version, updated.adapter_version)
+
+    def test_from_tensors_upsert_bumps_adapter_version(self):
+        tm = _make_tokenizer_manager()
+        existing = OFTRef(
+            adapter_name="a",
+            adapter_path="__tensor__",
+            reloadable=False,
+            adapter_version=1,
+        )
+        asyncio.run(tm.peft_registry.register(existing))
+
+        result = asyncio.run(
+            tm.load_oft_adapter_from_tensors(_make_tensors_req("a", upsert=True))
+        )
+
+        self.assertTrue(result.success)
+        updated = tm.peft_registry.get_all_adapters()["a"]
+        self.assertEqual(updated.adapter_version, existing.adapter_version + 1)
+
     def test_non_upsert_duplicate_fails(self):
         tm = _make_tokenizer_manager()
         asyncio.run(
@@ -415,6 +456,77 @@ class TestFinalizePeftLeaseNoOp(CustomTestCase):
             await asyncio.sleep(0)
 
         asyncio.run(run())
+
+
+class TestRegisterPeftRefRollback(CustomTestCase):
+    """Regression guard for C1c: register_peft_ref (used by the retired
+    load_format="oft_adapter" streamed-update path, tokenizer_control_mixin
+    .update_weights_from_tensor) must report whether it newly minted a
+    registration, so a caller whose backend load subsequently fails can roll
+    it back via rollback_peft_ref. Without this, a failed streamed load
+    leaves a registered-but-not-actually-resident name behind: a later
+    /generate naming it passes the tokenizer-side registry check and
+    reaches the GPU-side code with no matching adapter there, instead of a
+    clean "adapter not found" rejection."""
+
+    @staticmethod
+    def _make_tm():
+        return SimpleNamespace(peft_registry=OFTRegistry(), peft_ref_cache={})
+
+    def test_register_peft_ref_reports_newly_registered(self):
+        from sglang.srt.peft.tokenizer_hooks import register_peft_ref
+
+        tm = self._make_tm()
+        obj = SimpleNamespace(adapter_name="a", adapter_id=None)
+        newly_registered = asyncio.run(register_peft_ref(tm, obj))
+        self.assertTrue(newly_registered)
+        self.assertIn("a", tm.peft_ref_cache)
+        self.assertIsNotNone(obj.adapter_id)
+
+    def test_register_peft_ref_reports_not_new_for_existing_name(self):
+        from sglang.srt.peft.tokenizer_hooks import register_peft_ref
+
+        tm = self._make_tm()
+        obj1 = SimpleNamespace(adapter_name="a", adapter_id=None)
+        asyncio.run(register_peft_ref(tm, obj1))
+
+        obj2 = SimpleNamespace(adapter_name="a", adapter_id=None)
+        newly_registered = asyncio.run(register_peft_ref(tm, obj2))
+        self.assertFalse(newly_registered)
+        self.assertEqual(obj2.adapter_id, obj1.adapter_id)
+
+    def test_rollback_peft_ref_removes_newly_registered_name(self):
+        from sglang.srt.peft.tokenizer_hooks import (
+            register_peft_ref,
+            rollback_peft_ref,
+        )
+
+        tm = self._make_tm()
+        obj = SimpleNamespace(adapter_name="a", adapter_id=None)
+        newly_registered = asyncio.run(register_peft_ref(tm, obj))
+        self.assertTrue(newly_registered)
+
+        asyncio.run(rollback_peft_ref(tm, obj.adapter_name))
+
+        self.assertNotIn("a", tm.peft_ref_cache)
+        self.assertEqual(tm.peft_registry.num_registered_ofts, 0)
+
+    def test_rollback_gate_does_not_apply_to_a_previously_existing_adapter(self):
+        """Guards the exact regression this fix must avoid: a caller must
+        only roll back when register_peft_ref reported newly_registered=
+        True. A second registration attempt for an already-loaded name
+        resolves the EXISTING ref (newly_registered=False) precisely so a
+        caller never rolls back an adapter that was already loaded and
+        serving before this request."""
+        from sglang.srt.peft.tokenizer_hooks import register_peft_ref
+
+        tm = self._make_tm()
+        obj1 = SimpleNamespace(adapter_name="a", adapter_id=None)
+        asyncio.run(register_peft_ref(tm, obj1))
+
+        obj2 = SimpleNamespace(adapter_name="a", adapter_id=None)
+        newly_registered = asyncio.run(register_peft_ref(tm, obj2))
+        self.assertFalse(newly_registered)
 
 
 class TestWrongPeftConfigRejected(CustomTestCase):

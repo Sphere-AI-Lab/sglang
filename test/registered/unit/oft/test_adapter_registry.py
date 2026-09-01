@@ -38,6 +38,34 @@ class TestResolveOrReuse(unittest.IsolatedAsyncioTestCase):
         # resolve_or_reuse must not mutate the registry itself.
         self.assertIs(registry.get_all_adapters()["a"], existing)
 
+    async def test_upsert_bumps_adapter_version(self):
+        """Regression guard for C2: an in-place upsert must bump
+        adapter_version past the existing entry's, so the radix cache key
+        (which is extended with the adapter's version) changes across the
+        refresh. Without this, repeated in-place upserts of the same
+        adapter name never change the radix key, and a prompt re-served
+        after an upsert could be served from a stale KV prefix cached under
+        the pre-upsert weights."""
+        from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
+
+        registry = AdapterRegistry()
+        existing = AdapterRef(adapter_name="a", adapter_path="old", adapter_version=1)
+        await registry.register(existing)
+        new_ref = AdapterRef(adapter_name="a", adapter_path="new")
+        resolved, reused = await registry.resolve_or_reuse(new_ref, upsert=True)
+        self.assertTrue(reused)
+        self.assertEqual(resolved.adapter_version, existing.adapter_version + 1)
+
+        # A second round of upserts must keep bumping past the CURRENT
+        # registered version, not the original one.
+        await registry.refresh(resolved)
+        second_new_ref = AdapterRef(adapter_name="a", adapter_path="newer")
+        resolved_again, reused_again = await registry.resolve_or_reuse(
+            second_new_ref, upsert=True
+        )
+        self.assertTrue(reused_again)
+        self.assertEqual(resolved_again.adapter_version, resolved.adapter_version + 1)
+
     async def test_upsert_preserve_pinned(self):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 

@@ -768,7 +768,19 @@ class OFTMemoryPool(AdapterMemPool):
                 self.lm_head_R_buffer[k][buffer_id] = 0
             return
 
-        assert oft_adapter is not None
+        if oft_adapter is None:
+            # A registry/GPU-pool divergence (e.g. a batch names a uid the
+            # GPU pool no longer has a CPU-side OFTAdapter for -- a wire-
+            # loaded adapter that was, or should never have been, evicted)
+            # slipping through some path not yet foreseen. Raise a clear,
+            # catchable error instead of asserting, so this can never crash
+            # the engine outright.
+            raise ValueError(
+                f"No OFTAdapter available to load for uid={uid!r} into buffer "
+                f"slot {buffer_id}. This uid is resident in the memory pool's "
+                "admission bookkeeping but has no corresponding CPU-side "
+                "adapter to load weights from."
+            )
         block_size = oft_adapter.block_size
 
         # Precompute R from compact weights and load into buffer
@@ -1064,14 +1076,18 @@ class OFTMemoryPool(AdapterMemPool):
         self, refs: Dict[str, OFTRef]
     ) -> Tuple[int, Optional[str]]:
         """Like allocate_buffer_slot, but for the native multi-tenant RPC
-        admission path: if no slot is empty, LRU-evict an unpinned resident
-        real adapter to make room, mirroring AdapterMemPool._acquire_buffer_slot's
-        pattern (the lazy per-batch admission path used by disk-loaded
-        adapters) -- except the base/identity slot (uid=None) is never a
-        candidate here (there is no "current batch" context to safely
-        re-admit it into afterwards, unlike _acquire_buffer_slot's caller),
-        and a pinned ref (the caller's explicit "keep this one resident"
-        request) is never evicted either.
+        admission path: if no slot is empty, LRU-evict an unpinned,
+        reloadable resident real adapter to make room, mirroring
+        AdapterMemPool._acquire_buffer_slot's pattern (the lazy per-batch
+        admission path used by disk-loaded adapters) -- except the
+        base/identity slot (uid=None) is never a candidate here (there is no
+        "current batch" context to safely re-admit it into afterwards,
+        unlike _acquire_buffer_slot's caller), and neither is a pinned ref
+        (the caller's explicit "keep this one resident" request) nor a
+        non-reloadable one (an adapter loaded over the wire has no CPU-side
+        artifact to re-page from, so evicting it would be unrecoverable --
+        mirrors the retired streamed path's _make_streamed_ref, which always
+        pinned such adapters for exactly this reason).
 
         Returns (buffer_id, evicted_uid); evicted_uid is None when an empty
         slot was found and no eviction was needed.
@@ -1089,15 +1105,17 @@ class OFTMemoryPool(AdapterMemPool):
             if uid is None:
                 continue
             ref = refs.get(uid)
-            if ref is not None and ref.pinned:
+            if ref is not None and (ref.pinned or not ref.reloadable):
                 continue
             candidates.add(uid)
 
         if not candidates:
             raise ValueError(
                 "No available buffer slots for direct OFT loading, and no "
-                "evictable (unpinned) resident adapter to make room for a "
-                f"new one. (max_ofts_per_batch={self.max_ofts_per_batch})"
+                "evictable resident adapter to make room for a new one. "
+                "Pinned adapters and adapters loaded over the wire (no "
+                "on-disk artifact to reload from) are never evicted. "
+                f"(max_ofts_per_batch={self.max_ofts_per_batch})"
             )
 
         try:

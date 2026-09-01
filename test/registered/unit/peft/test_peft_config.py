@@ -3,11 +3,22 @@ from types import SimpleNamespace
 import pytest
 
 
-def _args(peft_method, *, enable_lora=True, max_loaded_ofts=None, max_ofts_per_batch=2):
+def _args(
+    peft_method,
+    *,
+    enable_lora=True,
+    max_loaded_ofts=None,
+    max_ofts_per_batch=2,
+    peft_paths=None,
+):
     ns = SimpleNamespace(
         enable_lora=enable_lora,
         peft_method=peft_method,
-        peft_paths=["/models/adapter"] if peft_method is not None else None,
+        peft_paths=(
+            peft_paths
+            if peft_paths is not None
+            else (["/models/adapter"] if peft_method is not None else None)
+        ),
         peft_target_modules=None,
         max_oft_block_size=None,
         max_ofts_per_batch=max_ofts_per_batch,
@@ -65,10 +76,52 @@ def test_native_lora_and_single_active_peft_validate_independently(
     validate_peft_args(_args(peft_method, enable_lora=enable_lora))
 
 
-def test_max_loaded_ofts_must_be_at_least_max_ofts_per_batch():
-    """Validate that max_loaded_ofts must be >= max_ofts_per_batch."""
+def test_max_loaded_ofts_must_be_at_least_max_ofts_per_batch_minus_one():
+    """Validate that max_loaded_ofts must be >= max_ofts_per_batch - 1.
+
+    Buffer slot 0 is always reserved for the base/identity placeholder, so
+    real per-batch adapter capacity is max_ofts_per_batch - 1, not
+    max_ofts_per_batch -- the bound must be checked against that real
+    capacity, or the minimum legal configuration silently overcommits by one
+    slot (see C1's fix in peft/config.py).
+    """
     from sglang.srt.peft.config import validate_peft_args
 
-    # Test case where max_loaded_ofts < max_ofts_per_batch should fail
+    # max_loaded_ofts=2 is below max_ofts_per_batch - 1 == 3: must still fail.
     with pytest.raises(AssertionError, match=r"max_loaded_ofts should be greater than or equal"):
         validate_peft_args(_args("oft", enable_lora=False, max_loaded_ofts=2, max_ofts_per_batch=4))
+
+
+def test_max_loaded_ofts_equal_to_max_ofts_per_batch_minus_one_is_legal():
+    """The new minimum legal boundary (max_loaded_ofts == max_ofts_per_batch
+    - 1) must be accepted -- regression guard for the fix that moved the
+    bound from max_ofts_per_batch to max_ofts_per_batch - 1."""
+    from sglang.srt.peft.config import validate_peft_args
+
+    validate_peft_args(
+        _args(
+            "oft",
+            enable_lora=False,
+            max_loaded_ofts=3,
+            max_ofts_per_batch=4,
+            peft_paths=["/models/adapter"],
+        )
+    )
+
+
+def test_peft_paths_count_must_not_exceed_max_loaded_ofts():
+    """Validate the second (previously untested) branch of the
+    max_loaded_ofts checks: the number of --peft-paths entries must not
+    exceed max_loaded_ofts."""
+    from sglang.srt.peft.config import validate_peft_args
+
+    with pytest.raises(AssertionError, match=r"should not exceed max_loaded_ofts"):
+        validate_peft_args(
+            _args(
+                "oft",
+                enable_lora=False,
+                max_loaded_ofts=3,
+                max_ofts_per_batch=4,
+                peft_paths=["/models/a", "/models/b", "/models/c", "/models/d"],
+            )
+        )

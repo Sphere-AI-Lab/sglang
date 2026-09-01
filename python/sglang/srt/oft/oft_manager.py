@@ -373,12 +373,25 @@ class OFTManager(AdapterManager):
         The buffer slot must already contain the precomputed R matrices.
         """
         try:
+            # Guards against double-counting if this is ever called twice for
+            # the same ref -- mirrors unload_streamed_adapter's symmetric
+            # was_registered guard.
+            was_already_registered = oft_ref.adapter_id in self.refs
             config = OFTConfig.from_dict(config_dict)
             self.configs[oft_ref.adapter_id] = config
             self.refs[oft_ref.adapter_id] = oft_ref
             # Register buffer slot mapping so inference can find this adapter
             self.memory_pool.uid_to_buffer_id[oft_ref.adapter_id] = buffer_id
             self.memory_pool.buffer_id_to_uid[buffer_id] = oft_ref.adapter_id
+            if not was_already_registered:
+                # Keeps num_pinned accurate for pinned adapters loaded over
+                # the wire -- this used to never be counted here, silently
+                # under-counting num_pinned and making validate_new_adapter's
+                # anti-starvation guard (below) and validate_batch's
+                # mem_pool_vacancy arithmetic (base/manager.py) wrong for
+                # pinned wire-loaded adapters. Mirrors AdapterManager.
+                # load_adapter's `self.num_pinned += int(ref.pinned)`.
+                self.num_pinned += int(oft_ref.pinned)
         except Exception as e:
             return self.create_oft_update_result(
                 success=False,
@@ -393,10 +406,18 @@ class OFTManager(AdapterManager):
         since streamed adapters have no OFTAdapter object.
         """
         try:
+            # Snapshot before deleting: was_registered gates the num_pinned
+            # decrement below so a second (idempotent) unload call for the
+            # same ref -- this method already tolerates being called more
+            # than once, via the `in self.configs`/`in self.refs` checks --
+            # can't double-decrement and drive num_pinned negative.
+            was_registered = oft_ref.adapter_id in self.refs
             if oft_ref.adapter_id in self.configs:
                 del self.configs[oft_ref.adapter_id]
             if oft_ref.adapter_id in self.refs:
                 del self.refs[oft_ref.adapter_id]
+            if was_registered:
+                self.num_pinned -= int(oft_ref.pinned)
             # Clean up buffer slot mapping
             if oft_ref.adapter_id in self.memory_pool.uid_to_buffer_id:
                 buffer_id = self.memory_pool.uid_to_buffer_id[oft_ref.adapter_id]
@@ -414,6 +435,40 @@ class OFTManager(AdapterManager):
                 error_message=str(e),
             )
         return self.create_oft_update_result(success=True)
+
+    def _unload_streamed_adapter_if_not_disk_backed(
+        self, oft_ref: OFTRef, *, context: str
+    ) -> "OFTUpdateOutput":
+        """Fully unload ``oft_ref`` via ``unload_streamed_adapter``, unless it
+        has a CPU-side ``OFTAdapter`` entry in ``self.adapters`` -- i.e. it
+        was loaded from disk via ``--peft-paths``, not over the wire.
+
+        ``self.refs``/``self.configs`` are shared by both disk-backed and
+        wire-loaded (streamed) adapters, but only wire-loaded ones lack a
+        ``self.adapters`` entry. Calling ``unload_streamed_adapter`` on a
+        disk-backed adapter would delete its ``configs``/``refs`` entries
+        while leaving ``self.adapters[uid]`` behind and ``num_pinned``
+        un-decremented -- a half-unloaded state that later confuses
+        ``AdapterManager.unload_adapter``'s disk-vs-streamed dispatch (it
+        would find ``adapter_id in self.adapters`` still true but
+        ``configs``/``refs`` already gone). A disk-backed adapter simply
+        losing its GPU buffer slot (already done by the caller, for the
+        eviction case, via ``allocate_buffer_slot_with_eviction``) is fine on
+        its own: it's exactly the same state as any adapter that has never
+        yet been admitted into a batch, and it will be paged back into a
+        fresh slot the next time a batch needs it.
+        """
+        if oft_ref.adapter_id in self.adapters:
+            logger.info(
+                "Freeing the GPU buffer slot of disk-backed OFT adapter "
+                "'%s' (%s) without unloading it -- it remains loaded and "
+                "will be re-admitted into a fresh slot when next "
+                "referenced.",
+                oft_ref.adapter_name,
+                context,
+            )
+            return self._make_update_result(success=True)
+        return self.unload_streamed_adapter(oft_ref)
 
     def load_adapter_from_tensors(
         self, ref: OFTRef, named_tensors, config_dict: dict, *, upsert: bool = False
@@ -512,7 +567,9 @@ class OFTManager(AdapterManager):
                             "loaded; pass upsert=True to refresh it in place."
                         ),
                     )
-                self.unload_streamed_adapter(self.refs[existing_id])
+                self._unload_streamed_adapter_if_not_disk_backed(
+                    self.refs[existing_id], context="upsert"
+                )
 
             buffer_id, evicted_uid = self.memory_pool.allocate_buffer_slot_with_eviction(
                 self.refs
@@ -521,7 +578,9 @@ class OFTManager(AdapterManager):
                 self.refs[evicted_uid].adapter_name if evicted_uid is not None else None
             )
             if evicted_uid is not None:
-                evict_result = self.unload_streamed_adapter(self.refs[evicted_uid])
+                evict_result = self._unload_streamed_adapter_if_not_disk_backed(
+                    self.refs[evicted_uid], context="eviction"
+                )
                 if not evict_result.success:
                     return evict_result
             self.memory_pool.reset_buffer_slot_to_identity(buffer_id)

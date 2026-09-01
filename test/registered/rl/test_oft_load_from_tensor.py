@@ -20,48 +20,18 @@ task). This file exercises the NEW native RPC surface added in Task 7
 the legacy single-active path -- allows multiple OFT adapters to be
 concurrently resident (Task 6's removal of the single-active restriction).
 
-KNOWN BUGS (see this task's report for full evidence/tracebacks -- reported
-to the controller, not fixed here per this task's charter):
-  1. OFTManager.load_adapter_from_tensors (srt/oft/oft_manager.py) passes a
-     raw dict where the shared _resolve_streamed_oft_tensor_groups/
-     _partition_expert_oft_tensors (srt/oft/streamed_weight_loader.py)
-     expect List[Tuple[str, Tensor]] and iterate it directly -- every call
-     currently fails with "ValueError: too many values to unpack (expected
-     2)". This is the first failure every scenario below hits. [Task 9 note:
-     load_adapter_from_tensors now normalizes dict -> list itself before
-     calling these helpers -- this may already be fixed; not verified here,
-     out of Task 9's scope.]
-  2. There is no release counterpart to peft/tokenizer_hooks.py's
-     `tm.peft_registry.acquire_with_version(path)` anywhere in the codebase
-     (unlike LoRA's TokenizerManager._finalize_lora_lease / lora_registry
-     .release). Once any /generate request names an adapter_path,
-     peft_registry.wait_for_unload() -- called by both unload_oft_adapter
-     and the tokenizer-side max_loaded_ofts LRU-eviction loop -- blocks
-     forever (confirmed by direct reproduction + py-spy). Deliberately
-     NEVER call engine.unload_oft_adapter() after a generate() call in this
-     file, to keep this suite from hanging CI indefinitely regardless of
-     bug #1's fix status; cls.engine's teardown is a process kill, not a
-     graceful unload.
-  3. OFTMemoryPool permanently reserves buffer slot 0 for the base/identity
-     (uid=None) placeholder at boot, leaving only max_ofts_per_batch - 1
-     slots for real adapters via allocate_buffer_slot() (srt/oft/mem_pool.py),
-     which -- unlike the regular scheduler-driven batch-admission path --
-     has no eviction fallback and raises once full. With this file's
-     max_ofts_per_batch=4/max_loaded_ofts=4 config, the pool physically
-     exhausts on the 4th real adapter, before the tokenizer-side
-     max_loaded_ofts=4 registry cap is ever reached -- so
-     test_lru_eviction_past_max_loaded_ofts's 5th-load eviction can never
-     be exercised as specified.
-
-Despite bug #1 blocking every scenario below in the pristine tree, a
-temporary local-only patch around bug #1 (reverted, never committed) was
-used to verify past it: test_multi_adapter_concurrent_residency's two
-adapters serve correctly and independently, and test_upsert_refresh's core
-mechanism -- the production RL use case of repeatedly refreshing one
-adapter name in place (resolve_or_reuse/refresh) -- is correct: adapter_id
-stays stable across rounds, the registry never grows, and each round's new
-weights visibly change generation output. See this task's report for the
-patched run transcripts.
+HISTORY: this file's docstring used to document three known bugs against the
+native RPC path (a dict/list mismatch in OFTManager.load_adapter_from_tensors,
+a missing release counterpart for peft_registry.acquire_with_version that made
+unload_oft_adapter hang forever after any generate() call, and
+OFTMemoryPool's eviction-free hard-fail once its buffer pool filled). All
+three were fixed and reviewed earlier in this branch's history: the dict/list
+normalization landed in OFTManager.load_adapter_from_tensors,
+peft_tokenizer_hooks.finalize_peft_lease now releases every request's
+adapter lease on every terminal path, and allocate_buffer_slot_with_eviction
+added LRU eviction to the native admission path. Per that last fix, tests
+below now call engine.unload_oft_adapter() after generate() (see
+test_fresh_load_and_generate) and it completes promptly instead of hanging.
 """
 
 import unittest
@@ -70,7 +40,6 @@ import torch
 from transformers import AutoConfig
 
 import sglang as sgl
-from sglang.srt.managers.io_struct import LoadOFTAdapterFromTensorsReqInput
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -168,11 +137,6 @@ class TestOFTLoadFromTensor(CustomTestCase):
         self.assertTrue(
             result.success, f"Failed to load OFT adapter from tensors: {result.error_message}"
         )
-        # No unload_oft_adapter call here -- see the module docstring: it
-        # hangs forever (peft_registry.wait_for_unload never returns) after
-        # any generate() call names this adapter, a confirmed separate bug.
-        # cls.engine's teardown (process kill, not a graceful unload) cleans
-        # this adapter up at tearDownClass.
         base_text = self._generate(self.engine)
         adapter_text = self._generate(self.engine, adapter_name=name)
         print(f"[Without OFT] {base_text}")
@@ -187,33 +151,26 @@ class TestOFTLoadFromTensor(CustomTestCase):
             "(random-but-nonzero OFT rotation weights should perturb decoding)",
         )
 
-    def _upsert(self, engine, name: str, seed: int):
-        """Send one in-place-refresh LoadOFTAdapterFromTensorsReqInput
-        (upsert=True) directly to the tokenizer-manager method, exactly
-        what engine.load_oft_adapter_from_tensors() builds internally.
+        # Regression guard: this used to hang forever (peft_registry.
+        # wait_for_unload never returned) after any generate() call named
+        # this adapter, because nothing released the request's adapter
+        # lease. peft_tokenizer_hooks.finalize_peft_lease now releases it on
+        # every terminal request path, so this must now complete promptly.
+        unload_result = self.engine.unload_oft_adapter(name)
+        self.assertTrue(
+            unload_result.success,
+            f"Failed to unload OFT adapter after generate(): {unload_result.error_message}",
+        )
 
-        engine.load_oft_adapter_from_tensors() (srt/entrypoints/engine.py)
-        has no `upsert` parameter, unlike the LoadOFTAdapterFromTensorsReqInput
-        it builds internally (and unlike the tokenizer-manager/oft_manager
-        route underneath, which fully supports upsert=True on this route --
-        confirmed by reading tokenizer_control_mixin.load_oft_adapter_from_tensors
-        and oft/oft_manager.py's load_adapter_from_tensors; this differs from
-        LoRA's from_tensors route, which explicitly *rejects* upsert). This
-        looks like a small Engine-surface API gap left over from Task 7 --
-        flagged in this task's report -- so the request is constructed
-        directly here to exercise upsert=True end to end.
-        """
-        serialized = engine._serialize_tensors_per_rank(
-            _oft_named_tensors(self.num_layers, self.intermediate_size, seed), None
-        )
-        req = LoadOFTAdapterFromTensorsReqInput(
+    def _upsert(self, engine, name: str, seed: int):
+        """One in-place-refresh load via engine.load_oft_adapter_from_tensors
+        (upsert=True). OFT's from_tensors route fully supports upsert=True
+        (unlike LoRA's, which explicitly rejects it)."""
+        return engine.load_oft_adapter_from_tensors(
             adapter_name=name,
+            tensors=_oft_named_tensors(self.num_layers, self.intermediate_size, seed),
             config_dict=_adapter_config_dict(),
-            serialized_named_tensors=serialized,
             upsert=True,
-        )
-        return engine.loop.run_until_complete(
-            engine.tokenizer_manager.load_oft_adapter_from_tensors(req, None)
         )
 
     def test_upsert_refresh(self):
@@ -228,13 +185,12 @@ class TestOFTLoadFromTensor(CustomTestCase):
         identity, never minting a new one), and the tokenizer-side registry
         never grows past a single entry. Uses a dedicated engine with the
         tightest config the current implementation's own invariants allow
-        (max_loaded_ofts=max_ofts_per_batch=2 -- validate_peft_args asserts
-        max_loaded_ofts >= max_ofts_per_batch, and bug #3 in the module
-        docstring means max_ofts_per_batch=1 would leave zero real-adapter
-        slots even for the very first load, so 2 is the practical floor, not
-        1) to prove this growth-free in-place-update path needs no capacity
-        headroom beyond a single adapter slot and never depends on (or
-        trips) LRU eviction.
+        (max_loaded_ofts=max_ofts_per_batch=2 -- buffer slot 0 is always the
+        identity placeholder, so max_ofts_per_batch=1 would leave zero
+        real-adapter slots even for the very first load, making 2 the
+        practical floor, not 1) to prove this growth-free in-place-update
+        path needs no capacity headroom beyond a single adapter slot and
+        never depends on (or trips) LRU eviction.
         """
         print("[Test]Testing repeated in-place OFT adapter upserts (RL training-loop pattern)...")
         name = "policy"
@@ -321,9 +277,92 @@ class TestOFTLoadFromTensor(CustomTestCase):
             )
             prev_text = text
 
+    def test_upsert_invalidates_radix_cache(self):
+        """Regression test for C2: an in-place upsert must bump
+        adapter_version so its radix cache key changes -- otherwise
+        re-issuing the SAME prompt after an upsert can be served from a
+        stale KV prefix cached under the pre-upsert weights' key (see
+        weight_updater.py's documented invariant: KV produced under version
+        k lives under a different radix key than requests at k+1,
+        specifically so this can never happen).
+
+        Unlike test_upsert_refresh (which uses a different prompt each
+        round, so a stale-cache hit would never be observable there), this
+        reuses the exact same prompt/adapter_name across both rounds, so a
+        cache hit is directly observable as unchanged output despite the
+        weights differing.
+        """
+        print("[Test]Testing that an in-place OFT upsert invalidates the radix cache...")
+        name = "policy_cache_check"
+        # Dedicated engine, mirroring test_upsert_refresh's rationale for
+        # using its own engine (never shut down -- see that test's note on
+        # why: Engine.shutdown() kills every child process of the current
+        # Python process, not just this engine's own subprocesses).
+        engine = sgl.Engine(
+            **{
+                **ENGINE_KWARGS,
+                "max_loaded_ofts": 2,
+                "max_ofts_per_batch": 2,
+                "mem_fraction_static": 0.15,
+            }
+        )
+        result = engine.load_oft_adapter_from_tensors(
+            adapter_name=name,
+            tensors=_oft_named_tensors(self.num_layers, self.intermediate_size, seed=400),
+            config_dict=_adapter_config_dict(),
+        )
+        self.assertTrue(result.success, f"Failed to load OFT adapter: {result.error_message}")
+        text_v1 = self._generate(engine, adapter_name=name)
+        self.assertTrue(text_v1, "Generation before upsert produced no text")
+
+        upsert_result = self._upsert(engine, name, seed=401)
+        self.assertTrue(upsert_result.success, f"Upsert failed: {upsert_result.error_message}")
+
+        # SAME prompt, SAME adapter name -- if the radix cache key didn't
+        # change across the upsert, this could be served from the
+        # pre-upsert KV prefix instead of reflecting the new weights.
+        text_v2 = self._generate(engine, adapter_name=name)
+        self.assertTrue(text_v2, "Generation after upsert produced no text")
+        self.assertNotEqual(
+            text_v1,
+            text_v2,
+            "Re-issuing the SAME prompt after an in-place OFT upsert produced "
+            "identical output -- the radix cache may have served a stale KV "
+            "prefix cached under the pre-upsert adapter_version (i.e. "
+            "adapter_version was not bumped on upsert).",
+        )
+
     def test_lru_eviction_past_max_loaded_ofts(self):
-        print("[Test]Testing OFT adapter LRU eviction past --max-loaded-ofts...")
-        max_loaded_ofts = ENGINE_KWARGS["max_loaded_ofts"]
+        """C1 fix: adapters loaded over the wire (this native RPC path) have
+        no CPU-side artifact to re-page from, so allocate_buffer_slot_with_
+        eviction now never selects one as a GPU-side eviction victim --
+        unlike before the fix, which would silently GPU-evict the LRU
+        wire-loaded adapter once real per-batch capacity (max_ofts_per_batch
+        - 1; slot 0 is always the identity placeholder) was exceeded, while
+        the tokenizer-side registry still considered it resident. A later
+        /generate or tokenizer-side max_loaded_ofts LRU eviction naming that
+        silently-evicted adapter then hit an assert/crash instead of a clean
+        rejection or unload -- this is the branch's own test config
+        (max_ofts_per_batch=4, max_loaded_ofts=4) the review reproduced this
+        crash against.
+
+        Note this also makes the tokenizer-side max_loaded_ofts LRU-eviction
+        loop unreachable for a pure wire-adapter workload in a *successful*
+        load: validate_peft_args now requires max_loaded_ofts >=
+        max_ofts_per_batch - 1, so the tokenizer-side cap can never bind
+        before the GPU-side one does for adapters that (unlike disk-backed
+        ones) can never be paged out once resident -- attempting to exceed
+        real GPU capacity fails at the GPU layer first, before
+        num_registered_ofts could ever exceed max_loaded_ofts. This test
+        confirms that overflow load now fails gracefully (instead of
+        crashing the engine), and that the already-resident adapters remain
+        fully intact, still generate correctly, and can still be unloaded
+        promptly afterward.
+        """
+        print("[Test]Testing that loading past real GPU OFT capacity fails gracefully...")
+        # Real per-batch adapter capacity is max_ofts_per_batch - 1 (slot 0
+        # is always the identity/base-model placeholder).
+        real_capacity = ENGINE_KWARGS["max_ofts_per_batch"] - 1
         # Dedicated engine (sharing GPU 0 with cls.engine -- this suite is
         # registered on a "1-gpu-large" CI runner_config, so no 2nd GPU is
         # assumed) so this capacity-boundary scenario is fully isolated from
@@ -341,9 +380,9 @@ class TestOFTLoadFromTensor(CustomTestCase):
         # cls.engine too and hang every later test. test_lora_lru_eviction
         # has the same shape and likewise never shuts its test_engine down.
         engine = sgl.Engine(**{**ENGINE_KWARGS, "mem_fraction_static": 0.15})
-        names = [f"oft_lru_{i}" for i in range(max_loaded_ofts + 1)]
-        for i, name in enumerate(names):
-            print(f"[Test]Loading OFT adapter {i + 1}/{len(names)}: {name}")
+        names = [f"oft_lru_{i}" for i in range(real_capacity + 1)]
+        for i, name in enumerate(names[:real_capacity]):
+            print(f"[Test]Loading OFT adapter {i + 1}/{real_capacity}: {name}")
             result = engine.load_oft_adapter_from_tensors(
                 adapter_name=name,
                 tensors=_oft_named_tensors(
@@ -355,22 +394,56 @@ class TestOFTLoadFromTensor(CustomTestCase):
                 result.success, f"Failed to load OFT adapter {name}: {result.error_message}"
             )
 
+        # One more, beyond real capacity: every resident adapter is
+        # wire-loaded (non-reloadable) and none is pinned, so there is no
+        # evictable candidate -- this must fail gracefully, not silently
+        # evict an unrecoverable adapter (the pre-fix behavior) or crash.
+        overflow_name = names[real_capacity]
+        overflow_result = engine.load_oft_adapter_from_tensors(
+            adapter_name=overflow_name,
+            tensors=_oft_named_tensors(
+                self.num_layers, self.intermediate_size, seed=999
+            ),
+            config_dict=_adapter_config_dict(),
+        )
+        self.assertFalse(
+            overflow_result.success,
+            f"Loading past real GPU capacity ({real_capacity}) with no evictable "
+            "resident adapter should fail gracefully, not succeed by silently "
+            "evicting an unrecoverable wire-loaded adapter.",
+        )
+        print(f"[Test]Overflow load correctly rejected: {overflow_result.error_message}")
+
         all_adapters = engine.tokenizer_manager.peft_registry.get_all_adapters()
-        print(f"[Test]Adapters resident after loading {len(names)}: {list(all_adapters)}")
-        self.assertLessEqual(
-            len(all_adapters),
-            max_loaded_ofts,
-            f"OFT registry should never exceed max_loaded_ofts={max_loaded_ofts}, "
-            f"got {len(all_adapters)}: {list(all_adapters)}",
-        )
         self.assertNotIn(
-            names[0],
+            overflow_name,
             all_adapters,
-            f"Least-recently-used adapter {names[0]!r} should have been evicted",
+            "The rejected overflow load must not leave a registered-but-not-"
+            "actually-resident name behind",
         )
-        for name in names[1:]:
+        for name in names[:real_capacity]:
             self.assertIn(
-                name, all_adapters, f"Adapter {name!r} should still be resident"
+                name,
+                all_adapters,
+                f"Resident adapter {name!r} must not have been evicted by the "
+                "failed overflow load",
+            )
+
+        # The already-resident adapters must be untouched by the rejected
+        # overflow load: they still generate correctly, and unloading them
+        # after generate() must complete promptly rather than hang (bug #2,
+        # fixed by finalize_peft_lease releasing the request's adapter lease
+        # on completion).
+        for name in names[:real_capacity]:
+            text = self._generate(engine, adapter_name=name)
+            self.assertTrue(
+                text, f"Generation with resident adapter {name!r} produced no text"
+            )
+            unload_result = engine.unload_oft_adapter(name)
+            self.assertTrue(
+                unload_result.success,
+                f"Failed to unload adapter {name!r} after generate(): "
+                f"{unload_result.error_message}",
             )
 
     def test_multi_adapter_concurrent_residency(self):
@@ -389,10 +462,11 @@ class TestOFTLoadFromTensor(CustomTestCase):
         )
         self.assertTrue(result_b.success, f"Failed to load {name_b}: {result_b.error_message}")
 
-        # Neither adapter is unloaded -- both must stay resident and
+        # Neither adapter is unloaded here -- both must stay resident and
         # generatable at once (the capability Task 6 newly unlocked by
-        # removing the old single-active restriction), and see the module
-        # docstring's note on why this test never calls unload_oft_adapter.
+        # removing the old single-active restriction). The unload path
+        # itself is covered by test_fresh_load_and_generate and
+        # test_lru_eviction_past_max_loaded_ofts.
         text_a = self._generate(self.engine, adapter_name=name_a)
         text_b = self._generate(self.engine, adapter_name=name_b)
         print(f"[Adapter A] {text_a}")
