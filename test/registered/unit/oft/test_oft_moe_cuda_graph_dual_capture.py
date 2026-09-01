@@ -46,5 +46,48 @@ class TestShapeKeyOftVariantField(unittest.TestCase):
         self.assertNotEqual(hash(a), hash(b))
 
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
+)
+
+
+class TestResolveOftVariant(unittest.TestCase):
+    def _make_runner(self, record_oft_variant_graph):
+        runner = MagicMock(spec=DecodeCudaGraphRunner)
+        runner.record_oft_variant_graph = record_oft_variant_graph
+        runner._resolve_oft_variant = DecodeCudaGraphRunner._resolve_oft_variant.__get__(
+            runner
+        )
+        return runner
+
+    def test_returns_none_when_dual_capture_not_enabled(self):
+        runner = self._make_runner(record_oft_variant_graph=False)
+        forward_batch = SimpleNamespace(adapter_ids=["a", "b", None])
+        self.assertIsNone(runner._resolve_oft_variant(forward_batch))
+
+    def test_returns_oft_single_for_at_most_one_distinct_adapter(self):
+        runner = self._make_runner(record_oft_variant_graph=True)
+        forward_batch = SimpleNamespace(adapter_ids=["a", "a", None])
+        self.assertEqual(runner._resolve_oft_variant(forward_batch), "oft_single")
+
+    def test_returns_oft_single_when_no_adapters_at_all(self):
+        runner = self._make_runner(record_oft_variant_graph=True)
+        forward_batch = SimpleNamespace(adapter_ids=[None, None])
+        self.assertEqual(runner._resolve_oft_variant(forward_batch), "oft_single")
+
+    def test_returns_oft_multi_for_two_or_more_distinct_adapters(self):
+        runner = self._make_runner(record_oft_variant_graph=True)
+        forward_batch = SimpleNamespace(adapter_ids=["a", "b", None])
+        self.assertEqual(runner._resolve_oft_variant(forward_batch), "oft_multi")
+
+    def test_returns_none_when_adapter_ids_is_none(self):
+        runner = self._make_runner(record_oft_variant_graph=True)
+        forward_batch = SimpleNamespace(adapter_ids=None)
+        self.assertIsNone(runner._resolve_oft_variant(forward_batch))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

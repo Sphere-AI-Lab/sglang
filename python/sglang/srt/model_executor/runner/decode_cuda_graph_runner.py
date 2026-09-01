@@ -551,13 +551,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(
-        self, size, stream_idx=None, variant_label=None, dsa_variant=None
+        self,
+        size,
+        stream_idx=None,
+        variant_label=None,
+        dsa_variant=None,
+        oft_variant=None,
     ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
             dsa_variant=dsa_variant,
+            oft_variant=oft_variant,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -591,6 +597,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return "lora"
         return "nolora"
+
+    def _resolve_oft_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
+        """Host dispatch: pick which pre-captured OFT MoE-expert decode graph
+        to replay, from the batch's real per-request adapter identity.
+
+        Mirrors _resolve_lora_variant's shape deliberately: reads
+        forward_batch.adapter_ids directly rather than reaching into
+        OFTManager, matching how _resolve_lora_variant reads
+        forward_batch.lora_ids directly rather than reaching into
+        LoRAManager. Returns None when OFT dual-graph capture is not enabled
+        for this server (the common case: zero extra cost)."""
+        if not getattr(self, "record_oft_variant_graph", False):
+            return None
+        if forward_batch.adapter_ids is None:
+            return None
+        distinct_real = {uid for uid in forward_batch.adapter_ids if uid is not None}
+        return "oft_multi" if len(distinct_real) > 1 else "oft_single"
 
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
@@ -694,6 +717,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
+            oft_variant=self._resolve_oft_variant(forward_batch),
         )
 
         is_bs_supported = (
@@ -1328,9 +1352,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             dsa_variant = self._resolve_dsa_variant(forward_batch)
+            oft_variant = self._resolve_oft_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label, dsa_variant
+                graph_size_key, stream_idx, variant_label, dsa_variant, oft_variant
             )
             return
 
@@ -1428,9 +1453,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         variant_label = self._resolve_lora_variant(forward_batch)
         dsa_variant = self._resolve_dsa_variant(forward_batch)
+        oft_variant = self._resolve_oft_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label, dsa_variant
+            graph_size_key, stream_idx, variant_label, dsa_variant, oft_variant
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
