@@ -42,6 +42,15 @@ _capture_lora_variant: Optional[str] = None
 # which is correct for any kv_len.
 _capture_dsa_variant: Optional[str] = None
 
+# When capturing dual OFT MoE-expert graphs (single-slot / multi-slot), tracks
+# which variant is being captured. Read by OFTManager's capture-time branch to
+# force the multi-slot routing path regardless of the capture-time dummy
+# batch's own adapter count.
+# None = not dual-capturing; the single-slot path is captured (today's
+# behavior, and the only behavior when a server has no MoE-target OFT
+# adapters needing more than one resident slot).
+_capture_oft_variant: Optional[str] = None
+
 
 def get_is_capture_mode() -> bool:
     return is_capture_mode or is_in_breakable_cuda_graph()
@@ -79,6 +88,17 @@ def get_capture_dsa_variant() -> Optional[str]:
 def _set_capture_dsa_variant(variant: Optional[str]) -> None:
     global _capture_dsa_variant
     _capture_dsa_variant = variant
+
+
+def get_capture_oft_variant() -> Optional[str]:
+    """Return the OFT MoE-expert variant being captured ("oft_single"/
+    "oft_multi"), or None when dual-variant capture is not active."""
+    return _capture_oft_variant
+
+
+def _set_capture_oft_variant(variant: Optional[str]) -> None:
+    global _capture_oft_variant
+    _capture_oft_variant = variant
 
 
 @contextmanager

@@ -33,9 +33,13 @@ class ShapeKey:
     dsa_variant: DSA decode dual-graph variant ("dense" / "sparse"), or None
         when DSA dual-graph capture is not enabled. Composes with variant_label
         so LoRA and DSA variants can be captured independently.
+    oft_variant: OFT MoE-expert dual-graph variant ("oft_single" / "oft_multi"),
+        or None when OFT dual-graph capture is not enabled. Composes
+        independently with variant_label and dsa_variant.
     """
 
     size: int
     stream_idx: Optional[int] = None
     variant_label: Optional[str] = None
     dsa_variant: Optional[str] = None
+    oft_variant: Optional[str] = None
