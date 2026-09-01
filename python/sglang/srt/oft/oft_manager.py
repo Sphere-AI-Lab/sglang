@@ -239,6 +239,9 @@ class OFTManager(AdapterManager):
         # a knob until the B2 pool-overflow work.
         self.eviction_policy = "lru"
 
+        # Per-batch MoE multi-tenancy decision and slot-index tensor
+        self._moe_multi_tenant_slot_ids: Optional[torch.Tensor] = None
+
         # OFT backend for running orthogonal transform kernels
         logger.info(f"Using {oft_backend} as backend of OFT kernels.")
         backend_type = get_backend_from_name(oft_backend)
@@ -697,6 +700,28 @@ class OFTManager(AdapterManager):
             oft_lm_head_module=self.lm_head_module,
         )
 
+    def _compute_moe_multi_tenant_slot_ids(
+        self, weight_indices: list, device: "torch.device"
+    ) -> "Optional[torch.Tensor]":
+        """Decide whether this batch needs the multi-tenant MoE OFT path.
+
+        ``weight_indices`` is the same per-token buffer-slot list
+        ``prepare_oft_batch`` already computes for the dense path (0 = identity/
+        base slot, no real adapter for that token). Returns None when at most
+        one distinct non-zero slot is present in the whole batch (the common
+        case: MoE forward takes today's unchanged single-slot path); otherwise
+        returns a torch.long tensor of the same length holding weight_indices
+        verbatim, for the multi-tenant MoE kernel to index per token.
+
+        This check is global (whole batch, not per MoE layer) -- see this
+        plan's Task 1 design note for why that is a deliberate, still-correct
+        simplification.
+        """
+        distinct_real_slots = {idx for idx in weight_indices if idx != 0}
+        if len(distinct_real_slots) <= 1:
+            return None
+        return torch.tensor(weight_indices, dtype=torch.long, device=device)
+
     def prepare_oft_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all oft modules
         bs = forward_batch.batch_size
@@ -726,6 +751,10 @@ class OFTManager(AdapterManager):
                     oft_block_sizes[weight_indices[i]] = self.configs[uid].block_size
                 else:
                     raise KeyError(f"OFT adapter {uid} not found in ofts or configs")
+        # Decide whether this batch needs the multi-tenant MoE OFT path.
+        self._moe_multi_tenant_slot_ids = self._compute_moe_multi_tenant_slot_ids(
+            weight_indices, device=forward_batch.input_ids.device
+        )
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.oft_backend.prepare_oft_batch(
