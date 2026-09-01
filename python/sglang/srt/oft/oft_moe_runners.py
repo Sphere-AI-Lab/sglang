@@ -113,11 +113,21 @@ def _oft_prerotate_multi_tenant(
 ):
     """Multi-tenant sibling of _oft_prerotate: selects each token's own
     adapter's R-block (via slot_ids) instead of applying one shared R to
-    the whole batch. Only exercised when >=2 distinct adapters carrying
-    MoE OFT weights are resident in the current forward batch (see
-    OFTManager._compute_moe_multi_tenant_slot_ids); the single-adapter
-    fast path (_oft_prerotate) is completely unaffected by this function's
-    existence.
+    the whole batch. Exercised whenever ANY real resident adapter is
+    referenced in the current forward batch -- not just ">=2 distinct"
+    adapters: in the plain native-RPC ("sibling") pool, buffer slot 0
+    (memory_pool.active_idx) is permanently reserved for the boot-time
+    base/identity registration, so a real adapter can never land there,
+    meaning OFTManager._compute_moe_multi_tenant_slot_ids already takes
+    this general per-token path for any batch with a single real adapter
+    too (see that function's docstring for the full history). Also forced
+    under CUDA-graph capture of the "oft_multi" dual-capture variant
+    (decode_cuda_graph_runner.py's _resolve_record_oft_variant_graph /
+    _resolve_oft_variant), even for the zero-real-adapter capture-time
+    dummy batch, so the captured graph learns to read per-token slot ids
+    at all -- see the 2026-09-01-oft-moe-cuda-graph-dual-capture plan. The
+    single-adapter fast path (_oft_prerotate) is completely unaffected by
+    this function's existence.
     """
     from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
         moe_align_block_size,
@@ -398,24 +408,33 @@ def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
             A = dequant_fp8_block_triton(A, A_scale, out_dtype=C.dtype)
             A_scale = None
 
-        # KNOWN LIMITATION: this branch is chosen HERE, on the Python side, so
-        # under a replayed decode CUDA graph it is frozen at whatever was true
-        # at capture time, and slot_ids itself is a fresh per-call allocation
-        # with no pointer stability across capture/replay -- see the full
-        # write-up on OFTManager._compute_moe_multi_tenant_slot_ids.
-        # validate_peft_args (peft/config.py) now disables decode CUDA graphs
-        # at boot whenever this is reachable (OFT dynamically targets MoE
-        # experts via oft_impl=sibling), so this branch never actually runs
-        # under a replayed decode graph in a correctly-configured server. The
-        # slot_ids-is-None path below (reading the persistent, in-place-
-        # updated pool buffers) is NOT a safe-under-decode-graphs escape
-        # hatch here: in the plain native-RPC pool a real adapter can never
-        # land at active_idx, so slot_ids is None only when zero real
-        # adapters are resident at all -- the moment one real MoE-target
-        # adapter loads, this branch (not the slot_ids-is-None one) is what
-        # runs. Real fix (persistent buffer + dual capture, restoring both a
-        # genuinely fast single-adapter path and CUDA-graph-safe multi-
-        # tenancy): the 2026-09-01-oft-moe-cuda-graph-dual-capture plan.
+        # This branch IS the hot path under a replayed decode CUDA graph for
+        # a correctly-configured server, and that is now SAFE: the
+        # 2026-09-01-oft-moe-cuda-graph-dual-capture plan's dual-capture
+        # mechanism captures a dedicated "oft_multi" graph variant whenever
+        # any real resident adapter is possible
+        # (decode_cuda_graph_runner.py's _resolve_record_oft_variant_graph /
+        # _resolve_oft_variant), and OFTManager._compute_moe_multi_tenant_
+        # slot_ids writes this batch's routing decision IN PLACE into a
+        # persistent buffer (allocated once by init_cuda_graph_batch_info)
+        # rather than a fresh per-call tensor -- so the captured kernel's
+        # pointer stays valid across every replay instead of going stale.
+        # Capture-time forcing (get_capture_oft_variant() == "oft_multi")
+        # makes sure the graph that gets captured is the one that actually
+        # reads slot_ids, even though the capture-time dummy batch itself
+        # carries zero real adapters. peft/config.py's validate_peft_args
+        # only disables decode CUDA graphs for the residual configurations
+        # dual-capture does NOT cover (DP-attention, insufficient effective
+        # adapter capacity -- see _resolve_record_oft_variant_graph's
+        # docstring); everywhere dual-capture does engage, this branch runs
+        # under replay by design, not by accident. The slot_ids-is-None path
+        # below (reading the persistent, in-place-updated pool buffers) is
+        # the OTHER captured variant ("oft_single"), read when the batch has
+        # zero real resident adapters at all -- in the plain native-RPC pool
+        # a real adapter can never land at active_idx, so slot_ids is None
+        # only for that zero-real-adapter case; the moment one real
+        # MoE-target adapter loads, this branch (not the slot_ids-is-None
+        # one) is what runs, exactly as intended.
         slot_ids = getattr(layer, "_oft_moe_multi_tenant_slot_ids", None)
         if slot_ids is not None:
             all_slots_attr = (

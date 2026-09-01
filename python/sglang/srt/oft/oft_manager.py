@@ -286,21 +286,108 @@ class OFTManager(AdapterManager):
     def init_cuda_graph_batch_info(
         self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
     ):
-        self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
-        # num_tokens_per_bs is the max per-request token count a captured
-        # decode graph can see (1 for plain decode, the spec draft width for
-        # target-verify -- BaseOFTBackend.init_cuda_graph_batch_info's own
-        # docstring), so this is sized exactly like the runner's own
-        # max_num_token = max_bs * captured_req_width.
-        self._moe_cg_slot_ids_buffer = torch.zeros(
-            max_bs_in_cuda_graph * num_tokens_per_bs,
-            dtype=torch.long,
-            device=self.device,
-        )
+        # Idempotence guard: this can be called a second time against the
+        # same OFTManager (e.g. a second DecodeCudaGraphRunner constructed
+        # against the same underlying manager, as in adaptive-speculative-
+        # decode setups with a target_graph_runner). A graph already
+        # captured against the first self._moe_cg_slot_ids_buffer holds a
+        # pointer into it; silently reallocating on a second call would
+        # leave that graph replaying against a freed/stale allocation. Only
+        # allocate once; a second call must match the original sizing
+        # exactly (both max_bs_in_cuda_graph and num_tokens_per_bs, not just
+        # their product -- max_bs_in_cuda_graph is also read directly by
+        # prepare_oft_batch's own use_cuda_graph gate).
+        if self._moe_cg_slot_ids_buffer is not None:
+            required_size = max_bs_in_cuda_graph * num_tokens_per_bs
+            assert (
+                self.max_bs_in_cuda_graph == max_bs_in_cuda_graph
+                and self._moe_cg_slot_ids_buffer.shape[0] == required_size
+            ), (
+                "OFTManager.init_cuda_graph_batch_info called twice with "
+                f"different sizing: existing buffer holds "
+                f"{self._moe_cg_slot_ids_buffer.shape[0]} token slots for "
+                f"max_bs_in_cuda_graph={self.max_bs_in_cuda_graph}, this "
+                f"call requested {required_size} token slots for "
+                f"max_bs_in_cuda_graph={max_bs_in_cuda_graph} (num_tokens_per_bs="
+                f"{num_tokens_per_bs}). A graph already captured against the "
+                "existing buffer holds a pointer into it; reallocating would "
+                "leave that graph replaying against a freed/stale allocation."
+            )
+        else:
+            self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+            # num_tokens_per_bs is the max per-request token count a captured
+            # decode graph can see (1 for plain decode, the spec draft width
+            # for target-verify -- BaseOFTBackend.init_cuda_graph_batch_info's
+            # own docstring), so this is sized exactly like the runner's own
+            # max_num_token = max_bs * captured_req_width.
+            self._moe_cg_slot_ids_buffer = torch.zeros(
+                max_bs_in_cuda_graph * num_tokens_per_bs,
+                dtype=torch.long,
+                device=self.device,
+            )
         self.oft_backend.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
         )
+
+    def moe_expert_oft_multi_tenant_ready(self) -> bool:
+        """Ground truth (post-boot-load) for whether every wrapped MoE-expert
+        module's OFT buffers this manager actually populated have their
+        multi-tenant per-slot ``_all_slots`` views bound -- i.e. whether it
+        is safe to force the general per-token routing path (dual-capture's
+        capture-time forcing in _compute_moe_multi_tenant_slot_ids) for this
+        server's boot-time configuration. Read by decode_cuda_graph_runner.py's
+        _resolve_record_oft_variant_graph.
+
+        False whenever no MoE-expert module has any OFT buffer at all
+        (nothing to dual-capture for -- covers both "model has no MoE
+        layers" and "OFT doesn't target expert modules", subsuming what
+        peft/config.py's pre-model-load _model_has_moe_layers probe can only
+        approximate).
+
+        Also False whenever a boot-loaded (--peft-paths) adapter already
+        populated a module's w13_oft_r / w1_oft_r+w3_oft_r / w2_oft_r with a
+        private, non-pool-backed tensor:
+        _init_identity_expert_oft_for_cuda_graph intentionally skips (re-)
+        binding the corresponding _all_slots attribute in that case (it must
+        not clobber the already-loaded adapter), leaving oft_moe_runners.py's
+        dispatch with a slot_ids-not-None / _all_slots-None combination that
+        raises at the first forward reaching it -- which, under capture-time
+        forcing, means at CUDA-graph-capture time (boot). Confirmed
+        reachable for a legacy-fused (oft_type="oft") boot adapter targeting
+        gate_up (its private w13_oft_r never gets a pool-backed view), and --
+        independent of oft_type -- for ANY boot adapter targeting down_proj
+        (w2_oft_r is always privately allocated by the single-active loader,
+        _apply_expert_oft_to_module, whether the adapter is split or
+        legacy): a split (canonical_oft) boot adapter targeting down_proj
+        hits the identical gap. A server_args.oft_type-only check cannot
+        distinguish either case from the safe ones (nothing boot-loaded on
+        that module at all), so this checks the actual post-load module
+        state instead of re-deriving a narrower, provably-incomplete
+        approximation from server_args.
+        """
+        moe_modules = self._find_fused_moe_modules()
+        if not moe_modules:
+            return False
+        any_expert_oft = False
+        for moe in moe_modules.values():
+            if getattr(moe, "w13_oft_r", None) is not None:
+                any_expert_oft = True
+                if getattr(moe, "_oft_w13_oft_r_all_slots", None) is None:
+                    return False
+            if getattr(moe, "w1_oft_r", None) is not None:
+                any_expert_oft = True
+                if getattr(moe, "_oft_w1_oft_r_all_slots", None) is None:
+                    return False
+            if getattr(moe, "w3_oft_r", None) is not None:
+                any_expert_oft = True
+                if getattr(moe, "_oft_w3_oft_r_all_slots", None) is None:
+                    return False
+            if getattr(moe, "w2_oft_r", None) is not None:
+                any_expert_oft = True
+                if getattr(moe, "_oft_w2_oft_r_all_slots", None) is None:
+                    return False
+        return any_expert_oft
 
     def load_oft_adapter(self, oft_ref: OFTRef) -> "OFTUpdateOutput":
         return self.load_adapter(oft_ref)
@@ -941,12 +1028,26 @@ class OFTManager(AdapterManager):
         )
         num_tokens = expanded.shape[0]
         if num_tokens > self._moe_cg_slot_ids_buffer.shape[0]:
+            # Last-resort backstop, not the primary defense: prepare_oft_batch's
+            # own early estimate (mirroring LoRAManager.prepare_lora_batch's
+            # MoE overflow guard) demotes use_cuda_graph to False for a
+            # TARGET_VERIFY batch whose draft_token_num would overflow this
+            # buffer, so _compute_moe_multi_tenant_slot_ids should never be
+            # called with use_cuda_graph=True for that case. There is no
+            # runner-level use_cuda_graph eligibility check that accounts for
+            # per-token draft-width sizing (can_run_graph only compares
+            # spec_info.num_tokens_per_req to the captured bucket width, not
+            # the actual per-token expansion built here) -- so reaching this
+            # raise means prepare_oft_batch's own estimate under-counted this
+            # batch (e.g. a forward mode outside {DECODE, TARGET_VERIFY} that
+            # generate_sequence_lengths expands ragged, such as DLLM_EXTEND).
             raise RuntimeError(
                 f"Multi-tenant MoE OFT CUDA-graph buffer holds "
                 f"{self._moe_cg_slot_ids_buffer.shape[0]} token slots, but "
-                f"this batch needs {num_tokens} -- this should have been "
-                "caught by the runner's own use_cuda_graph eligibility check "
-                "before reaching here."
+                f"this batch needs {num_tokens}. prepare_oft_batch's own "
+                "early overflow estimate should have demoted this call to "
+                "the eager path before reaching here -- investigate rather "
+                "than silently truncate or overrun the buffer."
             )
         self._moe_cg_slot_ids_buffer[:num_tokens].copy_(expanded)
         return self._moe_cg_slot_ids_buffer[:num_tokens]
@@ -968,6 +1069,30 @@ class OFTManager(AdapterManager):
             and bs <= self.max_bs_in_cuda_graph
             and forward_batch.forward_mode.is_cuda_graph()
         )
+        if use_cuda_graph and self._moe_cg_slot_ids_buffer is not None:
+            # This use_cuda_graph flag is a HEURISTIC computed above from
+            # only (bs, forward_mode) -- before the runner's real replay
+            # decision, and with no awareness of per-token draft-width
+            # sizing. Mirrors LoRAManager.prepare_lora_batch's own MoE
+            # overflow guard (get_gathered_moe_num_tokens vs
+            # moe_cg_buffers[...].shape[0]): a TARGET_VERIFY batch whose
+            # real draft_token_num exceeds what was captured (adaptive
+            # speculative decoding can vary this per step) would build a
+            # per-token routing tensor wider than the persistent
+            # _moe_cg_slot_ids_buffer. Demote THIS call to the eager
+            # (freshly-sized-tensor) path instead of overflowing that
+            # buffer -- the runner's own can_run_graph would run this exact
+            # batch eagerly anyway once it independently discovers the same
+            # width mismatch, so this only avoids prepping (and, without
+            # this guard, crashing on) persistent-buffer state for a replay
+            # that was never going to happen.
+            estimated_num_tokens = (
+                bs * forward_batch.spec_info.draft_token_num
+                if forward_batch.forward_mode.is_target_verify()
+                else bs
+            )
+            if estimated_num_tokens > self._moe_cg_slot_ids_buffer.shape[0]:
+                use_cuda_graph = False
 
         weight_indices = [0] * len(forward_batch.adapter_ids)
         oft_block_sizes = [0] * self.max_ofts_per_batch

@@ -294,7 +294,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # captures only the fast-path variant it already did before this
         # feature existed -- zero extra cost.
         self.record_oft_variant_graph = self._resolve_record_oft_variant_graph(
-            model_runner.server_args, model_runner.model_config
+            model_runner.server_args,
+            model_runner.model_config,
+            # OFTManager is only ever constructed when peft_method=="oft"
+            # (peft/integration.py's maybe_init_peft_manager), and by
+            # construction order (ModelRunner.initialize() runs
+            # maybe_init_peft_manager() before Scheduler ever calls
+            # init_cuda_graphs()) it already exists and is fully
+            # initialized here whenever that is true -- so plain attribute
+            # access would work in production. getattr is used anyway
+            # because this attribute is genuinely, conditionally absent
+            # (not merely possibly-None) for every non-OFT server, and this
+            # runner has no other reason to import/require peft internals.
+            oft_manager=getattr(model_runner, "oft_manager", None),
         )
         if self.record_oft_variant_graph:
             logger.info(
@@ -620,20 +632,53 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return "nolora"
 
     @staticmethod
-    def _resolve_record_oft_variant_graph(server_args, model_config) -> bool:
+    def _resolve_record_oft_variant_graph(
+        server_args, model_config, oft_manager=None
+    ) -> bool:
         """Whether this server needs OFT MoE-expert dual-graph capture: OFT
-        actually enabled, targeting MoE expert modules, and with effective
-        per-batch adapter capacity for at least one real resident adapter.
+        actually enabled, not under --enable-dp-attention, targeting MoE
+        expert modules with fully-bound multi-tenant buffers, and with
+        effective per-batch adapter capacity for at least one real resident
+        adapter.
 
-        Three real-config checks, mirroring dsa_dual_graph's own
-        real-config-check model in __init__:
+        Real-config checks, mirroring dsa_dual_graph's own real-config-check
+        model in __init__:
           1. OFT is actually enabled (--peft-method oft).
-          2. It targets MoE expert modules -- the same
-             gate_up_proj/gate_proj/up_proj/down_proj set and HF-config
-             per-token-expert-count probe peft/config.py's
-             validate_peft_args already uses to decide whether this server
-             has expert-OFT buffers at all.
-          3. Effective per-batch adapter capacity (max_ofts_per_batch - 1;
+          2. --enable-dp-attention is NOT set. _compute_moe_multi_tenant_
+             slot_ids (oft_manager.py) all-gathers MoE tokens across DP
+             ranks, which this per-rank persistent buffer's sizing does not
+             account for -- it raises RuntimeError under DP-attention
+             unconditionally, and capture-time forcing (see 3 below) would
+             trip that raise AT BOOT (capture), not runtime, the moment
+             dual-capture engaged (final whole-branch review's C1).
+             peft/config.py's validate_peft_args disables decode CUDA
+             graphs outright for this combination for the identical reason
+             -- dual-capture never engages here, and the single fast-path
+             graph alone is not safe for it either (unlike the
+             insufficient-capacity case below, a real adapter is not
+             guaranteed to stay off memory_pool.active_idx under DP
+             gathering).
+          3. It targets MoE expert modules AND has every multi-tenant
+             buffer view actually bound post-model-load -- preferred source
+             of truth: ``oft_manager.moe_expert_oft_multi_tenant_ready()``
+             (oft_manager.py), which is ground truth for both "does this
+             server actually have MoE-expert OFT buffers at all" (subsuming
+             peft/config.py's pre-model-load target-module-set +
+             HF-config-probe approximation, including the --peft-paths
+             -inferred target-modules case that approximation cannot see)
+             and "did a boot-loaded adapter leave any buffer's per-slot view
+             unbound" (final whole-branch review's I1: a boot-loaded
+             legacy-fused adapter, or -- independent of oft_type -- ANY
+             boot-loaded adapter targeting down_proj, leaves a gap that
+             oft_moe_runners.py's dispatch raises on the moment capture-time
+             forcing makes slot_ids non-None, i.e. at boot). Falls back to
+             re-deriving from server_args (reusing peft/config.py's own
+             shared constants, not a second hand-copied literal) only when
+             oft_manager is not available -- this cannot see the I1 gap
+             (no model is loaded yet at that point) or --peft-paths
+             -inferred target modules, but is otherwise this method's
+             pre-plan behavior.
+          4. Effective per-batch adapter capacity (max_ofts_per_batch - 1;
              buffer slot 0 is always reserved for the base/identity
              placeholder, see OFTMemoryPool) allows at least ONE real
              resident adapter -- not ">1". _compute_moe_multi_tenant_
@@ -648,24 +693,32 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """
         if server_args.peft_method != "oft":
             return False
-        peft_target_modules = set(server_args.peft_target_modules or ())
-        targets_moe_experts = bool(
-            {"gate_up_proj", "gate_proj", "up_proj", "down_proj"} & peft_target_modules
-        )
-        model_has_moe_layers = any(
-            hasattr(model_config.hf_text_config, attr)
-            for attr in (
-                "num_experts_per_tok",
-                "num_experts_per_token",
-                "top_k_experts",
-                "moe_top_k",
-                "moe_topk",
+        if server_args.enable_dp_attention:
+            return False
+
+        if oft_manager is not None:
+            if not oft_manager.moe_expert_oft_multi_tenant_ready():
+                return False
+        else:
+            from sglang.srt.peft.config import (
+                _MOE_EXPERT_COUNT_CONFIG_ATTRS,
+                MOE_EXPERT_TARGET_MODULES,
             )
-        )
-        effective_oft_capacity = server_args.max_ofts_per_batch - 1
-        return (
-            targets_moe_experts and model_has_moe_layers and effective_oft_capacity >= 1
-        )
+
+            peft_target_modules = set(server_args.peft_target_modules or ())
+            targets_moe_experts = bool(
+                MOE_EXPERT_TARGET_MODULES & peft_target_modules
+            )
+            model_has_moe_layers = any(
+                hasattr(model_config.hf_text_config, attr)
+                for attr in _MOE_EXPERT_COUNT_CONFIG_ATTRS
+            )
+            if not (targets_moe_experts and model_has_moe_layers):
+                return False
+
+        from sglang.srt.peft.config import effective_oft_capacity
+
+        return effective_oft_capacity(server_args) >= 1
 
     def _resolve_oft_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
         """Host dispatch: pick which pre-captured OFT MoE-expert decode graph

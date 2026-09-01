@@ -135,6 +135,7 @@ class TestResolveRecordOftVariantGraph(unittest.TestCase):
             peft_method="oft",
             peft_target_modules={"gate_up_proj", "down_proj"},
             max_ofts_per_batch=8,
+            enable_dp_attention=False,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -198,6 +199,105 @@ class TestResolveRecordOftVariantGraph(unittest.TestCase):
         self.assertFalse(
             DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
                 server_args, model_config
+            )
+        )
+
+    def test_false_when_enable_dp_attention(self):
+        """Final whole-branch review C1: dual-capture must never engage for
+        a --enable-dp-attention server, regardless of otherwise-eligible
+        target modules / capacity. _compute_moe_multi_tenant_slot_ids
+        (oft_manager.py) raises RuntimeError unconditionally under
+        --enable-dp-attention when use_cuda_graph=True -- before this fix,
+        _resolve_record_oft_variant_graph did not check enable_dp_attention
+        at all, so dual-capture's capture-time forcing would trip that raise
+        AT BOOT (capture), not runtime, for a DP-attention + MoE-target-OFT
+        server that previously booted fine (eagerly, decode graphs
+        disabled). Verified this fails without the enable_dp_attention
+        check and passes with it."""
+        server_args = self._server_args(max_ofts_per_batch=8, enable_dp_attention=True)
+        model_config = self._model_config(has_moe_layers=True)
+        self.assertFalse(
+            DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
+                server_args, model_config
+            )
+        )
+
+    def _fake_oft_manager(self, ready: bool):
+        return SimpleNamespace(moe_expert_oft_multi_tenant_ready=lambda: ready)
+
+    def test_manager_path_true_when_ready_and_capacity_sufficient(self):
+        server_args = self._server_args(max_ofts_per_batch=2)
+        model_config = self._model_config(has_moe_layers=True)
+        oft_manager = self._fake_oft_manager(ready=True)
+        self.assertTrue(
+            DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
+                server_args, model_config, oft_manager=oft_manager
+            )
+        )
+
+    def test_manager_path_false_when_not_ready(self):
+        """Final whole-branch review I1 (generalized): when an OFTManager is
+        available, its moe_expert_oft_multi_tenant_ready() ground truth --
+        not server_args's re-derived approximation -- decides eligibility.
+        False here models a boot-loaded adapter that left a multi-tenant
+        buffer view unbound (legacy-fused gate_up, or any-oft_type
+        down_proj -- see OFTManager.moe_expert_oft_multi_tenant_ready's
+        docstring): capture-time forcing would otherwise crash at boot the
+        moment dual-capture engaged. Even though server_args alone (target
+        modules + capacity) looks eligible, the manager's ready()=False must
+        veto it."""
+        server_args = self._server_args(max_ofts_per_batch=8)
+        model_config = self._model_config(has_moe_layers=True)
+        oft_manager = self._fake_oft_manager(ready=False)
+        self.assertFalse(
+            DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
+                server_args, model_config, oft_manager=oft_manager
+            )
+        )
+
+    def test_manager_path_still_respects_capacity(self):
+        """The manager's readiness check subsumes target-module/MoE-layer
+        detection but NOT capacity -- capacity stays a separate,
+        server_args-only criterion (effective_oft_capacity), checked after
+        the manager says ready."""
+        server_args = self._server_args(max_ofts_per_batch=1)
+        model_config = self._model_config(has_moe_layers=True)
+        oft_manager = self._fake_oft_manager(ready=True)
+        self.assertFalse(
+            DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
+                server_args, model_config, oft_manager=oft_manager
+            )
+        )
+
+    def test_manager_path_still_excludes_dp_attention(self):
+        """DP-attention must short-circuit before the manager is even
+        consulted -- a truthy ready() must not override it."""
+        server_args = self._server_args(max_ofts_per_batch=8, enable_dp_attention=True)
+        model_config = self._model_config(has_moe_layers=True)
+        oft_manager = self._fake_oft_manager(ready=True)
+        self.assertFalse(
+            DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
+                server_args, model_config, oft_manager=oft_manager
+            )
+        )
+
+    def test_manager_path_ignores_stale_server_args_target_modules(self):
+        """Final whole-branch review I2/I3: when --peft-target-modules is
+        not given explicitly and target modules are instead inferred from
+        --peft-paths adapter configs, server_args.peft_target_modules stays
+        None/empty -- the server_args-only fallback branch cannot see this
+        (a pre-existing blind spot), but the manager-derived ground truth
+        must not be fooled by it: moe_expert_oft_multi_tenant_ready() alone
+        decides eligibility once a manager is available, regardless of what
+        server_args.peft_target_modules says."""
+        server_args = self._server_args(
+            max_ofts_per_batch=2, peft_target_modules=None
+        )
+        model_config = self._model_config(has_moe_layers=True)
+        oft_manager = self._fake_oft_manager(ready=True)
+        self.assertTrue(
+            DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
+                server_args, model_config, oft_manager=oft_manager
             )
         )
 

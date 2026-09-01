@@ -14,9 +14,11 @@ def _args(
     oft_impl="sibling",
     cuda_graph_config=None,
     model_has_moe=False,
+    enable_dp_attention=False,
 ):
     ns = SimpleNamespace(
         enable_lora=enable_lora,
+        enable_dp_attention=enable_dp_attention,
         peft_method=peft_method,
         peft_paths=(
             peft_paths
@@ -292,6 +294,58 @@ def test_moe_target_oft_staged_impl_leaves_decode_cuda_graph_enabled():
         # not fire here.
         model_has_moe=True,
         max_ofts_per_batch=1,
+    )
+    validate_peft_args(args)
+    assert args.cuda_graph_config.decode.backend == Backend.FULL
+
+
+def test_moe_target_oft_sibling_with_dp_attention_disables_decode_cuda_graph_even_with_capacity():
+    """Final whole-branch review C1: --enable-dp-attention must keep decode
+    CUDA graphs disabled for MoE-target sibling OFT regardless of capacity.
+    decode_cuda_graph_runner.py's _resolve_record_oft_variant_graph excludes
+    --enable-dp-attention outright (its cross-rank MoE token gathering is not
+    supported by the per-rank persistent slot_ids buffer -- see
+    OFTManager._compute_moe_multi_tenant_slot_ids), so dual-capture never
+    engages for this combination no matter how much capacity is configured.
+    Before this fix, this guard only looked at capacity (Task 4b), so a
+    DP-attention server with capacity >= 1 would have kept decode CUDA
+    graphs enabled -- "eligible but never dual-captured" -- which is unsafe:
+    the single fast-path graph alone does not guarantee a real adapter lands
+    at memory_pool.active_idx the way the capacity-only case does."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.peft.config import validate_peft_args
+
+    args = _args(
+        "oft",
+        enable_lora=False,
+        peft_target_modules=["gate_proj", "up_proj", "down_proj"],
+        oft_impl="sibling",
+        cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
+        model_has_moe=True,
+        max_ofts_per_batch=4,
+        enable_dp_attention=True,
+    )
+    validate_peft_args(args)
+    assert args.cuda_graph_config.decode.backend == Backend.DISABLED
+
+
+def test_moe_target_oft_sibling_without_dp_attention_and_with_capacity_keeps_decode_cuda_graph():
+    """Negative case for the test above: without --enable-dp-attention, real
+    capacity alone must still be sufficient to keep decode CUDA graphs
+    enabled (Task 4b's relaxation must not be silently re-broken by adding
+    the DP-attention term)."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.peft.config import validate_peft_args
+
+    args = _args(
+        "oft",
+        enable_lora=False,
+        peft_target_modules=["gate_proj", "up_proj", "down_proj"],
+        oft_impl="sibling",
+        cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
+        model_has_moe=True,
+        max_ofts_per_batch=4,
+        enable_dp_attention=False,
     )
     validate_peft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.FULL

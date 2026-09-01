@@ -436,6 +436,109 @@ class TestFullBufferBindingsInCudaGraphInit(unittest.TestCase):
         self.assertIs(moe._oft_w3_oft_r_all_slots, w3_tensor)
 
 
+class TestMoeExpertOftMultiTenantReady(unittest.TestCase):
+    """Unit tests for OFTManager.moe_expert_oft_multi_tenant_ready -- the
+    post-model-load ground truth decode_cuda_graph_runner.py's
+    _resolve_record_oft_variant_graph reads (final whole-branch review's
+    I1/I2/I3 fix). No GPU required: binds the real method onto a minimal
+    OFTManager stand-in whose _find_fused_moe_modules returns hand-built
+    SimpleNamespace "moe" objects with the exact attributes the real
+    _init_identity_expert_oft_for_cuda_graph / _apply_expert_oft_to_module
+    would have left on them.
+    """
+
+    def _ready(self, moe_modules: dict) -> bool:
+        tm = SimpleNamespace()
+        tm._find_fused_moe_modules = lambda: moe_modules
+        tm.moe_expert_oft_multi_tenant_ready = MethodType(
+            OFTManager.moe_expert_oft_multi_tenant_ready, tm
+        )
+        return tm.moe_expert_oft_multi_tenant_ready()
+
+    def test_false_when_no_moe_modules_found(self):
+        """Dense model (or no MoE targeting at all): nothing to dual-capture
+        for."""
+        self.assertFalse(self._ready({}))
+
+    def test_false_when_moe_modules_found_but_no_oft_buffers(self):
+        """MoE model, but OFT doesn't target its expert modules: MoE modules
+        exist but carry no OFT buffers at all."""
+        moe = SimpleNamespace(w13_oft_r=None, w1_oft_r=None, w3_oft_r=None, w2_oft_r=None)
+        self.assertFalse(self._ready({0: moe}))
+
+    def test_true_when_split_buffers_fully_bound(self):
+        """The common, safe case: nothing boot-loaded (or a split adapter
+        whose loader unconditionally binds _all_slots regardless of
+        preexisting content -- see _init_identity_expert_oft_for_cuda_graph's
+        elif w13_is_split branch) -- both w1/w3 and w2 all_slots bound."""
+        moe = SimpleNamespace(
+            w13_oft_r=None,
+            w1_oft_r=torch.zeros(1),
+            w3_oft_r=torch.zeros(1),
+            w2_oft_r=torch.zeros(1),
+            _oft_w1_oft_r_all_slots=torch.zeros(3, 1),
+            _oft_w3_oft_r_all_slots=torch.zeros(3, 1),
+            _oft_w2_oft_r_all_slots=torch.zeros(3, 1),
+        )
+        self.assertTrue(self._ready({0: moe}))
+
+    def test_false_when_legacy_fused_boot_adapter_leaves_w13_all_slots_unbound(self):
+        """Final whole-branch review I1: a legacy-fused (oft_type="oft")
+        boot-loaded adapter leaves moe.w13_oft_r bound (the loader's private
+        tensor) but _init_identity_expert_oft_for_cuda_graph's short-circuit
+        (moe.w13_oft_r is not None: pass) never binds
+        _oft_w13_oft_r_all_slots for it. Reproduced empirically against the
+        real _init_identity_expert_oft_for_cuda_graph before writing this
+        fixture (see final-review-fix-report.md)."""
+        moe = SimpleNamespace(
+            w13_oft_r=torch.zeros(1),  # boot-loaded, private -- no all_slots.
+            w1_oft_r=None,
+            w3_oft_r=None,
+            w2_oft_r=None,
+        )
+        self.assertFalse(self._ready({0: moe}))
+
+    def test_false_when_any_boot_adapter_leaves_w2_all_slots_unbound_regardless_of_oft_type(self):
+        """Generalization of I1 found during investigation: _apply_expert_
+        oft_to_module always privately allocates w2_oft_r for a boot-loaded
+        adapter targeting down_proj -- for BOTH split (canonical_oft) and
+        legacy adapters, since down_proj handling doesn't depend on oft_type
+        -- so _init_identity_expert_oft_for_cuda_graph's
+        `if init_w2 and moe.w2_oft_r is None` guard skips binding
+        _oft_w2_oft_r_all_slots whenever ANYTHING is already loaded on it,
+        not just for legacy. A server_args.oft_type-only exclusion would
+        have missed this case entirely."""
+        moe = SimpleNamespace(
+            w13_oft_r=None,
+            w1_oft_r=torch.zeros(1),
+            w3_oft_r=torch.zeros(1),
+            w2_oft_r=torch.zeros(1),  # boot-loaded, private -- no all_slots.
+            _oft_w1_oft_r_all_slots=torch.zeros(3, 1),
+            _oft_w3_oft_r_all_slots=torch.zeros(3, 1),
+        )
+        self.assertFalse(self._ready({0: moe}))
+
+    def test_false_when_any_single_layer_has_a_gap(self):
+        """Multi-layer model: one fully-bound layer must not mask a gap on
+        another layer."""
+        good = SimpleNamespace(
+            w13_oft_r=None,
+            w1_oft_r=torch.zeros(1),
+            w3_oft_r=torch.zeros(1),
+            w2_oft_r=torch.zeros(1),
+            _oft_w1_oft_r_all_slots=torch.zeros(3, 1),
+            _oft_w3_oft_r_all_slots=torch.zeros(3, 1),
+            _oft_w2_oft_r_all_slots=torch.zeros(3, 1),
+        )
+        gapped = SimpleNamespace(
+            w13_oft_r=torch.zeros(1),
+            w1_oft_r=None,
+            w3_oft_r=None,
+            w2_oft_r=None,
+        )
+        self.assertFalse(self._ready({0: good, 1: gapped}))
+
+
 class TestMakeOftInvokeMultiTenantBranch(unittest.TestCase):
     def test_invoke_uses_multi_tenant_path_when_slot_ids_present(self):
         from sglang.srt.oft import oft_moe_runners
@@ -884,6 +987,109 @@ class TestPersistentSlotIdsBufferAndCaptureForcing(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TestPrepareOftBatchEagerDemotionOnOverflow(unittest.TestCase):
+    """Final whole-branch review I4: prepare_oft_batch's own use_cuda_graph
+    heuristic (bs <= max_bs_in_cuda_graph and forward_mode.is_cuda_graph())
+    has no awareness of per-token draft-width sizing. A TARGET_VERIFY batch
+    whose real draft_token_num exceeds the persistent buffer's capacity must
+    demote to the eager path for that one call (mirroring
+    LoRAManager.prepare_lora_batch's own use_cuda_graph=False demotion) --
+    not raise, since the runner would have run this batch eagerly anyway."""
+
+    def _make_tm(self, *, buffer_size: int):
+        tm = SimpleNamespace()
+        tm.max_bs_in_cuda_graph = 8
+        tm._moe_cg_slot_ids_buffer = torch.full(
+            (buffer_size,), -1, dtype=torch.long
+        )
+        tm.max_ofts_per_batch = 4
+        tm.memory_pool = SimpleNamespace(
+            uid_to_buffer_id={"adapterA": 1, "adapterB": 2},
+            get_buffer_id=lambda uid: {"adapterA": 1, "adapterB": 2}[uid],
+            active_idx=0,
+        )
+        tm.adapters = {
+            "adapterA": SimpleNamespace(block_size=32),
+            "adapterB": SimpleNamespace(block_size=32),
+        }
+        tm.configs = {}
+        tm.enable_dp_attention = False
+        tm._find_fused_moe_modules = lambda: {}
+        tm.oft_backend = SimpleNamespace(
+            prepare_oft_batch=mock.Mock()
+        )
+        tm._compute_moe_multi_tenant_slot_ids = MethodType(
+            OFTManager._compute_moe_multi_tenant_slot_ids, tm
+        )
+        tm.prepare_oft_batch = MethodType(OFTManager.prepare_oft_batch, tm)
+        tm._push_moe_multi_tenant_slot_ids = MethodType(
+            OFTManager._push_moe_multi_tenant_slot_ids, tm
+        )
+        return tm
+
+    def _target_verify_batch(self, *, batch_size, draft_token_num):
+        return SimpleNamespace(
+            batch_size=batch_size,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            adapter_ids=["adapterA", "adapterB"][:batch_size],
+            input_ids=torch.zeros(batch_size * draft_token_num, dtype=torch.int32),
+            spec_info=SimpleNamespace(draft_token_num=draft_token_num),
+        )
+
+    def test_overflowing_target_verify_batch_demotes_instead_of_raising(self):
+        """bs=2, draft_token_num=5 -> 10 real per-token slots needed, but the
+        persistent buffer only holds 4 -- must not raise."""
+        tm = self._make_tm(buffer_size=4)
+        forward_batch = self._target_verify_batch(batch_size=2, draft_token_num=5)
+
+        tm.prepare_oft_batch(forward_batch)  # must not raise
+
+        # Demoted to eager: the backend must see use_cuda_graph=False.
+        self.assertFalse(
+            tm.oft_backend.prepare_oft_batch.call_args.kwargs["use_cuda_graph"]
+        )
+
+    def test_demoted_batch_produces_a_correctly_sized_fresh_tensor(self):
+        """The demoted call must still produce a CORRECT result -- a
+        freshly-built tensor with one entry per real token (bs *
+        draft_token_num), not a truncated/garbage view into the
+        undersized persistent buffer."""
+        tm = self._make_tm(buffer_size=4)
+        forward_batch = self._target_verify_batch(batch_size=2, draft_token_num=5)
+
+        tm.prepare_oft_batch(forward_batch)
+
+        self.assertEqual(tm._moe_multi_tenant_slot_ids.shape, (10,))
+        self.assertTrue(
+            torch.equal(
+                tm._moe_multi_tenant_slot_ids,
+                torch.tensor([1] * 5 + [2] * 5, dtype=torch.long),
+            )
+        )
+        # Not a view into the (too-small) persistent buffer.
+        self.assertNotEqual(
+            tm._moe_multi_tenant_slot_ids.data_ptr(),
+            tm._moe_cg_slot_ids_buffer.data_ptr(),
+        )
+
+    def test_non_overflowing_target_verify_batch_still_uses_cuda_graph_path(self):
+        """Negative case: a batch that fits must NOT be demoted -- the
+        persistent buffer is still written in place, exactly as before this
+        fix, for the same shape the buffer was captured for."""
+        tm = self._make_tm(buffer_size=8)
+        forward_batch = self._target_verify_batch(batch_size=2, draft_token_num=4)
+
+        tm.prepare_oft_batch(forward_batch)
+
+        self.assertTrue(
+            tm.oft_backend.prepare_oft_batch.call_args.kwargs["use_cuda_graph"]
+        )
+        self.assertEqual(
+            tm._moe_multi_tenant_slot_ids.data_ptr(),
+            tm._moe_cg_slot_ids_buffer.data_ptr(),
+        )
+
+
 class TestInitCudaGraphBatchInfoAllocatesSlotIdsBuffer(unittest.TestCase):
     """The persistent buffer's sizing (max_bs_in_cuda_graph *
     num_tokens_per_bs) is the one line the whole CUDA-graph mechanism depends
@@ -893,6 +1099,10 @@ class TestInitCudaGraphBatchInfoAllocatesSlotIdsBuffer(unittest.TestCase):
     def _make_tm(self):
         tm = SimpleNamespace()
         tm.device = torch.device("cpu")
+        # Matches OFTManager.__init__'s own field lifecycle (always set to
+        # None, then a None check) -- the idempotence guard in
+        # init_cuda_graph_batch_info reads this directly.
+        tm._moe_cg_slot_ids_buffer = None
         tm.oft_backend = SimpleNamespace(
             init_cuda_graph_batch_info=lambda **kwargs: None
         )
@@ -920,6 +1130,44 @@ class TestInitCudaGraphBatchInfoAllocatesSlotIdsBuffer(unittest.TestCase):
         tm = self._make_tm()
         tm.init_cuda_graph_batch_info(max_bs_in_cuda_graph=8, num_tokens_per_bs=1)
         self.assertEqual(tm._moe_cg_slot_ids_buffer.shape, (8,))
+
+    def test_second_call_with_matching_sizing_is_a_no_op(self):
+        """Final whole-branch review I5: a second DecodeCudaGraphRunner can
+        be constructed against the same underlying OFTManager (e.g.
+        adaptive-speculative-decode's target_graph_runner). A graph already
+        captured against the first buffer holds a pointer into it, so a
+        second call with the SAME sizing must reuse the existing buffer
+        (identity preserved), not silently reallocate a new one."""
+        tm = self._make_tm()
+        tm.init_cuda_graph_batch_info(max_bs_in_cuda_graph=4, num_tokens_per_bs=3)
+        first_buffer = tm._moe_cg_slot_ids_buffer
+
+        tm.init_cuda_graph_batch_info(max_bs_in_cuda_graph=4, num_tokens_per_bs=3)
+
+        self.assertIs(tm._moe_cg_slot_ids_buffer, first_buffer)
+        self.assertEqual(tm.max_bs_in_cuda_graph, 4)
+
+    def test_second_call_with_different_sizing_raises_clearly(self):
+        """A second call with DIFFERENT sizing must fail loudly rather than
+        silently reallocate out from under a graph that already captured a
+        pointer into the first buffer."""
+        tm = self._make_tm()
+        tm.init_cuda_graph_batch_info(max_bs_in_cuda_graph=4, num_tokens_per_bs=3)
+
+        with self.assertRaises(AssertionError):
+            tm.init_cuda_graph_batch_info(max_bs_in_cuda_graph=8, num_tokens_per_bs=3)
+
+    def test_second_call_with_same_product_but_different_max_bs_still_raises(self):
+        """max_bs_in_cuda_graph is read directly elsewhere (prepare_oft_
+        batch's own use_cuda_graph gate), so a second call must match it
+        exactly -- not just the buffer's total token-slot count -- even when
+        the product (max_bs_in_cuda_graph * num_tokens_per_bs) happens to
+        match."""
+        tm = self._make_tm()
+        tm.init_cuda_graph_batch_info(max_bs_in_cuda_graph=4, num_tokens_per_bs=2)
+
+        with self.assertRaises(AssertionError):
+            tm.init_cuda_graph_batch_info(max_bs_in_cuda_graph=2, num_tokens_per_bs=4)
 
 
 if __name__ == "__main__":

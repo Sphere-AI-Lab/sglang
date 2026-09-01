@@ -241,6 +241,24 @@ _MOE_EXPERT_COUNT_CONFIG_ATTRS = (
     "moe_topk",
 )
 
+# The MoE expert projection module names OFT can target. Shared with
+# decode_cuda_graph_runner.py's _resolve_record_oft_variant_graph (its
+# pre-model-load fallback branch) so the two never drift out of sync -- see
+# the final whole-branch review's I2/I3 findings for
+# 2026-09-01-oft-moe-cuda-graph-dual-capture.
+MOE_EXPERT_TARGET_MODULES = frozenset(
+    {"gate_up_proj", "gate_proj", "up_proj", "down_proj"}
+)
+
+
+def effective_oft_capacity(server_args) -> int:
+    """Effective per-batch adapter capacity: buffer slot 0 is always reserved
+    for the base/identity placeholder (OFTMemoryPool), so real resident-
+    adapter capacity is max_ofts_per_batch - 1, not max_ofts_per_batch.
+    Shared with decode_cuda_graph_runner.py's own copy of this arithmetic so
+    the two can never drift (final whole-branch review's I2/I3)."""
+    return server_args.max_ofts_per_batch - 1
+
 
 def _model_has_moe_layers(server_args) -> bool:
     """Whether the model this server is about to load actually has MoE layers
@@ -478,12 +496,23 @@ def validate_peft_args(server_args) -> None:
         # single fast-path graph is captured -- so this guard must keep
         # disabling decode CUDA graphs for that residual case rather than
         # silently serve wrong rotations under replay.
-        moe_expert_target_modules = {
-            "gate_up_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        } & (peft_target_modules or set())
+        #
+        # --enable-dp-attention is a SECOND, independent reason to keep
+        # disabling: _resolve_record_oft_variant_graph also excludes it
+        # outright (final whole-branch review's C1) because
+        # _compute_moe_multi_tenant_slot_ids's cross-rank MoE token gathering
+        # is not supported by this per-rank persistent buffer -- so
+        # dual-capture never engages for a DP-attention server EITHER,
+        # regardless of capacity. Without this guard also disabling decode
+        # CUDA graphs for that combination, a DP-attention server would be
+        # "eligible but never dual-captured": the single fast-path graph
+        # alone is not safe here the way it is for the capacity-only case
+        # above (a real adapter is never guaranteed to land at
+        # memory_pool.active_idx), so this must unconditionally disable,
+        # exactly like the pre-plan behavior for this whole configuration.
+        moe_expert_target_modules = MOE_EXPERT_TARGET_MODULES & (
+            peft_target_modules or set()
+        )
         if (
             server_args.oft_impl == "sibling"
             and moe_expert_target_modules
@@ -495,32 +524,39 @@ def validate_peft_args(server_args) -> None:
             # reserved for the base/identity placeholder). Checked before the
             # expensive _model_has_moe_layers call below, mirroring
             # _resolve_record_oft_variant_graph's own capacity check exactly.
-            effective_oft_capacity = server_args.max_ofts_per_batch - 1
+            capacity = effective_oft_capacity(server_args)
+            insufficient_capacity = capacity < 1
+            dp_attention_unsupported = server_args.enable_dp_attention
 
             # _model_has_moe_layers last: it resolves (and caches) the model
             # config, so servers whose decode graphs are already disabled --
-            # and every non-MoE-targeting or sufficient-capacity server
-            # above -- never pay for it.
+            # and every non-MoE-targeting or sufficient-capacity,
+            # non-DP-attention server above -- never pay for it.
             if (
                 server_args.cuda_graph_config.decode.backend != Backend.DISABLED
-                and effective_oft_capacity < 1
+                and (insufficient_capacity or dp_attention_unsupported)
                 and _model_has_moe_layers(server_args)
             ):
                 logger.warning(
                     "peft_method=oft with oft_impl=sibling targeting MoE expert "
-                    "modules %s is incompatible with decode CUDA graphs at "
-                    "--max-ofts-per-batch=%s (effective per-batch adapter "
-                    "capacity %s < 1, so the dual-capture mechanism in "
-                    "docs/superpowers/plans/"
+                    "modules %s is incompatible with decode CUDA graphs "
+                    "(effective per-batch adapter capacity %s%s, so the "
+                    "dual-capture mechanism in docs/superpowers/plans/"
                     "2026-09-01-oft-moe-cuda-graph-dual-capture.md never "
                     "engages and only the single fast-path graph is "
                     "captured); disabling the decode CUDA graph (was "
-                    "backend=%s). Increase --max-ofts-per-batch to >= 2 to "
-                    "keep decode CUDA graphs enabled for this configuration.",
+                    "backend=%s).%s",
                     sorted(moe_expert_target_modules),
-                    server_args.max_ofts_per_batch,
-                    effective_oft_capacity,
+                    capacity,
+                    " < 1" if insufficient_capacity else " is sufficient",
                     server_args.cuda_graph_config.decode.backend,
+                    (
+                        " --enable-dp-attention is not supported by this "
+                        "mechanism regardless of capacity."
+                        if dp_attention_unsupported
+                        else " Increase --max-ofts-per-batch to >= 2 to keep "
+                        "decode CUDA graphs enabled for this configuration."
+                    ),
                 )
                 server_args.cuda_graph_config.decode.backend = Backend.DISABLED
 
