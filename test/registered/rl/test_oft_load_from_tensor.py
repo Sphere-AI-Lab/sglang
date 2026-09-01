@@ -12,22 +12,25 @@ _adapter_config_dict helpers: per that file's own module docstring, no
 reusable small real trained OFT HF adapter repo exists to download the way
 the LoRA test downloads "charent/self_cognition_Alice".
 
-NOT the same mechanism as test/registered/rl/test_oft_sibling_streamed_update.py
-(that file covers the OLD legacy update_weights_from_tensor(load_format=
-"oft_adapter") streamed path). This file exercises the NEW native RPC surface
-added in Task 7 (engine.load_oft_adapter_from_tensors / unload_oft_adapter),
-which -- unlike the legacy single-active path -- allows multiple OFT adapters
-to be concurrently resident (Task 6's removal of the single-active
-restriction).
+NOT the same mechanism as the OLD legacy update_weights_from_tensor(load_format=
+"oft_adapter") streamed path (retired in Task 9; formerly covered by
+test/registered/rl/test_oft_sibling_streamed_update.py, deleted in that same
+task). This file exercises the NEW native RPC surface added in Task 7
+(engine.load_oft_adapter_from_tensors / unload_oft_adapter), which -- unlike
+the legacy single-active path -- allows multiple OFT adapters to be
+concurrently resident (Task 6's removal of the single-active restriction).
 
 KNOWN BUGS (see this task's report for full evidence/tracebacks -- reported
 to the controller, not fixed here per this task's charter):
   1. OFTManager.load_adapter_from_tensors (srt/oft/oft_manager.py) passes a
-     raw dict where the shared _write_streamed_oft_tensors/
+     raw dict where the shared _resolve_streamed_oft_tensor_groups/
      _partition_expert_oft_tensors (srt/oft/streamed_weight_loader.py)
      expect List[Tuple[str, Tensor]] and iterate it directly -- every call
      currently fails with "ValueError: too many values to unpack (expected
-     2)". This is the first failure every scenario below hits.
+     2)". This is the first failure every scenario below hits. [Task 9 note:
+     load_adapter_from_tensors now normalizes dict -> list itself before
+     calling these helpers -- this may already be fixed; not verified here,
+     out of Task 9's scope.]
   2. There is no release counterpart to peft/tokenizer_hooks.py's
      `tm.peft_registry.acquire_with_version(path)` anywhere in the codebase
      (unlike LoRA's TokenizerManager._finalize_lora_lease / lora_registry

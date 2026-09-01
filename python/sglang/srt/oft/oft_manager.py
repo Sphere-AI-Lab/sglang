@@ -418,9 +418,9 @@ class OFTManager(AdapterManager):
     def load_adapter_from_tensors(
         self, ref: OFTRef, named_tensors, config_dict: dict, *, upsert: bool = False
     ) -> "OFTUpdateOutput":
-        """Native-RPC admission path: like _ensure_streaming_oft_adapter_slot,
-        but multi-tenant (no single-active restriction) since this serves
-        the new native load_oft_adapter_from_tensors RPC, not the legacy
+        """Native-RPC admission path: multi-tenant (no single-active
+        restriction) since this serves the new native
+        load_oft_adapter_from_tensors RPC, not the (now-retired) legacy
         srt/peft streamed path. Capacity is still bounded by
         max_ofts_per_batch via the memory pool's own admission.
 
@@ -1615,10 +1615,9 @@ class OFTManager(AdapterManager):
 
     def _stage_fill(self, named_tensors, config, name, version):
         """Per-method hook for ``AdapterManager.stage_adapter``: partition
-        ``named_tensors`` (raw checkpoint-name tensors -- the SAME format
-        ``load_streamed_oft_adapter`` consumes) into dense vs expert, bake
-        each dense tensor's R via Cayley (mirroring
-        ``load_streamed_oft_adapter``'s dense dispatch, minus its chunking --
+        ``named_tensors`` (raw checkpoint-name tensors) into dense vs expert,
+        bake each dense tensor's R via Cayley (mirroring the streamed dense
+        dispatch in ``streamed_weight_loader.py``, minus its chunking --
         chunking there is a streaming-transport perf optimization for the
         ACTIVE path's multi-RPC sync, not needed for a single-shot stage()
         fill), then write dense into STAGING via ``mem_pool.stage()`` and
@@ -1674,8 +1673,9 @@ class OFTManager(AdapterManager):
 
         # CanonicalOFT: pre-fuse split per-slice q/k/v (gate/up) tensors into
         # one stacked qkv_proj/gate_up_proj tensor when ALL siblings are
-        # present in this call -- mirrors load_streamed_oft_adapter exactly.
-        # Skipped entirely for an expert-only payload (nothing to normalize).
+        # present in this call -- mirrors the streamed dense dispatch in
+        # streamed_weight_loader.py exactly. Skipped entirely for an
+        # expert-only payload (nothing to normalize).
         if dense_named_tensors:
             dense_dict = dict(dense_named_tensors)
             if len(dense_dict) == len(dense_named_tensors):
@@ -1759,8 +1759,7 @@ class OFTManager(AdapterManager):
         from sglang.srt.oft.oft_registry import OFTRef
 
         # Single-active convention: the id IS the name when the tokenizer supplies
-        # none (mirrors _ensure_streaming_oft_adapter_slot). OFTRef rejects a None
-        # adapter_id.
+        # none. OFTRef rejects a None adapter_id.
         if adapter_id is None:
             adapter_id = name
         oft_ref = OFTRef(

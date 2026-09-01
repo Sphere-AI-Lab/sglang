@@ -462,8 +462,7 @@ class WeightUpdater:
                 adapter_name,
                 # Single-active convention: the tokenizer-registered adapter_id
                 # (== adapter_name == "orbit_oft"); fall back to adapter_name when
-                # the tokenizer supplied none (mirrors
-                # _ensure_streaming_oft_adapter_slot's guard).
+                # the tokenizer supplied none.
                 adapter_id=adapter_id if adapter_id is not None else adapter_name,
                 version=int(adapter_version),
                 payload_metadata=payload_metadata,
@@ -549,21 +548,6 @@ class WeightUpdater:
         # We need to get device after patch otherwise the device would be wrong
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
-
-        # Streamed peft adapter sync (load_format "oft_adapter" / "lora_adapter"):
-        # dispatch to the single-active peft managers; NOT_HANDLED falls through
-        # to the base-weight paths below.
-        result = peft.maybe_load_adapter_format(
-            self.get_model_runner(),
-            load_format,
-            named_tensors,
-            adapter_config,
-            adapter_name,
-            adapter_id,
-            device=infered_device,
-        )
-        if result is not peft.NOT_HANDLED:
-            return result
 
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))

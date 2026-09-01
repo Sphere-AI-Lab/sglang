@@ -16,11 +16,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.oft.oft_registry import OFTRef
-from sglang.srt.oft.streamed_weight_loader import (
-    FlattenedOFTTensorPayload,
-    load_streamed_oft_adapter,
-    normalize_oft_weight_payload,
-)
+from sglang.srt.oft.streamed_weight_loader import FlattenedOFTTensorPayload
 from sglang.srt.utils import get_available_gpu_memory
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
@@ -41,7 +37,6 @@ __all__ = [
     "OFTRef",
     "NOT_HANDLED",
     "maybe_init_peft_manager",
-    "maybe_load_adapter_format",
     "reconstruct_oft_staging",
     "maybe_load_adapter",
     "maybe_load_adapter_from_tensors",
@@ -57,8 +52,9 @@ __all__ = [
     "activate_adapter",
 ]
 
-# Sentinel returned by maybe_load_adapter_format when load_format isn't
-# "oft_adapter", so the caller can fall through to the lora_adapter branch.
+# Sentinel returned by stage_adapter/activate_adapter when the request isn't
+# handled by the active peft manager, so the caller can fall through to its
+# own handling.
 NOT_HANDLED = object()
 
 
@@ -120,38 +116,6 @@ def _init_oft_manager(model_runner: "ModelRunner", server_args: "ServerArgs") ->
         memory_saver_adapter=model_runner.memory_saver_adapter,
         memory_saver_cpu_backup=model_runner.server_args.enable_weights_cpu_backup,
     )
-
-
-def maybe_load_adapter_format(
-    model_runner: "ModelRunner",
-    load_format,
-    tensors,
-    adapter_config: Optional[dict],
-    adapter_name: Optional[str],
-    adapter_id: Optional[str],
-    *,
-    payload_metadata: Optional[dict] = None,
-    device=None,
-):
-    """Absorbs the OFT bodies of the 3 ``load_format == "oft_adapter"`` sites.
-
-    Returns ``NOT_HANDLED`` when ``load_format`` is some other value -- so the
-    caller can fall through to its own (upstream ``srt/lora``) handling.
-    """
-    if load_format == "oft_adapter":
-        if payload_metadata is not None:
-            tensors = reconstruct_oft_staging(tensors, payload_metadata)
-        elif device is not None:
-            tensors = normalize_oft_weight_payload(tensors, device=device)
-        return load_streamed_oft_adapter(
-            model_runner,
-            tensors,
-            adapter_config,
-            adapter_name,
-            adapter_id,
-        )
-
-    return NOT_HANDLED
 
 
 def reconstruct_oft_staging(
@@ -218,14 +182,11 @@ def stage_adapter(
     payload_metadata: Optional[dict] = None,
     double_buffer: bool = True,
 ):
-    """Double-buffer STAGING fill -- the ``stage()`` counterpart of
-    ``maybe_load_adapter_format``'s ``oft_adapter`` dispatch. Reconstructs the
-    wire payload identically (the ``payload_metadata`` path only -- NCCL is
-    the sole transport the stage/activate endpoints use, unlike the CUDA-IPC
-    ``device=`` path ``maybe_load_adapter_format`` also supports), then calls
-    the resolved manager's ``stage_adapter``. Returns ``NOT_HANDLED`` when
-    ``load_format`` doesn't resolve to an active manager, mirroring
-    ``maybe_load_adapter_format``.
+    """Double-buffer STAGING fill for the ``oft_adapter`` load_format.
+    Reconstructs the wire payload identically (the ``payload_metadata`` path
+    only -- NCCL is the sole transport the stage/activate endpoints use), then
+    calls the resolved manager's ``stage_adapter``. Returns ``NOT_HANDLED``
+    when ``load_format`` doesn't resolve to an active manager.
 
     ``double_buffer=False`` (distributed sync without ``--adapter-double-
     buffer``) is rejected for OFT: with DB-off sizing the pool inherits the
@@ -261,9 +222,8 @@ def activate_adapter(model_runner: "ModelRunner", adapter_name: str, version):
     """Double-buffer ACTIVATE flip: drain-then-copy staging->active on the
     resolved manager's memory pool. Unlike ``stage_adapter``, there is no
     ``load_format`` to dispatch on here, so this dispatches on
-    ``server_args.peft_method`` directly (mirroring
-    ``maybe_load_adapter_format``'s dispatch). Returns ``NOT_HANDLED`` when
-    the method isn't active.
+    ``server_args.peft_method`` directly. Returns ``NOT_HANDLED`` when the
+    method isn't active.
     """
     peft_method = model_runner.server_args.peft_method
     if peft_method == "oft":
