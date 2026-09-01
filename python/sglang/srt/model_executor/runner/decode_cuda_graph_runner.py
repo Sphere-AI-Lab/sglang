@@ -284,56 +284,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         # --- OFT MoE-expert dual-graph capture -------------------------
-        # OFT MoE-expert dual-graph capture: single-slot (today's fast path)
-        # and multi-slot (per-token routing) variants, selected at replay by
-        # how many distinct adapters are actually resident. Opt-in: a server
-        # without OFT, or with no more than one possible resident MoE-target
-        # adapter, captures only the single-slot variant it already did
-        # before this feature existed -- zero extra cost.
-        #
-        # Three real-config checks, mirroring dsa_dual_graph's own
-        # real-config-check model above:
-        #   1. OFT is actually enabled (--peft-method oft).
-        #   2. It targets MoE expert modules -- the same
-        #      gate_up_proj/gate_proj/up_proj/down_proj set and HF-config
-        #      per-token-expert-count probe peft/config.py's
-        #      validate_peft_args already uses to decide whether this
-        #      server has expert-OFT buffers at all.
-        #   3. Effective per-batch adapter capacity (max_ofts_per_batch - 1;
-        #      buffer slot 0 is always reserved for the base/identity
-        #      placeholder, see OFTMemoryPool) allows more than one real
-        #      resident adapter.
-        self.record_oft_variant_graph = False
-        if model_runner.server_args.peft_method == "oft":
-            peft_target_modules = set(
-                model_runner.server_args.peft_target_modules or ()
+        # OFT MoE-expert dual-graph capture: no-real-adapter (today's fast
+        # path) and any-real-adapter (per-token routing) variants, selected
+        # at replay by whether the batch has ANY real resident adapter (not
+        # "how many" -- see _resolve_record_oft_variant_graph's docstring
+        # for the threshold's real-config checks and why the boundary is
+        # zero-vs-any rather than one-vs-many). Opt-in: a server without
+        # OFT, or with no possible resident MoE-target adapter at all,
+        # captures only the fast-path variant it already did before this
+        # feature existed -- zero extra cost.
+        self.record_oft_variant_graph = self._resolve_record_oft_variant_graph(
+            model_runner.server_args, model_runner.model_config
+        )
+        if self.record_oft_variant_graph:
+            logger.info(
+                "[dense-decode] OFT MoE-expert dual-graph enabled: capturing "
+                "no-real-adapter + any-real-adapter decode graphs; dispatch "
+                "on whether the batch has any real resident adapter."
             )
-            targets_moe_experts = bool(
-                {"gate_up_proj", "gate_proj", "up_proj", "down_proj"}
-                & peft_target_modules
-            )
-            model_has_moe_layers = any(
-                hasattr(model_runner.model_config.hf_text_config, attr)
-                for attr in (
-                    "num_experts_per_tok",
-                    "num_experts_per_token",
-                    "top_k_experts",
-                    "moe_top_k",
-                    "moe_topk",
-                )
-            )
-            effective_oft_capacity = model_runner.server_args.max_ofts_per_batch - 1
-            if (
-                targets_moe_experts
-                and model_has_moe_layers
-                and effective_oft_capacity > 1
-            ):
-                self.record_oft_variant_graph = True
-                logger.info(
-                    "[dense-decode] OFT MoE-expert dual-graph enabled: capturing "
-                    "single-slot + multi-slot decode graphs; dispatch on the "
-                    "batch's distinct resident adapter count."
-                )
 
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
@@ -651,6 +619,54 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return "lora"
         return "nolora"
 
+    @staticmethod
+    def _resolve_record_oft_variant_graph(server_args, model_config) -> bool:
+        """Whether this server needs OFT MoE-expert dual-graph capture: OFT
+        actually enabled, targeting MoE expert modules, and with effective
+        per-batch adapter capacity for at least one real resident adapter.
+
+        Three real-config checks, mirroring dsa_dual_graph's own
+        real-config-check model in __init__:
+          1. OFT is actually enabled (--peft-method oft).
+          2. It targets MoE expert modules -- the same
+             gate_up_proj/gate_proj/up_proj/down_proj set and HF-config
+             per-token-expert-count probe peft/config.py's
+             validate_peft_args already uses to decide whether this server
+             has expert-OFT buffers at all.
+          3. Effective per-batch adapter capacity (max_ofts_per_batch - 1;
+             buffer slot 0 is always reserved for the base/identity
+             placeholder, see OFTMemoryPool) allows at least ONE real
+             resident adapter -- not ">1". _compute_moe_multi_tenant_
+             slot_ids (oft_manager.py) already takes the general per-token
+             path for EVERY batch with >=1 real adapter today, not just 2+:
+             in the plain native-RPC ("sibling") pool, slot 0 (memory_pool.
+             active_idx) is permanently reserved for the boot-time
+             base/identity registration, so a real adapter can never land
+             there, making the old "single real adapter at active_idx is
+             fast-path-safe" carve-out unreachable. See that function's
+             docstring for the full history.
+        """
+        if server_args.peft_method != "oft":
+            return False
+        peft_target_modules = set(server_args.peft_target_modules or ())
+        targets_moe_experts = bool(
+            {"gate_up_proj", "gate_proj", "up_proj", "down_proj"} & peft_target_modules
+        )
+        model_has_moe_layers = any(
+            hasattr(model_config.hf_text_config, attr)
+            for attr in (
+                "num_experts_per_tok",
+                "num_experts_per_token",
+                "top_k_experts",
+                "moe_top_k",
+                "moe_topk",
+            )
+        )
+        effective_oft_capacity = server_args.max_ofts_per_batch - 1
+        return (
+            targets_moe_experts and model_has_moe_layers and effective_oft_capacity >= 1
+        )
+
     def _resolve_oft_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
         """Host dispatch: pick which pre-captured OFT MoE-expert decode graph
         to replay, from the batch's real per-request adapter identity.
@@ -660,13 +676,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         OFTManager, matching how _resolve_lora_variant reads
         forward_batch.lora_ids directly rather than reaching into
         LoRAManager. Returns None when OFT dual-graph capture is not enabled
-        for this server (the common case: zero extra cost)."""
+        for this server (the common case: zero extra cost).
+
+        The "oft_multi"/"oft_single" boundary is ANY real adapter vs. ZERO
+        real adapters, not "many" vs. "one" (the labels are historical, kept
+        as literal values other code depends on -- see Task 1). This mirrors
+        _compute_moe_multi_tenant_slot_ids's actual current fast-path
+        condition (oft_manager.py): in the plain native-RPC ("sibling")
+        pool, buffer slot 0 (memory_pool.active_idx) is permanently reserved
+        for the boot-time base/identity registration, so a real adapter can
+        never land there -- meaning that function already takes the general
+        per-token path for ANY batch with a real adapter, not just 2+."""
         if not getattr(self, "record_oft_variant_graph", False):
             return None
         if forward_batch.adapter_ids is None:
             return None
         distinct_real = {uid for uid in forward_batch.adapter_ids if uid is not None}
-        return "oft_multi" if len(distinct_real) > 1 else "oft_single"
+        return "oft_multi" if len(distinct_real) >= 1 else "oft_single"
 
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
@@ -1196,8 +1222,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         # OFT MoE-expert dual-graph: capture a multi-slot (per-token routing)
         # and a single-slot (today's fast path) variant, selected at replay by
-        # how many distinct adapters are actually resident. getattr default:
-        # same reasoning as dsa_variants above -- subclasses that don't run
+        # whether the batch has ANY real resident adapter (not "how many" --
+        # see _resolve_oft_variant's docstring for why the boundary is
+        # zero-vs-any rather than one-vs-many, despite the oft_single/
+        # oft_multi label names). getattr default: same reasoning as
+        # dsa_variants above -- subclasses that don't run
         # DecodeCudaGraphRunner.__init__ never set record_oft_variant_graph.
         oft_variants = (
             [("oft_multi", True), ("oft_single", False)]

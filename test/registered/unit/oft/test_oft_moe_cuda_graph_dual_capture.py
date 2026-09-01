@@ -68,10 +68,22 @@ class TestResolveOftVariant(unittest.TestCase):
         forward_batch = SimpleNamespace(adapter_ids=["a", "b", None])
         self.assertIsNone(runner._resolve_oft_variant(forward_batch))
 
-    def test_returns_oft_single_for_at_most_one_distinct_adapter(self):
+    def test_exactly_one_real_adapter_resolves_to_oft_multi_not_oft_single(self):
+        """Regression guard: a single real adapter used to resolve to
+        "oft_single" (>1-distinct-adapters threshold), but
+        _compute_moe_multi_tenant_slot_ids (oft_manager.py) already takes
+        the general per-token path for ANY real adapter today, not just 2+
+        -- in the plain native-RPC ("sibling") pool, buffer slot 0
+        (memory_pool.active_idx) is permanently reserved for the boot-time
+        base/identity registration, so a real adapter can never land there
+        and the old "single real adapter is fast-path-safe" case is
+        unreachable. Replaying a single-real-adapter batch against a graph
+        captured for the (dead) "oft_single" variant would silently apply
+        the wrong routing. Verified this fails against the pre-fix (`> 1`)
+        threshold and passes against the fixed (`>= 1`) one."""
         runner = self._make_runner(record_oft_variant_graph=True)
         forward_batch = SimpleNamespace(adapter_ids=["a", "a", None])
-        self.assertEqual(runner._resolve_oft_variant(forward_batch), "oft_single")
+        self.assertEqual(runner._resolve_oft_variant(forward_batch), "oft_multi")
 
     def test_returns_oft_single_when_no_adapters_at_all(self):
         runner = self._make_runner(record_oft_variant_graph=True)
@@ -111,6 +123,83 @@ class TestOftVariantsCaptureAxis(unittest.TestCase):
             else [(None, None)]
         )
         self.assertEqual(oft_variants, [("oft_multi", True), ("oft_single", False)])
+
+
+class TestResolveRecordOftVariantGraph(unittest.TestCase):
+    """Unit tests for DecodeCudaGraphRunner._resolve_record_oft_variant_graph,
+    the pure (server_args, model_config) -> bool condition that __init__
+    assigns to self.record_oft_variant_graph."""
+
+    def _server_args(self, **overrides):
+        defaults = dict(
+            peft_method="oft",
+            peft_target_modules={"gate_up_proj", "down_proj"},
+            max_ofts_per_batch=8,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def _model_config(self, has_moe_layers=True):
+        hf_text_config = SimpleNamespace()
+        if has_moe_layers:
+            hf_text_config.num_experts_per_tok = 2
+        return SimpleNamespace(hf_text_config=hf_text_config)
+
+    def test_capacity_for_exactly_one_real_adapter_is_true(self):
+        """Regression guard: max_ofts_per_batch=2 gives effective capacity
+        (max_ofts_per_batch - 1) of exactly 1 -- room for exactly ONE real
+        resident adapter. Before the >=1 threshold fix this required
+        capacity > 1 (max_ofts_per_batch >= 3), wrongly treating a
+        single-adapter-capacity server as not needing dual-capture even
+        though oft_manager.py's _compute_moe_multi_tenant_slot_ids already
+        takes the general per-token path for any real adapter. Verified this
+        fails against the pre-fix (`> 1`) threshold and passes against the
+        fixed (`>= 1`) one."""
+        server_args = self._server_args(max_ofts_per_batch=2)
+        model_config = self._model_config(has_moe_layers=True)
+        self.assertTrue(
+            DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
+                server_args, model_config
+            )
+        )
+
+    def test_false_when_oft_not_enabled(self):
+        server_args = self._server_args(peft_method=None)
+        model_config = self._model_config(has_moe_layers=True)
+        self.assertFalse(
+            DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
+                server_args, model_config
+            )
+        )
+
+    def test_false_when_not_targeting_moe_expert_modules(self):
+        server_args = self._server_args(peft_target_modules={"q_proj", "k_proj"})
+        model_config = self._model_config(has_moe_layers=True)
+        self.assertFalse(
+            DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
+                server_args, model_config
+            )
+        )
+
+    def test_false_when_model_has_no_moe_layers(self):
+        server_args = self._server_args()
+        model_config = self._model_config(has_moe_layers=False)
+        self.assertFalse(
+            DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
+                server_args, model_config
+            )
+        )
+
+    def test_false_when_capacity_allows_zero_real_adapters(self):
+        # max_ofts_per_batch=1 -> effective capacity = 0 (only the reserved
+        # base/identity slot exists) -- no real adapter can ever be resident.
+        server_args = self._server_args(max_ofts_per_batch=1)
+        model_config = self._model_config(has_moe_layers=True)
+        self.assertFalse(
+            DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
+                server_args, model_config
+            )
+        )
 
 
 if __name__ == "__main__":
