@@ -23,6 +23,7 @@ scheduler-facing communicator is mocked.
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -31,6 +32,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
     LoadOFTAdapterFromDistributedReqInput,
     LoadOFTAdapterFromTensorsReqInput,
     OFTUpdateOutput,
@@ -38,6 +40,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.oft.oft_registry import OFTRef, OFTRegistry
+from sglang.srt.peft.tokenizer_hooks import finalize_peft_lease
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -325,6 +328,93 @@ class TestMultiRankFailureNotSwallowed(CustomTestCase):
 
         self.assertFalse(result.success)
         self.assertIn("rank1 oom", result.error_message)
+
+
+class TestFinalizePeftLeaseIdempotency(CustomTestCase):
+    """Regression guard for finalize_peft_lease's idempotency contract: every
+    terminal request path (normal finish, abort echo, status-code abort,
+    failed dispatch) calls it, and more than one of those can legitimately
+    fire for the same state (see the "idempotency is what prevents the
+    counter from going negative here" comment at the
+    _handle_abort_finish_reason call site). A future 5th terminal path that
+    forgets the peft_lease_released guard would double-release the lease,
+    driving the registry's usage counter negative -- which hangs
+    wait_for_unload forever just as surely as never releasing at all (it
+    waits for exactly zero, per ConcurrentCounter.wait_for_zero)."""
+
+    def _finalize(self, tm, state, times=1):
+        async def run():
+            for _ in range(times):
+                finalize_peft_lease(tm, state)
+            # Let the create_task'd release coroutine run.
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+
+    def test_double_finalize_releases_exactly_once(self):
+        tm = SimpleNamespace(peft_registry=MagicMock())
+        tm.peft_registry.release = AsyncMock()
+        state = SimpleNamespace(
+            peft_lease_released=False, obj=SimpleNamespace(adapter_id="adapter-1")
+        )
+
+        self._finalize(tm, state, times=3)
+
+        tm.peft_registry.release.assert_awaited_once_with("adapter-1")
+        self.assertTrue(state.peft_lease_released)
+
+
+class TestFinalizePeftLeaseNoOp(CustomTestCase):
+    """finalize_peft_lease must be a safe no-op whenever there is no lease to
+    release, rather than raising or releasing something bogus."""
+
+    def test_no_op_when_state_is_none(self):
+        # A request whose peft acquire failed before state existed (or was
+        # already dropped by another terminal path) has nothing to release.
+        tm = SimpleNamespace(peft_registry=MagicMock())
+        tm.peft_registry.release = AsyncMock()
+
+        self._run(finalize_peft_lease, tm, None)
+
+        tm.peft_registry.release.assert_not_awaited()
+
+    def test_no_op_when_adapter_id_is_none(self):
+        # Base-only request (peft enabled, no adapter named): adapter_id
+        # stays None, so there is no lease to release.
+        tm = SimpleNamespace(peft_registry=MagicMock())
+        tm.peft_registry.release = AsyncMock()
+        state = SimpleNamespace(
+            peft_lease_released=False, obj=SimpleNamespace(adapter_id=None)
+        )
+
+        self._run(finalize_peft_lease, tm, state)
+
+        tm.peft_registry.release.assert_not_awaited()
+        self.assertFalse(state.peft_lease_released)
+
+    def test_no_op_when_request_type_has_no_adapter_id_field(self):
+        # EmbeddingReqInput never declares adapter_id at all (peft has no
+        # embedding support -- generate_request only calls
+        # maybe_resolve_peft_path under isinstance(obj, GenerateReqInput)),
+        # so state.obj can genuinely lack the attribute. Must getattr-guard
+        # this rather than assume the field exists.
+        tm = SimpleNamespace(peft_registry=MagicMock())
+        tm.peft_registry.release = AsyncMock()
+        state = SimpleNamespace(
+            peft_lease_released=False, obj=EmbeddingReqInput(text="hi")
+        )
+
+        self._run(finalize_peft_lease, tm, state)
+
+        tm.peft_registry.release.assert_not_awaited()
+
+    @staticmethod
+    def _run(fn, *args):
+        async def run():
+            fn(*args)
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
 
 
 class TestWrongPeftConfigRejected(CustomTestCase):
