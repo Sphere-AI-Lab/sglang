@@ -422,18 +422,37 @@ class OFTManager(AdapterManager):
         but multi-tenant (no single-active restriction) since this serves
         the new native load_oft_adapter_from_tensors RPC, not the legacy
         srt/peft streamed path. Capacity is still bounded by
-        max_ofts_per_batch via the memory pool's own admission."""
-        from sglang.srt.oft.streamed_weight_loader import _write_streamed_oft_tensors
+        max_ofts_per_batch via the memory pool's own admission.
+
+        Validates the payload (_resolve_streamed_oft_tensor_groups) BEFORE
+        evicting anything: unlike the legacy single-active path (which only
+        ever replaces the SAME-named adapter), this path can evict a
+        DIFFERENT, unrelated resident adapter to make room, and that
+        adapter has no CPU-side backing to reload from if evicted for
+        nothing. Resolving first means a malformed payload (bad tensor
+        names, unsupported target modules, an unabsorbable DSV4 expert
+        chunk -- the realistic failure modes) is caught while any would-be
+        eviction victim is still intact. The remaining, much narrower risk
+        (a failure inside the actual GPU write/precompute after validation
+        already passed -- e.g. an OOM) is not eliminated: there is no spare
+        buffer slot to stage into first, so once eviction has happened,
+        that adapter is gone regardless of how the subsequent commit turns
+        out. That residual case is called out explicitly in the returned
+        error message rather than left silent."""
+        from sglang.srt.oft.streamed_weight_loader import (
+            _commit_streamed_oft_tensor_groups,
+            _resolve_streamed_oft_tensor_groups,
+        )
 
         # The from-tensors RPC entry point deserializes a raw
         # Dict[str, torch.Tensor] (TpModelWorker._deserialize_own_rank
         # preserves whatever type the client serialized); the
         # from-distributed entry point (which delegates into this method)
         # already hands over List[Tuple[str, torch.Tensor]] from
-        # WeightUpdater.receive_weights_from_distributed. _write_streamed_oft_tensors
-        # (and _partition_expert_oft_tensors inside it) require the
-        # list-of-tuples form and iterate it directly -- normalize once here
-        # so both callers land in the same shape.
+        # WeightUpdater.receive_weights_from_distributed. The resolve/commit
+        # helpers (and _partition_expert_oft_tensors inside them) require
+        # the list-of-tuples form and iterate it directly -- normalize once
+        # here so both callers land in the same shape.
         if isinstance(named_tensors, dict):
             named_tensors = list(named_tensors.items())
 
@@ -449,6 +468,14 @@ class OFTManager(AdapterManager):
                         f"--max-oft-block-size={max_block_size}; smaller or "
                         "mixed block sizes are unsupported."
                     ),
+                )
+
+            plan, resolve_error = _resolve_streamed_oft_tensor_groups(
+                self, named_tensors, block_size
+            )
+            if plan is None:
+                return self._make_update_result(
+                    success=False, error_message=resolve_error
                 )
 
             existing_id = None
@@ -470,6 +497,9 @@ class OFTManager(AdapterManager):
             buffer_id, evicted_uid = self.memory_pool.allocate_buffer_slot_with_eviction(
                 self.refs
             )
+            evicted_name = (
+                self.refs[evicted_uid].adapter_name if evicted_uid is not None else None
+            )
             if evicted_uid is not None:
                 evict_result = self.unload_streamed_adapter(self.refs[evicted_uid])
                 if not evict_result.success:
@@ -485,15 +515,21 @@ class OFTManager(AdapterManager):
             # never-served adapters and find nothing tracked to select.
             self.memory_pool.eviction_policy.mark_used(ref.adapter_id)
 
-            success, error_message = _write_streamed_oft_tensors(
+            success, error_message = _commit_streamed_oft_tensor_groups(
                 self,
                 named_tensors,
+                plan,
                 buffer_id,
                 block_size,
                 ref.adapter_name,
                 ref.adapter_id,
             )
             if not success:
+                if evicted_name is not None:
+                    error_message = (
+                        f"adapter '{evicted_name}' was evicted to make room, "
+                        f"and the new load also failed: {error_message}"
+                    )
                 return self._make_update_result(
                     success=False, error_message=error_message
                 )
