@@ -720,10 +720,25 @@ class OFTManager(AdapterManager):
         in mixed batches ``extend_lens`` carries a 1 for each decode request,
         so it stays one entry per request there too).
 
-        Returns None when at most one distinct non-zero slot is present in the
-        whole batch (the common case: MoE forward takes today's unchanged
-        single-slot path); otherwise a torch.long tensor of shape
-        ``(num_tokens,)``.
+        Returns None only when the fast (single-slot) read path is actually
+        SAFE: no real adapter is referenced at all, or exactly one real
+        adapter is referenced AND it is resident at
+        ``self.memory_pool.active_idx`` -- the ONE slot
+        ``oft_moe_runners.py``'s fast path (``slot_ids is None``) ever reads
+        (a module attribute bound once, at boot, to the pool's active_idx
+        view -- never rebound afterward for the plain native-RPC manager,
+        since ``apply_streamed_expert_oft`` now always writes a real
+        adapter's OWN ``buffer_id`` slot, per Task 4b's fix, rather than
+        ``active_idx``). A single real adapter resident at any OTHER slot
+        still needs the general per-token tensor built below, even though
+        only one adapter is present: skipping it would have the fast path
+        silently read ``active_idx``'s data (identity, or an unrelated
+        adapter) instead of that adapter's own rotation. Building the
+        general tensor for that case is only ever a performance cost, never
+        a correctness one -- Task 4's own correctness oracle proved the
+        general multi-slot kernel reproduces the single-slot kernel's output
+        exactly when only one real slot's data actually matters, just
+        slower (no ``tl.dot``).
 
         This check is global (whole batch, not per MoE layer) -- see this
         plan's Task 1 design note for why that is a deliberate, still-correct
@@ -779,7 +794,9 @@ class OFTManager(AdapterManager):
         single-slot kernel at decode shapes).
         """
         distinct_real_slots = {idx for idx in weight_indices if idx != 0}
-        if len(distinct_real_slots) <= 1:
+        if not distinct_real_slots:
+            return None
+        if distinct_real_slots == {self.memory_pool.active_idx}:
             return None
 
         device = forward_batch.input_ids.device

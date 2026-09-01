@@ -235,6 +235,11 @@ class TestManagerSlotIdsFeedTheKernel(unittest.TestCase):
         num_tokens = sum(extend_seq_lens)
 
         tm = SimpleNamespace()
+        # active_idx=0 matches real production default; this batch has 2
+        # distinct real slots so the exact value doesn't change the
+        # outcome, but _compute_moe_multi_tenant_slot_ids always reads it to
+        # build its fast-path comparison set.
+        tm.memory_pool = SimpleNamespace(active_idx=0)
         tm._compute_moe_multi_tenant_slot_ids = MethodType(
             OFTManager._compute_moe_multi_tenant_slot_ids, tm
         )
