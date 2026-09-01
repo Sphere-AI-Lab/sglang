@@ -13,12 +13,15 @@ run, so the comparison for its own slot fails.
 """
 
 import unittest
+from types import MethodType, SimpleNamespace
 
 import torch
 
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.oft.oft_manager import OFTManager
 from sglang.srt.oft.triton_ops import (
     apply_oft_rotation_triton,
     apply_oft_rotation_triton_multi_slot,
@@ -189,6 +192,88 @@ class TestMultiSlotRotationMatchesSingleSlotPerAdapter(unittest.TestCase):
             bs=32,
             num_slots=5,
         )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires GPU")
+class TestManagerSlotIdsFeedTheKernel(unittest.TestCase):
+    """End-to-end guard that the two ends of the slot_ids contract agree.
+
+    OFTManager produces slot_ids; this kernel consumes them. They drifted once
+    already: the manager emitted one entry per REQUEST while the kernel indexes
+    per TOKEN, so every extend/prefill batch with two resident adapters was
+    rejected by the rotation entry point. Decode-only batches hid it (one token
+    per request), so this uses a multi-token-per-request extend batch.
+    """
+
+    def test_extend_batch_slot_ids_are_accepted_and_select_per_token(self):
+        device = "cuda"
+        torch.manual_seed(0)
+        hidden, num_experts, top_k, bs, num_slots = 64, 4, 1, 16, 3
+        # 3 requests on slots 1, 2, 1 contributing 4, 1 and 3 tokens.
+        weight_indices = [1, 2, 1]
+        extend_seq_lens = [4, 1, 3]
+        num_tokens = sum(extend_seq_lens)
+
+        tm = SimpleNamespace()
+        tm._compute_moe_multi_tenant_slot_ids = MethodType(
+            OFTManager._compute_moe_multi_tenant_slot_ids, tm
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=len(weight_indices),
+            input_ids=torch.zeros(num_tokens, dtype=torch.int32, device=device),
+            extend_seq_lens=torch.tensor(
+                extend_seq_lens, dtype=torch.int32, device=device
+            ),
+            extend_seq_lens_cpu=extend_seq_lens,
+            spec_info=None,
+        )
+        slot_ids = tm._compute_moe_multi_tenant_slot_ids(weight_indices, forward_batch)
+        self.assertEqual(slot_ids.shape[0], num_tokens)
+
+        A = torch.randn(num_tokens, hidden, device=device, dtype=torch.bfloat16)
+        topk_ids = torch.randint(
+            0, num_experts, (num_tokens, top_k), device=device, dtype=torch.int32
+        )
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, 64, num_experts
+        )
+        oft_r_all_slots = torch.randn(
+            num_slots,
+            num_experts,
+            hidden // bs,
+            bs,
+            bs,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+        # Would raise ValueError("slot_ids has 3 entries, expected 8") if the
+        # manager ever went back to emitting one entry per request.
+        multi_out = apply_oft_rotation_triton_multi_slot(
+            A,
+            oft_r_all_slots,
+            slot_ids,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            top_k,
+        )
+        for slot in (1, 2):
+            single_out = apply_oft_rotation_triton(
+                A,
+                oft_r_all_slots[slot],
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                top_k,
+            )
+            row_mask = slot_ids == slot
+            torch.testing.assert_close(
+                multi_out[row_mask], single_out[row_mask], atol=1e-2, rtol=1e-2
+            )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires GPU")

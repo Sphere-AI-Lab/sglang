@@ -34,6 +34,7 @@ from sglang.srt.oft.oft_config import OFTConfig
 from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.oft.mem_pool import EMPTY_SLOT, OFTMemoryPool
 from sglang.srt.oft.utils import (
+    generate_sequence_lengths,
     get_normalized_target_modules,
     validate_oft_block_size,
 )
@@ -701,26 +702,60 @@ class OFTManager(AdapterManager):
         )
 
     def _compute_moe_multi_tenant_slot_ids(
-        self, weight_indices: list, device: "torch.device"
+        self, weight_indices: list, forward_batch: ForwardBatch
     ) -> "Optional[torch.Tensor]":
-        """Decide whether this batch needs the multi-tenant MoE OFT path.
+        """Decide whether this batch needs the multi-tenant MoE OFT path, and
+        if so build its PER-TOKEN adapter-slot tensor.
 
-        ``weight_indices`` is the same per-token buffer-slot list
-        ``prepare_oft_batch`` already computes for the dense path (0 = identity/
-        base slot, no real adapter for that token). Returns None when at most
-        one distinct non-zero slot is present in the whole batch (the common
-        case: MoE forward takes today's unchanged single-slot path); otherwise
-        returns a torch.long tensor of the same length holding weight_indices
-        verbatim, for the multi-tenant MoE kernel to index per token.
+        ``weight_indices`` is the same buffer-slot list ``prepare_oft_batch``
+        already computes for the dense path (0 = identity/base slot, no real
+        adapter). It is indexed PER REQUEST -- it is built by iterating
+        ``forward_batch.adapter_ids``, which is ``[req.adapter_id for req in
+        batch.reqs]`` -- because an adapter assignment is inherently per
+        request: one request uses one adapter for its whole generation. The
+        dense path consumes it at that granularity via its ``seg_indptr``
+        segment metadata, and must keep doing so.
+
+        MoE routing, however, is per TOKEN (``topk_ids`` /
+        ``sorted_token_ids``), so the multi-tenant MoE kernel needs one slot
+        entry per token. This expands the per-request slots with the SAME
+        per-request token counts the dense path builds its segments from
+        (``oft.utils.generate_sequence_lengths``: 1 for decode, the spec
+        draft width for target-verify, ``extend_seq_lens`` for extend/mixed --
+        in mixed batches ``extend_lens`` carries a 1 for each decode request,
+        so it stays one entry per request there too).
+
+        Returns None when at most one distinct non-zero slot is present in the
+        whole batch (the common case: MoE forward takes today's unchanged
+        single-slot path); otherwise a torch.long tensor of shape
+        ``(num_tokens,)``.
 
         This check is global (whole batch, not per MoE layer) -- see this
         plan's Task 1 design note for why that is a deliberate, still-correct
         simplification.
+
+        Takes the whole ``forward_batch`` (read-only) rather than the values it
+        needs because ``generate_sequence_lengths`` is a leaf whose contract
+        genuinely requires it: it reads ``forward_mode``, ``batch_size``,
+        ``spec_info`` and the ``extend_seq_lens`` pair. Nothing outside the
+        multi-tenant branch is touched, so the single-adapter fast path pays
+        only the existing set comprehension.
         """
         distinct_real_slots = {idx for idx in weight_indices if idx != 0}
         if len(distinct_real_slots) <= 1:
             return None
-        return torch.tensor(weight_indices, dtype=torch.long, device=device)
+
+        device = forward_batch.input_ids.device
+        tokens_per_request = generate_sequence_lengths(forward_batch, device=device)
+        if tokens_per_request.shape[0] != len(weight_indices):
+            raise RuntimeError(
+                "Multi-tenant MoE OFT slot expansion needs one token count per "
+                f"request, got {tokens_per_request.shape[0]} counts for "
+                f"{len(weight_indices)} requests "
+                f"(forward_mode={forward_batch.forward_mode})"
+            )
+        per_request_slots = torch.tensor(weight_indices, dtype=torch.long, device=device)
+        return per_request_slots.repeat_interleave(tokens_per_request.to(torch.long))
 
     def _push_moe_multi_tenant_slot_ids(self) -> None:
         """Make this batch's MoE multi-tenancy decision visible to every
@@ -759,9 +794,11 @@ class OFTManager(AdapterManager):
                     oft_block_sizes[weight_indices[i]] = self.configs[uid].block_size
                 else:
                     raise KeyError(f"OFT adapter {uid} not found in ofts or configs")
-        # Decide whether this batch needs the multi-tenant MoE OFT path.
+        # Decide whether this batch needs the multi-tenant MoE OFT path. Only
+        # the MoE slot tensor is expanded to per-token there; weight_indices
+        # itself stays per-request for the dense backend call below.
         self._moe_multi_tenant_slot_ids = self._compute_moe_multi_tenant_slot_ids(
-            weight_indices, device=forward_batch.input_ids.device
+            weight_indices, forward_batch
         )
         self._push_moe_multi_tenant_slot_ids()
         # Do in-place updates when CUDA graph is enabled and the batch forward mode

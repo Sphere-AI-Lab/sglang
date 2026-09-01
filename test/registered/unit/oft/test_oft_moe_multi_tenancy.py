@@ -14,7 +14,37 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.oft.oft_manager import OFTManager
+
+
+def _forward_batch(
+    *,
+    forward_mode,
+    num_tokens,
+    batch_size=None,
+    extend_seq_lens=None,
+    draft_token_num=None,
+):
+    """Minimal read-only ForwardBatch stand-in carrying exactly the fields
+    ``generate_sequence_lengths`` and the method under test touch. Uses the
+    REAL ``ForwardMode`` enum so the mode predicates are the production ones."""
+    return SimpleNamespace(
+        forward_mode=forward_mode,
+        batch_size=batch_size,
+        input_ids=torch.zeros(num_tokens, dtype=torch.int32),
+        extend_seq_lens=(
+            None
+            if extend_seq_lens is None
+            else torch.tensor(extend_seq_lens, dtype=torch.int32)
+        ),
+        extend_seq_lens_cpu=extend_seq_lens,
+        spec_info=(
+            None
+            if draft_token_num is None
+            else SimpleNamespace(draft_token_num=draft_token_num)
+        ),
+    )
 
 
 class TestMoeMultiTenancyDecision(unittest.TestCase):
@@ -26,12 +56,15 @@ class TestMoeMultiTenancyDecision(unittest.TestCase):
         )
         return tm
 
+    # A bare SimpleNamespace raises AttributeError on ANY field access, so the
+    # single-adapter fast-path cases below also pin that the fast path reads
+    # nothing off the forward batch (no per-batch tensor work on it).
     def test_single_resident_adapter_yields_none(self):
         tm = self._make_tm()
-        # All tokens map to the same real slot (2) or the base slot (0).
+        # All requests map to the same real slot (2) or the base slot (0).
         weight_indices = [2, 2, 0, 2, 0]
         result = tm._compute_moe_multi_tenant_slot_ids(
-            weight_indices, device=torch.device("cpu")
+            weight_indices, SimpleNamespace()
         )
         self.assertIsNone(result)
 
@@ -39,7 +72,7 @@ class TestMoeMultiTenancyDecision(unittest.TestCase):
         tm = self._make_tm()
         weight_indices = [0, 0, 0]
         result = tm._compute_moe_multi_tenant_slot_ids(
-            weight_indices, device=torch.device("cpu")
+            weight_indices, SimpleNamespace()
         )
         self.assertIsNone(result)
 
@@ -47,7 +80,8 @@ class TestMoeMultiTenancyDecision(unittest.TestCase):
         tm = self._make_tm()
         weight_indices = [1, 2, 0, 1, 2]
         result = tm._compute_moe_multi_tenant_slot_ids(
-            weight_indices, device=torch.device("cpu")
+            weight_indices,
+            _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=5, batch_size=5),
         )
         self.assertIsNotNone(result)
         self.assertEqual(result.dtype, torch.long)
@@ -60,9 +94,119 @@ class TestMoeMultiTenancyDecision(unittest.TestCase):
         tm = self._make_tm()
         weight_indices = [1, 2, 3]
         result = tm._compute_moe_multi_tenant_slot_ids(
-            weight_indices, device=torch.device("cpu")
+            weight_indices,
+            _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=3, batch_size=3),
         )
         self.assertIsNotNone(result)
+
+
+class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
+    """The multi-tenant MoE kernel indexes slot_ids by TOKEN (MoE routing is
+    per token), but ``weight_indices`` is built per REQUEST from
+    ``forward_batch.adapter_ids`` (``[req.adapter_id for req in batch.reqs]``).
+
+    Regression guard for the bug that shipped in this plan's Task 1: the
+    per-request array was handed to the kernel unexpanded, so every extend /
+    prefill batch with two resident adapters produced a slot tensor shorter
+    than the token count and the rotation entry point rejected it. Decode-only
+    batches accidentally worked because they carry exactly one token per
+    request, which is why the cases below cover every mode that reaches here.
+    """
+
+    def _make_tm(self):
+        tm = SimpleNamespace()
+        tm._moe_multi_tenant_slot_ids = None
+        tm._compute_moe_multi_tenant_slot_ids = MethodType(
+            OFTManager._compute_moe_multi_tenant_slot_ids, tm
+        )
+        return tm
+
+    def test_extend_batch_expands_slots_to_one_entry_per_token(self):
+        tm = self._make_tm()
+        # 3 requests on slots 1, 2, 1 contributing 4, 1 and 3 tokens.
+        weight_indices = [1, 2, 1]
+        extend_seq_lens = [4, 1, 3]
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            weight_indices,
+            _forward_batch(
+                forward_mode=ForwardMode.EXTEND,
+                num_tokens=sum(extend_seq_lens),
+                batch_size=len(weight_indices),
+                extend_seq_lens=extend_seq_lens,
+            ),
+        )
+        self.assertEqual(result.shape[0], sum(extend_seq_lens))
+        self.assertEqual(result.dtype, torch.long)
+        self.assertTrue(
+            torch.equal(
+                result,
+                torch.tensor([1, 1, 1, 1, 2, 1, 1, 1], dtype=torch.long),
+            )
+        )
+
+    def test_decode_batch_is_one_token_per_request(self):
+        tm = self._make_tm()
+        weight_indices = [1, 2, 1]
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            weight_indices,
+            _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=3, batch_size=3),
+        )
+        self.assertTrue(torch.equal(result, torch.tensor([1, 2, 1], dtype=torch.long)))
+
+    def test_mixed_batch_expands_prefill_and_decode_requests(self):
+        tm = self._make_tm()
+        # ScheduleBatch.mix_with_running appends a 1 to extend_lens for every
+        # request folded in from the running (decode) batch, so extend_seq_lens
+        # stays one entry per request in MIXED mode: here a 5-token prefill
+        # request on slot 1 plus a 1-token decode request on slot 2.
+        weight_indices = [1, 2]
+        extend_seq_lens = [5, 1]
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            weight_indices,
+            _forward_batch(
+                forward_mode=ForwardMode.MIXED,
+                num_tokens=sum(extend_seq_lens),
+                batch_size=len(weight_indices),
+                extend_seq_lens=extend_seq_lens,
+            ),
+        )
+        self.assertTrue(
+            torch.equal(result, torch.tensor([1, 1, 1, 1, 1, 2], dtype=torch.long))
+        )
+
+    def test_target_verify_batch_expands_by_draft_width(self):
+        tm = self._make_tm()
+        # Speculative target-verify runs draft_token_num tokens per request.
+        weight_indices = [1, 2]
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            weight_indices,
+            _forward_batch(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_tokens=8,
+                batch_size=2,
+                draft_token_num=4,
+            ),
+        )
+        self.assertTrue(
+            torch.equal(
+                result, torch.tensor([1, 1, 1, 1, 2, 2, 2, 2], dtype=torch.long)
+            )
+        )
+
+    def test_token_count_request_count_mismatch_fails_loud(self):
+        tm = self._make_tm()
+        # One token count too few for the request list: must raise rather than
+        # silently emit a short (mis-indexed) per-token tensor.
+        with self.assertRaisesRegex(RuntimeError, "one token count per request"):
+            tm._compute_moe_multi_tenant_slot_ids(
+                [1, 2, 1],
+                _forward_batch(
+                    forward_mode=ForwardMode.EXTEND,
+                    num_tokens=5,
+                    batch_size=3,
+                    extend_seq_lens=[4, 1],
+                ),
+            )
 
 
 class TestPushSlotIdsOntoMoeModules(unittest.TestCase):
