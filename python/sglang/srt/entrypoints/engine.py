@@ -1595,6 +1595,60 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.load_lora_adapter_from_distributed(lora_req, None)
         )
 
+    def load_oft_adapter_from_tensors(
+        self,
+        adapter_name: str,
+        tensors: Union[Dict[str, torch.Tensor], List[SerializedTensorPayload]],
+        config_dict: Dict,
+        load_format: Optional[str] = None,
+        pinned: bool = False,
+        upsert: bool = False,
+    ):
+        from sglang.srt.oft.io_types import LoadOFTAdapterFromTensorsReqInput
+
+        serialized_named_tensors = self._serialize_tensors_per_rank(
+            tensors, load_format
+        )
+        request = LoadOFTAdapterFromTensorsReqInput(
+            adapter_name=adapter_name,
+            config_dict=config_dict,
+            serialized_named_tensors=serialized_named_tensors,
+            load_format=load_format,
+            pinned=pinned,
+            upsert=upsert,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_oft_adapter_from_tensors(request, None)
+        )
+
+    def load_oft_adapter_from_distributed(
+        self,
+        adapter_name: str,
+        config_dict: Dict,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "weight_update_group",
+        pinned: bool = False,
+        upsert: bool = False,
+    ):
+        """Load an OFT adapter broadcast over an initialized process group."""
+        from sglang.srt.oft.io_types import LoadOFTAdapterFromDistributedReqInput
+
+        request = LoadOFTAdapterFromDistributedReqInput(
+            adapter_name=adapter_name,
+            config_dict=config_dict,
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            pinned=pinned,
+            upsert=upsert,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_oft_adapter_from_distributed(request, None)
+        )
+
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
         """Load a new LoRA adapter without re-launching the engine."""
 
