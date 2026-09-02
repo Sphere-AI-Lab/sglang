@@ -8,7 +8,6 @@ from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.utils import get_stacked_multiply as _lora_get_stacked_multiply
 from sglang.srt.oft.base.mem_pool import EMPTY_SLOT, AdapterMemPool, EmptySlot
 from sglang.srt.oft.layers import BaseLayerWithOFT
-from sglang.srt.oft.oft import OFTAdapter
 from sglang.srt.oft.oft_config import OFTConfig
 from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.oft.utils import (
