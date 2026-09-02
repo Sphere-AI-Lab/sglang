@@ -142,6 +142,7 @@ class LoRARegistry:
         upsert: bool = False,
         *,
         preserve_pinned: bool = False,
+        bump_version: bool = False,
     ) -> Tuple[LoRARef, bool]:
         """Resolve which identity a load request should use.
 
@@ -162,6 +163,8 @@ class LoRARegistry:
             updates: Dict[str, object] = {"lora_id": existing.lora_id}
             if preserve_pinned:
                 updates["pinned"] = existing.pinned
+            if bump_version:
+                updates["version"] = existing.version + 1
             return replace(lora_ref, **updates), True
 
     async def refresh(self, lora_ref: LoRARef):

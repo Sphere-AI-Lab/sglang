@@ -199,6 +199,20 @@ class TestLoRARegistryRegisterOrReuse(CustomTestCase):
                 registry.refresh(LoRARef(lora_name="a", lora_path="__tensor__"))
             )
 
+    def test_bump_version_advances_past_existing_on_reuse(self):
+        registry = LoRARegistry()
+        asyncio.run(
+            registry.register(LoRARef(lora_name="a", lora_path="/x", version=5))
+        )
+
+        candidate = LoRARef(lora_name="a", lora_path="__distributed__")
+        resolved, reused = asyncio.run(
+            registry.register_or_reuse(candidate, True, bump_version=True)
+        )
+
+        self.assertTrue(reused)
+        self.assertEqual(resolved.version, 6)
+
 
 class TestUpsertRollback(CustomTestCase):
     """A failed load/upsert must not leave a live adapter half-updated."""
@@ -460,6 +474,25 @@ class TestLoadFromDistributedUpsert(CustomTestCase):
         registered = tm.lora_registry.get_all_adapters()["a"]
         self.assertEqual(registered.lora_id, existing.lora_id)
         self.assertTrue(registered.pinned)
+
+    def test_successive_upserts_bump_registry_version(self):
+        tm = _make_tokenizer_manager()
+        existing = LoRARef(
+            lora_name="a", lora_path="__distributed__", version=3
+        )
+        asyncio.run(tm.lora_registry.register(existing))
+
+        first = _make_distributed_req(upsert=True)
+        first_result = asyncio.run(tm.load_lora_adapter_from_distributed(first))
+
+        self.assertTrue(first_result.success)
+        self.assertEqual(tm.lora_registry.get_all_adapters()["a"].version, 4)
+
+        second = _make_distributed_req(upsert=True)
+        second_result = asyncio.run(tm.load_lora_adapter_from_distributed(second))
+
+        self.assertTrue(second_result.success)
+        self.assertEqual(tm.lora_registry.get_all_adapters()["a"].version, 5)
 
     def test_failed_backend_load_keeps_registry_untouched(self):
         tm = _make_tokenizer_manager()

@@ -978,6 +978,7 @@ class TokenizerControlMixin:
                         reloadable=False,
                     ),
                     upsert=obj.upsert,
+                    bump_version=True,
                 )
                 obj.lora_id = new_adapter.lora_id
                 result = (await self.update_lora_adapter_communicator(obj))[0]
