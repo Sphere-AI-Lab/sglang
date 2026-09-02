@@ -10,7 +10,9 @@ negative, which hangs it just the same (it waits for exactly zero). Covers:
   * LoRARegistry.acquire: lookup + counter increment are one atomic admission
     step under the writer lock, so acquire racing an unload fails cleanly
     instead of touching a deleted counter
-  * LoRARegistry.lru_lora_name never picks non-reloadable (wire-loaded) refs
+  * LoRARegistry.lru_lora_name selects purely by LRU order regardless of
+    ``reloadable``; it is not an eviction-candidate filter (reloadable only
+    gates *implicit reload* of an already-evicted adapter, in tokenizer_manager)
   * explicit unload drops the lora_ref_cache entry (DELETE) while the locked
     helper alone (the max_loaded_loras EVICT path) keeps it
 """
@@ -139,20 +141,28 @@ class TestAcquireAtomicity(CustomTestCase):
         asyncio.run(run())
 
 
-class TestLruSkipsNonReloadable(CustomTestCase):
-    def test_lru_prefers_reloadable_even_if_older_entry_is_wire_loaded(self):
+class TestLruIgnoresReloadable(CustomTestCase):
+    """Regression: ``reloadable=False`` (wire-loaded) adapters must remain
+    eligible LRU eviction candidates. Skipping them made ``--max-loaded-loras``
+    unenforceable once every resident adapter came from the RL-streaming RPC
+    path (load_lora_adapter_from_tensors/_from_distributed), since the loop
+    would then always fall through to ``None``.
+    """
+
+    def test_lru_picks_oldest_wire_loaded_adapter_when_it_is_lru(self):
         async def run():
             registry = LoRARegistry()
-            # Registration order = LRU order; the wire-loaded ref is oldest.
+            # Registration order = LRU order; the wire-loaded ref is oldest
+            # and must still be picked ahead of the more-recently-used disk ref.
             await registry.register(
                 LoRARef(lora_name="wire", lora_path="__distributed__", reloadable=False)
             )
             await registry.register(LoRARef(lora_name="disk", lora_path="/d"))
-            self.assertEqual(await registry.lru_lora_name(), "disk")
+            self.assertEqual(await registry.lru_lora_name(), "wire")
 
         asyncio.run(run())
 
-    def test_all_non_reloadable_yields_no_victim(self):
+    def test_all_non_reloadable_still_returns_a_victim(self):
         async def run():
             registry = LoRARegistry()
             await registry.register(
@@ -161,8 +171,8 @@ class TestLruSkipsNonReloadable(CustomTestCase):
             await registry.register(
                 LoRARef(lora_name="w2", lora_path="__distributed__", reloadable=False)
             )
-            self.assertIsNone(await registry.lru_lora_name())
-            self.assertIsNone(await registry.lru_lora_name(exclude_pinned=True))
+            self.assertEqual(await registry.lru_lora_name(), "w1")
+            self.assertEqual(await registry.lru_lora_name(exclude_pinned=True), "w1")
 
         asyncio.run(run())
 
