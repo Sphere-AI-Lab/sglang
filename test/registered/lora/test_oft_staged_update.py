@@ -6,45 +6,37 @@ test_oft_staged_update.py covering the base scenarios AND TP>1
 consistency), adapted for StagedOFTManager (python/sglang/srt/oft/
 staged_manager.py) instead of StagedLoRAManager.
 
-Two structural differences from the LoRA sibling, both discovered by
-reading the landed OFT staging code (not copied from an existing test --
-flagged prominently in this task's report):
+One structural difference from the LoRA sibling, discovered by reading the
+landed OFT staging code (not copied from an existing test -- flagged
+prominently in this task's report):
 
-1. No established real small OFT (Orthogonal Finetuning) HF adapter repo
-   was found anywhere in this codebase to reuse the way the LoRA test reuses
-   "charent/self_cognition_Alice". Adapter checkpoints are synthesized here
-   instead (see _oft_named_tensors/_write_local_oft_adapter) -- shape-correct
-   and deterministic, but not a real trained adapter.
+No established real small OFT (Orthogonal Finetuning) HF adapter repo was
+found anywhere in this codebase to reuse the way the LoRA test reuses
+"charent/self_cognition_Alice". Adapter checkpoints are synthesized here
+instead (see _oft_named_tensors) -- shape-correct and deterministic, but not
+a real trained adapter.
 
-2. StagedOFTManager.activate_adapter hard-fails ("No serving slot is
-   reserved for adapter uid=...") when memory_pool.uid_to_buffer_id has no
-   entry for the target uid yet -- unlike StagedLoRAManager.activate_adapter,
-   which tolerates a brand-new uid by registering self.configs/self.loras
-   without touching the pool, deferring the physical admission to the next
-   scheduler-driven fetch_new_loras (which loads straight from the
-   already-fully-updated self.loras[uid] object). OFT has no such lazy
-   fallback, so a brand-new adapter must already have a real buffer_id
-   before any stage()/activate() call for it can succeed. The only way to
-   get one (short of the legacy srt/peft/oft's /load_oft_adapter endpoint,
-   which is hardcoded to the OLD OFTRef class and not wired for
-   oft_impl=staged) is: boot the adapter via --peft-paths (a real on-disk
-   checkpoint, admitted into self.configs/self.adapters/self.refs at boot)
-   and then send one real /generate request naming it, which drives the
-   scheduler's fetch_new_ofts/prepare_oft_batch admission and assigns the
-   real buffer_id. See StagedOFTTestHarness.__init__'s warmup loop below.
+A brand-new adapter (staged then activated, with no serving slot reserved
+yet) is brought fully online with stage_adapter()/activate_adapter() alone --
+no on-disk preload, no separate warmup step. activate_adapter's CPU-side
+registration (self.configs/self.adapters) is deferred but unconditional; the
+real GPU admission for a genuinely new uid happens lazily, the next time
+OFTMemoryPool.prepare_oft_batch sees it referenced by a batch. Since
+fetch_new_ofts (which drives that admission) runs before every forward pass
+(peft/integration.py's maybe_apply_forward), the FIRST real /generate request
+naming the new adapter both triggers admission and immediately serves off
+the newly-written real weights -- see StagedOFTTestHarness.generate(), used
+directly (no extra warmup call) throughout this file.
 """
 
-import json
 import os
 import socket
-import tempfile
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import torch
-from safetensors.torch import save_file
 from transformers import AutoConfig
 
 # Match SGLang's established distributed-weight test setup. CUDA's cuMem and
@@ -140,22 +132,6 @@ def _oft_named_tensors(num_layers: int, intermediate_size: int, seed: int) -> di
     return tensors
 
 
-def _write_local_oft_adapter(root_dir: str, name: str, tensors: dict) -> str:
-    """Write a real on-disk OFT adapter checkpoint (adapter_config.json +
-    adapter_model.safetensors) -- the same file layout OFTConfig/
-    OFTAdapter.initialize_weights read for a real HF PEFT-OFT checkpoint,
-    just built locally instead of via snapshot_download (see this file's
-    module docstring: no reusable real OFT repo exists to download)."""
-    adapter_dir = os.path.join(root_dir, name)
-    os.makedirs(adapter_dir, exist_ok=True)
-    with open(
-        os.path.join(adapter_dir, "adapter_config.json"), "w", encoding="utf-8"
-    ) as config_file:
-        json.dump(_adapter_config_dict(), config_file)
-    save_file(tensors, os.path.join(adapter_dir, "adapter_model.safetensors"))
-    return adapter_dir
-
-
 def _stage_payload(name, version, tensors, *, double_buffer=True):
     return {
         "names": list(tensors),
@@ -176,7 +152,6 @@ class StagedOFTTestHarness:
         self,
         testcase,
         *,
-        adapters,
         model_path=MODEL_PATH,
         base_gpu_id=1,
         tp_size=1,
@@ -184,11 +159,12 @@ class StagedOFTTestHarness:
         disable_cuda_graph=False,
         url=DEFAULT_URL_FOR_TEST,
     ):
-        """``adapters`` maps adapter_name -> a local on-disk checkpoint
-        directory (see _write_local_oft_adapter), admitted via --peft-paths
-        at boot. ``max_ofts_per_batch`` must cover len(adapters) + 1 (the
-        auto-registered base/identity uid=None slot, admitted eagerly at
-        boot by StagedOFTManager.init_memory_pool's fetch_new_ofts({None}))
+        """No adapters are preloaded at boot (--peft-paths was fully
+        retired) -- every adapter used by a test is introduced via
+        stage()/activate() below. ``max_ofts_per_batch`` must cover the
+        number of distinct real adapters a test keeps resident at once, plus
+        1 (the auto-registered base/identity uid=None slot, admitted eagerly
+        at boot by StagedOFTManager.init_memory_pool's fetch_new_ofts({None}))
         or the two can evict each other via the pool's ordinary LRU
         admission (out of scope here -- see staged_manager.py's own
         docstring: eviction is "B1's existing multi-tenant admission and
@@ -215,7 +191,7 @@ class StagedOFTTestHarness:
             # matching test_lora_staged_update.py's approach.
             "--max-oft-block-size",
             str(BLOCK_SIZE),
-            "--peft-target-modules",
+            "--oft-target-modules",
             TARGET_MODULE,
             "--max-ofts-per-batch",
             str(max_ofts_per_batch),
@@ -224,9 +200,6 @@ class StagedOFTTestHarness:
             "--log-level",
             "error",
         ]
-        if adapters:
-            args.append("--peft-paths")
-            args.extend(f"{name}={path}" for name, path in adapters.items())
         if disable_cuda_graph:
             args.append("--disable-cuda-graph")
         self.process = popen_launch_server(
@@ -236,12 +209,6 @@ class StagedOFTTestHarness:
             other_args=tuple(args),
         )
         self._init_group()
-
-        # Warmup: admits each boot-loaded adapter into a real serving slot.
-        # See this file's module docstring (point 2) for why this is
-        # required for OFT but has no analogue in test_lora_staged_update.py.
-        for name in adapters:
-            self.generate(adapter=name)
 
     def _post(self, path, payload):
         response = requests.post(self.url + path, json=payload, timeout=300)
@@ -315,8 +282,8 @@ class StagedOFTTestHarness:
             # "adapter_path", not native LoRA's "lora_path" -- see
             # peft/tokenizer_hooks.py's _request_peft_path and
             # GenerateReqInput's adapter_path field; the value passed is the
-            # adapter's --peft-paths NAME, not its on-disk path, since
-            # tm.peft_ref_cache is keyed by name).
+            # adapter's NAME (the same name passed to stage()/activate()),
+            # not an on-disk path, since tm.peft_ref_cache is keyed by name).
             payload["adapter_path"] = adapter
         body = self._post("/generate", payload).json()
         return body["output_ids"]
@@ -333,7 +300,6 @@ class TestStagedOFTUpdate(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         torch.cuda.set_device(0)
-        cls.tmp_dir = tempfile.mkdtemp(prefix="oft_staged_test_")
         hf_config = AutoConfig.from_pretrained(MODEL_PATH)
         cls.num_layers = hf_config.num_hidden_layers
         cls.intermediate_size = hf_config.intermediate_size
@@ -346,21 +312,23 @@ class TestStagedOFTUpdate(CustomTestCase):
     def _tensors(self, seed):
         return _oft_named_tensors(self.num_layers, self.intermediate_size, seed)
 
-    def _write_adapter(self, name, seed):
-        return _write_local_oft_adapter(
-            self.tmp_dir, f"{name}-{seed}", self._tensors(seed)
-        )
+    def _admit(self, harness, name, version, tensors):
+        """Bring a brand-new adapter fully online: stage()+activate() alone
+        (activate_adapter's CPU-only registration -- no serving slot exists
+        yet) followed by one real /generate request naming it, which is what
+        actually drives OFTMemoryPool.prepare_oft_batch's lazy-admission
+        fallback and assigns a real buffer slot. Returns that request's
+        output so callers can use it as a "before" baseline."""
+        harness.stage(name, version, tensors)
+        harness.activate(name, version)
+        return harness.generate(adapter=name)
 
     def _run_update(self, *, disable_cuda_graph=False, fresh_check=False):
-        v1_dir = self._write_adapter("policy-a", 1)
+        v1_tensors = self._tensors(1)
         v2_tensors = self._tensors(2)
-        harness = StagedOFTTestHarness(
-            self,
-            adapters={"policy-a": v1_dir},
-            disable_cuda_graph=disable_cuda_graph,
-        )
+        harness = StagedOFTTestHarness(self, disable_cuda_graph=disable_cuda_graph)
         try:
-            before_a = harness.generate(adapter="policy-a")
+            before_a = self._admit(harness, "policy-a", 1, v1_tensors)
 
             harness.stage("policy-a", 2, v2_tensors)
             self.assertEqual(harness.generate(adapter="policy-a"), before_a)
@@ -372,8 +340,9 @@ class TestStagedOFTUpdate(CustomTestCase):
             harness.close()
 
         if fresh_check:
-            fresh = StagedOFTTestHarness(self, adapters={"policy-a": v1_dir})
+            fresh = StagedOFTTestHarness(self)
             try:
+                self._admit(fresh, "policy-a", 1, v1_tensors)
                 fresh.stage("policy-a", 2, v2_tensors)
                 fresh.activate("policy-a", 2)
                 self.assertEqual(fresh.generate(adapter="policy-a"), after_a)
@@ -405,17 +374,12 @@ class TestStagedOFTUpdate(CustomTestCase):
         those 3 serving slots, admitting all three upfront would already
         have evicted one of them.
         """
-        a_dir = self._write_adapter("policy-a", 1)
-        b_dir = self._write_adapter("policy-b", 1)
+        v1_tensors = self._tensors(1)
         v2_tensors = self._tensors(2)
-        harness = StagedOFTTestHarness(
-            self,
-            adapters={"policy-a": a_dir, "policy-b": b_dir},
-            max_ofts_per_batch=3,
-        )
+        harness = StagedOFTTestHarness(self, max_ofts_per_batch=3)
         try:
-            before_a = harness.generate(adapter="policy-a")
-            before_b = harness.generate(adapter="policy-b")
+            before_a = self._admit(harness, "policy-a", 1, v1_tensors)
+            before_b = self._admit(harness, "policy-b", 1, v1_tensors)
             before_base = harness.generate()
 
             harness.stage("policy-a", 2, v2_tensors)
@@ -442,16 +406,11 @@ class TestStagedOFTUpdate(CustomTestCase):
         stale/mismatched version after activate() would show up as a
         divergent generation vs. this oracle.
         """
-        v1_dir = self._write_adapter("policy-a", 1)
+        v1_tensors = self._tensors(1)
         v2_tensors = self._tensors(2)
-        tp2 = StagedOFTTestHarness(
-            self,
-            adapters={"policy-a": v1_dir},
-            base_gpu_id=1,
-            tp_size=2,
-        )
+        tp2 = StagedOFTTestHarness(self, base_gpu_id=1, tp_size=2)
         try:
-            before = tp2.generate(adapter="policy-a")
+            before = self._admit(tp2, "policy-a", 1, v1_tensors)
             tp2.stage("policy-a", 2, v2_tensors)
             self.assertEqual(tp2.generate(adapter="policy-a"), before)
             tp2.activate("policy-a", 2)
@@ -460,13 +419,9 @@ class TestStagedOFTUpdate(CustomTestCase):
         finally:
             tp2.close()
 
-        reference = StagedOFTTestHarness(
-            self,
-            adapters={"policy-a": v1_dir},
-            base_gpu_id=1,
-            tp_size=2,
-        )
+        reference = StagedOFTTestHarness(self, base_gpu_id=1, tp_size=2)
         try:
+            self._admit(reference, "policy-a", 1, v1_tensors)
             reference.stage("policy-a", 2, v2_tensors)
             reference.activate("policy-a", 2)
             self.assertEqual(reference.generate(adapter="policy-a"), tp2_v2)

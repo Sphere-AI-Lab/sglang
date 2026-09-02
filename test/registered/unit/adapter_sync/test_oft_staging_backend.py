@@ -213,6 +213,8 @@ def _manager(max_ofts_per_batch=4):
     manager.oft_backend = MagicMock()
     manager.max_oft_block_size = BLOCK_SIZE
     manager.adapter_modules = [{}]
+    manager.embed_tokens_module = None
+    manager.lm_head_module = None
     manager.configs = {}
     manager.adapters = {}
     manager.refs = {}
@@ -431,14 +433,51 @@ class TestStagedOFTManagerActivation(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("no OFT stage is pending", result.error_message)
 
-    def test_activate_requires_a_reserved_serving_slot(self):
+    def test_activate_admits_a_brand_new_uid_with_no_reserved_slot(self):
+        """Regression: a brand-new uid (staged but never yet given a
+        serving slot -- no --peft-paths preload exists anymore to have
+        admitted it eagerly) used to make activate_adapter fail with "No
+        serving slot is reserved...". Mirrors StagedLoRAManager.
+        activate_adapter's `if destination is not None:` gating: activation
+        must succeed by skipping the physical staging->active copy (nothing
+        to copy into yet) and registering CPU-side bookkeeping only, without
+        touching the memory pool's uid_to_buffer_id. Real GPU admission for
+        this uid happens lazily on the next batch that references it (see
+        OFTMemoryPool.prepare_oft_batch's lazy-admission fallback)."""
         manager = _manager()
         self._staged(manager)
 
         result = manager.activate_adapter("adapter-a", 1, "adapter-a")
 
-        self.assertFalse(result.success)
-        self.assertIn("No serving slot is reserved", result.error_message)
+        self.assertTrue(result.success, result.error_message)
+        self.assertIn("adapter-a", manager.configs)
+        self.assertIn("adapter-a", manager.adapters)
+        self.assertNotIn("adapter-a", manager.memory_pool.uid_to_buffer_id)
+
+    def test_activate_of_brand_new_uid_does_not_jam_the_staging_slot(self):
+        """Regression: activate_adapter's `destination is not None` branch
+        skips memory_pool.activate() entirely for a brand-new uid, but
+        activate() is also what normally clears the hidden staging slot's
+        _staged_uid/_staged_version as its own last step. Without an
+        explicit discard_stage() call in the skipped branch, the staging
+        slot would stay permanently occupied by the first-ever activated
+        brand-new uid, and every later stage_adapter call (for ANY uid)
+        would fail with "Staging slot already holds uid=..."."""
+        manager = _manager()
+        self._staged(manager, uid="adapter-a", version=1)
+
+        result = manager.activate_adapter("adapter-a", 1, "adapter-a")
+        self.assertTrue(result.success, result.error_message)
+        self.assertIsNone(manager.memory_pool.staged_identity())
+
+        result = manager.stage_adapter(
+            _raw_named_tensors_for_layer_0(fill_value=1.0),
+            CONFIG_DICT,
+            "adapter-b",
+            2,
+            "adapter-b",
+        )
+        self.assertTrue(result.success, result.error_message)
 
     def test_stage_then_activate_from_raw_tensors_lands_the_transformed_value(self):
         """End-to-end through the real transformation (mirrors Task 2's
@@ -505,6 +544,55 @@ class TestActivateUpdatesManagerBookkeeping(unittest.TestCase):
         self.assertIn("adapter-a", manager.adapters)
         self.assertEqual(manager.configs["adapter-a"].block_size, BLOCK_SIZE)
         self.assertEqual(manager.adapters["adapter-a"].block_size, BLOCK_SIZE)
+
+
+class TestPrepareOftBatchLazilyAdmitsAStagedAdapter(unittest.TestCase):
+    """Regression for the OFTMemoryPool.prepare_oft_batch half of this fix:
+    activate_adapter (above) can leave a brand-new uid fully registered
+    CPU-side (self.configs/self.adapters) but with no serving slot in
+    memory_pool.uid_to_buffer_id -- unlike the native-RPC path (OFTManager.
+    load_adapter_from_tensors), which always admits eagerly at load time.
+    Before this fix, OFTMemoryPool.prepare_oft_batch hard-failed with "was
+    never loaded" for any real uid not yet resident, with no fallback --
+    this drives the REAL production call chain a `/generate` request makes
+    (OFTManager._prepare_mem_pool_batch -> memory_pool.prepare_oft_batch)
+    and confirms the adapter is admitted into a real buffer slot with its
+    real (Cayley-transformed) weights, not just "no exception"."""
+
+    def test_prepare_oft_batch_admits_the_staged_adapter_and_writes_real_weights(self):
+        from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
+
+        manager = _manager(max_ofts_per_batch=2)
+        compact = _raw_named_tensors_for_layer_0(fill_value=9.0)[0][1]
+
+        result = manager.stage_adapter(
+            _raw_named_tensors_for_layer_0(fill_value=9.0),
+            CONFIG_DICT,
+            "adapter-a",
+            1,
+            "adapter-a",
+        )
+        self.assertTrue(result.success, result.error_message)
+        result = manager.activate_adapter("adapter-a", 1, "adapter-a")
+        self.assertTrue(result.success, result.error_message)
+        self.assertNotIn("adapter-a", manager.memory_pool.uid_to_buffer_id)
+
+        # The real call chain OFTManager.fetch_new_ofts's caller
+        # (peft/integration.py, driven by every /generate request) uses:
+        # _prepare_mem_pool_batch -> memory_pool.prepare_oft_batch(...).
+        manager._prepare_mem_pool_batch({"adapter-a"})
+
+        buffer_id = manager.memory_pool.uid_to_buffer_id.get("adapter-a")
+        self.assertIsNotNone(buffer_id)
+        self.assertEqual(manager.memory_pool.buffer_id_to_uid[buffer_id], "adapter-a")
+        expected_r = precompute_oft_r(compact, BLOCK_SIZE)[0]
+        actual = manager.memory_pool.slot(f"R:{TARGET_MODULE}", 0, buffer_id)
+        self.assertTrue(
+            torch.allclose(actual, expected_r.expand_as(actual)),
+            "lazy admission must write the adapter's real (Cayley-"
+            "transformed) weights, not leave the slot at whatever it "
+            "previously held",
+        )
 
 
 class TestOFTManagerClassSelection(unittest.TestCase):
