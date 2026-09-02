@@ -609,44 +609,6 @@ class ColumnParallelLinearWithOFT(BaseLayerWithOFT):
         )
         return rotated_x
 
-    def apply_input_rotation(
-        self,
-        x: torch.Tensor,
-        *,
-        transpose: bool = False,
-        n_groups: int = 1,
-    ) -> torch.Tensor:
-        """Apply only the OFT input rotation without running the base linear.
-
-        Some MLA serving paths algebraically absorb a ColumnParallelLinear's
-        weight into attention-side batched GEMMs and never call ``forward``.
-        This hook lets those paths preserve the same ``x @ R`` semantics.  When
-        the absorbed algebra moves the rotation to the query side, callers can
-        request ``transpose=True`` to apply ``x @ R.T``.
-        """
-        if not self.oft_active:
-            return x
-        if n_groups <= 0:
-            raise ValueError(f"n_groups must be positive, got {n_groups}")
-
-        orig_shape = x.shape
-        if x.dim() != 2:
-            x = x.reshape(-1, orig_shape[-1])
-
-        weights = self.R_buffer.transpose(-1, -2) if transpose else self.R_buffer
-        if n_groups == 1:
-            rotated = self.oft_backend.run_oft_r_sgemm(x=x, weights=weights)
-        else:
-            rotated = self.oft_backend.run_grouped_oft_r_sgemm(
-                x=x,
-                weights=weights,
-                n_groups=n_groups,
-            )
-
-        if rotated.shape != orig_shape:
-            rotated = rotated.reshape(orig_shape)
-        return rotated
-
     def forward(self, input_: torch.Tensor):
         # OFT: rotate input FIRST, then apply base forward
         if self.oft_active:

@@ -70,26 +70,6 @@ class TritonOFTBackend(BaseOFTBackend):
             )
         return sgemm_oft_r_fwd(x, weights, self.batch_info, num_slices=1)
 
-    def run_grouped_oft_r_sgemm(
-        self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        *args,
-        n_groups: int,
-        **kwargs,
-    ) -> torch.Tensor:
-        if self._use_single_adapter_fast_path:
-            if n_groups <= 0:
-                raise ValueError(f"n_groups must be positive, got {n_groups}")
-            return self.run_oft_r_sgemm(x, weights, *args, **kwargs)
-        return super().run_grouped_oft_r_sgemm(
-            x,
-            weights,
-            *args,
-            n_groups=n_groups,
-            **kwargs,
-        )
-
     def run_qkv_oft(
         self,
         x: torch.Tensor,
