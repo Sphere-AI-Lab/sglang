@@ -276,6 +276,24 @@ class TestNativeManagerStaging(CustomTestCase):
         self.assertIn("id-a", result.error_message)
         self.assertIn("4", result.error_message)
 
+    def test_rejects_equal_or_stale_versions_of_the_active_adapter(self):
+        old_ref = LoRARef(
+            lora_id="id-a",
+            lora_name="policy",
+            lora_path="__tensor__",
+            version=4,
+        )
+        manager = _manager(old_ref)
+
+        for version in (4, 3):
+            result = manager.stage_adapter(
+                [], CONFIG_DICT, "policy", version, "id-a"
+            )
+            self.assertFalse(result.success)
+            self.assertIn("newer than active version 4", result.error_message)
+
+        manager._create_lora_adapter_from_tensors.assert_not_called()
+
 
 class TestNativeManagerActivation(CustomTestCase):
     def _stage_existing(self, pinned=True):

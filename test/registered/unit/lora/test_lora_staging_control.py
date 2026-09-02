@@ -296,6 +296,24 @@ class TestTokenizerNativeStaging(unittest.TestCase):
         self.assertIs(tm.pending_lora_stage, pending)
         self.assertEqual(second.adapter_id, first.adapter_id)
 
+    def test_rejects_equal_or_stale_versions_before_staging(self):
+        tm = _make_tm()
+        old = LoRARef(
+            lora_id="id-a",
+            lora_name="policy",
+            lora_path="__distributed__",
+            version=4,
+        )
+        asyncio.run(tm.lora_registry.register(old))
+
+        for version in ("4", "3"):
+            with self.assertRaisesRegex(ValueError, "newer than active version 4"):
+                asyncio.run(
+                    tm.update_adapter_from_distributed(_stage_req(version=version))
+                )
+
+        tm.update_adapter_from_distributed_communicator.assert_not_awaited()
+
     def test_conflicting_stage_reports_pending_identity(self):
         tm = _make_tm()
         asyncio.run(tm.update_adapter_from_distributed(_stage_req()))
