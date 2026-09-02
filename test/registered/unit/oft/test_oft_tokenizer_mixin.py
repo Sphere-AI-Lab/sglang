@@ -139,6 +139,35 @@ def test_explicit_unload_removes_reload_catalog_entry():
     assert "adapter" not in handler.peft_ref_cache
 
 
+def test_unload_waits_for_active_leases_before_backend_removal():
+    handler = _handler()
+    ref = OFTRef(adapter_name="adapter", adapter_path="/disk/adapter")
+    asyncio.run(handler.peft_registry.register(ref))
+    handler.peft_ref_cache["adapter"] = ref
+    call_order = []
+    real_wait_for_unload = handler.peft_registry.wait_for_unload
+
+    async def tracking_wait_for_unload(adapter_id):
+        call_order.append("wait_for_unload")
+        return await real_wait_for_unload(adapter_id)
+
+    async def tracking_communicator(obj):
+        call_order.append("communicator")
+        return [OFTUpdateOutput(success=True)]
+
+    handler.peft_registry.wait_for_unload = tracking_wait_for_unload
+    handler.update_oft_adapter_communicator = tracking_communicator
+
+    result = asyncio.run(
+        handler.unload_oft_adapter(
+            UnloadOFTAdapterReqInput(adapter_name="adapter")
+        )
+    )
+
+    assert result.success
+    assert call_order == ["wait_for_unload", "communicator"]
+
+
 def test_unload_reports_any_rank_failure():
     handler = _handler(
         responses=[
