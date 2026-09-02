@@ -2651,20 +2651,6 @@ def _check_all_req_types():
             )
 
 
-# Re-export the OFT request/output dataclasses (relocated to
-# sglang.srt.peft.io_types) so `from sglang.srt.managers.io_struct import
-# OFTUpdateOutput` / `UnloadOFTAdapterReqInput` etc. keep working. io_types imports
-# from this module, so an eager `from ... import *` here is a genuine
-# cycle whenever io_types is imported first; PEP 562 `__getattr__` defers the
-# lookup until after this module has finished executing, breaking the cycle.
-def __getattr__(name):
-    from sglang.srt.peft import io_types
-
-    if name in io_types.__all__:
-        return getattr(io_types, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 _check_all_req_types()
 
 
