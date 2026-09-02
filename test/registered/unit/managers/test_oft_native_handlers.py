@@ -566,22 +566,33 @@ class TestWrongPeftConfigRejected(CustomTestCase):
         tm.update_oft_adapter_communicator.assert_not_awaited()
 
 
-class TestResolvePeftPathRejectsEvictedDiskBackedAdapter(CustomTestCase):
-    """Regression guard: resolve_peft_path's disk-backed-adapter reload
-    branch used to call tm.load_oft_adapter, which does not exist anywhere
-    on TokenizerManager -- OFT never got LoRA's equivalent disk-path reload
-    RPC (only the wire-load load_oft_adapter_from_tensors/_from_distributed
-    RPCs are wired up). So a disk-backed (--peft-paths) adapter whose
-    tokenizer-side registry entry was LRU-evicted (--max-loaded-ofts) and
-    then re-requested crashed with AttributeError instead of a clear,
-    catchable error. Constructs the post-eviction state directly (a
-    reloadable ref present in peft_ref_cache but absent from peft_registry)
-    rather than driving a full eviction cycle."""
+class TestMintRefIsNotReloadable(CustomTestCase):
+    """Regression guard: _mint_ref (the ref constructor for the streamed/
+    staged adapter path, used by register_peft_ref) used to construct its
+    OFTRef without an explicit reloadable=, silently defaulting to
+    reloadable=True (AdapterRef's dataclass default) -- as if a streamed
+    adapter were disk-backed. A streamed adapter has no on-disk artifact
+    either, so this must be reloadable=False, mirroring
+    staged_manager.py's LoRARef construction for its own streamed adapters.
+    """
 
-    def test_evicted_disk_backed_adapter_raises_value_error(self):
-        from sglang.srt.peft.tokenizer_hooks import resolve_peft_path
+    def test_mint_ref_is_not_reloadable(self):
+        from sglang.srt.peft.tokenizer_hooks import _mint_ref
 
-        ref = OFTRef(adapter_name="a", adapter_path="/disk/a", pinned=False)
+        tm = SimpleNamespace(peft_kind="oft")
+        ref = _mint_ref(tm, "a")
+
+        self.assertFalse(ref.reloadable)
+
+    def test_evicted_streamed_adapter_raises_wire_loaded_style_error(self):
+        """When a streamed adapter's ref (reloadable=False, per _mint_ref)
+        is evicted from the registry and then re-referenced, resolve_peft_path
+        must raise the "no on-disk artifact" error -- not attempt (or claim
+        to support) an implicit disk reload, since a streamed adapter never
+        had a disk artifact to reload from."""
+        from sglang.srt.peft.tokenizer_hooks import _mint_ref, resolve_peft_path
+
+        ref = _mint_ref(SimpleNamespace(peft_kind="oft"), "a")
         tm = SimpleNamespace(
             peft_kind="oft",
             peft_registry=OFTRegistry(),
@@ -589,7 +600,7 @@ class TestResolvePeftPathRejectsEvictedDiskBackedAdapter(CustomTestCase):
         )
         obj = SimpleNamespace(adapter_path="a", lora_path=None)
 
-        with self.assertRaisesRegex(ValueError, "evicted"):
+        with self.assertRaisesRegex(ValueError, "no on-disk artifact"):
             asyncio.run(resolve_peft_path(tm, obj))
 
 

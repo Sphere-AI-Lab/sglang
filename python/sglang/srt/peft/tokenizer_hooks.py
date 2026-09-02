@@ -25,10 +25,16 @@ def _peft_kind(tm):
 
 def _mint_ref(tm, name):
     """Build the OFT AdapterRef for ``name`` (path == name for streamed
-    adapters). Matches the registry class built in init_tokenizer_peft."""
+    adapters). Matches the registry class built in init_tokenizer_peft.
+
+    reloadable=False: a streamed adapter has no on-disk artifact to reload
+    from, mirroring staged_manager.py's LoRARef construction for its own
+    streamed/staged adapters."""
     from sglang.srt.oft.oft_registry import OFTRef
 
-    return OFTRef(adapter_name=name, adapter_path=name, pinned=False)
+    return OFTRef(
+        adapter_name=name, adapter_path=name, pinned=False, reloadable=False
+    )
 
 
 def _request_peft_path(obj):
@@ -166,24 +172,12 @@ async def resolve_peft_path(tm, obj):
         if not ref.reloadable:
             raise ValueError(
                 f"OFT adapter '{adapter_path}' was loaded dynamically (via "
-                "tensors/distributed) and was evicted from the registry; it "
-                "has no on-disk artifact to reload from and must be "
-                "re-loaded via a fresh load_oft_adapter_from_tensors/"
-                "_from_distributed call."
-            )
-        if tm.peft_kind == "oft":
-            # ref.reloadable is True here, meaning this is a disk-backed
-            # (--peft-paths) adapter whose registry entry was LRU-evicted --
-            # unlike LoRA, OFT has no wired-up disk-path reload RPC (only the
-            # wire-load load_oft_adapter_from_tensors/_from_distributed RPCs
-            # exist), so it cannot yet implicitly reload it here.
-            raise ValueError(
-                f"OFT adapter '{adapter_path}' was dynamically evicted from "
-                "the tokenizer-side registry (--max-loaded-ofts) and OFT "
-                "does not yet support implicitly reloading a disk-backed "
-                "adapter from its on-disk artifact at request time (unlike "
-                "LoRA's equivalent path); this adapter must be reloaded "
-                "explicitly."
+                "tensors/distributed, or streamed via "
+                "update_weights_from_tensor) and was evicted from the "
+                "registry; it has no on-disk artifact to reload from and "
+                "must be re-loaded via a fresh "
+                "load_oft_adapter_from_tensors/_from_distributed call, or "
+                "re-streamed by the trainer."
             )
 
     adapter_id, adapter_version = await tm.peft_registry.acquire_with_version(path)
