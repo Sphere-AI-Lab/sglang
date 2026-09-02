@@ -1685,7 +1685,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         peft.maybe_prepare_peft_batch(self.model_runner, static_forward_batch)
 
-        self._static_num_tokens = static_num_tokens
         return static_forward_batch
 
     def _execute_body_capture(

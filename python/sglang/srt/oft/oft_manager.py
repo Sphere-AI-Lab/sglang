@@ -38,6 +38,7 @@ from sglang.srt.oft.mem_pool import (
 )
 from sglang.srt.oft.utils import (
     generate_sequence_lengths,
+    get_hf_config_attr,
     get_normalized_target_modules,
     validate_oft_block_size,
 )
@@ -49,9 +50,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import OFTUpdateOutput
 
 logger = logging.getLogger(__name__)
-
-
-_MISSING_CONFIG_ATTR = object()
 
 
 def _orbit_log_weight_sync_enabled() -> bool:
@@ -70,23 +68,6 @@ def _expert_oft_delta_summary(buffer: Optional[torch.Tensor], block_size: int):
     delta = (buffer.detach().float() - eye.view(1, 1, block_size, block_size)).abs()
     per_expert = delta.amax(dim=(1, 2, 3))
     return int((per_expert > 0).sum().item()), float(per_expert.max().item())
-
-
-def _get_hf_config_attr(base_hf_config: AutoConfig, attr_name: str):
-    value = getattr(base_hf_config, attr_name, _MISSING_CONFIG_ATTR)
-    if value is not _MISSING_CONFIG_ATTR:
-        return value
-
-    text_config = getattr(base_hf_config, "text_config", None)
-    if text_config is not None:
-        value = getattr(text_config, attr_name, _MISSING_CONFIG_ATTR)
-        if value is not _MISSING_CONFIG_ATTR:
-            return value
-
-    raise AttributeError(
-        f"{type(base_hf_config).__name__} has no attribute {attr_name!r} "
-        "on the top-level config or text_config"
-    )
 
 
 def validate_model_oft_target_modules(
@@ -1418,7 +1399,7 @@ class OFTManager(AdapterManager):
 
     def init_oft_modules(self):
         # Look-up table that maps (layer_index, module_name) to the corresponding OFT module.
-        num_hidden_layers = _get_hf_config_attr(
+        num_hidden_layers = get_hf_config_attr(
             self.base_hf_config, "num_hidden_layers"
         )
         self.adapter_modules: List[Dict[str, BaseLayerWithOFT]] = [
@@ -1775,19 +1756,6 @@ class OFTManager(AdapterManager):
             moe.w3_oft_r = None
         if w2_oft_r is not None:
             moe.w2_oft_r = w2_oft_r
-
-    def _set_expert_oft(self, oft_adapter):
-        """Set expert OFT R on FusedMoE layers from a disk-loaded adapter."""
-        moe_modules = self._find_fused_moe_modules()
-        if not moe_modules:
-            return
-
-        block_size = oft_adapter.block_size
-        for layer_id, moe in moe_modules.items():
-            if layer_id >= len(oft_adapter.layers):
-                continue
-            ew_dict = oft_adapter.layers[layer_id].expert_weights
-            self._apply_expert_oft_to_module(moe, ew_dict, block_size, layer_id)
 
     def apply_streamed_expert_oft(self, expert_tensors, block_size, slot_idx=None):
         """Set FusedMoE expert OFT R from streamed-sync compact tensors.
@@ -2202,7 +2170,7 @@ class OFTManager(AdapterManager):
             adapter_version=version,
         )
         # Register per-request serving routing at the FIXED double-buffer
-        # active_idx (NOT a dynamically allocate_buffer_slot()-ed slot: the DB
+        # active_idx (NOT a dynamically-allocated slot: the DB
         # pool stages into staging_idx then copies into the fixed active_idx on
         # activate). This sets uid_to_buffer_id[adapter_id]=active_idx +
         # refs[adapter_id]=oft_ref, so the forward gather (get_buffer_id(uid))

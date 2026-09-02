@@ -57,31 +57,6 @@ class OFTRegistry(AdapterRegistry):
         )
         super().__init__(adapter_paths)
 
-    async def get_version_by_id(
-        self, adapter_id: Union[str, List[str], None]
-    ) -> Union[int, List[Optional[int]], None]:
-        """
-        Return the current OFT version for an adapter ID.
-
-        The tokenizer manager uses this to build radix-cache keys that
-        distinguish KV produced by different on-policy OFT weights.
-        """
-
-        def _lookup(uid: Optional[str]) -> Optional[int]:
-            if uid is None:
-                return None
-            for oft_ref in self._registry.values():
-                if oft_ref.adapter_id == uid:
-                    return oft_ref.adapter_version
-            raise ValueError(f"OFT ID {uid} does not exist.")
-
-        async with self._registry_lock.reader_lock:
-            if isinstance(adapter_id, str) or adapter_id is None:
-                return _lookup(adapter_id)
-            if isinstance(adapter_id, list):
-                return [_lookup(uid) for uid in adapter_id]
-            raise TypeError("adapter_id must be None, a string, or a list of strings.")
-
     async def bump_version_by_id(self, adapter_id: str) -> OFTRef:
         """
         Increment the version for an already-registered adapter ID.
@@ -99,9 +74,6 @@ class OFTRegistry(AdapterRegistry):
                     self._registry[adapter_name] = new_ref
                     return new_ref
         raise ValueError(f"OFT ID {adapter_id} does not exist.")
-
-    async def get_unregistered_ofts(self, adapter_name):
-        return await self.get_unregistered_adapters(adapter_name)
 
     async def lru_oft_name(self, exclude_pinned=False):
         return await self.lru_adapter_name(exclude_pinned=exclude_pinned)

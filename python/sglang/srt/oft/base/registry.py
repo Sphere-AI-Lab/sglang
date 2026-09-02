@@ -105,22 +105,6 @@ class AdapterRegistry:
 
         return ref.adapter_id
 
-    async def replace(self, ref: AdapterRef) -> Optional[str]:
-        """Atomically route future acquires for ref.adapter_name to a new AdapterRef.
-
-        Returns the old adapter ID if the public name was already active, or None.
-        The old counter is intentionally kept so in-flight requests can release
-        their reference. The caller is responsible for invoking
-        ``wait_for_unload(old_id)`` once in-flight requests drain, to free the
-        counter; otherwise the old id's counter leaks indefinitely.
-        """
-        async with self._registry_lock.writer_lock:
-            old_ref = self._registry.get(ref.adapter_name)
-            if old_ref is not None:
-                del self._registry[ref.adapter_name]
-            self._register_adapter(ref)
-            return old_ref.adapter_id if old_ref is not None else None
-
     async def resolve_or_reuse(
         self,
         ref: AdapterRef,

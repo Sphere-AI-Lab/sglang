@@ -89,9 +89,6 @@ class AdapterMemPool:
     def active_view(self, name, key):
         return self.slot(name, key, self.active_idx)
 
-    def staging_view(self, name, key):
-        return self.slot(name, key, self.staging_idx)
-
     def stage(self, version, named_tensors):
         self._fill_slot(self.staging_idx, named_tensors)
         self._staged_version = version

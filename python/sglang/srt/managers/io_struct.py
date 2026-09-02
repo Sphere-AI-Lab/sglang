@@ -2579,7 +2579,7 @@ class OFTUpdateOutput(BaseReq, kw_only=True):
     loaded_adapters: Optional[Dict[str, Union[str, OFTRef]]] = None
 
 
-LoadOFTAdapterReqOutput = UnloadOFTAdapterReqOutput = (
+UnloadOFTAdapterReqOutput = (
     LoadOFTAdapterFromTensorsReqOutput
 ) = LoadOFTAdapterFromDistributedReqOutput = OFTUpdateOutput
 

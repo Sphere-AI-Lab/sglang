@@ -220,17 +220,6 @@ def get_normalized_target_modules(
     return result
 
 
-def get_stacked_multiply(module_name: str) -> int:
-    """
-    Mapping an OFT module name to its magnification at output dimension.
-    """
-    stacked_rank = {
-        "qkv_proj": 3,
-        "gate_up_proj": 2,
-    }
-    return stacked_rank[module_name] if module_name in stacked_rank else 1
-
-
 def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> str:
     """
     Get the target module name in target_modules that can match full_module_name.
@@ -248,68 +237,6 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_OFT_NAMES = ["o_proj", "down_proj", "wo_b"]
-
-
-def detect_canonical_split_active() -> bool:
-    """True iff the global server args indicate canonical-split OFT will run.
-
-    Detection rule: peft_method == "oft" AND oft_type == "canonical_oft".
-    ``oft_type`` (``sglang.srt.peft.config.PEFTArgs.oft_type``) is the single
-    global split-vs-fused signal for OFT -- it also drives the MoE expert
-    gate/up group layout (``oft/mem_pool.py``'s ``_declare_expert_groups``)
-    and the dense split-buffer forward (``oft/layers.py``'s
-    ``_split_stacked_R``), so this helper simply reads that one flag rather
-    than re-deriving split-vs-fused from ``oft_target_modules`` (which cannot
-    disambiguate: a FusedMoE/QKV/gate-up module collapses both a legacy and a
-    split adapter's leaves to the same fused target name).
-
-    Called at process_weights_after_loading time, BEFORE OFT adapters have
-    been loaded -- we infer the future configuration from server args.
-
-    CONTRACT: this is the single source of truth for "is canonical-split
-    active for this run?". Any quant scheme that branches on this must call
-    this helper rather than re-implementing the rule.
-
-    SGLANG_DISABLE_PREPACK_SPLIT=1 forces this to return False regardless of
-    server args -- used for the launcher A/B baseline (Task 7).
-    """
-    from sglang.srt.utils import get_bool_env_var
-
-    if get_bool_env_var("SGLANG_DISABLE_PREPACK_SPLIT"):
-        return False
-    try:
-        from sglang.srt.server_args import get_global_server_args
-    except ImportError:
-        return False
-    try:
-        args = get_global_server_args()
-    except Exception:
-        return False
-    if args.peft_method != "oft":
-        return False
-    return args.oft_type == "canonical_oft"
-
-
-def assert_canonical_split_supported(scheme_name: str) -> None:
-    """Fail-fast when canonical-split OFT is requested but this MoE scheme
-    doesn't implement split-aware prepack/forward.
-
-    Called from process_weights_after_loading. If canonical-split is
-    detected via server args but the scheme has no split-aware path, raise
-    NotImplementedError now (at model load) instead of failing at first
-    forward inside the Triton MoE runner.
-    """
-    if not detect_canonical_split_active():
-        return
-    raise NotImplementedError(
-        f"Canonical-split OFT (gate_proj + up_proj both in "
-        f"--oft-target-modules) is not yet supported for MoE scheme "
-        f"{scheme_name!r}. Only INT4 W4A16 via CompressedTensorsWNA16MoE "
-        "has a split-aware kernel path at this time. "
-        "For FP8/NVFP4, either use legacy single-R OFT (--oft-type oft) "
-        "or wait for the follow-up plan to implement the split-aware "
-        "kernel for this scheme."
-    )
 
 
 def generate_sequence_lengths(

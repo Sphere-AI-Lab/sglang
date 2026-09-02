@@ -7,10 +7,10 @@ bugs found by Task 8's GPU integration suite and fixed afterward:
    production shape from `TpModelWorker._deserialize_own_rank`) straight
    through to code that iterates `named_tensors` as `List[Tuple[str, Tensor]]`
    -- crashed every native-RPC load with "too many values to unpack".
-2. `allocate_buffer_slot()` (used by the legacy single-active streamed path)
-   has no eviction fallback and hard-fails when the pool is full; the new
-   multi-tenant admission path needs real LRU eviction instead, without
-   changing `allocate_buffer_slot()`'s own behavior.
+2. The legacy single-active streamed path's admission had no eviction
+   fallback and hard-failed when the pool was full; the new multi-tenant
+   admission path (`allocate_buffer_slot_with_eviction`) needs real LRU
+   eviction instead.
 3. `LRUEvictionPolicy.select_victim` (`srt/lora/eviction_policy.py`, shared
    with LoRA) asserts if none of the eviction candidates were ever
    `mark_used(...)`'d and `None` isn't offered -- exactly the scenario of an
@@ -56,7 +56,7 @@ CONFIG_DICT = {
 
 def _make_pool(max_ofts_per_batch, max_block_size=BLOCK_SIZE):
     """A lightweight stand-in carrying exactly the attributes
-    OFTMemoryPool.allocate_buffer_slot[_with_eviction] touch (bookkeeping
+    OFTMemoryPool.allocate_buffer_slot_with_eviction touches (bookkeeping
     dicts/lists + the shared eviction_policy) -- no R_buffer/torch tensors,
     since none of this logic reads or writes them. The REAL (unbound)
     OFTMemoryPool methods are bound onto it via MethodType, so what's under
@@ -72,7 +72,6 @@ def _make_pool(max_ofts_per_batch, max_block_size=BLOCK_SIZE):
     pool.allocate_buffer_slot_with_eviction = MethodType(
         OFTMemoryPool.allocate_buffer_slot_with_eviction, pool
     )
-    pool.allocate_buffer_slot = MethodType(OFTMemoryPool.allocate_buffer_slot, pool)
     pool.prepare_oft_batch = MethodType(OFTMemoryPool.prepare_oft_batch, pool)
     pool.load_oft_weight_to_buffer = MethodType(
         OFTMemoryPool.load_oft_weight_to_buffer, pool
@@ -149,9 +148,9 @@ class TestLoadAdapterFromTensorsDictInput(unittest.TestCase):
 
 
 class TestAllocateBufferSlotWithEviction(unittest.TestCase):
-    """Bug 3: allocate_buffer_slot_with_eviction (new) evicts an unpinned
-    resident real adapter when full; allocate_buffer_slot() (legacy
-    primitive, unchanged) still hard-fails with no eviction."""
+    """Bug 3: allocate_buffer_slot_with_eviction evicts an unpinned
+    resident real adapter when full, instead of the legacy admission's
+    unconditional hard-fail."""
 
     def test_empty_slot_used_first_no_eviction(self):
         pool = _make_pool(max_ofts_per_batch=2)
@@ -244,13 +243,6 @@ class TestAllocateBufferSlotWithEviction(unittest.TestCase):
         pool.buffer_id_to_uid = ["pinned_one", "wire_loaded"]
         with self.assertRaises(ValueError):
             pool.allocate_buffer_slot_with_eviction(refs)
-
-    def test_allocate_buffer_slot_itself_still_hard_fails_unchanged(self):
-        pool = _make_pool(max_ofts_per_batch=1)
-        pool.uid_to_buffer_id = {"x": 0}
-        pool.buffer_id_to_uid = ["x"]
-        with self.assertRaises(ValueError):
-            pool.allocate_buffer_slot()
 
 
 def _prepare_oft_batch(pool, cur_uids, oft_adapters=None):

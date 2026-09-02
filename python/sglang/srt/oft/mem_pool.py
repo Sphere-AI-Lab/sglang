@@ -96,19 +96,6 @@ def normalize_merged_oft_weights(
     return result
 
 
-def resolve_fused_oft_slice(key: str) -> Tuple[str, int, int]:
-    """If ``key`` references a split CanonicalOFT projection
-    (``q_proj.oft_r`` etc.) return ``(fused_key, slice_index, split_count)``.
-    For non-split keys, return ``(key, 0, 1)``."""
-    for fused_leaf, split_leaves in MERGED_OFT_PROJ_GROUPS.items():
-        for index, split_leaf in enumerate(split_leaves):
-            token = "." + split_leaf + "."
-            if token in key:
-                fused = key.replace(token, "." + fused_leaf + ".", 1)
-                return fused, index, len(split_leaves)
-    return key, 0, 1
-
-
 def _contains_leaf(key: str, leaf: str) -> bool:
     return f".{leaf}." in key
 
@@ -1154,62 +1141,21 @@ class OFTMemoryPool(AdapterMemPool):
             else:
                 buffer[buffer_id, :num_blocks_adapter, :block_size, :block_size] = R
 
-    def allocate_buffer_slot(self) -> int:
-        """Allocate a buffer slot for direct-to-GPU loading.
-
-        Returns the buffer_id of an available slot (preferring empty slots).
-        Raises ValueError if no slot is available.
-        """
-        for buffer_id in range(self.max_ofts_per_batch):
-            if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
-                return buffer_id
-
-        # Diagnostic: dump the actual contents of each slot on failure so we
-        # can tell what's holding things up. With max_ofts_per_batch=1 this is
-        # what surfaces "the streamed identity adapter can't allocate even at
-        # init"-type bugs. Logged at error level since we're about to raise.
-        slot_summary = ", ".join(
-            f"slot[{i}]={self.buffer_id_to_uid[i]!r}"
-            for i in range(self.max_ofts_per_batch)
-        )
-        uid_summary = ", ".join(
-            f"{uid!r}->buffer[{bid}]"
-            for uid, bid in self.uid_to_buffer_id.items()
-        )
-        logger.error(
-            "allocate_buffer_slot: pool full at max_ofts_per_batch=%d. "
-            "Slot contents: {%s}. UID->buffer map: {%s}.",
-            self.max_ofts_per_batch,
-            slot_summary,
-            uid_summary,
-        )
-        raise ValueError(
-            "No available buffer slots for direct OFT loading. "
-            f"All slots are occupied. (max_ofts_per_batch={self.max_ofts_per_batch}, "
-            f"slot contents: {{{slot_summary}}}, "
-            f"uid_to_buffer_id={dict(self.uid_to_buffer_id)})"
-        )
-
     def allocate_buffer_slot_with_eviction(
         self, refs: Dict[str, OFTRef]
     ) -> Tuple[int, Optional[str]]:
-        """Like allocate_buffer_slot, but for the native multi-tenant RPC
-        admission path: if no slot is empty, LRU-evict an unpinned,
-        reloadable resident real adapter to make room. The base/identity slot
-        (uid=None) is never a candidate here (Task 4b review fix), and
-        neither is a pinned ref (the caller's explicit "keep this one
-        resident" request) nor a non-reloadable one (an adapter loaded over
-        the wire has no CPU-side artifact to re-page from, so evicting it
-        would be unrecoverable -- mirrors the retired streamed path's
-        _make_streamed_ref, which always pinned such adapters for exactly
-        this reason).
+        """Admission for the native multi-tenant RPC path: if no slot is
+        empty, LRU-evict an unpinned, reloadable resident real adapter to
+        make room. The base/identity slot (uid=None) is never a candidate
+        here (Task 4b review fix), and neither is a pinned ref (the caller's
+        explicit "keep this one resident" request) nor a non-reloadable one
+        (an adapter loaded over the wire has no CPU-side artifact to re-page
+        from, so evicting it would be unrecoverable -- mirrors the retired
+        streamed path's _make_streamed_ref, which always pinned such
+        adapters for exactly this reason).
 
         Returns (buffer_id, evicted_uid); evicted_uid is None when an empty
         slot was found and no eviction was needed.
-
-        Does not change allocate_buffer_slot()'s own behavior: the legacy
-        single-active streamed path calls that method directly and keeps
-        its hard-fail-when-full behavior unchanged.
         """
         for buffer_id in range(self.max_ofts_per_batch):
             if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
