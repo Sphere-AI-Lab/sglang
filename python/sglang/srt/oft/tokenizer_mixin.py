@@ -11,19 +11,23 @@ runtime exactly as before.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import fastapi
 
 from sglang.srt.oft.io_types import (
+    LoadOFTAdapterFromDistributedReqInput,
+    LoadOFTAdapterFromDistributedReqOutput,
     LoadOFTAdapterFromTensorsReqInput,
     LoadOFTAdapterFromTensorsReqOutput,
     LoadOFTAdapterReqInput,
     LoadOFTAdapterReqOutput,
+    OFTUpdateOutput,
     UnloadOFTAdapterReqInput,
     UnloadOFTAdapterReqOutput,
 )
 from sglang.srt.oft.oft_registry import OFTRef
+from sglang.srt.utils import normalize_serialized_named_tensor_payloads
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -31,8 +35,48 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _merge_oft_update_results(results: List[OFTUpdateOutput]) -> OFTUpdateOutput:
+    """Collapse worker replies, with any worker failure winning."""
+    failed = [result for result in results if not result.success]
+    if not failed:
+        return results[0]
+    messages = list(
+        dict.fromkeys(result.error_message for result in failed if result.error_message)
+    )
+    return OFTUpdateOutput(
+        success=False,
+        error_message=" | ".join(messages),
+        loaded_adapters=failed[0].loaded_adapters,
+    )
+
+
 class OFTTokenizerMixin:
     """Mixin class for TokenizerManager to handle OFT adapter loading/unloading."""
+
+    async def _enforce_oft_registry_limit(
+        self: TokenizerManager,
+        result: OFTUpdateOutput,
+    ) -> None:
+        limit = self.server_args.max_loaded_ofts
+        if limit is None:
+            return
+        while self.peft_registry.num_registered_ofts > limit:
+            lru_name = await self.peft_registry.lru_oft_name(exclude_pinned=True)
+            if lru_name is None:
+                raise ValueError(
+                    "Didn't find an OFT adapter eligible for LRU eviction. "
+                    f"Loaded adapters: {self.peft_registry.get_all_adapters()}"
+                )
+            unload_result = await self._unload_oft_adapter_locked(
+                UnloadOFTAdapterReqInput(adapter_name=lru_name)
+            )
+            if not unload_result.success:
+                raise ValueError(
+                    f"Error while unloading LRU OFT adapter {lru_name!r}: "
+                    f"{unload_result.error_message}"
+                )
+            if result.loaded_adapters is not None:
+                result.loaded_adapters.pop(lru_name, None)
 
     async def _unload_oft_adapter_locked(
         self: TokenizerManager,
@@ -43,12 +87,12 @@ class OFTTokenizerMixin:
         ), "self.peft_update_lock must be locked in order for self._unload_oft_adapter_locked() to be called"
 
         adapter_id = await self.peft_registry.unregister(obj.adapter_name)
+        await self.peft_registry.wait_for_unload(adapter_id)
         obj.adapter_id = adapter_id
 
-        await self.peft_registry.wait_for_unload(adapter_id)
-        result = (await self.update_oft_adapter_communicator(obj))[0]
-
-        return result
+        return _merge_oft_update_results(
+            await self.update_oft_adapter_communicator(obj)
+        )
 
     async def load_oft_adapter(
         self: TokenizerManager,
@@ -105,31 +149,88 @@ class OFTTokenizerMixin:
                 raise ValueError(
                     "OFT is not enabled. Please set `--peft-method oft` to enable OFT."
                 )
-
-            assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic OFT loading"
+            obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+                obj.serialized_named_tensors
+            )
             logger.info(
                 "Start load OFT adapter from tensors. OFT name=%s",
                 obj.adapter_name,
             )
 
             async with self.peft_update_lock:
-                new_adapter = OFTRef(
-                    adapter_name=obj.adapter_name,
-                    adapter_path="__tensor__",
-                    pinned=obj.pinned,
+                new_ref, reused = await self.peft_registry.resolve_or_reuse(
+                    OFTRef(
+                        adapter_name=obj.adapter_name,
+                        adapter_path="__tensor__",
+                        pinned=obj.pinned,
+                        reloadable=False,
+                    ),
+                    upsert=obj.upsert,
                 )
-                obj.adapter_id = new_adapter.adapter_id
-                result = (await self.update_oft_adapter_communicator(obj))[0]
+                obj.adapter_id = new_ref.adapter_id
+                result = _merge_oft_update_results(
+                    await self.update_oft_adapter_communicator(obj)
+                )
 
                 if result.success:
-                    await self.peft_registry.register(new_adapter)
-                    self.peft_ref_cache[obj.adapter_name] = new_adapter
+                    if reused:
+                        await self.peft_registry.refresh(new_ref)
+                    else:
+                        await self.peft_registry.register(new_ref)
+                    self.peft_ref_cache[obj.adapter_name] = new_ref
+                    await self._enforce_oft_registry_limit(result)
 
                 return result
         except ValueError as e:
             return LoadOFTAdapterFromTensorsReqOutput(
+                success=False,
+                error_message=str(e),
+            )
+
+    async def load_oft_adapter_from_distributed(
+        self: TokenizerManager,
+        obj: LoadOFTAdapterFromDistributedReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoadOFTAdapterFromDistributedReqOutput:
+        self.auto_create_handle_loop()
+
+        try:
+            if not self.server_args.peft_method == "oft":
+                raise ValueError(
+                    "OFT is not enabled. Please set `--peft-method oft` to enable OFT."
+                )
+            logger.info(
+                "Start load OFT adapter from distributed. OFT name=%s, group=%s",
+                obj.adapter_name,
+                obj.group_name,
+            )
+
+            async with self.peft_update_lock:
+                new_ref, reused = await self.peft_registry.resolve_or_reuse(
+                    OFTRef(
+                        adapter_name=obj.adapter_name,
+                        adapter_path="__distributed__",
+                        pinned=obj.pinned,
+                        reloadable=False,
+                    ),
+                    upsert=obj.upsert,
+                )
+                obj.adapter_id = new_ref.adapter_id
+                result = _merge_oft_update_results(
+                    await self.update_oft_adapter_communicator(obj)
+                )
+
+                if result.success:
+                    if reused:
+                        await self.peft_registry.refresh(new_ref)
+                    else:
+                        await self.peft_registry.register(new_ref)
+                    self.peft_ref_cache[obj.adapter_name] = new_ref
+                    await self._enforce_oft_registry_limit(result)
+
+                return result
+        except ValueError as e:
+            return LoadOFTAdapterFromDistributedReqOutput(
                 success=False,
                 error_message=str(e),
             )
@@ -160,6 +261,9 @@ class OFTTokenizerMixin:
             )
 
             async with self.peft_update_lock:
-                return await self._unload_oft_adapter_locked(obj)
+                result = await self._unload_oft_adapter_locked(obj)
+                if result.success:
+                    self.peft_ref_cache.pop(obj.adapter_name, None)
+                return result
         except ValueError as e:
             return UnloadOFTAdapterReqOutput(success=False, error_message=str(e))

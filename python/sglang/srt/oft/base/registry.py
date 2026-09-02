@@ -144,7 +144,10 @@ class AdapterRegistry:
             existing = self._registry.get(ref.adapter_name)
             if existing is None:
                 return ref, False
-            updates = {"adapter_id": existing.adapter_id}
+            updates = {
+                "adapter_id": existing.adapter_id,
+                "adapter_version": existing.adapter_version + 1,
+            }
             if preserve_pinned:
                 updates["pinned"] = existing.pinned
             return replace(ref, **updates), True
