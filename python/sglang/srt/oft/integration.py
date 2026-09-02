@@ -43,6 +43,7 @@ __all__ = [
     "reconstruct_oft_staging",
     "maybe_load_adapter",
     "maybe_load_adapter_from_tensors",
+    "maybe_load_adapter_from_distributed",
     "maybe_unload_adapter",
     "maybe_dummy_ids",
     "maybe_prepare_oft_batch",
@@ -248,14 +249,42 @@ def maybe_load_adapter_from_tensors(
     oft_ref: "OFTRef",
     tensors,
     config_dict,
-    added_tokens_config=None,
+    *,
+    upsert: bool = False,
 ):
     """Body of the former ``ModelRunner.load_oft_adapter_from_tensors``."""
     logger.info(f"OFT adapter loading from tensors starts: {oft_ref}.")
-    result = model_runner.oft_manager.load_oft_adapter_from_tensors(
-        oft_ref, tensors, config_dict, added_tokens_config
+    result = model_runner.oft_manager.load_adapter_from_tensors(
+        oft_ref, tensors, config_dict, upsert=upsert
     )
     logger.info(f"OFT adapter loading from tensors completes: {oft_ref}.")
+    return result
+
+
+def maybe_load_adapter_from_distributed(
+    model_runner: "ModelRunner",
+    oft_ref: "OFTRef",
+    names,
+    dtypes,
+    shapes,
+    config_dict,
+    group_name,
+    *,
+    upsert: bool = False,
+):
+    """Load native OFT tensors received by the model runner's updater."""
+    logger.info(f"OFT adapter loading from distributed starts: {oft_ref}.")
+    result = model_runner.oft_manager.load_adapter_from_distributed(
+        oft_ref,
+        names,
+        dtypes,
+        shapes,
+        config_dict,
+        group_name,
+        model_runner.weight_updater,
+        upsert=upsert,
+    )
+    logger.info(f"OFT adapter loading from distributed completes: {oft_ref}.")
     return result
 
 

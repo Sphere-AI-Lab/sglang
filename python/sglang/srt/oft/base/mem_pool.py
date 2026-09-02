@@ -153,14 +153,16 @@ class AdapterMemPool:
                 continue
             if uid is not None:
                 ref = refs.get(uid)
-                if ref and ref.pinned:
+                if ref and (ref.pinned or not ref.reloadable):
                     continue
             candidates.add(uid)
 
         if not candidates:
             raise ValueError(
                 "No available buffer slots found. Please ensure the number of "
-                "active (pinned) adapters is less than max_adapters_per_batch."
+                "active (pinned) adapters and adapters loaded over the wire "
+                "(no on-disk artifact to reload from, never evicted) is less "
+                "than max_adapters_per_batch."
             )
 
         # Prefer evicting adapters over base model (None)

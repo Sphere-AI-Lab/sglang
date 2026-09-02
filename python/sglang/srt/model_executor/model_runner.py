@@ -1375,6 +1375,39 @@ class ModelRunner:
 
         return _oft.maybe_load_adapter(self, oft_ref)
 
+    def load_oft_adapter_from_tensors(
+        self, oft_ref, tensors, config_dict, *, upsert: bool = False
+    ):
+        from sglang.srt.oft import integration as _oft
+
+        return _oft.maybe_load_adapter_from_tensors(
+            self, oft_ref, tensors, config_dict, upsert=upsert
+        )
+
+    def load_oft_adapter_from_distributed(
+        self,
+        oft_ref,
+        names,
+        dtypes,
+        shapes,
+        config_dict,
+        group_name,
+        *,
+        upsert: bool = False,
+    ):
+        from sglang.srt.oft import integration as _oft
+
+        return _oft.maybe_load_adapter_from_distributed(
+            self,
+            oft_ref,
+            names,
+            dtypes,
+            shapes,
+            config_dict,
+            group_name,
+            upsert=upsert,
+        )
+
     def unload_oft_adapter(self, oft_ref):
         """Unload an OFT adapter. Mirrors unload_lora_adapter().
 

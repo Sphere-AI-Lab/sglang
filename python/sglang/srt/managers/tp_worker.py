@@ -240,6 +240,26 @@ class BaseTpWorker(ABC):
         result = self.model_runner.load_oft_adapter(recv_req.to_ref())
         return result
 
+    def load_oft_adapter_from_tensors(self, recv_req):
+        data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
+        return self.model_runner.load_oft_adapter_from_tensors(
+            recv_req.to_ref(),
+            data,
+            recv_req.config_dict,
+            upsert=recv_req.upsert,
+        )
+
+    def load_oft_adapter_from_distributed(self, recv_req):
+        return self.model_runner.load_oft_adapter_from_distributed(
+            recv_req.to_ref(),
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.config_dict,
+            recv_req.group_name,
+            upsert=recv_req.upsert,
+        )
+
     def unload_oft_adapter(self, recv_req):
         result = self.model_runner.unload_oft_adapter(recv_req.to_ref())
         return result

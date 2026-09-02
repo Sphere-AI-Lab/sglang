@@ -1608,6 +1608,12 @@ class Scheduler(
             LoadOFTAdapterReqInput as _LoadOFTAdapterReqInput,
         )
         from sglang.srt.oft.io_types import (
+            LoadOFTAdapterFromDistributedReqInput as _LoadOFTAdapterFromDistributedReqInput,
+        )
+        from sglang.srt.oft.io_types import (
+            LoadOFTAdapterFromTensorsReqInput as _LoadOFTAdapterFromTensorsReqInput,
+        )
+        from sglang.srt.oft.io_types import (
             UnloadOFTAdapterReqInput as _UnloadOFTAdapterReqInput,
         )
 
@@ -1718,6 +1724,14 @@ class Scheduler(
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (_LoadOFTAdapterReqInput, self.load_oft_adapter),
+                (
+                    _LoadOFTAdapterFromTensorsReqInput,
+                    self.load_oft_adapter_from_tensors,
+                ),
+                (
+                    _LoadOFTAdapterFromDistributedReqInput,
+                    self.load_oft_adapter_from_distributed,
+                ),
                 (_UnloadOFTAdapterReqInput, self.unload_oft_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
@@ -5088,6 +5102,14 @@ class Scheduler(
 
         result = self.tp_worker.load_oft_adapter(recv_req)
         return result
+
+    def load_oft_adapter_from_tensors(self, recv_req):
+        """Load an OFT adapter from serialized tensors."""
+        return self.tp_worker.load_oft_adapter_from_tensors(recv_req)
+
+    def load_oft_adapter_from_distributed(self, recv_req):
+        """Load an OFT adapter broadcast over a process group."""
+        return self.tp_worker.load_oft_adapter_from_distributed(recv_req)
 
     def unload_oft_adapter(self, recv_req):
         """Unload the OFT adapter. Mirrors unload_lora_adapter()."""
