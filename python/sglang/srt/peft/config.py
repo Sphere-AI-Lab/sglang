@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 from sglang.srt.arg_groups.arg_utils import NS, A
-from sglang.srt.oft.oft_registry import OFTRef
 
 logger = logging.getLogger(__name__)
 
@@ -38,29 +37,9 @@ class PEFTArgs:
     peft_method: A[Optional[str], NS("lora")] = None
 
     # Shared single-active PEFT inputs (the active method is `peft_method`):
-    #   peft_paths          retired disk-preload flag; kept only so a value
-    #                       CAN still be captured if set programmatically or
-    #                       via a stale script -- validate_peft_args rejects
-    #                       it immediately (see the native RPC adapter-load
-    #                       mechanism instead).
     #   oft_target_modules  module allow-list; method-specific normalization
     #                       ("all"/embed/lm_head handling is OFT-only) in validate.
-    peft_paths: A[
-        Optional[
-            Union[
-                dict[str, str],
-                List[dict[str, str]],
-                List[str],
-                List[OFTRef],
-            ]
-        ],
-        NS("lora"),
-    ] = None
     oft_target_modules: A[Optional[Union[set[str], List[str]]], NS("lora")] = None
-    # Deprecated alias for oft_target_modules, kept only for backward-
-    # compatible input capture -- validate_peft_args copies it across (with a
-    # warning) when oft_target_modules is unset.
-    peft_target_modules: A[Optional[Union[set[str], List[str]]], NS("lora")] = None
 
     max_oft_block_size: A[Optional[int], NS("lora")] = None
     # Default 8 matches the CLI default (argparse resolved to 8 all along) and
@@ -109,10 +88,6 @@ class PEFTArgs:
     # live. Orbit sets this alongside --adapter-double-buffer. Off => in-place
     # single-active sync (IPC/colocate), byte-identical to today.
     oft_double_buffer: A[bool, NS("lora")] = False
-    # Deprecated alias for oft_double_buffer, kept only for backward-
-    # compatible input capture -- validate_peft_args OR-merges it in (with a
-    # warning) when set.
-    peft_double_buffer: A[bool, NS("lora")] = False
 
     @property
     def enable_peft(self) -> bool:
@@ -147,21 +122,6 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         help="The set of target modules where the active PEFT method is applied. "
         "'all' selects all supported modules (validated per-method in "
         "validate_peft_args).",
-    )
-    parser.add_argument(
-        "--peft-target-modules",
-        type=str,
-        nargs="*",
-        default=None,
-        help="Deprecated alias for --oft-target-modules; use --oft-target-modules instead.",
-    )
-    parser.add_argument(
-        "--peft-paths",
-        type=str,
-        nargs="*",
-        default=None,
-        help="Retired: on-disk adapter preload is no longer supported. Load "
-        "adapters via the native RPC adapter-load mechanism instead.",
     )
     parser.add_argument(
         "--max-ofts-per-batch",
@@ -214,12 +174,6 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         default=PEFTArgs.oft_double_buffer,
         help="Reserve a staging slot and enable the double-buffer stage/activate "
              "adapter endpoints (async-RL NCCL weight-sync).",
-    )
-    parser.add_argument(
-        "--peft-double-buffer",
-        action="store_true",
-        default=PEFTArgs.peft_double_buffer,
-        help="Deprecated alias for --oft-double-buffer; use --oft-double-buffer instead.",
     )
     parser.add_argument(
         "--oft-impl",
@@ -299,62 +253,6 @@ def validate_peft_args(server_args) -> None:
             "multi-tenant LoRA and single-active PEFT cannot be initialized together."
         )
 
-    # --peft-target-modules is a deprecated alias for --oft-target-modules
-    # (mirrors ServerArgs._handle_deprecated_args's --grpc-mode /
-    # --smg-grpc-mode pattern): copy the value across (with a warning) when
-    # only the old flag is set, and reject an explicit conflict outright
-    # (mirrors _handle_elastic_ep's --elastic-ep-rejoin conflict check) rather
-    # than silently picking one. Resolved through a local -- not written to
-    # server_args.oft_target_modules directly -- because ServerArgs is
-    # read-only once __post_init__ reaches materialize_declarations() (well
-    # before validate_peft_args runs, from check_server_args), so writes must
-    # go through _late_resolution at the end of this function (same reason
-    # the "all"-expansion further down normalizes through this same local
-    # rather than writing server_args directly). This local is what the rest
-    # of the function reads from now, including the "all"-expansion below.
-    oft_target_modules = server_args.oft_target_modules
-    if server_args.peft_target_modules is not None:
-        if oft_target_modules is None:
-            logger.warning(
-                "--peft-target-modules is deprecated; use --oft-target-modules "
-                "instead."
-            )
-            oft_target_modules = server_args.peft_target_modules
-        elif set(oft_target_modules) != set(server_args.peft_target_modules):
-            raise ValueError(
-                "--peft-target-modules (deprecated) conflicts with "
-                f"--oft-target-modules: {server_args.peft_target_modules!r} vs "
-                f"{oft_target_modules!r}. Specify only "
-                "--oft-target-modules."
-            )
-
-    # --peft-double-buffer is a deprecated alias for --oft-double-buffer.
-    # Unlike the target-modules alias above, both flags are plain booleans,
-    # so there's no "conflicting values" case to reject -- OR-merge instead
-    # (either flag being True means it's on). Resolved through a local --
-    # not written to server_args.oft_double_buffer directly -- for the same
-    # read-only-ServerArgs reason as oft_target_modules above; published via
-    # _late_resolution at the end of this function.
-    oft_double_buffer = server_args.oft_double_buffer or server_args.peft_double_buffer
-    if server_args.peft_double_buffer:
-        logger.warning(
-            "--peft-double-buffer is deprecated; use --oft-double-buffer instead."
-        )
-
-    # --peft-paths (on-disk adapter preload) has been retired: the native RPC
-    # adapter-load mechanism (load_oft_adapter_from_tensors/_from_distributed)
-    # now fully supersedes it functionally. Reject loudly rather than parse
-    # something that no admission code path consumes anymore. Checked with
-    # `is not None` (not truthiness) so an explicit empty list/dict -- still
-    # "was set" -- is caught too, not just a non-empty value.
-    if server_args.peft_paths is not None:
-        raise ValueError(
-            "--peft-paths has been retired: on-disk adapter preload is no "
-            "longer supported. Load adapters via the native RPC adapter-load "
-            "mechanism instead (load_oft_adapter_from_tensors / "
-            "load_oft_adapter_from_distributed)."
-        )
-
     from sglang.srt.utils.common import SUPPORTED_OFT_TARGET_MODULES
 
     assert server_args.max_ofts_per_batch > 0, "max_ofts_per_batch must be positive"
@@ -389,7 +287,7 @@ def validate_peft_args(server_args) -> None:
         # collide (active==staging==1), so activate()'s staging->active copy
         # would corrupt the active slot instead of promoting it. Fail loud
         # here rather than at pool-init time.
-        if oft_double_buffer:
+        if server_args.oft_double_buffer:
             assert server_args.max_ofts_per_batch >= 3, (
                 "double-buffer OFT requires --max-ofts-per-batch >= 3 "
                 "(base + active + staging); got "
@@ -428,9 +326,12 @@ def validate_peft_args(server_args) -> None:
                 )
                 server_args.cuda_graph_config.prefill.backend = Backend.DISABLED
 
-        # Expand target modules (OFT-specific "all"/embed/lm_head handling)
-        # on the local resolved above (already merged with the deprecated
-        # --peft-target-modules alias, if set).
+        # Expand target modules (OFT-specific "all"/embed/lm_head handling).
+        # Normalize through a local -- not server_args.oft_target_modules
+        # directly -- because ServerArgs is read-only once __post_init__
+        # reaches materialize_declarations() (well before this call), so
+        # writes must go through _late_resolution below.
+        oft_target_modules = server_args.oft_target_modules
         if oft_target_modules:
             oft_target_modules = set(oft_target_modules)
             if "all" in oft_target_modules:
@@ -466,8 +367,8 @@ def validate_peft_args(server_args) -> None:
         # (memory_pool.active_idx) is permanently reserved by the boot-time
         # base-request registration -- OFTMemoryPool.
         # allocate_buffer_slot_with_eviction (oft/mem_pool.py), the sole
-        # admission path since the on-disk (--peft-paths) lazy admission path
-        # was retired, excludes uid=None from its eviction candidates
+        # admission path since the on-disk lazy admission path was retired,
+        # excludes uid=None from its eviction candidates
         # outright (Task 4b review fix), so a real dynamically-loaded
         # adapter can genuinely never occupy it -- meaning
         # OFTManager._compute_moe_multi_tenant_slot_ids always takes its
@@ -575,5 +476,4 @@ def validate_peft_args(server_args) -> None:
         server_args._late_resolution(
             "validate_peft_args",
             oft_target_modules=oft_target_modules,
-            oft_double_buffer=oft_double_buffer,
         )
