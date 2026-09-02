@@ -3027,6 +3027,8 @@ class Scheduler(
             dimensions=recv_req.dimensions,
             lora_id=recv_req.lora_id,
             lora_version=recv_req.lora_version,
+            adapter_id=recv_req.adapter_id,
+            adapter_version=recv_req.adapter_version,
             http_worker_ipc=recv_req.http_worker_ipc,
             time_stats=recv_req.time_stats,
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,

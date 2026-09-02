@@ -17,6 +17,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import _extend_lora_extra_key
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 class TestLoRARefVersion(CustomTestCase):
@@ -76,8 +77,28 @@ class TestLoRARefVersion(CustomTestCase):
         asyncio.run(run())
 
     def test_tokenized_version_fields_are_wire_compatible_trailing_fields(self):
-        for req_type in (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput):
-            self.assertEqual(msgspec.structs.fields(req_type)[-1].name, "lora_version")
+        self.assertEqual(
+            msgspec.structs.fields(TokenizedGenerateReqInput)[-1].name,
+            "lora_version",
+        )
+
+        request = TokenizedEmbeddingReqInput(
+            input_text=None,
+            input_ids=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(max_new_tokens=0),
+            lora_version=7,
+        )
+        current_payload = msgspec.json.decode(msgspec.json.encode(request))
+        old_payload = current_payload[:-2]
+        decoded = msgspec.json.decode(
+            msgspec.json.encode(old_payload), type=TokenizedEmbeddingReqInput
+        )
+
+        self.assertEqual(decoded.lora_version, 7)
+        self.assertIsNone(decoded.adapter_id)
+        self.assertIsNone(decoded.adapter_version)
 
 
 class TestLoRARadixIdentity(CustomTestCase):

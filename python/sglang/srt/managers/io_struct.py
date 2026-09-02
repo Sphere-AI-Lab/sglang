@@ -1238,6 +1238,12 @@ class EmbeddingReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
+    # Canonical OFT path and tokenizer-resolved identity/version. These are
+    # trailing fields to preserve positional IPC compatibility.
+    adapter_path: Optional[Union[List[Optional[str]], str]] = None
+    adapter_id: Optional[Union[List[Optional[str]], str]] = None
+    adapter_version: Optional[Union[List[Optional[int]], int]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -1308,6 +1314,7 @@ class EmbeddingReqInput:
 
             self._normalize_lora_paths(self.batch_size)
             self._normalize_lora_versions(self.batch_size)
+            self._normalize_adapter_paths(self.batch_size)
 
         self._validate_rid_uniqueness()
 
@@ -1337,6 +1344,21 @@ class EmbeddingReqInput:
                 )
         else:
             raise ValueError("lora_version should be a list or an integer.")
+
+    def _normalize_adapter_paths(self, num):
+        """Normalize canonical OFT paths for batch processing."""
+        if self.adapter_path is None:
+            return
+        if isinstance(self.adapter_path, str):
+            self.adapter_path = [self.adapter_path] * num
+        elif isinstance(self.adapter_path, list):
+            if len(self.adapter_path) != num:
+                raise ValueError(
+                    f"adapter_path list length ({len(self.adapter_path)}) "
+                    f"must match batch size ({num})"
+                )
+        else:
+            raise ValueError("adapter_path should be a list or a string.")
 
     def contains_mm_input(self) -> bool:
         return (
@@ -1374,6 +1396,19 @@ class EmbeddingReqInput:
                     if isinstance(self.lora_version, list)
                     else self.lora_version
                 ),
+                adapter_path=(
+                    self.adapter_path[i] if self.adapter_path is not None else None
+                ),
+                adapter_id=(
+                    self.adapter_id[i]
+                    if isinstance(self.adapter_id, list)
+                    else self.adapter_id
+                ),
+                adapter_version=(
+                    self.adapter_version[i]
+                    if isinstance(self.adapter_version, list)
+                    else self.adapter_version
+                ),
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
@@ -1406,6 +1441,19 @@ class EmbeddingReqInput:
                     self.lora_version[i]
                     if isinstance(self.lora_version, list)
                     else self.lora_version
+                ),
+                adapter_path=(
+                    self.adapter_path[i] if self.adapter_path is not None else None
+                ),
+                adapter_id=(
+                    self.adapter_id[i]
+                    if isinstance(self.adapter_id, list)
+                    else self.adapter_id
+                ),
+                adapter_version=(
+                    self.adapter_version[i]
+                    if isinstance(self.adapter_version, list)
+                    else self.adapter_version
                 ),
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
@@ -1454,8 +1502,14 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
 
-    # Active native LoRA version. Keep this final for positional IPC compatibility.
+    # Active native LoRA version. New wire fields are appended after this one
+    # so older positional payloads retain its index.
     lora_version: Optional[int] = None
+
+    # Canonical OFT identity. Appended after all pre-existing fields so older
+    # positional payloads keep their original field mapping.
+    adapter_id: Optional[str] = None
+    adapter_version: Optional[int] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)

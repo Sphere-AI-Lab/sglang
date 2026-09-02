@@ -5,6 +5,7 @@ import pytest
 
 from sglang.srt.oft.oft_registry import OFTRef, OFTRegistry
 from sglang.srt.oft.tokenizer_hooks import resolve_oft_path
+from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 
 def test_evicted_wire_adapter_requires_a_fresh_native_load():
@@ -68,6 +69,31 @@ def test_resolver_uses_one_atomic_id_and_version_snapshot():
 
         assert request.adapter_id == ref.adapter_id
         assert request.adapter_version == 7
+        await registry.release(request.adapter_id)
+
+    asyncio.run(run())
+
+
+def test_resolver_attaches_oft_identity_and_version_to_embedding_request():
+    async def run():
+        registry = OFTRegistry()
+        ref = OFTRef(
+            adapter_id="id-a",
+            adapter_name="policy",
+            adapter_path="__distributed__",
+            adapter_version=7,
+            reloadable=False,
+        )
+        await registry.register(ref)
+        tokenizer_manager = SimpleNamespace(
+            peft_registry=registry,
+            peft_ref_cache={ref.adapter_name: ref},
+        )
+        request = EmbeddingReqInput(text="hello", adapter_path="policy")
+
+        await resolve_oft_path(tokenizer_manager, request)
+
+        assert (request.adapter_id, request.adapter_version) == ("id-a", 7)
         await registry.release(request.adapter_id)
 
     asyncio.run(run())

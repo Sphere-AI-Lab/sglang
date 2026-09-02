@@ -970,7 +970,7 @@ class TokenizerManager(
             async with self.model_update_lock.reader_lock:
                 if (
                     self.server_args.peft_method == "oft"
-                    and isinstance(obj, GenerateReqInput)
+                    and isinstance(obj, (GenerateReqInput, EmbeddingReqInput))
                 ):
                     await oft_tokenizer_hooks.maybe_resolve_oft_path(self, obj)
                 else:
@@ -1662,6 +1662,8 @@ class TokenizerManager(
                 dimensions=obj.dimensions,
                 lora_id=obj.lora_id,
                 lora_version=obj.lora_version,
+                adapter_id=obj.adapter_id,
+                adapter_version=obj.adapter_version,
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
