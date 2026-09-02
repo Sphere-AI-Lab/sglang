@@ -1042,6 +1042,12 @@ class FusedMoEWithOFT(nn.Module):
         self._oft_runner._peft_layer = base_layer
 
     def forward(self, hidden_states, topk_output, **kwargs):
+        # KNOWN LIMITATION: this reads one shared set of expert-OFT weights
+        # (base_layer.w13_oft_r/w2_oft_r etc.) for the whole batch -- no
+        # per-token adapter routing like LoRA's MoE path (token_lora_mapping)
+        # or the dense OFT path (prepare_oft_batch's weight_indices). Two
+        # concurrently-resident adapters that both carry expert OFT weights
+        # will silently share/clobber this state.
         base_layer = self.base_layer
         dispatch_output = base_layer.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
