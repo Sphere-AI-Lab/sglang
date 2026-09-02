@@ -192,7 +192,7 @@ class StagedOFTManager(OFTManager):
             oft_added_tokens_size=self.oft_added_tokens_size,
             memory_saver_adapter=self.memory_saver_adapter,
             memory_saver_cpu_backup=self.memory_saver_cpu_backup,
-            double_buffer=self.peft_double_buffer,
+            double_buffer=self.oft_double_buffer,
         )
         logger.info(
             "Using %s for OFT R buffers (model dtype %s).",

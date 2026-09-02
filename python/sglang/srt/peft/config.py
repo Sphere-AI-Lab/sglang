@@ -108,6 +108,10 @@ class PEFTArgs:
     # memory pools reserve a staging slot and the stage/activate endpoints are
     # live. Orbit sets this alongside --adapter-double-buffer. Off => in-place
     # single-active sync (IPC/colocate), byte-identical to today.
+    oft_double_buffer: A[bool, NS("lora")] = False
+    # Deprecated alias for oft_double_buffer, kept only for backward-
+    # compatible input capture -- validate_peft_args OR-merges it in (with a
+    # warning) when set.
     peft_double_buffer: A[bool, NS("lora")] = False
 
     @property
@@ -205,11 +209,17 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
     )
 
     parser.add_argument(
+        "--oft-double-buffer",
+        action="store_true",
+        default=PEFTArgs.oft_double_buffer,
+        help="Reserve a staging slot and enable the double-buffer stage/activate "
+             "adapter endpoints (async-RL NCCL weight-sync).",
+    )
+    parser.add_argument(
         "--peft-double-buffer",
         action="store_true",
         default=PEFTArgs.peft_double_buffer,
-        help="Reserve a staging slot and enable the double-buffer stage/activate "
-             "adapter endpoints (async-RL NCCL weight-sync).",
+        help="Deprecated alias for --oft-double-buffer; use --oft-double-buffer instead.",
     )
     parser.add_argument(
         "--oft-impl",
@@ -318,6 +328,19 @@ def validate_peft_args(server_args) -> None:
                 "--oft-target-modules."
             )
 
+    # --peft-double-buffer is a deprecated alias for --oft-double-buffer.
+    # Unlike the target-modules alias above, both flags are plain booleans,
+    # so there's no "conflicting values" case to reject -- OR-merge instead
+    # (either flag being True means it's on). Resolved through a local --
+    # not written to server_args.oft_double_buffer directly -- for the same
+    # read-only-ServerArgs reason as oft_target_modules above; published via
+    # _late_resolution at the end of this function.
+    oft_double_buffer = server_args.oft_double_buffer or server_args.peft_double_buffer
+    if server_args.peft_double_buffer:
+        logger.warning(
+            "--peft-double-buffer is deprecated; use --oft-double-buffer instead."
+        )
+
     # --peft-paths (on-disk adapter preload) has been retired: the native RPC
     # adapter-load mechanism (load_oft_adapter_from_tensors/_from_distributed)
     # now fully supersedes it functionally. Reject loudly rather than parse
@@ -366,7 +389,7 @@ def validate_peft_args(server_args) -> None:
         # collide (active==staging==1), so activate()'s staging->active copy
         # would corrupt the active slot instead of promoting it. Fail loud
         # here rather than at pool-init time.
-        if server_args.peft_double_buffer:
+        if oft_double_buffer:
             assert server_args.max_ofts_per_batch >= 3, (
                 "double-buffer OFT requires --max-ofts-per-batch >= 3 "
                 "(base + active + staging); got "
@@ -552,4 +575,5 @@ def validate_peft_args(server_args) -> None:
         server_args._late_resolution(
             "validate_peft_args",
             oft_target_modules=oft_target_modules,
+            oft_double_buffer=oft_double_buffer,
         )

@@ -219,9 +219,9 @@ class OFTManager(AdapterManager):
         # (see OFTMemoryPool._declare_expert_groups) and the CUDA-graph
         # pre-alloc layout below (_init_identity_expert_oft_for_cuda_graph).
         self.oft_type: str = server_args.oft_type
-        # Double-buffer sizing signal (PEFTArgs.peft_double_buffer), threaded
+        # Double-buffer sizing signal (PEFTArgs.oft_double_buffer), threaded
         # into OFTMemoryPool below so it reserves a staging slot iff set.
-        self.peft_double_buffer: bool = server_args.peft_double_buffer
+        self.oft_double_buffer: bool = server_args.oft_double_buffer
         # Read once here (Task 4's DP-attention guard in
         # _compute_moe_multi_tenant_slot_ids): --enable-dp-attention's
         # cross-rank MoE token gathering is not yet supported by the
@@ -877,7 +877,7 @@ class OFTManager(AdapterManager):
         batches with 2+ distinct adapters.
 
         WHY THE ``active_idx`` CARVE-OUT IS EAGER-ONLY: under
-        ``--peft-double-buffer`` (``oft_impl="staged"``), ``active_idx`` is
+        ``--oft-double-buffer`` (``oft_impl="staged"``), ``active_idx`` is
         NOT permanently reserved the way it is for the plain sibling pool --
         a staged adapter's ``activate()`` genuinely registers it AT
         ``active_idx`` (``OFTMemoryPool``), so a resident staged adapter can
@@ -1177,7 +1177,7 @@ class OFTManager(AdapterManager):
         # Double-buffer hardening: seed the STAGING slot from the now-neutral
         # (identity) ACTIVE slot so a partial-coverage stage can't leave garbage
         # for activate() to promote. No-op for full-coverage orbit syncs.
-        if self.peft_double_buffer:
+        if self.oft_double_buffer:
             self.memory_pool._init_staging_from_active()
 
         wrapped_module_count = sum(
@@ -1404,7 +1404,7 @@ class OFTManager(AdapterManager):
             oft_added_tokens_size=self.oft_added_tokens_size,
             memory_saver_adapter=self.memory_saver_adapter,
             memory_saver_cpu_backup=self.memory_saver_cpu_backup,
-            double_buffer=self.peft_double_buffer,
+            double_buffer=self.oft_double_buffer,
         )
         logger.info(
             "Using %s for OFT R buffers (model dtype %s).",

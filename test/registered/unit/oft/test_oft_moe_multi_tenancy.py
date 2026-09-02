@@ -933,7 +933,7 @@ class TestPersistentSlotIdsBufferAndCaptureForcing(unittest.TestCase):
         self,
     ):
         """Regression (independently-verified review finding on this task's
-        own commit): under --peft-double-buffer (oft_impl="staged"),
+        own commit): under --oft-double-buffer (oft_impl="staged"),
         active_idx is NOT permanently reserved the way it is for the plain
         sibling pool -- a staged adapter's activate() genuinely registers it
         AT active_idx (mem_pool.py). So a single resident staged adapter can

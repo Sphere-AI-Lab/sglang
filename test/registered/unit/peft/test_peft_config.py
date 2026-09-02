@@ -20,6 +20,8 @@ def _args(
     oft_target_modules=_UNSET,
     peft_target_modules=None,
     max_oft_block_size=None,
+    oft_double_buffer=False,
+    peft_double_buffer=False,
     oft_impl="sibling",
     cuda_graph_config=None,
     model_has_moe=False,
@@ -53,7 +55,8 @@ def _args(
         oft_dtype=None,
         oft_type="canonical_oft",
         max_oft_chunk_size=16,
-        peft_double_buffer=False,
+        oft_double_buffer=oft_double_buffer,
+        peft_double_buffer=peft_double_buffer,
         speculative_algorithm=None,
         cuda_graph_config=cuda_graph_config,
         oft_impl=oft_impl,
@@ -239,6 +242,7 @@ def test_peft_target_modules_alias_copy_survives_real_server_args_read_only_guar
         oft_dtype=None,
         oft_type="canonical_oft",
         max_oft_chunk_size=16,
+        oft_double_buffer=False,
         peft_double_buffer=False,
         speculative_algorithm=None,
         cuda_graph_config=None,
@@ -270,6 +274,93 @@ def test_peft_target_modules_conflicting_with_oft_target_modules_is_rejected():
                 peft_target_modules=["down_proj"],
             )
         )
+
+
+def test_oft_double_buffer_alone_works_as_canonical_flag():
+    """--oft-double-buffer, with no deprecated --peft-double-buffer alias
+    involved at all, must work as the new canonical flag: the value lands on
+    oft_double_buffer unchanged."""
+    from sglang.srt.peft.config import validate_peft_args
+
+    args = _args(
+        "oft",
+        enable_lora=False,
+        max_ofts_per_batch=3,
+        oft_double_buffer=True,
+    )
+    validate_peft_args(args)
+    assert args.oft_double_buffer is True
+
+
+def test_peft_double_buffer_deprecated_alias_still_works_and_warns(caplog):
+    """--peft-double-buffer is deprecated in favor of --oft-double-buffer,
+    but must still work as an alias: when the old flag is set, a warning is
+    logged and it is OR-merged into oft_double_buffer."""
+    import logging
+
+    from sglang.srt.peft.config import validate_peft_args
+
+    args = _args(
+        "oft",
+        enable_lora=False,
+        max_ofts_per_batch=3,
+        oft_double_buffer=False,
+        peft_double_buffer=True,
+    )
+    with caplog.at_level(logging.WARNING, logger="sglang.srt.peft.config"):
+        validate_peft_args(args)
+
+    assert any(
+        "--peft-double-buffer is deprecated" in message
+        for message in caplog.messages
+    )
+    assert args.oft_double_buffer is True
+
+
+def test_peft_double_buffer_alias_copy_survives_real_server_args_read_only_guard():
+    """Regression, mirroring
+    test_peft_target_modules_alias_copy_survives_real_server_args_read_only_guard:
+    the deprecated --peft-double-buffer -> --oft-double-buffer OR-merge must
+    not write ``server_args.oft_double_buffer = ...`` directly, since real
+    ``ServerArgs.__setattr__`` raises ``AttributeError`` for any bare field
+    write once ``_declarations_materialized`` is set -- which is always true
+    by the time ``validate_peft_args`` runs at a real server launch. This
+    drives the REAL, read-only ``ServerArgs`` seam (not the ``SimpleNamespace``
+    fixture the other alias tests use, which can't catch this class of bug).
+    """
+    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.server_args import ServerArgs
+
+    sa = ServerArgs.__new__(ServerArgs)
+    fields = dict(
+        peft_method="oft",
+        enable_lora=False,
+        oft_impl="sibling",
+        peft_paths=None,
+        oft_target_modules=["down_proj"],
+        peft_target_modules=None,
+        max_oft_block_size=32,
+        max_ofts_per_batch=4,
+        max_loaded_ofts=None,
+        oft_backend="triton",
+        oft_dtype=None,
+        oft_type="canonical_oft",
+        max_oft_chunk_size=16,
+        oft_double_buffer=False,
+        peft_double_buffer=True,
+        speculative_algorithm=None,
+        cuda_graph_config=None,
+        enable_dp_attention=False,
+    )
+    for name, value in fields.items():
+        object.__setattr__(sa, name, value)
+    # Reproduce the read-only guard: real server launches always reach
+    # validate_peft_args with this already set (see docstring above).
+    object.__setattr__(sa, "_declarations_materialized", True)
+
+    validate_peft_args(sa)  # must not raise AttributeError
+
+    assert sa.oft_double_buffer is True
 
 
 def _cuda_graph_config(*, decode_backend):
