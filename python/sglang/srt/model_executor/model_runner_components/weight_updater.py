@@ -514,6 +514,13 @@ class WeightUpdater:
                 flattened_tensor_bucket_dict=named_tensors
             )
 
+        if load_format == "oft_adapter":
+            return (
+                False,
+                "load_format='oft_adapter' is no longer supported; use the native "
+                "OFT adapter RPC instead.",
+            )
+
         # We need to get device after patch otherwise the device would be wrong
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
