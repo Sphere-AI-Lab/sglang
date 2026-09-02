@@ -9,14 +9,26 @@ _RETIRED_LORA_METHOD = "lo" + "ra"
 _RETIRED_IMPLEMENTATION_FLAG = "--oft-" + "impl"
 
 
-def _args(peft_method, *, enable_lora=True):
+def _args(
+    peft_method,
+    *,
+    enable_lora=True,
+    max_loaded_ofts=None,
+    max_ofts_per_batch=2,
+    peft_paths=None,
+):
     ns = SimpleNamespace(
         enable_lora=enable_lora,
         peft_method=peft_method,
-        peft_paths=["/models/adapter"] if peft_method is not None else None,
+        peft_paths=(
+            peft_paths
+            if peft_paths is not None
+            else (["/models/adapter"] if peft_method is not None else None)
+        ),
         peft_target_modules=None,
         max_oft_block_size=None,
-        max_ofts_per_batch=2,
+        max_ofts_per_batch=max_ofts_per_batch,
+        max_loaded_ofts=max_loaded_ofts,
         oft_backend="triton",
         oft_dtype=None,
         oft_type="canonical_oft",
@@ -72,6 +84,61 @@ def test_register_oft_args_exposes_only_the_canonical_selector():
         parser.parse_args(["--peft-method", _RETIRED_LORA_METHOD])
     with pytest.raises(SystemExit):
         parser.parse_args([_RETIRED_IMPLEMENTATION_FLAG, "peft"])
+
+
+def test_register_oft_args_exposes_max_loaded_ofts():
+    from sglang.srt.oft.config import register_oft_args
+
+    parser = argparse.ArgumentParser()
+    register_oft_args(parser)
+
+    assert parser.parse_args(["--max-loaded-ofts", "3"]).max_loaded_ofts == 3
+
+
+def test_max_loaded_ofts_must_cover_real_per_batch_capacity():
+    """Slot zero is base, so real adapter capacity is max_ofts_per_batch - 1."""
+    from sglang.srt.oft.config import validate_oft_args
+
+    with pytest.raises(
+        AssertionError,
+        match=r"max_loaded_ofts should be greater than or equal",
+    ):
+        validate_oft_args(
+            _args(
+                "oft",
+                enable_lora=False,
+                max_loaded_ofts=2,
+                max_ofts_per_batch=4,
+            )
+        )
+
+
+def test_max_loaded_ofts_accepts_real_capacity_boundary():
+    from sglang.srt.oft.config import validate_oft_args
+
+    validate_oft_args(
+        _args(
+            "oft",
+            enable_lora=False,
+            max_loaded_ofts=3,
+            max_ofts_per_batch=4,
+        )
+    )
+
+
+def test_initial_paths_must_fit_max_loaded_ofts():
+    from sglang.srt.oft.config import validate_oft_args
+
+    with pytest.raises(AssertionError, match=r"should not exceed max_loaded_ofts"):
+        validate_oft_args(
+            _args(
+                "oft",
+                enable_lora=False,
+                max_loaded_ofts=3,
+                max_ofts_per_batch=4,
+                peft_paths=["/models/a", "/models/b", "/models/c", "/models/d"],
+            )
+        )
 
 
 def test_oft_args_type_hints_resolve_for_server_args_consumers():

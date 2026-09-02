@@ -59,6 +59,7 @@ class OFTArgs:
     peft_target_modules: A[Optional[Union[set[str], List[str]]], NS("lora")] = None
     max_oft_block_size: A[Optional[int], NS("lora")] = None
     max_ofts_per_batch: A[int, NS("lora")] = 8
+    max_loaded_ofts: A[Optional[int], NS("lora")] = None
     oft_backend: A[str, NS("lora")] = "triton"
     oft_dtype: A[Optional[str], NS("lora")] = None
     oft_type: A[str, NS("lora")] = "canonical_oft"
@@ -123,6 +124,15 @@ def register_oft_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=OFTArgs.max_ofts_per_batch,
         help="Maximum resident OFT identities in one batch, including base.",
+    )
+    parser.add_argument(
+        "--max-loaded-ofts",
+        type=int,
+        default=OFTArgs.max_loaded_ofts,
+        help=(
+            "Maximum OFT adapters kept in the tokenizer-side registry. Must be "
+            "at least --max-ofts-per-batch - 1 because slot 0 is the base model."
+        ),
     )
     parser.add_argument(
         "--oft-backend",
@@ -221,6 +231,19 @@ def validate_oft_args(server_args) -> None:
         )
 
     assert server_args.max_ofts_per_batch > 0, "max_ofts_per_batch must be positive"
+    if server_args.max_loaded_ofts is not None:
+        assert server_args.max_loaded_ofts >= server_args.max_ofts_per_batch - 1, (
+            "max_loaded_ofts should be greater than or equal to "
+            "max_ofts_per_batch - 1 (slot 0 is reserved for the base model). "
+            f"max_loaded_ofts={server_args.max_loaded_ofts}, "
+            f"max_ofts_per_batch={server_args.max_ofts_per_batch}"
+        )
+        if server_args.peft_paths:
+            assert len(server_args.peft_paths) <= server_args.max_loaded_ofts, (
+                "The number of OFT paths should not exceed max_loaded_ofts. "
+                f"max_loaded_ofts={server_args.max_loaded_ofts}, "
+                f"peft_paths={len(server_args.peft_paths)}"
+            )
     if server_args.peft_paths and method is None:
         raise ValueError("--peft-paths requires --peft-method oft.")
     if method is None:

@@ -7,19 +7,22 @@ types under ``srt/oft/``. ``io_struct.py`` re-exports these during Task 6 via
 imports keep working.
 """
 
-from typing import Any, Dict, Optional
+from typing import Annotated, Any, Dict, List, Optional, Union
 
 from sglang.srt.managers.io_struct import BaseReq
 from sglang.srt.oft.oft_registry import OFTRef
+from sglang.srt.utils.msgspec_utils import Base64Bytes
 
 __all__ = [
     "LoadOFTAdapterReqInput",
     "UnloadOFTAdapterReqInput",
     "LoadOFTAdapterFromTensorsReqInput",
+    "LoadOFTAdapterFromDistributedReqInput",
     "OFTUpdateOutput",
     "LoadOFTAdapterReqOutput",
     "UnloadOFTAdapterReqOutput",
     "LoadOFTAdapterFromTensorsReqOutput",
+    "LoadOFTAdapterFromDistributedReqOutput",
 ]
 
 
@@ -57,11 +60,16 @@ class UnloadOFTAdapterReqInput(BaseReq, kw_only=True):
 
 class LoadOFTAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     adapter_name: str
+    # The PEFT adapter_config.json, already JSON.
     config_dict: Dict[str, Any]
-    serialized_tensors: str
+    # One serialized copy of the adapter tensors per TP rank; each rank
+    # deserializes only its own copy.
+    serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
     pinned: bool = False
-    added_tokens_config: Optional[Dict[str, Any]] = None
     adapter_id: Optional[str] = None
+    load_format: Optional[str] = None
+    # If already loaded, refresh weights in place instead of failing.
+    upsert: bool = False
 
     def to_ref(self) -> OFTRef:
         return OFTRef(
@@ -69,15 +77,38 @@ class LoadOFTAdapterFromTensorsReqInput(BaseReq, kw_only=True):
             adapter_name=self.adapter_name,
             adapter_path="__tensor__",
             pinned=self.pinned,
+            reloadable=False,
+        )
+
+
+class LoadOFTAdapterFromDistributedReqInput(BaseReq, kw_only=True):
+    adapter_name: str
+    config_dict: Dict[str, Any]
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    group_name: str = "weight_update_group"
+    pinned: bool = False
+    adapter_id: Optional[str] = None
+    # If already loaded, refresh weights in place instead of failing.
+    upsert: bool = False
+
+    def to_ref(self) -> OFTRef:
+        return OFTRef(
+            adapter_id=self.adapter_id,
+            adapter_name=self.adapter_name,
+            adapter_path="__distributed__",
+            pinned=self.pinned,
+            reloadable=False,
         )
 
 
 class OFTUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None
-    loaded_adapters: Optional[Dict[str, OFTRef]] = None
+    loaded_adapters: Optional[Dict[str, Union[str, OFTRef]]] = None
 
 
 LoadOFTAdapterReqOutput = UnloadOFTAdapterReqOutput = (
     LoadOFTAdapterFromTensorsReqOutput
-) = OFTUpdateOutput
+) = LoadOFTAdapterFromDistributedReqOutput = OFTUpdateOutput
