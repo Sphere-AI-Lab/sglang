@@ -72,8 +72,7 @@ def _raw_named_tensors_for_layer_0(fill_value: float):
     the actual shape StagedOFTManager.stage_adapter's named_tensors argument
     takes in production (weight_updater.py -> peft/integration.py ->
     oft_manager.stage_adapter(tensors, ...), and OFTManager._stage_fill's own
-    docstring: "raw checkpoint-name tensors -- the SAME format
-    load_streamed_oft_adapter consumes"). A single compact block
+    docstring: "raw checkpoint-name tensors"). A single compact block
     (num_blocks=1) so precompute_oft_r's result broadcasts to every block
     position in the runtime buffer regardless of that buffer's own block
     count -- the same "block_share" case _write_oft_r_block already handles

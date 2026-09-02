@@ -52,6 +52,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.oft.streamed_weight_loader import normalize_oft_weight_payload
 from sglang.srt.runtime_context import get_exec, get_model, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
@@ -242,6 +243,11 @@ class BaseTpWorker(ABC):
 
     def load_oft_adapter_from_tensors(self, recv_req):
         data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
+        if recv_req.load_format == "oft_adapter":
+            data = normalize_oft_weight_payload(
+                data,
+                device=self.model_runner.device,
+            )
         return self.model_runner.load_oft_adapter_from_tensors(
             recv_req.to_ref(),
             data,

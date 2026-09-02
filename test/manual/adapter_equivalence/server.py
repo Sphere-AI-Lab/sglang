@@ -366,12 +366,11 @@ def _resolve_worker_oft_ref_type(
 def install_internal_oft_control_bridge(revision_kind: str) -> None:
     """Install the harness-only worker dispatch before Engine subprocess spawn."""
 
-    if revision_kind == "source":
-        integration = importlib.import_module(_LEGACY_PEFT_PACKAGE + ".integration")
-    elif revision_kind == "candidate":
-        from sglang.srt.oft import integration
-    else:
+    if revision_kind not in {"source", "candidate"}:
         raise ScenarioContractError(f"unknown revision kind: {revision_kind}")
+    if revision_kind == "candidate":
+        return
+    integration = importlib.import_module(_LEGACY_PEFT_PACKAGE + ".integration")
 
     marker = "_adapter_equivalence_oft_control_bridge"
     installed_revision = getattr(integration, marker, None)
@@ -487,6 +486,20 @@ class InternalOFTControl:
         if operation == "load":
             tensors, config = self.fixture_loader(adapter_path)
             serialized = self.payload_serializer(tensors)
+            if self.revision_kind == "candidate":
+                from sglang.srt.oft.io_types import (
+                    LoadOFTAdapterFromTensorsReqInput,
+                )
+
+                return LoadOFTAdapterFromTensorsReqInput(
+                    adapter_name=adapter_name,
+                    config_dict=config,
+                    serialized_named_tensors=[
+                        serialized for _ in range(self.engine.server_args.tp_size)
+                    ],
+                    load_format="oft_adapter",
+                    pinned=pinned,
+                )
             return self.update_request_type(
                 serialized_named_tensors=[
                     serialized for _ in range(self.engine.server_args.tp_size)
@@ -497,6 +510,10 @@ class InternalOFTControl:
                 adapter_name=adapter_name,
                 adapter_id=None,
             )
+        if self.revision_kind == "candidate":
+            from sglang.srt.oft.io_types import UnloadOFTAdapterReqInput
+
+            return UnloadOFTAdapterReqInput(adapter_name=adapter_name)
         return self.update_request_type(
             serialized_named_tensors=self.engine._serialize_tensors_per_rank(
                 [], _INTERNAL_OFT_CONTROL_FORMAT
@@ -520,14 +537,16 @@ class InternalOFTControl:
         pinned: bool,
     ) -> object:
         manager = self.engine.tokenizer_manager
+        request = self._request(
+            operation="load",
+            adapter_name=adapter_name,
+            adapter_path=adapter_path,
+            pinned=pinned,
+            adapter_id=None,
+        )
+        if self.revision_kind == "candidate":
+            return await manager.load_oft_adapter_from_tensors(request, None)
         async with manager.peft_update_lock:
-            request = self._request(
-                operation="load",
-                adapter_name=adapter_name,
-                adapter_path=adapter_path,
-                pinned=pinned,
-                adapter_id=None,
-            )
             try:
                 result = await manager.update_weights_from_tensor(request, None)
             except Exception:
@@ -546,6 +565,15 @@ class InternalOFTControl:
 
     async def _unload(self, adapter_name: str) -> object:
         manager = self.engine.tokenizer_manager
+        if self.revision_kind == "candidate":
+            request = self._request(
+                operation="unload",
+                adapter_name=adapter_name,
+                adapter_path="",
+                pinned=False,
+                adapter_id=None,
+            )
+            return await manager.unload_oft_adapter(request, None)
         async with manager.peft_update_lock:
             ref = manager.peft_ref_cache.get(adapter_name)
             if ref is None:

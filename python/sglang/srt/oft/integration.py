@@ -1,9 +1,8 @@
 """OFT integration façade — the thin seam ``model_runner.py`` calls through.
 
-Owns the OFT-manager lifecycle (init/load/unload) and the ``load_format ==
-"oft_adapter"`` dispatch bodies that used to live directly on ``ModelRunner``.
-Task 6 imports this module as ``oft`` and keeps the model runner's call-outs
-thin, while this provider owns the canonical adapter lifecycle.
+Owns the OFT-manager lifecycle (init/load/unload). Task 6 imports this module
+as ``oft`` and keeps the model runner's call-outs thin, while this provider
+owns the canonical adapter lifecycle.
 """
 
 from __future__ import annotations
@@ -16,8 +15,6 @@ import torch
 from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.oft.streamed_weight_loader import (
     FlattenedOFTTensorPayload,
-    load_streamed_oft_adapter,
-    normalize_oft_weight_payload,
 )
 from sglang.srt.utils import get_available_gpu_memory
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -39,7 +36,6 @@ __all__ = [
     "OFTRef",
     "NOT_HANDLED",
     "maybe_init_oft_manager",
-    "maybe_load_adapter_format",
     "reconstruct_oft_staging",
     "maybe_load_adapter",
     "maybe_load_adapter_from_tensors",
@@ -90,34 +86,6 @@ def _init_oft_manager(model_runner: "ModelRunner", server_args: "ServerArgs") ->
         memory_saver_adapter=model_runner.memory_saver_adapter,
         memory_saver_cpu_backup=model_runner.server_args.enable_weights_cpu_backup,
     )
-
-
-def maybe_load_adapter_format(
-    model_runner: "ModelRunner",
-    load_format,
-    tensors,
-    adapter_config: Optional[dict],
-    adapter_name: Optional[str],
-    adapter_id: Optional[str],
-    *,
-    payload_metadata: Optional[dict] = None,
-    device=None,
-):
-    """Handle a canonical streamed OFT payload or return ``NOT_HANDLED``."""
-    if load_format == "oft_adapter":
-        if payload_metadata is not None:
-            tensors = reconstruct_oft_staging(tensors, payload_metadata)
-        elif device is not None:
-            tensors = normalize_oft_weight_payload(tensors, device=device)
-        return load_streamed_oft_adapter(
-            model_runner,
-            tensors,
-            adapter_config,
-            adapter_name,
-            adapter_id,
-        )
-
-    return NOT_HANDLED
 
 
 def reconstruct_oft_staging(
@@ -184,11 +152,9 @@ def stage_adapter(
     payload_metadata: Optional[dict] = None,
     double_buffer: bool = True,
 ):
-    """Canonical OFT STAGING fill. Reconstructs the wire payload identically (the
-    ``payload_metadata`` path only -- NCCL is the sole transport the
-    stage/activate endpoints use, unlike the CUDA-IPC ``device=`` path
-    ``maybe_load_adapter_format`` also supports), then calls the resolved
-    manager's ``stage_adapter``. Returns ``NOT_HANDLED`` for non-OFT payloads.
+    """Canonical OFT STAGING fill. Reconstructs the NCCL wire payload, then
+    calls the resolved manager's ``stage_adapter``. Returns ``NOT_HANDLED``
+    for non-OFT payloads.
 
     ``double_buffer=False`` (distributed sync without ``--adapter-double-
     buffer``) is rejected for OFT: with DB-off sizing the pool inherits the

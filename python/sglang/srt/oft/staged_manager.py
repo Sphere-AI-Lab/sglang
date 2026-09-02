@@ -148,8 +148,8 @@ class StagedOFTManager(OFTManager):
     B1's existing multi-tenant admission and eviction (unaffected).
 
     ``stage_adapter``'s ``named_tensors`` is raw checkpoint-name tensors --
-    the SAME format ``OFTManager._stage_fill``/``load_streamed_oft_adapter``
-    consume, and the SAME format ``weight_updater.py`` -> ``oft/
+    the SAME format ``OFTManager._stage_fill`` consumes, and the SAME format
+    ``weight_updater.py`` -> ``oft/
     integration.py`` -> ``oft_manager.stage_adapter(...)`` actually supplies
     in production. This class reuses every transformation primitive
     ``_stage_fill`` (oft_manager.py:1412-1538, unedited) itself uses --

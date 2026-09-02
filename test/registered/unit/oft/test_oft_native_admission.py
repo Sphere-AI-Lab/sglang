@@ -3,6 +3,7 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.lora.eviction_policy import get_eviction_policy
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.oft.base.mem_pool import EMPTY_SLOT
 from sglang.srt.oft.mem_pool import OFTMemoryPool
 from sglang.srt.oft.oft_manager import OFTManager
@@ -51,6 +52,45 @@ def _manager(capacity=2):
 
 
 class TestNativeAdmission(unittest.TestCase):
+    def test_worker_normalizes_flattened_native_payload(self):
+        worker = TpModelWorker.__new__(TpModelWorker)
+        worker.ps = SimpleNamespace(tp_rank=0)
+        runner = SimpleNamespace(
+            device="cuda:0",
+            load_oft_adapter_from_tensors=MagicMock(return_value="loaded"),
+        )
+        worker._model_runner = runner
+        ref = _ref("adapter")
+        request = SimpleNamespace(
+            serialized_named_tensors=[b"rank-0"],
+            load_format="oft_adapter",
+            config_dict=CONFIG,
+            upsert=True,
+            to_ref=lambda: ref,
+        )
+        raw_payload = ("flattened_oft_payload", b"tensor", [], [])
+        normalized_payload = [("layer.oft_R", "tensor")]
+
+        with patch.object(
+            worker,
+            "_deserialize_own_rank",
+            return_value=raw_payload,
+        ), patch(
+            "sglang.srt.managers.tp_worker.normalize_oft_weight_payload",
+            return_value=normalized_payload,
+            create=True,
+        ) as normalize:
+            result = worker.load_oft_adapter_from_tensors(request)
+
+        self.assertEqual(result, "loaded")
+        normalize.assert_called_once_with(raw_payload, device="cuda:0")
+        runner.load_oft_adapter_from_tensors.assert_called_once_with(
+            ref,
+            normalized_payload,
+            CONFIG,
+            upsert=True,
+        )
+
     def test_dict_payload_is_normalized_before_resolve_and_commit(self):
         manager = _manager()
         ref = _ref("new")

@@ -518,18 +518,6 @@ class WeightUpdater:
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
 
-        result = oft.maybe_load_adapter_format(
-            self.get_model_runner(),
-            load_format,
-            named_tensors,
-            adapter_config,
-            adapter_name,
-            adapter_id,
-            device=infered_device,
-        )
-        if result is not oft.NOT_HANDLED:
-            return result
-
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
             for name, tensor in named_tensors

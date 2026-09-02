@@ -7,7 +7,6 @@ from typing import Dict, List, Literal, Sequence, Tuple
 
 import torch
 
-from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
@@ -305,114 +304,6 @@ def _flush_oft_group_chunk(
         offset = next_offset
 
 
-def _ensure_streaming_oft_adapter_slot(
-    model_runner,
-    adapter_config: dict,
-    adapter_name: str,
-    adapter_id: str | None,
-) -> tuple[int, int]:
-    # Orbit's IPC OFT sync passes adapter_name but NO adapter_id; for a
-    # single-active adapter the id IS the name (stable across syncs, so the
-    # forward's adapter_path->adapter_id resolution stays valid). OFTRef rejects a
-    # None adapter_id, so default it here rather than crash the streamed path.
-    if adapter_id is None:
-        adapter_id = adapter_name
-    block_size = adapter_config.get("oft_block_size", 32)
-    max_block_size = model_runner.oft_manager.memory_pool.max_oft_block_size
-    if block_size != max_block_size:
-        raise ValueError(
-            f"OFT adapter '{adapter_name}' has block_size={block_size}, but the "
-            f"server pool is allocated for --max-oft-block-size={max_block_size}; "
-            f"smaller or mixed block sizes are unsupported."
-        )
-    other_adapters = sorted(
-        r.adapter_name
-        for r in model_runner.oft_manager.refs.values()
-        if r.adapter_name != adapter_name
-    )
-    if other_adapters:
-        raise ValueError(
-            f"Streamed OFT sync for '{adapter_name}' while other adapters are "
-            f"resident ({other_adapters}) is unsupported: the streamed path "
-            "assumes the single-active slot convention. Hot-swap combined with "
-            "multi-tenant serving lands with the adapter_sync extension."
-        )
-    if (
-        hasattr(model_runner, "_oft_streaming_buffer_id")
-        and model_runner._oft_streaming_name == adapter_name
-    ):
-        return (
-            model_runner._oft_streaming_buffer_id,
-            model_runner._oft_streaming_block_size,
-        )
-
-    existing_id = None
-    # NB: do not reuse `adapter_id` as the loop variable -- it is the id we are
-    # about to register under, and rebinding it here keyed the new OFTRef by
-    # whatever ref happened to be iterated last.
-    for ref_id, ref in list(model_runner.oft_manager.refs.items()):
-        if ref.adapter_name == adapter_name:
-            existing_id = ref_id
-            break
-    if existing_id is not None:
-        old_ref = model_runner.oft_manager.refs[existing_id]
-        model_runner.oft_manager.unload_streamed_adapter(old_ref)
-
-    buffer_id = model_runner.oft_manager.memory_pool.allocate_buffer_slot()
-    model_runner.oft_manager.memory_pool.reset_buffer_slot_to_identity(buffer_id)
-
-    oft_ref = OFTRef(
-        adapter_id=adapter_id,
-        adapter_name=adapter_name,
-        adapter_path=adapter_name,
-        # Pinned: no CPU-side OFTAdapter exists for a streamed adapter, so an
-        # eviction could never be re-paged (see _make_streamed_ref).
-        pinned=True,
-    )
-    result = model_runner.oft_manager.register_streamed_adapter(
-        oft_ref, buffer_id, adapter_config
-    )
-    if not result.success:
-        raise RuntimeError(
-            f"Failed to register OFT adapter: {result.error_message}"
-        )
-
-    model_runner._oft_streaming_buffer_id = buffer_id
-    model_runner._oft_streaming_name = adapter_name
-    model_runner._oft_streaming_block_size = block_size
-    return buffer_id, block_size
-
-
-def load_streamed_oft_adapter(
-    model_runner,
-    named_tensors: List[Tuple[str, torch.Tensor]],
-    adapter_config: dict,
-    adapter_name: str,
-    adapter_id: str | None = None,
-) -> tuple[bool, str]:
-    assert adapter_config is not None, "adapter_config is required for oft_adapter"
-    assert adapter_name is not None, "adapter_name is required for oft_adapter"
-
-    try:
-        buffer_id, block_size = _ensure_streaming_oft_adapter_slot(
-            model_runner,
-            adapter_config,
-            adapter_name,
-            adapter_id,
-        )
-    except (RuntimeError, ValueError) as exc:
-        return False, str(exc)
-
-    return _write_streamed_oft_tensors(
-        model_runner.oft_manager,
-        named_tensors,
-        buffer_id,
-        block_size,
-        adapter_name,
-        adapter_id,
-    )
-
-
 def _resolve_streamed_oft_tensor_groups(
     oft_manager,
     named_tensors: List[Tuple[str, torch.Tensor]],
@@ -647,35 +538,6 @@ def _commit_streamed_oft_tensor_groups(
         torch.cuda.empty_cache()
 
     return True, "Success"
-
-
-def _write_streamed_oft_tensors(
-    oft_manager,
-    named_tensors: List[Tuple[str, torch.Tensor]],
-    buffer_id: int,
-    block_size: int,
-    adapter_name: str,
-    adapter_id: str | None,
-) -> tuple[bool, str]:
-    """Resolve then commit in one call (unchanged external behavior).
-
-    Used by the legacy single-active streamed path
-    (`load_streamed_oft_adapter`, which admits the slot via
-    `_ensure_streaming_oft_adapter_slot` before calling this) where a
-    buffer_id already exists by the time this runs. The native
-    multi-tenant admission path (`OFTManager.load_adapter_from_tensors`)
-    calls `_resolve_streamed_oft_tensor_groups` and
-    `_commit_streamed_oft_tensor_groups` separately instead, so validation
-    happens before it evicts a resident adapter to make room.
-    """
-    plan, error_message = _resolve_streamed_oft_tensor_groups(
-        oft_manager, named_tensors, block_size
-    )
-    if plan is None:
-        return False, error_message
-    return _commit_streamed_oft_tensor_groups(
-        oft_manager, named_tensors, plan, buffer_id, block_size, adapter_name, adapter_id
-    )
 
 
 def _flush_oft_group_in_chunks(
