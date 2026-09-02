@@ -402,7 +402,7 @@ def load_streamed_oft_adapter(
             adapter_name,
             adapter_id,
         )
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         return False, str(exc)
 
     memory_pool = model_runner.oft_manager.memory_pool
@@ -558,7 +558,7 @@ def load_streamed_oft_adapter(
         # Fork DeepSeekV4 model was dropped (Task 2b); DSV4-named expert OFT
         # adapters are converted onto FusedMoE above. Reaching here means no
         # FusedMoE was available to absorb them.
-        raise ValueError(
+        return False, (
             "DSV4-style expert OFT adapter has no FusedMoE target "
             "(fork DeepSeekV4 model support was removed)"
         )
