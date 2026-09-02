@@ -180,3 +180,61 @@ A wrapper flaw is also recorded: the Task 8 wrappers evaluate the verdict check
 under `set -e` before extracting the measurement, so a surrogate-only failure
 leaves `oft_differs=unknown` in `completion.status` even when the JSONL records
 `true`. The per-transition JSONL is authoritative.
+
+## 8. Addendum, 2026-09-02: the MoE cell is closed at TP=2
+
+Supersedes section 6 items 1 and 2, and reclassifies part of item 4. The MoE cell was
+redefined to TP=2/EP=2 (ruling in the ledger); every result below is at that cell.
+
+### MoE results
+
+| Job | Host/GPU | Mode | Config | Result |
+|---|---|---|---|---|
+| `17503913` | mpi3 H100 | native LoRA | long-prefix, expert set | pass |
+| `17503953` | mpi3 H100 | native LoRA | factual, expert set | pass |
+| `17503968` | mpi3 H100 | canonical OFT | BF16 factual | pass, base restored exactly |
+| `17503969` | mpi3 H100 | canonical OFT | BF16 long-prefix | pass, base restored exactly |
+| `17503974` | mpi3 H100 | canonical OFT | scale probe `1e-1`, short set | pass, `oft_differs=yes` |
+| `7149` | slurm H200 | canonical OFT | FP8, clean env | fail-loud boundary (below) |
+| `7212` | slurm H200 | canonical OFT | BF16, clean env, fusion off | pass 13/13, active, restored |
+| `7213` | slurm H200 | canonical OFT | BF16, clean env, **fusion on** | pass 13/13, active, restored |
+
+MoE adapter-activity evidence is carried at fixture scale `1e-1` (probe `17503974`): at
+`1e-2` the 30B does not move tokens, the same blindness class the dense sweep resolved.
+
+### Five stacked causes, two of them code
+
+The cell was blocked by: the unpassed `--max-oft-block-size 32`; FlashInfer allreduce
+fusion auto-enabling after user kwargs (`enforce_disable_flashinfer_allreduce_fusion`
+is the effective switch); JIT caches on NFS `$HOME`; the Radix merge dropping the
+`invoke` seam from `TritonRunnerCore.run` and `_fused_moe_kernel_sequence` (restored in
+`45b2c304c`); and disk-loaded expert R stored in adapter dtype instead of the rotation
+dtype (fixed in `5e65eca4c`). Full mechanism and job IDs in the ledger.
+
+### Installation artifacts vs real boundaries (clean-environment verdicts)
+
+A coherent single-torch env (slurm, `miles-orbit-final/sglang/.venv`, candidate at
+`5e65eca4c`) shows:
+
+- The mpi3 FP8 `deep_gemm` interpreter assert **does not occur** — it was an ABI
+  artifact of the layered mpi3 runtime (extension built against the shadowed venv
+  torch). Underneath it, FP8 MoE OFT reaches a designed fail-loud guard:
+  *"Split expert gate/up OFT is currently implemented for BF16/unquantized FusedMoE
+  only."* The cell is **unimplemented by design**, future work named.
+- The FlashInfer fused-allreduce path **passes with fusion enabled** (job `7213`), so
+  the mpi3 SIGBUS class is also attributed to the layered environment
+  (caveat: H200 vs H100, same SM90 code path).
+
+### Voids and environment notes
+
+mpi3 node `i203` fails jobs in wrapper preamble (two exit-255 voids; excluded via
+requirements). Slurm jobs `7155`/`7156`/`7161`/`7162` are void — tokenizer-only model
+cache entry; 16/16 shards verified before `7212`/`7213`. The engine-side
+`peft_target_modules` 5-suffix observation is a new open item.
+
+### Closing gates at HEAD `5e65eca4c`
+
+| Gate | Job | Result |
+|---|---|---|
+| `compileall` + registered `adapter_sync`/`lora`/`oft` (clean env) | `7530` | `compileall=0`; 228 passed, 12 subtests, 118.54s |
+| `test_moe_sharded_placement` retest (clean env, 3 GPUs) | `7531` | **1 passed**, 401.80s — the section-6 item-2 failure does not reproduce on the fixed tree |
