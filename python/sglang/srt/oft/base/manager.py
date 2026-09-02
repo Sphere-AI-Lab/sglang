@@ -104,9 +104,14 @@ class AdapterManager:
     def unload_adapter(self, ref):
         adapter = self.configs.get(ref.adapter_id)
         stored_ref = self.refs.get(ref.adapter_id)
-        assert adapter is not None and stored_ref is not None, (
-            f"Adapter with ID {ref.adapter_id} is not loaded. This should have been verified before request is sent to the backend."
-        )
+        if adapter is None or stored_ref is None:
+            return self._make_update_result(
+                success=False,
+                error_message=(
+                    f"Adapter with ID {ref.adapter_id} is not loaded. This "
+                    "should have been verified before request is sent to the backend."
+                ),
+            )
         if ref.adapter_id not in self.adapters:
             return self._unload_streamed_adapter(stored_ref)
         try:

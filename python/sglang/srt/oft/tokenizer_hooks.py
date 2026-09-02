@@ -55,16 +55,27 @@ def init_tokenizer_oft(tm):
     )
 
 
-async def register_oft_ref(tm, obj):
+async def register_oft_ref(tm, obj) -> bool:
     """Register a streamed OFT adapter before dispatch and attach its ID."""
     if obj.adapter_name is None or tm.peft_registry is None:
-        return
+        return False
     name = obj.adapter_name
-    if name not in tm.peft_ref_cache:
+    newly_registered = name not in tm.peft_ref_cache
+    if newly_registered:
         ref = _mint_ref(name)
         await tm.peft_registry.register(ref)
         tm.peft_ref_cache[name] = ref
     obj.adapter_id = tm.peft_ref_cache[name].adapter_id
+    return newly_registered
+
+
+async def rollback_oft_ref(tm, name):
+    """Undo a new tokenizer registration after its backend load fails."""
+    if tm.peft_registry is None:
+        return
+    adapter_id = await tm.peft_registry.unregister(name)
+    await tm.peft_registry.wait_for_unload(adapter_id)
+    tm.peft_ref_cache.pop(name, None)
 
 
 async def bump_oft_version(tm, obj, success):

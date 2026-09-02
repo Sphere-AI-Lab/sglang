@@ -677,7 +677,9 @@ class TokenizerControlMixin:
 
         from sglang.srt.oft import tokenizer_hooks as oft_tokenizer_hooks
 
-        await oft_tokenizer_hooks.register_oft_ref(self, obj)
+        newly_registered_oft_ref = await oft_tokenizer_hooks.register_oft_ref(
+            self, obj
+        )
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -695,6 +697,8 @@ class TokenizerControlMixin:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
         message += await oft_tokenizer_hooks.bump_oft_version(self, obj, success)
+        if not success and newly_registered_oft_ref:
+            await oft_tokenizer_hooks.rollback_oft_ref(self, obj.adapter_name)
 
         return success, message
 

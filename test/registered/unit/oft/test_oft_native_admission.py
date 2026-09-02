@@ -174,6 +174,12 @@ class TestNativeAdmission(unittest.TestCase):
         self.assertIn(disk_ref.adapter_id, manager.refs)
         self.assertIn(disk_ref.adapter_id, manager.adapters)
 
+    def test_unload_missing_adapter_returns_failure(self):
+        result = _manager().unload_adapter(_ref("missing"))
+
+        self.assertFalse(result.success)
+        self.assertIn("not loaded", result.error_message)
+
     def test_pinned_count_tracks_register_and_idempotent_unload(self):
         manager = _manager()
         ref = _ref("pinned", pinned=True)
