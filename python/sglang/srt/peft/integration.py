@@ -15,9 +15,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.oft.oft_registry import OFTRef
-from sglang.srt.oft.streamed_weight_loader import FlattenedOFTTensorPayload
-from sglang.srt.utils import get_available_gpu_memory
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -33,13 +30,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "FlattenedOFTTensorPayload",
-    "OFTRef",
     "NOT_HANDLED",
     "maybe_init_peft_manager",
     "reconstruct_oft_staging",
-    "maybe_load_adapter_from_tensors",
-    "maybe_unload_adapter",
     "maybe_dummy_ids",
     "maybe_prepare_peft_batch",
     "maybe_admit_request",
@@ -227,39 +220,6 @@ def activate_adapter(model_runner: "ModelRunner", adapter_name: str, version):
         return model_runner.oft_manager.activate_adapter(adapter_name, version)
 
     return NOT_HANDLED
-
-
-def maybe_load_adapter_from_tensors(
-    model_runner: "ModelRunner",
-    oft_ref: "OFTRef",
-    tensors,
-    config_dict,
-    added_tokens_config=None,
-):
-    """Body of the former ``ModelRunner.load_oft_adapter_from_tensors``."""
-    logger.info(f"OFT adapter loading from tensors starts: {oft_ref}.")
-    result = model_runner.oft_manager.load_oft_adapter_from_tensors(
-        oft_ref, tensors, config_dict, added_tokens_config
-    )
-    logger.info(f"OFT adapter loading from tensors completes: {oft_ref}.")
-    return result
-
-
-def maybe_unload_adapter(model_runner: "ModelRunner", oft_ref: "OFTRef"):
-    """Body of the former ``ModelRunner.unload_oft_adapter``."""
-    logger.info(
-        f"OFT adapter unloading starts: {oft_ref}. "
-        f"avail mem={get_available_gpu_memory(model_runner.device, model_runner.gpu_id):.2f} GB"
-    )
-
-    result = model_runner.oft_manager.unload_oft_adapter(oft_ref)
-
-    logger.info(
-        f"OFT adapter unloading completes: {oft_ref}. "
-        f"avail mem={get_available_gpu_memory(model_runner.device, model_runner.gpu_id):.2f} GB"
-    )
-
-    return result
 
 
 def maybe_dummy_ids(server_args: "ServerArgs", batch_size: int):

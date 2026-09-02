@@ -367,9 +367,6 @@ class OFTManager(AdapterManager):
                     return False
         return any_expert_oft
 
-    def unload_oft_adapter(self, oft_ref: OFTRef) -> "OFTUpdateOutput":
-        return self.unload_adapter(oft_ref)
-
     def create_oft_update_result(
         self, success: bool, error_message: str = ""
     ) -> "OFTUpdateOutput":
@@ -1300,24 +1297,6 @@ class OFTManager(AdapterManager):
                     f"self.oft_added_tokens_size={inferred_extra_vocab_size} from OFT adapters."
                 )
             self.oft_added_tokens_size = inferred_extra_vocab_size
-
-    def load_oft_adapter_from_tensors(
-        self,
-        oft_ref: OFTRef,
-        tensors: Dict[str, torch.Tensor],
-        config_dict: Dict,
-        added_tokens_config: Optional[Dict] = None,
-    ) -> "OFTUpdateOutput":
-        """Not supported. Adapter loading from tensors goes through the
-        native OFT adapter RPC (``load_adapter_from_tensors``/
-        ``load_adapter_from_distributed``, reached via the
-        ``load_oft_adapter_from_tensors``/``_from_distributed`` HTTP routes),
-        not this method."""
-        raise NotImplementedError(
-            "OFT load-from-tensors via this method is not supported. Use "
-            "the native OFT adapter RPC (load_oft_adapter_from_tensors/"
-            "_from_distributed) instead."
-        )
 
     def init_memory_pool(self):
         """(Re)initialize the OFT memory pool based on the current configurations."""
