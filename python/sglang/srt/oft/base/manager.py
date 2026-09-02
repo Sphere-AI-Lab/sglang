@@ -23,9 +23,6 @@ class AdapterManager:
     def _build_config(self, path):
         raise NotImplementedError
 
-    def _load_weights(self, ref):
-        raise NotImplementedError
-
     def _clear_expert_on_unload(self, adapter):
         raise NotImplementedError
 
@@ -73,36 +70,11 @@ class AdapterManager:
             },
         )
 
-    def init_adapters(self, refs=None):
+    def init_adapters(self):
         self.configs = {}
         self.adapters = {}
         self.refs = {}
         self.num_pinned = 0
-        if refs:
-            for ref in refs:
-                result = self.load_adapter(ref)
-                if not result.success:
-                    raise RuntimeError(
-                        f"Failed to load adapter {ref.adapter_name}: {result.error_message}"
-                    )
-
-    def load_adapter(self, ref):
-        assert ref.adapter_name is not None and ref.adapter_path is not None, (
-            "Adapter ref must have both name and path set for loading."
-        )
-        assert ref.adapter_id not in self.adapters, (
-            f"Adapter with ID {ref.adapter_id} is already loaded. This should have been verified before request is sent to the backend."
-        )
-        try:
-            new_adapter = self._build_config(ref.adapter_path)
-            self.validate_new_adapter(new_adapter, ref)
-            self.configs[ref.adapter_id] = new_adapter
-            self._load_weights(ref)
-            self.refs[ref.adapter_id] = ref
-            self.num_pinned += int(ref.pinned)
-        except Exception as e:
-            return self._make_update_result(success=False, error_message=str(e))
-        return self._make_update_result(success=True)
 
     def unload_adapter(self, ref):
         adapter = self.configs.get(ref.adapter_id)
@@ -192,7 +164,19 @@ class AdapterManager:
         """
         Validate if the OFT IDs in the batch can be loaded into the current OFT memory pool.
         """
-        if len(adapter_ids) > self.max_adapters_per_batch:
+        # Buffer slot 0 is always reserved for the base/identity placeholder
+        # (uid=None) -- allocate_buffer_slot_with_eviction never evicts it
+        # (Task 4b review fix) -- so real per-batch adapter capacity is
+        # max_adapters_per_batch - 1, not max_adapters_per_batch. A None in
+        # adapter_ids never competes for a slot, so it must not count toward
+        # this bound either; admitting it here without correcting for that
+        # let a batch referencing more distinct real adapters than the pool
+        # could ever hold resident simultaneously reach prepare_oft_batch,
+        # which raises ValueError for any adapter not already resident (no
+        # on-disk preload path exists anymore to lazily seat it) with no
+        # handler for that error -- SIGQUITs the whole engine.
+        real_adapter_ids = {a for a in adapter_ids if a is not None}
+        if len(real_adapter_ids) > self.max_adapters_per_batch - 1:
             return False
 
         # skip pinned OFT check if no pinned OFT adapters are loaded.
@@ -201,21 +185,22 @@ class AdapterManager:
 
         # counting the number of pinned OFT adapters in the batch.
         pinned_ofts_in_batch = 0
-        for adapter_id in adapter_ids:
-            if adapter_id is not None:
-                oft_ref = self.refs.get(adapter_id)
-                assert (
-                    oft_ref is not None
-                ), f"adapter ID {adapter_id} not found in refs."
-                pinned_ofts_in_batch += int(oft_ref.pinned)
+        for adapter_id in real_adapter_ids:
+            oft_ref = self.refs.get(adapter_id)
+            assert (
+                oft_ref is not None
+            ), f"adapter ID {adapter_id} not found in refs."
+            pinned_ofts_in_batch += int(oft_ref.pinned)
 
         assert pinned_ofts_in_batch <= self.num_pinned, (
             f"Number of pinned adapters in the batch ({pinned_ofts_in_batch}) exceeds the total number of pinned adapters "
             f"({self.num_pinned}). This indicates a bug in the adapter loading logic."
         )
 
-        required_slots = len(adapter_ids) - pinned_ofts_in_batch
-        mem_pool_vacancy = self.memory_pool.max_adapters_per_batch - self.num_pinned
+        required_slots = len(real_adapter_ids) - pinned_ofts_in_batch
+        mem_pool_vacancy = (
+            self.memory_pool.max_adapters_per_batch - 1
+        ) - self.num_pinned
 
         return required_slots <= mem_pool_vacancy
 
@@ -236,5 +221,10 @@ class AdapterManager:
 
     def fetch_new_adapters(self, new_adapters, running_adapters=set()):
         cur_uids = new_adapters | running_adapters
-        assert len(cur_uids) <= self.max_adapters_per_batch
+        # Real (non-None) adapter capacity is max_adapters_per_batch - 1 --
+        # buffer slot 0 is always reserved for the base/identity placeholder
+        # and never evicted (see validate_batch above for the full
+        # rationale). A None in cur_uids never competes for a slot.
+        real_uids = {uid for uid in cur_uids if uid is not None}
+        assert len(real_uids) <= self.max_adapters_per_batch - 1
         self._prepare_mem_pool_batch(cur_uids)

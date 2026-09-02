@@ -560,8 +560,9 @@ class WeightUpdater:
             # _ensure_streaming_oft_adapter_slot's ValueError.
             return (
                 False,
-                "load_format='oft_adapter' is no longer supported; use the "
-                "native OFT adapter RPC (load_oft_adapter_from_tensors/"
+                "load_format='oft_adapter' is a permanently retired legacy "
+                "format, not a transient error -- please migrate the caller "
+                "to the native OFT adapter RPC (load_oft_adapter_from_tensors/"
                 "_from_distributed) instead.",
             )
 

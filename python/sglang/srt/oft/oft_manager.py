@@ -29,11 +29,15 @@ from sglang.srt.oft.base.manager import AdapterManager
 from sglang.srt.oft.backend.base_backend import BaseOFTBackend
 from sglang.srt.oft.backend.oft_registry import get_backend_from_name
 from sglang.srt.oft.layers import BaseLayerWithOFT, get_oft_layer
-from sglang.srt.oft.oft import OFTAdapter
 from sglang.srt.oft.oft_config import OFTConfig
 from sglang.srt.oft.oft_registry import OFTRef
-from sglang.srt.oft.mem_pool import EMPTY_SLOT, OFTMemoryPool
+from sglang.srt.oft.mem_pool import (
+    EMPTY_SLOT,
+    OFTMemoryPool,
+    _fill_expert_oft_identity,
+)
 from sglang.srt.oft.utils import (
+    generate_sequence_lengths,
     get_normalized_target_modules,
     validate_oft_block_size,
 )
@@ -111,15 +115,6 @@ def _first_expert_oft_tensor(ew_dict, name: str):
         if tensor is not None:
             return tensor
     return None
-
-
-def _fill_expert_oft_identity(buffer: torch.Tensor) -> None:
-    buffer.zero_()
-    if buffer.numel() == 0:
-        return
-    block_size = buffer.shape[-1]
-    eye = torch.eye(block_size, dtype=buffer.dtype, device=buffer.device)
-    buffer[...] = eye
 
 
 def _expert_oft_buffer_desc(buffer: Optional[torch.Tensor]) -> str:
@@ -206,7 +201,6 @@ class OFTManager(AdapterManager):
         tp_rank: int = 0,
         max_oft_block_size: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
-        adapter_paths: Optional[List[OFTRef]] = None,
         memory_saver_adapter=None,
         memory_saver_cpu_backup: bool = False,
     ):
@@ -224,9 +218,14 @@ class OFTManager(AdapterManager):
         # (see OFTMemoryPool._declare_expert_groups) and the CUDA-graph
         # pre-alloc layout below (_init_identity_expert_oft_for_cuda_graph).
         self.oft_type: str = server_args.oft_type
-        # Double-buffer sizing signal (PEFTArgs.peft_double_buffer), threaded
+        # Double-buffer sizing signal (PEFTArgs.oft_double_buffer), threaded
         # into OFTMemoryPool below so it reserves a staging slot iff set.
-        self.peft_double_buffer: bool = server_args.peft_double_buffer
+        self.oft_double_buffer: bool = server_args.oft_double_buffer
+        # Read once here (Task 4's DP-attention guard in
+        # _compute_moe_multi_tenant_slot_ids): --enable-dp-attention's
+        # cross-rank MoE token gathering is not yet supported by the
+        # CUDA-graph multi-tenant OFT path (see that method's docstring).
+        self.enable_dp_attention: bool = server_args.enable_dp_attention
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
@@ -238,6 +237,16 @@ class OFTManager(AdapterManager):
         # check in init_state), so eviction never fires and the policy is not
         # a knob until the B2 pool-overflow work.
         self.eviction_policy = "lru"
+
+        # Per-batch MoE multi-tenancy decision and slot-index tensor
+        self._moe_multi_tenant_slot_ids: Optional[torch.Tensor] = None
+        # Persistent, pre-allocated per-token slot-id buffer for CUDA-graph
+        # replay of the multi-tenant MoE OFT path (allocated in
+        # init_cuda_graph_batch_info once max_bs_in_cuda_graph is known).
+        # Gives the captured graph's kernel launch a pointer that stays valid
+        # across every replay -- see _compute_moe_multi_tenant_slot_ids's
+        # docstring for why a fresh tensor per call cannot work under replay.
+        self._moe_cg_slot_ids_buffer: Optional[torch.Tensor] = None
 
         # OFT backend for running orthogonal transform kernels
         logger.info(f"Using {oft_backend} as backend of OFT kernels.")
@@ -252,7 +261,6 @@ class OFTManager(AdapterManager):
         self.init_state(
             max_oft_block_size=max_oft_block_size,
             target_modules=target_modules,
-            adapter_paths=adapter_paths,
         )
 
     @staticmethod
@@ -275,14 +283,108 @@ class OFTManager(AdapterManager):
     def init_cuda_graph_batch_info(
         self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
     ):
-        self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+        # Idempotence guard: this can be called a second time against the
+        # same OFTManager (e.g. a second DecodeCudaGraphRunner constructed
+        # against the same underlying manager, as in adaptive-speculative-
+        # decode setups with a target_graph_runner). A graph already
+        # captured against the first self._moe_cg_slot_ids_buffer holds a
+        # pointer into it; silently reallocating on a second call would
+        # leave that graph replaying against a freed/stale allocation. Only
+        # allocate once; a second call must match the original sizing
+        # exactly (both max_bs_in_cuda_graph and num_tokens_per_bs, not just
+        # their product -- max_bs_in_cuda_graph is also read directly by
+        # prepare_oft_batch's own use_cuda_graph gate).
+        if self._moe_cg_slot_ids_buffer is not None:
+            required_size = max_bs_in_cuda_graph * num_tokens_per_bs
+            assert (
+                self.max_bs_in_cuda_graph == max_bs_in_cuda_graph
+                and self._moe_cg_slot_ids_buffer.shape[0] == required_size
+            ), (
+                "OFTManager.init_cuda_graph_batch_info called twice with "
+                f"different sizing: existing buffer holds "
+                f"{self._moe_cg_slot_ids_buffer.shape[0]} token slots for "
+                f"max_bs_in_cuda_graph={self.max_bs_in_cuda_graph}, this "
+                f"call requested {required_size} token slots for "
+                f"max_bs_in_cuda_graph={max_bs_in_cuda_graph} (num_tokens_per_bs="
+                f"{num_tokens_per_bs}). A graph already captured against the "
+                "existing buffer holds a pointer into it; reallocating would "
+                "leave that graph replaying against a freed/stale allocation."
+            )
+        else:
+            self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+            # num_tokens_per_bs is the max per-request token count a captured
+            # decode graph can see (1 for plain decode, the spec draft width
+            # for target-verify -- BaseOFTBackend.init_cuda_graph_batch_info's
+            # own docstring), so this is sized exactly like the runner's own
+            # max_num_token = max_bs * captured_req_width.
+            self._moe_cg_slot_ids_buffer = torch.zeros(
+                max_bs_in_cuda_graph * num_tokens_per_bs,
+                dtype=torch.long,
+                device=self.device,
+            )
         self.oft_backend.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
         )
 
-    def load_oft_adapter(self, oft_ref: OFTRef) -> "OFTUpdateOutput":
-        return self.load_adapter(oft_ref)
+    def moe_expert_oft_multi_tenant_ready(self) -> bool:
+        """Ground truth (post-boot-load) for whether every wrapped MoE-expert
+        module's OFT buffers this manager actually populated have their
+        multi-tenant per-slot ``_all_slots`` views bound -- i.e. whether it
+        is safe to force the general per-token routing path (dual-capture's
+        capture-time forcing in _compute_moe_multi_tenant_slot_ids) for this
+        server's boot-time configuration. Read by decode_cuda_graph_runner.py's
+        _resolve_record_oft_variant_graph.
+
+        False whenever no MoE-expert module has any OFT buffer at all
+        (nothing to dual-capture for -- covers both "model has no MoE
+        layers" and "OFT doesn't target expert modules", subsuming what
+        peft/config.py's pre-model-load _model_has_moe_layers probe can only
+        approximate).
+
+        Also False whenever a boot-loaded (--peft-paths) adapter already
+        populated a module's w13_oft_r / w1_oft_r+w3_oft_r / w2_oft_r with a
+        private, non-pool-backed tensor:
+        _init_identity_expert_oft_for_cuda_graph intentionally skips (re-)
+        binding the corresponding _all_slots attribute in that case (it must
+        not clobber the already-loaded adapter), leaving oft_moe_runners.py's
+        dispatch with a slot_ids-not-None / _all_slots-None combination that
+        raises at the first forward reaching it -- which, under capture-time
+        forcing, means at CUDA-graph-capture time (boot). Confirmed
+        reachable for a legacy-fused (oft_type="oft") boot adapter targeting
+        gate_up (its private w13_oft_r never gets a pool-backed view), and --
+        independent of oft_type -- for ANY boot adapter targeting down_proj
+        (w2_oft_r is always privately allocated by the single-active loader,
+        _apply_expert_oft_to_module, whether the adapter is split or
+        legacy): a split (canonical_oft) boot adapter targeting down_proj
+        hits the identical gap. A server_args.oft_type-only check cannot
+        distinguish either case from the safe ones (nothing boot-loaded on
+        that module at all), so this checks the actual post-load module
+        state instead of re-deriving a narrower, provably-incomplete
+        approximation from server_args.
+        """
+        moe_modules = self._find_fused_moe_modules()
+        if not moe_modules:
+            return False
+        any_expert_oft = False
+        for moe in moe_modules.values():
+            if getattr(moe, "w13_oft_r", None) is not None:
+                any_expert_oft = True
+                if getattr(moe, "_oft_w13_oft_r_all_slots", None) is None:
+                    return False
+            if getattr(moe, "w1_oft_r", None) is not None:
+                any_expert_oft = True
+                if getattr(moe, "_oft_w1_oft_r_all_slots", None) is None:
+                    return False
+            if getattr(moe, "w3_oft_r", None) is not None:
+                any_expert_oft = True
+                if getattr(moe, "_oft_w3_oft_r_all_slots", None) is None:
+                    return False
+            if getattr(moe, "w2_oft_r", None) is not None:
+                any_expert_oft = True
+                if getattr(moe, "_oft_w2_oft_r_all_slots", None) is None:
+                    return False
+        return any_expert_oft
 
     def unload_oft_adapter(self, oft_ref: OFTRef) -> "OFTUpdateOutput":
         return self.unload_adapter(oft_ref)
@@ -299,9 +401,6 @@ class OFTManager(AdapterManager):
 
     def _build_config(self, path):
         return OFTConfig(path)
-
-    def _load_weights(self, ref):
-        self.load_oft_weights(ref)
 
     def _clear_expert_on_unload(self, adapter):
         if adapter is not None and any(
@@ -353,11 +452,20 @@ class OFTManager(AdapterManager):
             )
 
         # Ensure pinned OFT adapters does not exceed maximal limit or cause starvation.
-        if oft_ref.pinned and self.num_pinned >= self.max_ofts_per_batch - 1:
+        # Buffer slot 0 is permanently reserved for the base/identity
+        # placeholder and never available to real adapters (Task 4b review
+        # fix; enforced by allocate_buffer_slot_with_eviction's uid=None
+        # exclusion), so only max_ofts_per_batch - 1 real slots ever exist.
+        # The bound below reserves one more of those for unpinned adapters
+        # (max_ofts_per_batch - 2 pinned max) -- previously max_ofts_per_batch
+        # - 1 pinned adapters were allowed, which could now claim every real
+        # slot and leave zero room for any unpinned one.
+        if oft_ref.pinned and self.num_pinned >= self.max_ofts_per_batch - 2:
             raise ValueError(
-                f"Failed to load OFT adapter {oft_ref.adapter_name} as a pinned adapter. It is not allowed to pin all slots "
-                "in the OFT memory pool to avoid starvation for unpinned adapters and base models. Please increase your "
-                "`--max-ofts-per-batch` or load it as unpinned OFT adapters."
+                f"Failed to load OFT adapter {oft_ref.adapter_name} as a pinned adapter. It is not allowed to pin all "
+                "real slots in the OFT memory pool (buffer slot 0 is reserved for the base/identity placeholder) to "
+                "avoid starvation for unpinned adapters. Please increase your `--max-ofts-per-batch` or load it as "
+                "unpinned OFT adapters."
             )
 
     def register_streamed_adapter(
@@ -504,16 +612,34 @@ class OFTManager(AdapterManager):
         undoes that registration on commit failure so the phantom ref is
         never left resident.
 
-        KNOWN LIMITATION: multi-tenant serving is only correct for
-        dense-target-module adapters. If two concurrently-resident adapters
-        both carry MoE/expert OFT weights, they silently share state
-        (`apply_streamed_expert_oft` writes onto module-level
-        `moe.w13_oft_r`/`w1_oft_r`/`w3_oft_r`/`w2_oft_r`, not a per-adapter
-        slot) because `FusedMoEWithOFT.forward` has no per-token
-        adapter-routing mechanism, unlike the dense path (`prepare_oft_batch`'s
-        `weight_indices`) or LoRA's MoE path (`token_lora_mapping`). See
-        `apply_streamed_expert_oft`'s docstring for why `slot_idx` alone
-        doesn't fix this."""
+        MoE expert-target adapters (the ``2026-09-01-moe-expert-oft-multi-
+        tenancy`` plan): multiple concurrently-resident adapters loaded
+        through this path CAN both carry MoE/expert OFT weights and each get
+        its own correct rotation. Each adapter's expert-OFT weights write
+        into its OWN buffer slot (`apply_streamed_expert_oft`'s `slot_idx`,
+        threaded through from this method's `buffer_id`), and
+        `FusedMoEWithOFT.forward` (`oft_moe_runners.py`) now has a real
+        per-token adapter-routing mechanism (`OFTManager.
+        _compute_moe_multi_tenant_slot_ids`, mirroring the dense path's
+        `weight_indices` and LoRA's MoE `token_lora_mapping`) that selects
+        each token's own adapter's rotation out of the per-slot buffers.
+
+        REMAINING CAVEAT: the `2026-09-01-oft-moe-cuda-graph-dual-capture`
+        plan's persistent routing buffer + dual-capture mechanism (Tasks
+        1-4, plus its Task 4b relaxation of `validate_peft_args`'s decode-
+        CUDA-graph guard in `peft/config.py`) makes decode-CUDA-graph replay
+        safe for this (`oft_impl=sibling`) native-RPC path targeting MoE
+        experts, PROVIDED the mechanism actually engages:
+        `decode_cuda_graph_runner.py`'s `_resolve_record_oft_variant_graph`
+        requires effective per-batch adapter capacity
+        (`max_ofts_per_batch - 1`) to be >= 1. At `max_ofts_per_batch == 1`
+        (no real adapter buffer slot exists at all), dual-capture never
+        engages and `validate_peft_args` still disables decode CUDA graphs
+        for that residual configuration -- not because the per-token routing
+        tensor `_compute_moe_multi_tenant_slot_ids` builds is unsafe there
+        (see that method's own docstring for the full mechanism), but
+        because there is no dual-capture to make it safe in the first place.
+        """
         from sglang.srt.oft.streamed_weight_loader import (
             _commit_streamed_oft_tensor_groups,
             _resolve_streamed_oft_tensor_groups,
@@ -688,14 +814,223 @@ class OFTManager(AdapterManager):
         return self.fetch_new_adapters(new_ofts, running_ofts)
 
     def _prepare_mem_pool_batch(self, cur_uids):
-        self.memory_pool.prepare_oft_batch(
-            cur_uids=cur_uids,
-            oft_adapters=self.adapters,
-            oft_modules=self.adapter_modules,
-            oft_refs=self.refs.copy(),
-            oft_embed_tokens_module=self.embed_tokens_module,
-            oft_lm_head_module=self.lm_head_module,
+        self.memory_pool.prepare_oft_batch(cur_uids=cur_uids)
+
+    def _compute_moe_multi_tenant_slot_ids(
+        self,
+        weight_indices: list,
+        forward_batch: ForwardBatch,
+        use_cuda_graph: bool,
+    ) -> "Optional[torch.Tensor]":
+        """Decide whether this batch needs the multi-tenant MoE OFT path, and
+        if so build its PER-TOKEN adapter-slot tensor.
+
+        ``weight_indices`` is the same buffer-slot list ``prepare_oft_batch``
+        already computes for the dense path (0 = identity/base slot, no real
+        adapter). It is indexed PER REQUEST -- it is built by iterating
+        ``forward_batch.adapter_ids``, which is ``[req.adapter_id for req in
+        batch.reqs]`` -- because an adapter assignment is inherently per
+        request: one request uses one adapter for its whole generation. The
+        dense path consumes it at that granularity via its ``seg_indptr``
+        segment metadata, and must keep doing so.
+
+        MoE routing, however, is per TOKEN (``topk_ids`` /
+        ``sorted_token_ids``), so the multi-tenant MoE kernel needs one slot
+        entry per token. This expands the per-request slots with the SAME
+        per-request token counts the dense path builds its segments from
+        (``oft.utils.generate_sequence_lengths``: 1 for decode, the spec
+        draft width for target-verify, ``extend_seq_lens`` for extend/mixed --
+        in mixed batches ``extend_lens`` carries a 1 for each decode request,
+        so it stays one entry per request there too).
+
+        Returns None only when the fast (single-slot) read path is actually
+        SAFE: no real adapter is referenced at all (this carve-out applies
+        regardless of ``use_cuda_graph``), or -- in EAGER MODE ONLY
+        (``not use_cuda_graph``) -- exactly one real adapter is referenced
+        AND it is resident at ``self.memory_pool.active_idx`` -- the ONE
+        slot ``oft_moe_runners.py``'s fast path (``slot_ids is None``) ever
+        reads (a module attribute bound once, at boot, to the pool's
+        active_idx view -- never rebound afterward for the plain native-RPC
+        manager, since ``apply_streamed_expert_oft`` now always writes a
+        real adapter's OWN ``buffer_id`` slot, per Task 4b's fix, rather
+        than ``active_idx``). A single real adapter resident at any OTHER
+        slot still needs the general per-token tensor built below, even
+        though only one adapter is present: skipping it would have the fast
+        path silently read ``active_idx``'s data (identity, or an unrelated
+        adapter) instead of that adapter's own rotation. Building the
+        general tensor for that case is only ever a performance cost, never
+        a correctness one -- Task 4's own correctness oracle proved the
+        general multi-slot kernel reproduces the single-slot kernel's output
+        exactly when only one real slot's data actually matters, just
+        slower (no ``tl.dot``). In the plain native-RPC ("sibling") pool,
+        slot 0 (``self.memory_pool.active_idx``) is permanently reserved for
+        the boot-time base/identity registration, so a real adapter can
+        NEVER actually land there -- meaning EVERY batch with at least one
+        real adapter takes the general per-token path today, not just
+        batches with 2+ distinct adapters.
+
+        WHY THE ``active_idx`` CARVE-OUT IS EAGER-ONLY: under
+        ``--oft-double-buffer`` (``oft_impl="staged"``), ``active_idx`` is
+        NOT permanently reserved the way it is for the plain sibling pool --
+        a staged adapter's ``activate()`` genuinely registers it AT
+        ``active_idx`` (``OFTMemoryPool``), so a resident staged adapter can
+        legitimately satisfy ``distinct_real_slots == {active_idx}``. That
+        is still safe in EAGER mode: this function's own direct read is
+        consistent with what ``oft_moe_runners.py``'s fast path reads. It is
+        NOT safe under CUDA-GRAPH REPLAY: the host-side graph-variant
+        selector (``decode_cuda_graph_runner.py``'s ``_resolve_oft_variant``)
+        decides purely from whether ANY real adapter is present, with no
+        visibility into which slot it occupies -- it selects the
+        general-kernel ("oft_multi") graph for this exact single-staged-
+        adapter-at-active_idx case. If this function instead returned None
+        here (skipping the persistent-buffer write below), the replayed
+        general kernel would read stale/unwritten buffer contents --
+        silently wrong rotation. So under ``use_cuda_graph=True``, ANY real
+        adapter present -- regardless of which slot -- always builds and
+        writes the general per-token tensor, matching the host's own
+        "any real adapter -> general path" criterion exactly; only the
+        zero-real-adapter case still returns None under CUDA-graph replay.
+
+        This check is global (whole batch, not per MoE layer) -- see this
+        plan's Task 1 design note for why that is a deliberate, still-correct
+        simplification.
+
+        Takes the whole ``forward_batch`` (read-only) rather than the values it
+        needs because ``generate_sequence_lengths`` is a leaf whose contract
+        genuinely requires it: it reads ``forward_mode``, ``batch_size``,
+        ``spec_info`` and the ``extend_seq_lens`` pair. Nothing outside the
+        multi-tenant branch is touched, so the single-adapter fast path pays
+        only the existing set comprehension.
+
+        CUDA-GRAPH REPLAY (the ``use_cuda_graph`` parameter): a captured
+        graph's kernel launch holds a pointer to whatever address existed at
+        capture time, so a fresh tensor allocated on every eager call cannot
+        be read correctly on replay. Two mechanisms fix that, mirroring the
+        existing LoRA/DSA dual-capture pattern:
+
+        1. Capture-time forcing -- the capture-time dummy batch always
+           carries 0 real adapters, which would otherwise always satisfy the
+           first early-return above, so only the single-slot kernel would
+           ever get captured. ``get_capture_oft_variant() == "oft_multi"``
+           (set by ``decode_cuda_graph_runner.py``'s ``oft_variants`` capture
+           axis) bypasses BOTH early-returns above, forcing the general
+           per-token tensor to be built for that variant regardless of what
+           ``distinct_real_slots`` naturally evaluates to.
+        2. Persistent buffer -- when ``use_cuda_graph`` is True, the
+           returned (non-None) tensor is a VIEW into
+           ``self._moe_cg_slot_ids_buffer`` (allocated once by
+           ``init_cuda_graph_batch_info``), written IN PLACE -- never
+           reassigned -- so the graph's captured pointer stays valid across
+           every replay. Mirrors ``LoRABackend._add_moe_lora_info``'s
+           ``moe_cg_buffers`` discipline: read the persistent buffer (or
+           build a fresh eager tensor when not replaying a graph), then
+           always write into whichever tensor was resolved. When
+           ``use_cuda_graph`` is False (eager), behaves exactly as before: a
+           fresh tensor.
+
+        ``--enable-dp-attention`` is NOT supported by this CUDA-graph path
+        yet: it all-gathers MoE tokens across DP ranks (see LoRA's own
+        ``get_gathered_moe_num_tokens`` for the mechanism this would need to
+        mirror), which this per-rank persistent buffer's sizing
+        (``max_bs_in_cuda_graph * num_tokens_per_bs``, local tokens only)
+        does not account for. Raises ``RuntimeError`` rather than silently
+        truncating or overrunning the buffer; lifting this restriction is
+        out of scope for this first cut (see the
+        ``2026-09-01-oft-moe-cuda-graph-dual-capture`` plan's Global
+        Constraints).
+        """
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_oft_variant,
         )
+
+        capturing_multi = get_capture_oft_variant() == "oft_multi"
+        distinct_real_slots = {idx for idx in weight_indices if idx != 0}
+        if not capturing_multi:
+            if not distinct_real_slots:
+                return None
+            # Eager-mode-only fast path -- see the docstring's "WHY THE
+            # active_idx CARVE-OUT IS EAGER-ONLY" section for why this must
+            # NOT apply under use_cuda_graph=True.
+            if not use_cuda_graph and distinct_real_slots == {
+                self.memory_pool.active_idx
+            }:
+                return None
+
+        device = forward_batch.input_ids.device
+        tokens_per_request = generate_sequence_lengths(forward_batch, device=device)
+        if tokens_per_request.shape[0] != len(weight_indices):
+            raise RuntimeError(
+                "Multi-tenant MoE OFT slot expansion needs one token count per "
+                f"request, got {tokens_per_request.shape[0]} counts for "
+                f"{len(weight_indices)} requests "
+                f"(forward_mode={forward_batch.forward_mode})"
+            )
+        per_request_slots = torch.tensor(weight_indices, dtype=torch.long, device=device)
+        # Deliberately NO output_size= here, even though passing one would
+        # avoid the device-to-host sync repeat_interleave needs to size its
+        # own output from a CUDA `repeats` tensor: there is no host-side value
+        # that is correct for every batch. forward_batch.input_ids.shape[0]
+        # (the obvious candidate) is the RAW token count, but under
+        # decode-CUDA-graph replay peft/integration.py's
+        # maybe_prepare_replay_batch pads forward_batch.batch_size and
+        # adapter_ids up to the capture-bucket size WITHOUT touching
+        # input_ids, so tokens_per_request (built off batch_size) legitimately
+        # sums to the PADDED count instead. A mismatch there is not a
+        # catchable error on CUDA -- it is a device-side assert that poisons
+        # the context and kills the engine process. The sync costs less than
+        # that.
+        expanded = per_request_slots.repeat_interleave(tokens_per_request.to(torch.long))
+
+        if not use_cuda_graph:
+            return expanded
+
+        if self.enable_dp_attention:
+            raise RuntimeError(
+                "Multi-tenant MoE OFT CUDA-graph replay does not support "
+                "--enable-dp-attention yet: its cross-rank token gathering is "
+                "not reflected in this per-rank persistent buffer's sizing "
+                "(max_bs_in_cuda_graph * num_tokens_per_bs, local tokens "
+                "only). See the 2026-09-01-oft-moe-cuda-graph-dual-capture "
+                "plan's Global Constraints."
+            )
+        assert self._moe_cg_slot_ids_buffer is not None, (
+            "_compute_moe_multi_tenant_slot_ids called with use_cuda_graph="
+            "True before init_cuda_graph_batch_info allocated the persistent "
+            "slot_ids buffer."
+        )
+        num_tokens = expanded.shape[0]
+        if num_tokens > self._moe_cg_slot_ids_buffer.shape[0]:
+            # Last-resort backstop, not the primary defense: prepare_oft_batch's
+            # own early estimate (mirroring LoRAManager.prepare_lora_batch's
+            # MoE overflow guard) demotes use_cuda_graph to False for a
+            # TARGET_VERIFY batch whose draft_token_num would overflow this
+            # buffer, so _compute_moe_multi_tenant_slot_ids should never be
+            # called with use_cuda_graph=True for that case. There is no
+            # runner-level use_cuda_graph eligibility check that accounts for
+            # per-token draft-width sizing (can_run_graph only compares
+            # spec_info.num_tokens_per_req to the captured bucket width, not
+            # the actual per-token expansion built here) -- so reaching this
+            # raise means prepare_oft_batch's own estimate under-counted this
+            # batch (e.g. a forward mode outside {DECODE, TARGET_VERIFY} that
+            # generate_sequence_lengths expands ragged, such as DLLM_EXTEND).
+            raise RuntimeError(
+                f"Multi-tenant MoE OFT CUDA-graph buffer holds "
+                f"{self._moe_cg_slot_ids_buffer.shape[0]} token slots, but "
+                f"this batch needs {num_tokens}. prepare_oft_batch's own "
+                "early overflow estimate should have demoted this call to "
+                "the eager path before reaching here -- investigate rather "
+                "than silently truncate or overrun the buffer."
+            )
+        self._moe_cg_slot_ids_buffer[:num_tokens].copy_(expanded)
+        return self._moe_cg_slot_ids_buffer[:num_tokens]
+
+    def _push_moe_multi_tenant_slot_ids(self) -> None:
+        """Make this batch's MoE multi-tenancy decision visible to every
+        resident FusedMoE module, read live by oft_moe_runners.make_oft_invoke
+        on every kernel-invoker call -- same self-gating pattern as
+        moe.w13_oft_r etc."""
+        for moe in self._find_fused_moe_modules().values():
+            moe._oft_moe_multi_tenant_slot_ids = self._moe_multi_tenant_slot_ids
 
     def prepare_oft_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all oft modules
@@ -706,16 +1041,49 @@ class OFTManager(AdapterManager):
             and bs <= self.max_bs_in_cuda_graph
             and forward_batch.forward_mode.is_cuda_graph()
         )
+        if use_cuda_graph and self._moe_cg_slot_ids_buffer is not None:
+            # This use_cuda_graph flag is a HEURISTIC computed above from
+            # only (bs, forward_mode) -- before the runner's real replay
+            # decision, and with no awareness of per-token draft-width
+            # sizing. Mirrors LoRAManager.prepare_lora_batch's own MoE
+            # overflow guard (get_gathered_moe_num_tokens vs
+            # moe_cg_buffers[...].shape[0]): a TARGET_VERIFY batch whose
+            # real draft_token_num exceeds what was captured (adaptive
+            # speculative decoding can vary this per step) would build a
+            # per-token routing tensor wider than the persistent
+            # _moe_cg_slot_ids_buffer. Demote THIS call to the eager
+            # (freshly-sized-tensor) path instead of overflowing that
+            # buffer -- the runner's own can_run_graph would run this exact
+            # batch eagerly anyway once it independently discovers the same
+            # width mismatch, so this only avoids prepping (and, without
+            # this guard, crashing on) persistent-buffer state for a replay
+            # that was never going to happen.
+            estimated_num_tokens = (
+                bs * forward_batch.spec_info.draft_token_num
+                if forward_batch.forward_mode.is_target_verify()
+                else bs
+            )
+            if estimated_num_tokens > self._moe_cg_slot_ids_buffer.shape[0]:
+                use_cuda_graph = False
 
         weight_indices = [0] * len(forward_batch.adapter_ids)
         oft_block_sizes = [0] * self.max_ofts_per_batch
         for i, uid in enumerate(forward_batch.adapter_ids):
             # Mirrors upstream LoRAManager.prepare_lora_batch: a uid with no
             # resident slot keeps weight_indices[i] = 0 rather than raising.
-            # Real requests are always resident (fetch_new_ofts runs first);
-            # the CUDA-graph replay path pads adapter_ids with None WITHOUT a
-            # fetch, so an evicted base slot lands here. Those padded rows are
-            # discarded, so slot 0's contents are immaterial for them.
+            # Real requests are always resident (fetch_new_ofts runs first).
+            # The CUDA-graph replay path pads adapter_ids with None WITHOUT a
+            # fetch too, but that padding no longer reaches this `continue`
+            # branch at all: the base/identity placeholder (uid=None) is now
+            # permanently resident (registered once at boot by OFTMemoryPool.
+            # prepare_oft_batch's own None-specific slot assignment, and never
+            # evicted -- allocate_buffer_slot_with_eviction's uid=None
+            # exclusion, Task 4b review fix), so a padded None row resolves
+            # normally via its own always-registered slot 0 below -- slot 0's
+            # contents are immaterial for those rows regardless, since
+            # they're discarded downstream. This branch is now reachable only
+            # by a genuinely un-fetched real uid, which should not occur in
+            # practice.
             if uid not in self.memory_pool.uid_to_buffer_id:
                 continue
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
@@ -726,6 +1094,13 @@ class OFTManager(AdapterManager):
                     oft_block_sizes[weight_indices[i]] = self.configs[uid].block_size
                 else:
                     raise KeyError(f"OFT adapter {uid} not found in ofts or configs")
+        # Decide whether this batch needs the multi-tenant MoE OFT path. Only
+        # the MoE slot tensor is expanded to per-token there; weight_indices
+        # itself stays per-request for the dense backend call below.
+        self._moe_multi_tenant_slot_ids = self._compute_moe_multi_tenant_slot_ids(
+            weight_indices, forward_batch, use_cuda_graph=use_cuda_graph
+        )
+        self._push_moe_multi_tenant_slot_ids()
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.oft_backend.prepare_oft_batch(
@@ -758,20 +1133,16 @@ class OFTManager(AdapterManager):
         self,
         max_oft_block_size: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
-        adapter_paths: Optional[List[OFTRef]] = None,
     ):
         """
         Initialize the internal (mutable) state of the OFTManager.
-
-        When `adapter_paths` is provided and not empty, it might be used for inferring OFT shape info such as
-        the target modules and max_oft_block_size.
         """
 
-        assert adapter_paths or (
+        assert (
             max_oft_block_size is not None and target_modules is not None
-        ), "When no initial --oft-paths is provided, you need to specify both --max-oft-block-size and --oft-target-modules for OFT initialization."
+        ), "You need to specify both --max-oft-block-size and --oft-target-modules for OFT initialization."
 
-        self.init_oft_adapters(adapter_paths)
+        self.init_oft_adapters()
         self.init_oft_shapes(
             max_oft_block_size=max_oft_block_size,
             target_modules=target_modules,
@@ -791,7 +1162,7 @@ class OFTManager(AdapterManager):
                 f"Multi-adapter OFT serving is unsupported on MoE expert "
                 f"targets: {len(self.refs)} adapters are loaded but expert OFT "
                 "buffers are single-adapter. Serve one adapter, or remove "
-                "expert projections from --peft-target-modules."
+                "expert projections from --oft-target-modules."
             )
         self.init_memory_pool()
         self.update_oft_info()
@@ -799,7 +1170,7 @@ class OFTManager(AdapterManager):
         # Double-buffer hardening: seed the STAGING slot from the now-neutral
         # (identity) ACTIVE slot so a partial-coverage stage can't leave garbage
         # for activate() to promote. No-op for full-coverage orbit syncs.
-        if self.peft_double_buffer:
+        if self.oft_double_buffer:
             self.memory_pool._init_staging_from_active()
 
         wrapped_module_count = sum(
@@ -826,8 +1197,8 @@ class OFTManager(AdapterManager):
             None in self.memory_pool.uid_to_buffer_id,
         )
 
-    def init_oft_adapters(self, adapter_paths: Optional[List[OFTRef]] = None):
-        return self.init_adapters(adapter_paths)
+    def init_oft_adapters(self):
+        return self.init_adapters()
 
     def init_oft_shapes(
         self,
@@ -942,51 +1313,6 @@ class OFTManager(AdapterManager):
                 )
             self.oft_added_tokens_size = inferred_extra_vocab_size
 
-    def load_oft_weights(self, oft_ref: OFTRef):
-        """
-        Load the weights of an OFT adapter to CPU memory.
-        """
-        oft_adapter = OFTAdapter(
-            oft_ref.adapter_id,
-            self.configs[oft_ref.adapter_id],
-            self.base_hf_config,
-            self.load_config,
-            self.oft_backend,
-        )
-        oft_adapter.initialize_weights()
-
-        self.adapters[oft_ref.adapter_id] = oft_adapter
-
-        # Set expert OFT weights on FusedMoE layers if present
-        if any(
-            hasattr(layer, "expert_weights") and layer.expert_weights
-            for layer in oft_adapter.layers
-        ):
-            self._set_expert_oft(oft_adapter)
-
-    def load_oft_weights_from_tensors(
-        self, oft_ref: OFTRef, tensors: Dict[str, torch.Tensor]
-    ):
-        """
-        Load the weights of an OFT adapter from tensors to CPU memory.
-        """
-        oft_adapter = OFTAdapter(
-            oft_ref.adapter_id,
-            self.configs[oft_ref.adapter_id],
-            self.base_hf_config,
-            self.load_config,
-            self.oft_backend,
-        )
-        oft_adapter.initialize_weights_from_tensors(tensors)
-        self.adapters[oft_ref.adapter_id] = oft_adapter
-
-        # Set expert OFT weights on FusedMoE layers if present
-        if any(
-            hasattr(layer, "expert_weights") and layer.expert_weights
-            for layer in oft_adapter.layers
-        ):
-            self._set_expert_oft(oft_adapter)
-
     def load_oft_adapter_from_tensors(
         self,
         oft_ref: OFTRef,
@@ -994,14 +1320,15 @@ class OFTManager(AdapterManager):
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
     ) -> "OFTUpdateOutput":
-        """Not supported. Pure-inference users should register adapters via
-        ``/load_oft_adapter`` (disk path); training-time adapter sync goes
-        through ``update_weights_from_tensor(load_format='oft_adapter')``."""
+        """Not supported. Adapter loading from tensors goes through the
+        native OFT adapter RPC (``load_adapter_from_tensors``/
+        ``load_adapter_from_distributed``, reached via the
+        ``load_oft_adapter_from_tensors``/``_from_distributed`` HTTP routes),
+        not this method."""
         raise NotImplementedError(
-            "OFT load-from-tensors over HTTP is not supported. Use "
-            "/load_oft_adapter with a disk path for pure inference, or "
-            "update_weights_from_tensor(load_format='oft_adapter') for "
-            "orbit/verl-style streamed sync."
+            "OFT load-from-tensors via this method is not supported. Use "
+            "the native OFT adapter RPC (load_oft_adapter_from_tensors/"
+            "_from_distributed) instead."
         )
 
     def init_memory_pool(self):
@@ -1026,7 +1353,7 @@ class OFTManager(AdapterManager):
             oft_added_tokens_size=self.oft_added_tokens_size,
             memory_saver_adapter=self.memory_saver_adapter,
             memory_saver_cpu_backup=self.memory_saver_cpu_backup,
-            double_buffer=self.peft_double_buffer,
+            double_buffer=self.oft_double_buffer,
         )
         logger.info(
             "Using %s for OFT R buffers (model dtype %s).",
@@ -1238,7 +1565,9 @@ class OFTManager(AdapterManager):
                     # Loaded legacy fused w13 — leave entirely untouched (do NOT
                     # split it, do NOT null it). This short-circuit is the fix:
                     # a loaded legacy adapter must survive regardless of
-                    # oft_type.
+                    # oft_type. Note: _oft_w13_oft_r_all_slots binding is
+                    # intentionally omitted here; legacy-fused multi-tenancy is
+                    # out of scope (canonical_oft split path is the active code path).
                     pass
                 elif w13_is_split:
                     # Pool-backed (mem_pool.py ``_declare_expert_groups``):
@@ -1260,6 +1589,13 @@ class OFTManager(AdapterManager):
                                 self.memory_pool.active_view(attr, layer_id),
                             )
                             initialized = True
+                    # Bind full-buffer views for multi-tenant access (read by Task 3).
+                    moe._oft_w1_oft_r_all_slots = self.memory_pool._groups.get(
+                        "w1_oft_r", {}
+                    ).get(layer_id)
+                    moe._oft_w3_oft_r_all_slots = self.memory_pool._groups.get(
+                        "w3_oft_r", {}
+                    ).get(layer_id)
                     # Split buffers supersede the legacy fused buffer.
                     moe.w13_oft_r = None
                 else:
@@ -1279,6 +1615,10 @@ class OFTManager(AdapterManager):
                     moe.w13_oft_r = self.memory_pool.active_view(
                         "w13_oft_r", layer_id
                     )
+                    # Bind full-buffer view for multi-tenant access (read by Task 3).
+                    moe._oft_w13_oft_r_all_slots = self.memory_pool._groups.get(
+                        "w13_oft_r", {}
+                    ).get(layer_id)
                     initialized = True
 
             if init_w2 and getattr(moe, "w2_oft_r", None) is None:
@@ -1293,6 +1633,10 @@ class OFTManager(AdapterManager):
                     self.memory_pool.slot("w2_oft_r", layer_id, self.memory_pool.active_idx)
                 )
                 moe.w2_oft_r = self.memory_pool.active_view("w2_oft_r", layer_id)
+                # Bind full-buffer view for multi-tenant access (read by Task 3).
+                moe._oft_w2_oft_r_all_slots = self.memory_pool._groups.get(
+                    "w2_oft_r", {}
+                ).get(layer_id)
                 initialized = True
 
         if initialized:
@@ -1846,7 +2190,7 @@ class OFTManager(AdapterManager):
             # from (the trainer pushed R straight into the slot), so evicting it
             # is unrecoverable. Upstream LoRA needs no equivalent -- every one of
             # its adapters is disk-backed. Pinning excludes the slot from
-            # _acquire_buffer_slot's eviction candidates.
+            # allocate_buffer_slot_with_eviction's eviction candidates.
             pinned=True,
             adapter_version=version,
         )

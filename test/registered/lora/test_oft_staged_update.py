@@ -77,7 +77,7 @@ PROMPT = "Hello, my name is"
 # under TP (srt/oft/utils.py's ROW_PARALLELISM_LINEAR_OFT_NAMES), so it also
 # exercises the TP-aware compact-weight slicing path
 # (StagedOFTMemoryPool/_partition_and_precompute's is_row_parallel branch,
-# and the regular admission path's load_oft_weight_to_buffer) for the TP=2
+# and the native-RPC admission path's load_oft_weight_direct) for the TP=2
 # test below, without needing per-head-dim bookkeeping that q/k/v/o_proj
 # would require.
 TARGET_MODULE = "down_proj"
@@ -110,7 +110,7 @@ def _oft_named_tensors(num_layers: int, intermediate_size: int, seed: int) -> di
     down_proj's INPUT dimension (intermediate_size), matching
     OFTMemoryPool.get_oft_R_shape's "OFT input rotation" convention. This is
     the FULL, unsharded size regardless of --tp-size: both
-    load_oft_weight_to_buffer (regular admission) and
+    load_oft_weight_direct (native-RPC admission) and
     _partition_and_precompute (staged updates) slice a row-parallel
     module's compact weight down to each TP rank's shard internally
     (module.slice_oft_r_weights), so the raw tensor supplied here -- on disk

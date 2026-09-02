@@ -1,12 +1,9 @@
-import logging
 from contextlib import nullcontext
 
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.lora.eviction_policy import get_eviction_policy
-
-logger = logging.getLogger(__name__)
 
 
 class EmptySlot:
@@ -138,45 +135,3 @@ class AdapterMemPool:
 
     def _fill_slot(self, slot_idx, named_tensors):
         raise NotImplementedError
-
-    def _acquire_buffer_slot(self, cur_uids, refs):
-        # 1. Prioritize empty slots
-        for buffer_id in range(self.max_adapters_per_batch):
-            if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
-                return buffer_id
-
-        # 2. Memory pool is full, need to evict
-        candidates = set()
-        for buffer_id in range(self.max_adapters_per_batch):
-            uid = self.buffer_id_to_uid[buffer_id]
-            if uid in cur_uids:
-                continue
-            if uid is not None:
-                ref = refs.get(uid)
-                if ref and (ref.pinned or not ref.reloadable):
-                    continue
-            candidates.add(uid)
-
-        if not candidates:
-            raise ValueError(
-                "No available buffer slots found. Please ensure the number of "
-                "active (pinned) adapters and adapters loaded over the wire "
-                "(no on-disk artifact to reload from, never evicted) is less "
-                "than max_adapters_per_batch."
-            )
-
-        # Prefer evicting adapters over base model (None)
-        non_none_candidates = candidates - {None}
-        candidates_to_use = (
-            non_none_candidates if non_none_candidates else candidates
-        )
-
-        victim_uid = self.eviction_policy.select_victim(candidates_to_use)
-        victim_buffer_id = self.uid_to_buffer_id[victim_uid]
-        self.uid_to_buffer_id.pop(victim_uid)
-        self.eviction_policy.remove(victim_uid)
-        self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
-        logger.debug(
-            f"Evicting adapter {victim_uid} from buffer slot {victim_buffer_id}."
-        )
-        return victim_buffer_id

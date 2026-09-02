@@ -566,5 +566,43 @@ class TestWrongPeftConfigRejected(CustomTestCase):
         tm.update_oft_adapter_communicator.assert_not_awaited()
 
 
+class TestMintRefIsNotReloadable(CustomTestCase):
+    """Regression guard: _mint_ref (the ref constructor for the streamed/
+    staged adapter path, used by register_peft_ref) used to construct its
+    OFTRef without an explicit reloadable=, silently defaulting to
+    reloadable=True (AdapterRef's dataclass default) -- as if a streamed
+    adapter were disk-backed. A streamed adapter has no on-disk artifact
+    either, so this must be reloadable=False, mirroring
+    staged_manager.py's LoRARef construction for its own streamed adapters.
+    """
+
+    def test_mint_ref_is_not_reloadable(self):
+        from sglang.srt.peft.tokenizer_hooks import _mint_ref
+
+        tm = SimpleNamespace(peft_kind="oft")
+        ref = _mint_ref(tm, "a")
+
+        self.assertFalse(ref.reloadable)
+
+    def test_evicted_streamed_adapter_raises_wire_loaded_style_error(self):
+        """When a streamed adapter's ref (reloadable=False, per _mint_ref)
+        is evicted from the registry and then re-referenced, resolve_peft_path
+        must raise the "no on-disk artifact" error -- not attempt (or claim
+        to support) an implicit disk reload, since a streamed adapter never
+        had a disk artifact to reload from."""
+        from sglang.srt.peft.tokenizer_hooks import _mint_ref, resolve_peft_path
+
+        ref = _mint_ref(SimpleNamespace(peft_kind="oft"), "a")
+        tm = SimpleNamespace(
+            peft_kind="oft",
+            peft_registry=OFTRegistry(),
+            peft_ref_cache={"a": ref},
+        )
+        obj = SimpleNamespace(adapter_path="a", lora_path=None)
+
+        with self.assertRaisesRegex(ValueError, "no on-disk artifact"):
+            asyncio.run(resolve_peft_path(tm, obj))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

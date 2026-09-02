@@ -8,7 +8,6 @@ from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.utils import get_stacked_multiply as _lora_get_stacked_multiply
 from sglang.srt.oft.base.mem_pool import EMPTY_SLOT, AdapterMemPool, EmptySlot
 from sglang.srt.oft.layers import BaseLayerWithOFT
-from sglang.srt.oft.oft import OFTAdapter
 from sglang.srt.oft.oft_config import OFTConfig
 from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.oft.utils import (
@@ -142,6 +141,28 @@ def _fill_identity(buffer_view: torch.Tensor, block_size: int) -> None:
         block_size, dtype=buffer_view.dtype, device=buffer_view.device
     )
     buffer_view[:, :block_size, :block_size] = eye
+
+
+def _fill_expert_oft_identity(buffer: torch.Tensor) -> None:
+    """Fill an expert-OFT R buffer view with identity (OFT passthrough).
+
+    Expert-OFT groups (``w13_oft_r``/``w1_oft_r``/``w3_oft_r``/``w2_oft_r``)
+    have no max-block-size padding concept unlike the dense ``_fill_identity``
+    above -- ``buffer.shape[-1]`` (the block dim) IS the block size, so the
+    whole trailing (block_size, block_size) sub-matrix is set to eye, not just
+    a top-left sub-block. Moved here (from ``oft_manager.py``) so this module
+    -- which already owns ``_fill_identity``, the dense equivalent -- can call
+    it from ``reset_buffer_slot_to_identity`` without a circular import
+    (``oft_manager.py`` imports from this module, not the reverse);
+    ``oft_manager.py`` re-imports it under the same name for its own
+    boot-time ``active_idx`` fill.
+    """
+    buffer.zero_()
+    if buffer.numel() == 0:
+        return
+    block_size = buffer.shape[-1]
+    eye = torch.eye(block_size, dtype=buffer.dtype, device=buffer.device)
+    buffer[...] = eye
 
 
 def _write_oft_r_block(
@@ -676,15 +697,7 @@ class OFTMemoryPool(AdapterMemPool):
                 split_count=split_count,
             )
 
-    def prepare_oft_batch(
-        self,
-        cur_uids: Set[Optional[str]],
-        oft_adapters: Dict[str, OFTAdapter],
-        oft_modules: List[Dict[str, BaseLayerWithOFT]],
-        oft_refs: Dict[str, OFTRef],
-        oft_embed_tokens_module: Optional[BaseLayerWithOFT],
-        oft_lm_head_module: Optional[BaseLayerWithOFT],
-    ):
+    def prepare_oft_batch(self, cur_uids: Set[Optional[str]]):
         # Mark all adapters in current batch as used (for LRU tracking)
         for uid in cur_uids:
             self.eviction_policy.mark_used(uid)
@@ -695,153 +708,51 @@ class OFTMemoryPool(AdapterMemPool):
         # Mirrors upstream LoRAMemoryPool.prepare_lora_batch.
         for uid in sorted(cur_uids, key=lambda uid: (uid is not None, uid or "")):
             if uid not in self.uid_to_buffer_id:
-                buffer_id = self._acquire_buffer_slot(cur_uids, oft_refs)
-                oft_adapter = oft_adapters.get(uid, None)
-                self.load_oft_weight_to_buffer(
-                    uid,
-                    buffer_id,
-                    oft_adapter,
-                    oft_modules,
-                    oft_embed_tokens_module,
-                    oft_lm_head_module,
-                )
-                self.uid_to_buffer_id[uid] = buffer_id
-                self.buffer_id_to_uid[buffer_id] = uid
-
-    def load_oft_weight_to_buffer(
-        self,
-        uid: Optional[str],
-        buffer_id: int,
-        oft_adapter: Optional[OFTAdapter],
-        oft_modules: List[Dict[str, BaseLayerWithOFT]],
-        oft_embed_tokens_module: Optional[BaseLayerWithOFT],
-        oft_lm_head_module: Optional[BaseLayerWithOFT],
-    ):
-        def precompute_and_store_R(
-            buffer_view: torch.Tensor,
-            compact_weight: Optional[torch.Tensor],
-            block_size: int,
-        ):
-            """Precompute R from compact weights and store in buffer.
-
-            Replaces load_weight_tensor: instead of storing compact 2D weights,
-            precomputes the full orthogonal rotation matrices via Cayley transform
-            and stores the 3D result (num_blocks, block_size, block_size).
-
-            When compact_weight is None (the adapter has no weights for this
-            module), the buffer is filled with the block-diagonal *identity*
-            rotation. Identity is the only correct passthrough for OFT — a
-            zero R would map every input to zero and silently kill the layer.
-
-            Args:
-                buffer_view: (total_blocks_buffer, block_size, block_size) GPU tensor
-                compact_weight: (num_blocks_adapter, n_elements) CPU tensor, or None
-                block_size: adapter's block size
-            """
-            from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
-
-            if compact_weight is None:
-                _fill_identity(buffer_view, block_size)
-                return
-
-            R = precompute_oft_r(
-                compact_weight.to(buffer_view.device), block_size
-            )
-            num_blocks_adapter = R.shape[0]
-            total_blocks_buffer = buffer_view.shape[0]
-
-            buffer_view.zero_()
-            if num_blocks_adapter == 1 and total_blocks_buffer > 1:
-                # Block-share: replicate single R block to all positions
-                buffer_view[:, :block_size, :block_size] = R[0]
-            else:
-                buffer_view[:num_blocks_adapter, :block_size, :block_size] = R
-
-        if uid is None:
-            # Base model: zero all R buffers (kernel does passthrough when block_size=0)
-            for i in range(self.num_layer):
-                for k in self.R_buffer:
-                    self.R_buffer[k][i][buffer_id] = 0
-            for k in self.embedding_R_buffer:
-                self.embedding_R_buffer[k][buffer_id] = 0
-            for k in self.lm_head_R_buffer:
-                self.lm_head_R_buffer[k][buffer_id] = 0
-            return
-
-        if oft_adapter is None:
-            # A registry/GPU-pool divergence (e.g. a batch names a uid the
-            # GPU pool no longer has a CPU-side OFTAdapter for -- a wire-
-            # loaded adapter that was, or should never have been, evicted)
-            # slipping through some path not yet foreseen. Raise a clear,
-            # catchable error instead of asserting, so this can never crash
-            # the engine outright.
-            raise ValueError(
-                f"No OFTAdapter available to load for uid={uid!r} into buffer "
-                f"slot {buffer_id}. This uid is resident in the memory pool's "
-                "admission bookkeeping but has no corresponding CPU-side "
-                "adapter to load weights from."
-            )
-        block_size = oft_adapter.block_size
-
-        # Precompute R from compact weights and load into buffer
-        available_fused_targets = set(self.R_buffer)
-        for layer_id in range(self.num_layer):
-            layer_weights = normalize_merged_oft_weights(
-                oft_adapter.layers[layer_id].weights,
-                available_fused_targets=available_fused_targets,
-            )
-            temp_R_buffer: Dict[str, Optional[torch.Tensor]] = {
-                target_module: None for target_module in self.R_buffer
-            }
-
-            for name, weights in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
-                temp_R_buffer[target_module] = weights
-
-            # TP slicing (on compact weights before precompute)
-            if self.tp_size > 1:
-                cur_layer_modules = oft_modules[layer_id]
-                for module_name, module in cur_layer_modules.items():
-                    target_module = get_target_module_name(
-                        module_name, self.target_modules
+                if uid is None:
+                    # The base/identity placeholder's own one-time boot
+                    # registration (OFTManager.init_memory_pool's
+                    # fetch_new_ofts({None}) call, against a freshly
+                    # constructed, entirely empty pool) -- not admission for
+                    # a real adapter, so it needs no eviction fallback and is
+                    # unrelated to the (now-retired) on-disk (--peft-paths)
+                    # lazy admission this loop used to also perform. Always
+                    # lands in the first empty slot (slot 0 on a fresh pool);
+                    # never evicted afterward (see allocate_buffer_slot_with_
+                    # eviction's uid=None exclusion), so this branch never
+                    # runs again post-boot.
+                    buffer_id = next(
+                        (
+                            i
+                            for i in range(self.max_ofts_per_batch)
+                            if self.buffer_id_to_uid[i] == EMPTY_SLOT
+                        ),
+                        None,
                     )
-                    if temp_R_buffer[target_module] is not None:
-                        temp_R_buffer[target_module] = module.slice_oft_r_weights(
-                            temp_R_buffer[target_module]
+                    if buffer_id is None:
+                        raise ValueError(
+                            "No empty buffer slot available for the base/"
+                            "identity placeholder's boot registration -- this "
+                            "should be unreachable (it is the very first uid "
+                            "ever admitted, against a freshly constructed, "
+                            "entirely empty pool)."
                         )
-
-            for name, weights in temp_R_buffer.items():
-                target_buffer = self.R_buffer[name][layer_id]
-                precompute_and_store_R(
-                    target_buffer[buffer_id], weights, block_size
+                    self.reset_buffer_slot_to_identity(buffer_id)
+                    self.uid_to_buffer_id[uid] = buffer_id
+                    self.buffer_id_to_uid[buffer_id] = uid
+                    continue
+                # Every uid referenced by a request must already be resident
+                # -- loaded via the native-RPC path (OFTManager.
+                # load_adapter_from_tensors/_from_distributed), which admits
+                # eagerly at load time via allocate_buffer_slot_with_eviction.
+                # There is no on-disk preload path anymore (--peft-paths was
+                # retired) to lazily page this uid in from, so a uid missing
+                # here means it was never loaded -- fail loudly rather than
+                # silently proceed with a stale/missing buffer_id.
+                raise ValueError(
+                    f"Adapter {uid!r} referenced by this batch was never "
+                    "loaded (no on-disk preload path exists anymore; load "
+                    "it via the native RPC adapter-load mechanism first)."
                 )
-
-        # Load embedding layer weights (precompute R)
-        if oft_adapter.embedding_layers:
-            for name, weights in oft_adapter.embedding_layers.items():
-                target_module = get_target_module_name(name, self.target_modules)
-                if target_module == "embed_tokens" and "embed_tokens" in name:
-                    precompute_and_store_R(
-                        self.embedding_R_buffer[target_module][buffer_id],
-                        weights,
-                        block_size,
-                    )
-                elif target_module == "lm_head" and "lm_head" in name:
-                    precompute_and_store_R(
-                        self.lm_head_R_buffer[target_module][buffer_id],
-                        weights,
-                        block_size,
-                    )
-
-        # Load extra token embeddings (raw embeddings, no precompute needed)
-        if oft_adapter.added_tokens_embeddings:
-            added_tokens_size = oft_adapter.config.oft_added_tokens_size
-            for name, weights in oft_adapter.added_tokens_embeddings.items():
-                if "input_embeddings" in name:
-                    buffer_view = self.new_embeddings_buffer["input_embeddings"][
-                        buffer_id, :added_tokens_size
-                    ]
-                    buffer_view.copy_(weights, non_blocking=True)
 
     def _runtime_buffer_target_for_name(
         self, name: str
@@ -1077,17 +988,14 @@ class OFTMemoryPool(AdapterMemPool):
     ) -> Tuple[int, Optional[str]]:
         """Like allocate_buffer_slot, but for the native multi-tenant RPC
         admission path: if no slot is empty, LRU-evict an unpinned,
-        reloadable resident real adapter to make room, mirroring
-        AdapterMemPool._acquire_buffer_slot's pattern (the lazy per-batch
-        admission path used by disk-loaded adapters) -- except the
-        base/identity slot (uid=None) is never a candidate here (there is no
-        "current batch" context to safely re-admit it into afterwards,
-        unlike _acquire_buffer_slot's caller), and neither is a pinned ref
-        (the caller's explicit "keep this one resident" request) nor a
-        non-reloadable one (an adapter loaded over the wire has no CPU-side
-        artifact to re-page from, so evicting it would be unrecoverable --
-        mirrors the retired streamed path's _make_streamed_ref, which always
-        pinned such adapters for exactly this reason).
+        reloadable resident real adapter to make room. The base/identity slot
+        (uid=None) is never a candidate here (Task 4b review fix), and
+        neither is a pinned ref (the caller's explicit "keep this one
+        resident" request) nor a non-reloadable one (an adapter loaded over
+        the wire has no CPU-side artifact to re-page from, so evicting it
+        would be unrecoverable -- mirrors the retired streamed path's
+        _make_streamed_ref, which always pinned such adapters for exactly
+        this reason).
 
         Returns (buffer_id, evicted_uid); evicted_uid is None when an empty
         slot was found and no eviction was needed.
@@ -1160,6 +1068,21 @@ class OFTMemoryPool(AdapterMemPool):
             _fill_identity(self.embedding_R_buffer[k][buffer_id], bs)
         for k in self.lm_head_R_buffer:
             _fill_identity(self.lm_head_R_buffer[k][buffer_id], bs)
+
+        # Expert-OFT groups (w13_oft_r / w1_oft_r / w3_oft_r / w2_oft_r) are
+        # NOT covered by the R_buffer loop above (_declare_expert_groups
+        # registers them separately in self._groups) and were never reset
+        # per-slot before -- only slot active_idx ever got identity-filled,
+        # at boot (_init_identity_expert_oft_for_cuda_graph). Without this, a
+        # token whose adapter has no MoE weights for a layer (or a freshly
+        # (re)assigned slot before any real weights are written) reads
+        # uninitialized torch.empty memory here instead of identity.
+        for group_name in ("w13_oft_r", "w1_oft_r", "w3_oft_r", "w2_oft_r"):
+            groups = self._groups.get(group_name)
+            if groups is None:
+                continue
+            for tensor in groups.values():
+                _fill_expert_oft_identity(tensor[buffer_id])
 
     def get_tensor(self, target_module: str, layer_id: int) -> torch.Tensor:
         """Get the R buffer tensor for a given module and layer."""

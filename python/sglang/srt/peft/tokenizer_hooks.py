@@ -25,10 +25,16 @@ def _peft_kind(tm):
 
 def _mint_ref(tm, name):
     """Build the OFT AdapterRef for ``name`` (path == name for streamed
-    adapters). Matches the registry class built in init_tokenizer_peft."""
+    adapters). Matches the registry class built in init_tokenizer_peft.
+
+    reloadable=False: a streamed adapter has no on-disk artifact to reload
+    from, mirroring staged_manager.py's LoRARef construction for its own
+    streamed/staged adapters."""
     from sglang.srt.oft.oft_registry import OFTRef
 
-    return OFTRef(adapter_name=name, adapter_path=name, pinned=False)
+    return OFTRef(
+        adapter_name=name, adapter_path=name, pinned=False, reloadable=False
+    )
 
 
 def _request_peft_path(obj):
@@ -50,13 +56,9 @@ def init_tokenizer_peft(tm):
     tm._logged_peft_base_only_request = False
 
     if kind == "oft":
-        # Its ctor asserts the refs are its own OFTRef class, which
-        # validate_peft_args normalized with the same class.
         from sglang.srt.oft.oft_registry import OFTRegistry
 
-        tm.peft_registry = OFTRegistry(tm.server_args.peft_paths)
-        for ref in tm.server_args.peft_paths or []:
-            tm.peft_ref_cache[ref.adapter_name] = ref
+        tm.peft_registry = OFTRegistry()
 
     if kind is not None:
         logger.info(
@@ -170,28 +172,13 @@ async def resolve_peft_path(tm, obj):
         if not ref.reloadable:
             raise ValueError(
                 f"OFT adapter '{adapter_path}' was loaded dynamically (via "
-                "tensors/distributed) and was evicted from the registry; it "
-                "has no on-disk artifact to reload from and must be "
-                "re-loaded via a fresh load_oft_adapter_from_tensors/"
-                "_from_distributed call."
+                "tensors/distributed, or streamed via "
+                "update_weights_from_tensor) and was evicted from the "
+                "registry; it has no on-disk artifact to reload from and "
+                "must be re-loaded via a fresh "
+                "load_oft_adapter_from_tensors/_from_distributed call, or "
+                "re-streamed by the trainer."
             )
-        if tm.peft_kind == "oft":
-            from sglang.srt.peft.io_types import LoadOFTAdapterReqInput
-
-            logger.info(f"Reloading evicted adapter: {adapter_path}")
-            load_result = await tm.load_oft_adapter(
-                LoadOFTAdapterReqInput(
-                    adapter_name=ref.adapter_name, adapter_path=ref.adapter_path, pinned=ref.pinned
-                )
-            )
-            if (
-                not load_result.success
-                and "already loaded" not in load_result.error_message
-            ):
-                raise ValueError(
-                    f"Failed to implicitly load OFT adapter {adapter_path}: "
-                    f"{load_result.error_message}"
-                )
 
     adapter_id, adapter_version = await tm.peft_registry.acquire_with_version(path)
     # Set the request-side id/version fields the scheduler reads.

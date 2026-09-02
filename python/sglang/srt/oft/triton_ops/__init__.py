@@ -22,4 +22,7 @@ from sglang.srt.oft.triton_ops.grouped_moe_rotate_project import (
     fused_split_w13_oft_grouped_moe,
     packed_bmm_split_w13_oft_grouped_moe,
 )
-from sglang.srt.oft.triton_ops.block_rotate import apply_oft_rotation_triton
+from sglang.srt.oft.triton_ops.block_rotate import (
+    apply_oft_rotation_triton,
+    apply_oft_rotation_triton_multi_slot,
+)

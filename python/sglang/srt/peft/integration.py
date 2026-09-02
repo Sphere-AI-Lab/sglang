@@ -38,7 +38,6 @@ __all__ = [
     "NOT_HANDLED",
     "maybe_init_peft_manager",
     "reconstruct_oft_staging",
-    "maybe_load_adapter",
     "maybe_load_adapter_from_tensors",
     "maybe_unload_adapter",
     "maybe_dummy_ids",
@@ -111,8 +110,7 @@ def _init_oft_manager(model_runner: "ModelRunner", server_args: "ServerArgs") ->
         tp_size=model_runner.ps.tp_size,
         tp_rank=model_runner.ps.tp_rank,
         max_oft_block_size=model_runner.server_args.max_oft_block_size,
-        target_modules=model_runner.server_args.peft_target_modules,
-        adapter_paths=model_runner.server_args.peft_paths,
+        target_modules=model_runner.server_args.oft_target_modules,
         memory_saver_adapter=model_runner.memory_saver_adapter,
         memory_saver_cpu_backup=model_runner.server_args.enable_weights_cpu_backup,
     )
@@ -190,10 +188,9 @@ def stage_adapter(
 
     ``double_buffer=False`` (distributed sync without ``--adapter-double-
     buffer``) is rejected for OFT: with DB-off sizing the pool inherits the
-    ``AdapterMemPool`` base defaults (active_idx=0, staging_idx=1), and
-    ``_acquire_buffer_slot`` gives the base-identity placeholder slot 0
-    (==active_idx) and the live per-token adapter gather slot 1
-    (==staging_idx). ``stage()`` correctly fills slot 1 (the adapter's own
+    ``AdapterMemPool`` base defaults (active_idx=0, staging_idx=1) -- the
+    base-identity placeholder boots into slot 0 (==active_idx), and
+    ``stage()`` correctly fills slot 1 (==staging_idx, the adapter's own
     gather slot), but ``activate()`` unconditionally copies every group's
     staging_idx->active_idx (slot1->slot0) -- CLOBBERING the base-identity
     slot with adapter data instead of updating the adapter in place (the
@@ -230,23 +227,6 @@ def activate_adapter(model_runner: "ModelRunner", adapter_name: str, version):
         return model_runner.oft_manager.activate_adapter(adapter_name, version)
 
     return NOT_HANDLED
-
-
-def maybe_load_adapter(model_runner: "ModelRunner", oft_ref: "OFTRef"):
-    """Body of the former ``ModelRunner.load_oft_adapter``."""
-    logger.info(
-        f"OFT adapter loading starts: {oft_ref}. "
-        f"avail mem={get_available_gpu_memory(model_runner.device, model_runner.gpu_id):.2f} GB"
-    )
-
-    result = model_runner.oft_manager.load_oft_adapter(oft_ref)
-
-    logger.info(
-        f"OFT adapter loading completes: {oft_ref}. "
-        f"avail mem={get_available_gpu_memory(model_runner.device, model_runner.gpu_id):.2f} GB"
-    )
-
-    return result
 
 
 def maybe_load_adapter_from_tensors(

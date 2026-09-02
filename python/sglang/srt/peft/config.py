@@ -12,13 +12,11 @@ keyword-only OFT fields construct fine.
 """
 
 import argparse
-import json
 import logging
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
 from sglang.srt.arg_groups.arg_utils import NS, A
-from sglang.srt.oft.oft_registry import OFTRef
 
 logger = logging.getLogger(__name__)
 
@@ -39,22 +37,9 @@ class PEFTArgs:
     peft_method: A[Optional[str], NS("lora")] = None
 
     # Shared single-active PEFT inputs (the active method is `peft_method`):
-    #   peft_paths          adapter path map; normalized to OFTRef by
-    #                       peft_method in validate_peft_args.
-    #   peft_target_modules module allow-list; method-specific normalization
+    #   oft_target_modules  module allow-list; method-specific normalization
     #                       ("all"/embed/lm_head handling is OFT-only) in validate.
-    peft_paths: A[
-        Optional[
-            Union[
-                dict[str, str],
-                List[dict[str, str]],
-                List[str],
-                List[OFTRef],
-            ]
-        ],
-        NS("lora"),
-    ] = None
-    peft_target_modules: A[Optional[Union[set[str], List[str]]], NS("lora")] = None
+    oft_target_modules: A[Optional[Union[set[str], List[str]]], NS("lora")] = None
 
     max_oft_block_size: A[Optional[int], NS("lora")] = None
     # Default 8 matches the CLI default (argparse resolved to 8 all along) and
@@ -102,31 +87,12 @@ class PEFTArgs:
     # memory pools reserve a staging slot and the stage/activate endpoints are
     # live. Orbit sets this alongside --adapter-double-buffer. Off => in-place
     # single-active sync (IPC/colocate), byte-identical to today.
-    peft_double_buffer: A[bool, NS("lora")] = False
+    oft_double_buffer: A[bool, NS("lora")] = False
 
     @property
     def enable_peft(self) -> bool:
         """True if the single-active peft method (OFT) is enabled."""
         return self.peft_method is not None
-
-
-class PeftPathAction(argparse.Action):
-    """Collect --peft-paths entries (strings or JSON dicts). Dict entries use
-    {adapter_name, adapter_path} keys; key validation is deferred to
-    validate_peft_args, which knows the active peft_method."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        paths = []
-        if values:
-            assert isinstance(values, list), "Expected a list of peft paths."
-            for path in values:
-                path = path.strip()
-                if path.startswith("{") and path.endswith("}"):
-                    paths.append(json.loads(path))
-                else:
-                    paths.append(path)
-
-        setattr(namespace, self.dest, paths)
 
 
 def register_peft_args(parser: argparse.ArgumentParser) -> None:
@@ -139,32 +105,23 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         default=PEFTArgs.peft_method,
         choices=["oft"],
         help="Single-active PEFT method: 'oft' (Orthogonal Finetuning). "
-        "Required when --peft-paths is given. Distinct from upstream "
-        "--enable-lora (multi-tenant).",
+        "Distinct from upstream --enable-lora (multi-tenant).",
     )
     parser.add_argument(
         "--max-oft-block-size",
         default=PEFTArgs.max_oft_block_size,
         type=int,
-        help="The maximum block size of OFT adapters. If not specified, it will be automatically inferred from the adapters provided in --peft-paths.",
+        help="The maximum block size of OFT adapters. Required (together with "
+        "--oft-target-modules) for OFT initialization.",
     )
     parser.add_argument(
-        "--peft-target-modules",
+        "--oft-target-modules",
         type=str,
         nargs="*",
         default=None,
         help="The set of target modules where the active PEFT method is applied. "
-        "If not specified, inferred from the adapters in --peft-paths. For OFT, "
-        "'all' selects all supported modules (validated per-method in validate_peft_args).",
-    )
-    parser.add_argument(
-        "--peft-paths",
-        type=str,
-        nargs="*",
-        default=None,
-        action=PeftPathAction,
-        help='The list of PEFT adapters to load (requires --peft-method). Each adapter: '
-        '<PATH> | <NAME>=<PATH> | JSON {"adapter_name":str,"adapter_path":str,"pinned":bool}',
+        "'all' selects all supported modules (validated per-method in "
+        "validate_peft_args).",
     )
     parser.add_argument(
         "--max-ofts-per-batch",
@@ -212,9 +169,9 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
     )
 
     parser.add_argument(
-        "--peft-double-buffer",
+        "--oft-double-buffer",
         action="store_true",
-        default=PEFTArgs.peft_double_buffer,
+        default=PEFTArgs.oft_double_buffer,
         help="Reserve a staging slot and enable the double-buffer stage/activate "
              "adapter endpoints (async-RL NCCL weight-sync).",
     )
@@ -228,6 +185,54 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         "'staged' = srt/oft's StagedOFTManager (explicit stage/activate "
         "transaction for async-RL weight sync).",
     )
+
+
+# Attribute names the MoE architectures in this repo use for their per-token
+# expert count -- the same probe Scheduler.init_moe_gemm_config
+# (managers/scheduler.py) uses to decide whether a model is MoE at all.
+_MOE_EXPERT_COUNT_CONFIG_ATTRS = (
+    "num_experts_per_tok",
+    "num_experts_per_token",
+    "top_k_experts",
+    "moe_top_k",
+    "moe_topk",
+)
+
+# The MoE expert projection module names OFT can target. Shared with
+# decode_cuda_graph_runner.py's _resolve_record_oft_variant_graph (its
+# pre-model-load fallback branch) so the two never drift out of sync -- see
+# the final whole-branch review's I2/I3 findings for
+# 2026-09-01-oft-moe-cuda-graph-dual-capture.
+MOE_EXPERT_TARGET_MODULES = frozenset(
+    {"gate_up_proj", "gate_proj", "up_proj", "down_proj"}
+)
+
+
+def effective_oft_capacity(server_args) -> int:
+    """Effective per-batch adapter capacity: buffer slot 0 is always reserved
+    for the base/identity placeholder (OFTMemoryPool), so real resident-
+    adapter capacity is max_ofts_per_batch - 1, not max_ofts_per_batch.
+    Shared with decode_cuda_graph_runner.py's own copy of this arithmetic so
+    the two can never drift (final whole-branch review's I2/I3)."""
+    return server_args.max_ofts_per_batch - 1
+
+
+def _model_has_moe_layers(server_args) -> bool:
+    """Whether the model this server is about to load actually has MoE layers
+    (and therefore FusedMoE modules for expert OFT to wrap).
+
+    The runtime equivalents of this check -- ``OFTMemoryPool.
+    _declare_expert_groups``'s ``if not moe_layers: return`` and
+    ``OFTManager._install_moe_oft_wrappers``'s ``moe_names`` scan -- walk the
+    built module tree, which does not exist yet at server-args validation
+    time. The HF config's per-token expert count is the earliest available
+    signal for the same fact.
+    """
+    return any(
+        hasattr(server_args.get_model_config().hf_text_config, attr)
+        for attr in _MOE_EXPERT_COUNT_CONFIG_ATTRS
+    )
+
 
 def validate_peft_args(server_args) -> None:
     """Validate + normalize OFT server args in place (was check_oft_server_args)."""
@@ -270,19 +275,6 @@ def validate_peft_args(server_args) -> None:
             f"max_loaded_ofts={server_args.max_loaded_ofts}, "
             f"max_ofts_per_batch={server_args.max_ofts_per_batch}"
         )
-        if server_args.peft_paths:
-            assert len(server_args.peft_paths) <= server_args.max_loaded_ofts, (
-                "The number of OFT paths should not exceed max_loaded_ofts. "
-                f"max_loaded_ofts={server_args.max_loaded_ofts}, "
-                f"peft_paths={len(server_args.peft_paths)}"
-            )
-
-    # peft_paths is method-agnostic, so the method can no longer be inferred from
-    # which path field was set -- require it explicitly when paths are given.
-    if server_args.peft_paths and server_args.peft_method is None:
-        raise ValueError(
-            "--peft-paths requires --peft-method (oft) to be set explicitly."
-        )
 
     if server_args.peft_method == "oft":
         assert server_args.oft_type in OFT_TYPE_CHOICES, (
@@ -295,7 +287,7 @@ def validate_peft_args(server_args) -> None:
         # collide (active==staging==1), so activate()'s staging->active copy
         # would corrupt the active slot instead of promoting it. Fail loud
         # here rather than at pool-init time.
-        if server_args.peft_double_buffer:
+        if server_args.oft_double_buffer:
             assert server_args.max_ofts_per_batch >= 3, (
                 "double-buffer OFT requires --max-ofts-per-batch >= 3 "
                 "(base + active + staging); got "
@@ -334,76 +326,146 @@ def validate_peft_args(server_args) -> None:
                 )
                 server_args.cuda_graph_config.prefill.backend = Backend.DISABLED
 
-        # Parse peft_paths -> List[OFTRef]. Normalize through locals -- not
-        # server_args.peft_paths directly -- because ServerArgs is read-only
-        # once __post_init__ reaches materialize_declarations() (well before
-        # this call), so writes must go through _late_resolution below.
-        peft_paths = server_args.peft_paths
-        if isinstance(peft_paths, list):
-            adapter_paths = peft_paths
-            peft_paths = []
-            for adapter_path in adapter_paths:
-                if isinstance(adapter_path, str):
-                    if "=" in adapter_path:
-                        name, path = adapter_path.split("=", 1)
-                        oft_ref = OFTRef(
-                            adapter_name=name, adapter_path=path, pinned=False
-                        )
-                    else:
-                        oft_ref = OFTRef(
-                            adapter_name=adapter_path, adapter_path=adapter_path, pinned=False
-                        )
-                elif isinstance(adapter_path, dict):
-                    assert (
-                        "adapter_name" in adapter_path and "adapter_path" in adapter_path
-                    ), f"When providing OFT paths as a list of dict, each dict should contain 'adapter_name' and 'adapter_path' keys. Got: {adapter_path}"
-                    oft_ref = OFTRef(
-                        adapter_name=adapter_path["adapter_name"],
-                        adapter_path=adapter_path["adapter_path"],
-                        pinned=adapter_path.get("pinned", False),
-                    )
-                else:
-                    raise ValueError(
-                        f"Invalid type for item in --peft-paths list: {type(adapter_path)}. "
-                        "Expected a string or a dictionary."
-                    )
-                peft_paths.append(oft_ref)
-        elif isinstance(peft_paths, dict):
-            peft_paths = [
-                OFTRef(adapter_name=k, adapter_path=v, pinned=False)
-                for k, v in peft_paths.items()
-            ]
-        elif peft_paths is None:
-            peft_paths = []
-        else:
-            raise ValueError(
-                f"Invalid type for --peft-paths: {type(peft_paths)}. "
-                "Expected a list or a dictionary."
-            )
-
-        # Expand target modules (OFT-specific "all"/embed/lm_head handling)
-        peft_target_modules = server_args.peft_target_modules
-        if peft_target_modules:
-            peft_target_modules = set(peft_target_modules)
-            if "all" in peft_target_modules:
+        # Expand target modules (OFT-specific "all"/embed/lm_head handling).
+        # Normalize through a local -- not server_args.oft_target_modules
+        # directly -- because ServerArgs is read-only once __post_init__
+        # reaches materialize_declarations() (well before this call), so
+        # writes must go through _late_resolution below.
+        oft_target_modules = server_args.oft_target_modules
+        if oft_target_modules:
+            oft_target_modules = set(oft_target_modules)
+            if "all" in oft_target_modules:
                 assert (
-                    len(peft_target_modules) == 1
-                ), "If 'all' is specified in --peft-target-modules, it should be the only module specified."
-                peft_target_modules = set(SUPPORTED_OFT_TARGET_MODULES)
+                    len(oft_target_modules) == 1
+                ), "If 'all' is specified in --oft-target-modules, it should be the only module specified."
+                oft_target_modules = set(SUPPORTED_OFT_TARGET_MODULES)
 
                 # OFT currently only supports torch_native backend,
                 # which does not support embedding / lm_head layers yet.
                 logger.warning(
                     "OFT backend does not yet support embedding or lm_head layers; "
-                    "dropping 'embed_tokens' and 'lm_head' from --peft-target-modules=all."
+                    "dropping 'embed_tokens' and 'lm_head' from --oft-target-modules=all."
                 )
-                peft_target_modules.discard("embed_tokens")
-                peft_target_modules.discard("lm_head")
+                oft_target_modules.discard("embed_tokens")
+                oft_target_modules.discard("lm_head")
+
+        # OFT is not decode-CUDA-graph-safe either, but only for one specific
+        # configuration: dynamically-loaded adapters served via the native-RPC
+        # ("sibling") implementation, when MoE expert modules are targeted AND
+        # the model actually has MoE layers -- both halves of the same gate
+        # OFTManager._install_moe_oft_wrappers and OFTMemoryPool.
+        # _declare_expert_groups use to decide whether expert-OFT buffers exist
+        # at all (their gate_up_proj/gate_proj/up_proj/down_proj target-module
+        # check plus their non-empty FusedMoE scan, which this pre-model-load
+        # check approximates via _model_has_moe_layers above). The names alone
+        # are not enough: a dense model's MLP uses those same names, and
+        # --oft-target-modules=all expands to include them, so checking only
+        # the names would strip decode CUDA graphs from dense deployments that
+        # have no expert-OFT buffers and never take the path below at all.
+        #
+        # In the plain native-RPC pool, buffer slot 0
+        # (memory_pool.active_idx) is permanently reserved by the boot-time
+        # base-request registration -- OFTMemoryPool.
+        # allocate_buffer_slot_with_eviction (oft/mem_pool.py), the sole
+        # admission path since the on-disk lazy admission path was retired,
+        # excludes uid=None from its eviction candidates
+        # outright (Task 4b review fix), so a real dynamically-loaded
+        # adapter can genuinely never occupy it -- meaning
+        # OFTManager._compute_moe_multi_tenant_slot_ids always takes its
+        # general, per-token multi-tenant branch for any real adapter. That
+        # branch allocates a FRESH routing tensor on
+        # every prepare_oft_batch call, which has no pointer stability across
+        # CUDA-graph capture and replay (prepare_oft_batch runs outside the
+        # capture region -- see decode_cuda_graph_runner.py's
+        # maybe_prepare_peft_batch/maybe_prepare_replay_batch calls): a
+        # captured decode graph replays against the stale capture-time
+        # tensor, silently applying an unrelated adapter's rotation (or
+        # identity) instead of erroring. Same class of failure as the OFT
+        # prefill-graph freeze above. The dense OFT path is unaffected (its
+        # own per-token weight_indices mechanism is a different,
+        # already-correct code path), and oft_impl="staged" is unaffected too
+        # (its double-buffer activate() copies real adapter data in place
+        # into active_idx, so the single-adapter fast path stays genuinely
+        # correct under decode-graph replay there). The
+        # 2026-09-01-oft-moe-cuda-graph-dual-capture plan's Tasks 1-4 added
+        # the persistent-buffer + dual-capture mechanism that makes this
+        # configuration safe under decode-graph replay -- but only when it
+        # actually engages: decode_cuda_graph_runner.py's
+        # _resolve_record_oft_variant_graph gates it on effective per-batch
+        # adapter capacity (max_ofts_per_batch - 1) being >= 1, i.e. at least
+        # one real (non-base) adapter buffer slot existing at all. Below that
+        # (max_ofts_per_batch == 1), dual-capture never engages -- only the
+        # single fast-path graph is captured -- so this guard must keep
+        # disabling decode CUDA graphs for that residual case rather than
+        # silently serve wrong rotations under replay.
+        #
+        # --enable-dp-attention is a SECOND, independent reason to keep
+        # disabling: _resolve_record_oft_variant_graph also excludes it
+        # outright (final whole-branch review's C1) because
+        # _compute_moe_multi_tenant_slot_ids's cross-rank MoE token gathering
+        # is not supported by this per-rank persistent buffer -- so
+        # dual-capture never engages for a DP-attention server EITHER,
+        # regardless of capacity. Without this guard also disabling decode
+        # CUDA graphs for that combination, a DP-attention server would be
+        # "eligible but never dual-captured": the single fast-path graph
+        # alone is not safe here the way it is for the capacity-only case
+        # above (a real adapter is never guaranteed to land at
+        # memory_pool.active_idx), so this must unconditionally disable,
+        # exactly like the pre-plan behavior for this whole configuration.
+        moe_expert_target_modules = MOE_EXPERT_TARGET_MODULES & (
+            oft_target_modules or set()
+        )
+        if (
+            server_args.oft_impl == "sibling"
+            and moe_expert_target_modules
+            and server_args.cuda_graph_config is not None
+        ):
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            # Effective per-batch adapter capacity (buffer slot 0 is always
+            # reserved for the base/identity placeholder). Checked before the
+            # expensive _model_has_moe_layers call below, mirroring
+            # _resolve_record_oft_variant_graph's own capacity check exactly.
+            capacity = effective_oft_capacity(server_args)
+            insufficient_capacity = capacity < 1
+            dp_attention_unsupported = server_args.enable_dp_attention
+
+            # _model_has_moe_layers last: it resolves (and caches) the model
+            # config, so servers whose decode graphs are already disabled --
+            # and every non-MoE-targeting or sufficient-capacity,
+            # non-DP-attention server above -- never pay for it.
+            if (
+                server_args.cuda_graph_config.decode.backend != Backend.DISABLED
+                and (insufficient_capacity or dp_attention_unsupported)
+                and _model_has_moe_layers(server_args)
+            ):
+                logger.warning(
+                    "peft_method=oft with oft_impl=sibling targeting MoE expert "
+                    "modules %s is incompatible with decode CUDA graphs "
+                    "(effective per-batch adapter capacity %s%s, so the "
+                    "dual-capture mechanism in docs/superpowers/plans/"
+                    "2026-09-01-oft-moe-cuda-graph-dual-capture.md never "
+                    "engages and only the single fast-path graph is "
+                    "captured); disabling the decode CUDA graph (was "
+                    "backend=%s).%s",
+                    sorted(moe_expert_target_modules),
+                    capacity,
+                    " < 1" if insufficient_capacity else " is sufficient",
+                    server_args.cuda_graph_config.decode.backend,
+                    (
+                        " --enable-dp-attention is not supported by this "
+                        "mechanism regardless of capacity."
+                        if dp_attention_unsupported
+                        else " Increase --max-ofts-per-batch to >= 2 to keep "
+                        "decode CUDA graphs enabled for this configuration."
+                    ),
+                )
+                server_args.cuda_graph_config.decode.backend = Backend.DISABLED
 
         # Ensure sufficient information is provided for OFT initialization.
-        assert peft_paths or (
-            server_args.max_oft_block_size and peft_target_modules
-        ), "When no initial --peft-paths is provided, you need to specify both --max-oft-block-size and --peft-target-modules for OFT initialization."
+        assert (
+            server_args.max_oft_block_size and oft_target_modules
+        ), "You need to specify both --max-oft-block-size and --oft-target-modules for OFT initialization."
 
         if server_args.max_oft_chunk_size is not None:
             assert (
@@ -413,6 +475,5 @@ def validate_peft_args(server_args) -> None:
 
         server_args._late_resolution(
             "validate_peft_args",
-            peft_paths=peft_paths,
-            peft_target_modules=peft_target_modules,
+            oft_target_modules=oft_target_modules,
         )
