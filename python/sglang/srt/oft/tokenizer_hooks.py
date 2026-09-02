@@ -116,6 +116,14 @@ async def resolve_oft_path(tm, obj):
                 f"All loaded adapters: {tm.peft_ref_cache.keys()}."
             )
         ref = tm.peft_ref_cache[adapter_path]
+        if not ref.reloadable:
+            raise ValueError(
+                f"OFT adapter '{adapter_path}' was loaded dynamically (via "
+                "tensors/distributed) and was evicted from the registry; it "
+                "has no on-disk artifact to reload from and must be re-loaded "
+                "via a fresh load_oft_adapter_from_tensors/"
+                "_from_distributed call."
+            )
         logger.info("Reloading evicted OFT adapter: %s", adapter_path)
         load_result = await tm.load_oft_adapter(
             LoadOFTAdapterReqInput(
@@ -130,9 +138,8 @@ async def resolve_oft_path(tm, obj):
                 f"{load_result.error_message}"
             )
 
-    adapter_id = await tm.peft_registry.acquire(path)
+    adapter_id, adapter_version = await tm.peft_registry.acquire_with_version(path)
     obj.adapter_id = adapter_id
-    adapter_version = await tm.peft_registry.get_version_by_id(adapter_id)
     obj.adapter_version = adapter_version
     _propagate_id_to_cached_sub_objs(obj, field="adapter_id", resolved=adapter_id)
     _propagate_id_to_cached_sub_objs(
