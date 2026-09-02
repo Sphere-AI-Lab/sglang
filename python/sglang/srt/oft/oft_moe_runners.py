@@ -1,4 +1,4 @@
-"""Peft-owned MoE kernel-invoker wrapper for OFT expert pre-rotation.
+"""OFT MoE kernel-invoker wrapper for expert pre-rotation.
 
 Upstream sglang ships only POST-GEMM void hooks (``LoRAHooks.after_gate_up`` /
 ``after_down``) that mutate the GEMM *output* in place. OFT is different: it is a
@@ -20,10 +20,9 @@ never rebound -- so the LoRA ``after_down`` hook and the combine path keep seein
 the ORIGINAL ``topk_weights``/``topk_ids``/``topk`` by construction, which the
 previous design had to preserve by hand via renamed variables.
 
-``_oft_prerotate`` and the split gate-up body are VERBATIM moves (from
-the canonical OFT runner helpers, themselves moved from the in-kernel originals, so
-numerics stay bit-identical -- guarded by the A/B golden
-the OFT MoE golden tests (drift MUST be 0, 3 configs).
+``_oft_prerotate`` and the split gate-up body are verbatim moves of the
+in-kernel originals, so numerics stay bit-identical. The OFT MoE golden tests
+guard this contract across three configurations with zero permitted drift.
 
 The wrapper closes over the LAYER and re-reads ``layer.w*_oft_r`` on EVERY call,
 so a streamed in-place weight sync stays visible under CUDA-graph replay, and an
