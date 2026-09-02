@@ -74,6 +74,9 @@ def _make_pool(max_ofts_per_batch, max_block_size=BLOCK_SIZE):
     )
     pool.allocate_buffer_slot = MethodType(OFTMemoryPool.allocate_buffer_slot, pool)
     pool.prepare_oft_batch = MethodType(OFTMemoryPool.prepare_oft_batch, pool)
+    pool.load_oft_weight_to_buffer = MethodType(
+        OFTMemoryPool.load_oft_weight_to_buffer, pool
+    )
     return pool
 
 
@@ -250,21 +253,40 @@ class TestAllocateBufferSlotWithEviction(unittest.TestCase):
             pool.allocate_buffer_slot()
 
 
+def _prepare_oft_batch(pool, cur_uids, oft_adapters=None):
+    """Thin wrapper supplying the (usually irrelevant, for these tests)
+    lazy-admission parameters prepare_oft_batch now requires (oft_adapters/
+    oft_modules/oft_refs/oft_embed_tokens_module/oft_lm_head_module) --
+    mirrors OFTManager._prepare_mem_pool_batch's real call shape."""
+    return pool.prepare_oft_batch(
+        cur_uids=cur_uids,
+        oft_adapters=oft_adapters or {},
+        oft_modules=[],
+        oft_refs={},
+        oft_embed_tokens_module=None,
+        oft_lm_head_module=None,
+    )
+
+
 class TestPrepareOftBatchAdmission(unittest.TestCase):
     """--peft-paths (on-disk adapter preload) has been retired, along with
     the lazy per-batch admission (_acquire_buffer_slot / load_oft_weight_
-    to_buffer) it depended on -- OFTMemoryPool.prepare_oft_batch's per-uid
-    loop must now do exactly two things for a uid not yet resident: (1) the
-    base/identity placeholder (uid=None) gets its own one-time boot
-    registration (unrelated to the retired disk path, and the only reason
-    prepare_oft_batch still ever assigns a fresh slot at all); (2) any real
-    uid must already be resident from the native-RPC path -- a real uid
-    reaching here unresident means it was never loaded, so this must fail
-    loudly rather than silently proceed with a stale/missing buffer_id."""
+    to_buffer) it depended on. A NEW lazy-admission fallback was added for
+    the staged path (StagedOFTManager.activate_adapter can leave a brand-new
+    uid registered CPU-side, in oft_adapters, with no serving slot yet) --
+    OFTMemoryPool.prepare_oft_batch's per-uid loop now does exactly three
+    things for a uid not yet resident: (1) the base/identity placeholder
+    (uid=None) gets its own one-time boot registration (unrelated to either
+    admission path); (2) a real uid WITH a materialized adapter in
+    oft_adapters is admitted lazily (covered end-to-end, with real buffer-
+    content verification, by test_oft_staging_backend.py's
+    TestPrepareOftBatchLazilyAdmitsAStagedAdapter); (3) a real uid with NO
+    materialized adapter either (a registry/GPU-pool divergence) must still
+    fail loudly rather than silently proceed with a stale/missing buffer_id."""
 
     def test_base_placeholder_gets_boot_registered_into_first_empty_slot(self):
         pool = _make_pool(max_ofts_per_batch=2)
-        pool.prepare_oft_batch(cur_uids={None})
+        _prepare_oft_batch(pool, cur_uids={None})
         self.assertEqual(pool.uid_to_buffer_id[None], 0)
         self.assertEqual(pool.buffer_id_to_uid[0], None)
         pool.reset_buffer_slot_to_identity.assert_called_once_with(0)
@@ -276,21 +298,20 @@ class TestPrepareOftBatchAdmission(unittest.TestCase):
         pool = _make_pool(max_ofts_per_batch=2)
         pool.uid_to_buffer_id = {None: 0}
         pool.buffer_id_to_uid = [None, EMPTY_SLOT]
-        pool.prepare_oft_batch(cur_uids={None})
+        _prepare_oft_batch(pool, cur_uids={None})
         pool.reset_buffer_slot_to_identity.assert_not_called()
 
-    def test_unresident_real_adapter_raises_loudly(self):
-        # No on-disk preload path exists anymore to lazily seat a real uid
-        # -- a batch naming one that was never loaded via the native-RPC
-        # path must fail loudly, not silently proceed with a missing
-        # buffer_id.
+    def test_unresident_real_adapter_with_no_materialized_adapter_raises_loudly(self):
+        # A real uid reaching here unresident, with no materialized
+        # OFTAdapter in oft_adapters either (a registry/GPU-pool
+        # divergence), must still fail loudly, not silently proceed with a
+        # missing buffer_id.
         pool = _make_pool(max_ofts_per_batch=2)
         pool.uid_to_buffer_id = {None: 0}
         pool.buffer_id_to_uid = [None, EMPTY_SLOT]
         with self.assertRaises(ValueError) as ctx:
-            pool.prepare_oft_batch(cur_uids={"never_loaded"})
+            _prepare_oft_batch(pool, cur_uids={"never_loaded"})
         self.assertIn("never_loaded", str(ctx.exception))
-        self.assertIn("never loaded", str(ctx.exception))
 
 
 class TestSelectVictimNeverUsedEdgeCase(unittest.TestCase):

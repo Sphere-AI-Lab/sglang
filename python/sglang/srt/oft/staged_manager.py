@@ -401,18 +401,32 @@ class StagedOFTManager(OFTManager):
                 ),
             )
 
+        # A brand-new uid has no serving slot reserved yet -- unlike an
+        # update to an already-resident adapter, there is no physical
+        # staging->active copy to perform. Mirrors StagedLoRAManager.
+        # activate_adapter's `if destination is not None:` gating exactly:
+        # skip memory_pool.activate() and fall through to the CPU-side
+        # registration below, which is what actually makes the adapter
+        # resolvable. Real GPU admission for a genuinely new uid happens
+        # lazily, on the next batch that references it (see
+        # OFTMemoryPool.prepare_oft_batch's lazy-admission fallback).
         destination = self.memory_pool.uid_to_buffer_id.get(uid)
-        if destination is None:
-            return self.create_oft_update_result(
-                success=False,
-                error_message=f"No serving slot is reserved for adapter uid={uid}.",
-            )
-        try:
-            self.memory_pool.activate(uid, version, destination)
-        except Exception as activation_error:
-            return self.create_oft_update_result(
-                success=False, error_message=str(activation_error)
-            )
+        if destination is not None:
+            try:
+                self.memory_pool.activate(uid, version, destination)
+            except Exception as activation_error:
+                return self.create_oft_update_result(
+                    success=False, error_message=str(activation_error)
+                )
+        else:
+            # activate() (above) is what normally clears the hidden staging
+            # slot's _staged_uid/_staged_version as its own last step (see
+            # the comment below) -- since it was skipped entirely here,
+            # nothing else has cleared it yet. Without this, the staging
+            # slot would stay permanently occupied by this (uid, version),
+            # and the very next stage_adapter call (for ANY uid) would fail
+            # with "Staging slot already holds uid=...".
+            self.memory_pool.discard_stage(uid, version)
 
         # REQUIRED, not optional: OFTManager.prepare_oft_batch reads
         # self.adapters[uid].block_size / self.configs[uid].block_size for
@@ -426,11 +440,12 @@ class StagedOFTManager(OFTManager):
         self.configs[uid] = pending.config
         self.adapters[uid] = pending.adapter
 
-        # No discard_stage() call here, unlike StagedLoRAManager: unlike
-        # StagedLoRAMemoryPool.activate (which leaves _staged_uid/_staged_
-        # version set so the manager must clear them separately),
+        # No SECOND discard_stage() call here, unlike StagedLoRAManager:
+        # unlike StagedLoRAMemoryPool.activate (which leaves _staged_uid/
+        # _staged_version set so the manager must clear them separately),
         # StagedOFTMemoryPool.activate (Task 2) already clears them itself
-        # as its last step. Calling discard_stage() again here would re-run
+        # as its last step when it IS called (the `destination is not None`
+        # branch above). Calling discard_stage() again here would re-run
         # _require_staged_identity against an already-empty staging slot and
         # raise unconditionally.
         self._pending_oft_stage = None
