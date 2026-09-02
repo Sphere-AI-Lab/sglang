@@ -264,14 +264,7 @@ class TestPrepareOftBatchAdmission(unittest.TestCase):
 
     def test_base_placeholder_gets_boot_registered_into_first_empty_slot(self):
         pool = _make_pool(max_ofts_per_batch=2)
-        pool.prepare_oft_batch(
-            cur_uids={None},
-            oft_adapters={},
-            oft_modules=[],
-            oft_refs={},
-            oft_embed_tokens_module=None,
-            oft_lm_head_module=None,
-        )
+        pool.prepare_oft_batch(cur_uids={None})
         self.assertEqual(pool.uid_to_buffer_id[None], 0)
         self.assertEqual(pool.buffer_id_to_uid[0], None)
         pool.reset_buffer_slot_to_identity.assert_called_once_with(0)
@@ -283,14 +276,7 @@ class TestPrepareOftBatchAdmission(unittest.TestCase):
         pool = _make_pool(max_ofts_per_batch=2)
         pool.uid_to_buffer_id = {None: 0}
         pool.buffer_id_to_uid = [None, EMPTY_SLOT]
-        pool.prepare_oft_batch(
-            cur_uids={None},
-            oft_adapters={},
-            oft_modules=[],
-            oft_refs={},
-            oft_embed_tokens_module=None,
-            oft_lm_head_module=None,
-        )
+        pool.prepare_oft_batch(cur_uids={None})
         pool.reset_buffer_slot_to_identity.assert_not_called()
 
     def test_unresident_real_adapter_raises_loudly(self):
@@ -302,14 +288,7 @@ class TestPrepareOftBatchAdmission(unittest.TestCase):
         pool.uid_to_buffer_id = {None: 0}
         pool.buffer_id_to_uid = [None, EMPTY_SLOT]
         with self.assertRaises(ValueError) as ctx:
-            pool.prepare_oft_batch(
-                cur_uids={"never_loaded"},
-                oft_adapters={},
-                oft_modules=[],
-                oft_refs={},
-                oft_embed_tokens_module=None,
-                oft_lm_head_module=None,
-            )
+            pool.prepare_oft_batch(cur_uids={"never_loaded"})
         self.assertIn("never_loaded", str(ctx.exception))
         self.assertIn("never loaded", str(ctx.exception))
 

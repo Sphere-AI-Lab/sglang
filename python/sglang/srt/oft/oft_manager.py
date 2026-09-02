@@ -821,14 +821,7 @@ class OFTManager(AdapterManager):
         return self.fetch_new_adapters(new_ofts, running_ofts)
 
     def _prepare_mem_pool_batch(self, cur_uids):
-        self.memory_pool.prepare_oft_batch(
-            cur_uids=cur_uids,
-            oft_adapters=self.adapters,
-            oft_modules=self.adapter_modules,
-            oft_refs=self.refs.copy(),
-            oft_embed_tokens_module=self.embed_tokens_module,
-            oft_lm_head_module=self.lm_head_module,
-        )
+        self.memory_pool.prepare_oft_batch(cur_uids=cur_uids)
 
     def _compute_moe_multi_tenant_slot_ids(
         self,
@@ -1176,7 +1169,7 @@ class OFTManager(AdapterManager):
                 f"Multi-adapter OFT serving is unsupported on MoE expert "
                 f"targets: {len(self.refs)} adapters are loaded but expert OFT "
                 "buffers are single-adapter. Serve one adapter, or remove "
-                "expert projections from --peft-target-modules."
+                "expert projections from --oft-target-modules."
             )
         self.init_memory_pool()
         self.update_oft_info()

@@ -698,15 +698,7 @@ class OFTMemoryPool(AdapterMemPool):
                 split_count=split_count,
             )
 
-    def prepare_oft_batch(
-        self,
-        cur_uids: Set[Optional[str]],
-        oft_adapters: Dict[str, OFTAdapter],
-        oft_modules: List[Dict[str, BaseLayerWithOFT]],
-        oft_refs: Dict[str, OFTRef],
-        oft_embed_tokens_module: Optional[BaseLayerWithOFT],
-        oft_lm_head_module: Optional[BaseLayerWithOFT],
-    ):
+    def prepare_oft_batch(self, cur_uids: Set[Optional[str]]):
         # Mark all adapters in current batch as used (for LRU tracking)
         for uid in cur_uids:
             self.eviction_policy.mark_used(uid)
@@ -723,16 +715,28 @@ class OFTMemoryPool(AdapterMemPool):
                     # fetch_new_ofts({None}) call, against a freshly
                     # constructed, entirely empty pool) -- not admission for
                     # a real adapter, so it needs no eviction fallback and is
-                    # unrelated to the retired on-disk (--peft-paths) lazy
-                    # admission path below. Always lands in the first empty
-                    # slot (slot 0 on a fresh pool); never evicted afterward
-                    # (see allocate_buffer_slot_with_eviction's uid=None
-                    # exclusion), so this branch never runs again post-boot.
+                    # unrelated to the (now-retired) on-disk (--peft-paths)
+                    # lazy admission this loop used to also perform. Always
+                    # lands in the first empty slot (slot 0 on a fresh pool);
+                    # never evicted afterward (see allocate_buffer_slot_with_
+                    # eviction's uid=None exclusion), so this branch never
+                    # runs again post-boot.
                     buffer_id = next(
-                        i
-                        for i in range(self.max_ofts_per_batch)
-                        if self.buffer_id_to_uid[i] == EMPTY_SLOT
+                        (
+                            i
+                            for i in range(self.max_ofts_per_batch)
+                            if self.buffer_id_to_uid[i] == EMPTY_SLOT
+                        ),
+                        None,
                     )
+                    if buffer_id is None:
+                        raise ValueError(
+                            "No empty buffer slot available for the base/"
+                            "identity placeholder's boot registration -- this "
+                            "should be unreachable (it is the very first uid "
+                            "ever admitted, against a freshly constructed, "
+                            "entirely empty pool)."
+                        )
                     self.reset_buffer_slot_to_identity(buffer_id)
                     self.uid_to_buffer_id[uid] = buffer_id
                     self.buffer_id_to_uid[buffer_id] = uid

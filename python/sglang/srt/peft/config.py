@@ -294,27 +294,37 @@ def validate_peft_args(server_args) -> None:
     # --smg-grpc-mode pattern): copy the value across (with a warning) when
     # only the old flag is set, and reject an explicit conflict outright
     # (mirrors _handle_elastic_ep's --elastic-ep-rejoin conflict check) rather
-    # than silently picking one.
+    # than silently picking one. Resolved through a local -- not written to
+    # server_args.oft_target_modules directly -- because ServerArgs is
+    # read-only once __post_init__ reaches materialize_declarations() (well
+    # before validate_peft_args runs, from check_server_args), so writes must
+    # go through _late_resolution at the end of this function (same reason
+    # the "all"-expansion further down normalizes through this same local
+    # rather than writing server_args directly). This local is what the rest
+    # of the function reads from now, including the "all"-expansion below.
+    oft_target_modules = server_args.oft_target_modules
     if server_args.peft_target_modules is not None:
-        if server_args.oft_target_modules is None:
+        if oft_target_modules is None:
             logger.warning(
                 "--peft-target-modules is deprecated; use --oft-target-modules "
                 "instead."
             )
-            server_args.oft_target_modules = server_args.peft_target_modules
-        elif set(server_args.oft_target_modules) != set(server_args.peft_target_modules):
+            oft_target_modules = server_args.peft_target_modules
+        elif set(oft_target_modules) != set(server_args.peft_target_modules):
             raise ValueError(
                 "--peft-target-modules (deprecated) conflicts with "
                 f"--oft-target-modules: {server_args.peft_target_modules!r} vs "
-                f"{server_args.oft_target_modules!r}. Specify only "
+                f"{oft_target_modules!r}. Specify only "
                 "--oft-target-modules."
             )
 
     # --peft-paths (on-disk adapter preload) has been retired: the native RPC
     # adapter-load mechanism (load_oft_adapter_from_tensors/_from_distributed)
     # now fully supersedes it functionally. Reject loudly rather than parse
-    # something that no admission code path consumes anymore.
-    if server_args.peft_paths:
+    # something that no admission code path consumes anymore. Checked with
+    # `is not None` (not truthiness) so an explicit empty list/dict -- still
+    # "was set" -- is caught too, not just a non-empty value.
+    if server_args.peft_paths is not None:
         raise ValueError(
             "--peft-paths has been retired: on-disk adapter preload is no "
             "longer supported. Load adapters via the native RPC adapter-load "
@@ -395,12 +405,9 @@ def validate_peft_args(server_args) -> None:
                 )
                 server_args.cuda_graph_config.prefill.backend = Backend.DISABLED
 
-        # Expand target modules (OFT-specific "all"/embed/lm_head handling).
-        # Normalize through a local -- not server_args.oft_target_modules
-        # directly -- because ServerArgs is read-only once __post_init__
-        # reaches materialize_declarations() (well before this call), so
-        # writes must go through _late_resolution below.
-        oft_target_modules = server_args.oft_target_modules
+        # Expand target modules (OFT-specific "all"/embed/lm_head handling)
+        # on the local resolved above (already merged with the deprecated
+        # --peft-target-modules alias, if set).
         if oft_target_modules:
             oft_target_modules = set(oft_target_modules)
             if "all" in oft_target_modules:

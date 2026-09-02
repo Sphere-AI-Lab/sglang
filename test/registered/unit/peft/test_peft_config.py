@@ -200,6 +200,61 @@ def test_peft_target_modules_deprecated_alias_still_works_and_warns(caplog):
     assert args.oft_target_modules == {"o_proj", "down_proj"}
 
 
+def test_peft_target_modules_alias_copy_survives_real_server_args_read_only_guard():
+    """Regression: the deprecated --peft-target-modules -> --oft-target-modules
+    alias copy used to write ``server_args.oft_target_modules = ...`` directly.
+    Real ``ServerArgs.__setattr__`` raises ``AttributeError`` for any bare
+    (non-underscore) field write once ``__post_init__``'s
+    ``materialize_declarations()`` sets ``_declarations_materialized`` --
+    which always happens before ``validate_peft_args`` runs (it's called from
+    ``check_server_args``, itself called from ``Engine._launch_subprocesses``,
+    well after ``__post_init__`` completes). So the ONLY case the alias
+    exists for -- old flag set, new flag unset -- crashed with
+    ``AttributeError`` at every real server launch.
+
+    The other alias tests in this file use a ``SimpleNamespace`` fixture
+    whose ``_late_resolution`` stand-in just does ``ns.__dict__.update(...)``
+    -- a plain mutable object happily accepts any attribute write, so that
+    fixture cannot catch this bug at all. This test instead drives the REAL,
+    read-only ``ServerArgs`` seam: a bare instance (``__new__`` bypasses
+    ``__init__``) with ``_declarations_materialized`` set, reproducing the
+    exact post-``__post_init__`` state ``validate_peft_args`` always runs
+    under for a real launch.
+    """
+    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.server_args import ServerArgs
+
+    sa = ServerArgs.__new__(ServerArgs)
+    fields = dict(
+        peft_method="oft",
+        enable_lora=False,
+        oft_impl="sibling",
+        peft_paths=None,
+        oft_target_modules=None,
+        peft_target_modules=["down_proj"],
+        max_oft_block_size=32,
+        max_ofts_per_batch=4,
+        max_loaded_ofts=None,
+        oft_backend="triton",
+        oft_dtype=None,
+        oft_type="canonical_oft",
+        max_oft_chunk_size=16,
+        peft_double_buffer=False,
+        speculative_algorithm=None,
+        cuda_graph_config=None,
+        enable_dp_attention=False,
+    )
+    for name, value in fields.items():
+        object.__setattr__(sa, name, value)
+    # Reproduce the read-only guard: real server launches always reach
+    # validate_peft_args with this already set (see docstring above).
+    object.__setattr__(sa, "_declarations_materialized", True)
+
+    validate_peft_args(sa)  # must not raise AttributeError
+
+    assert sa.oft_target_modules == {"down_proj"}
+
+
 def test_peft_target_modules_conflicting_with_oft_target_modules_is_rejected():
     """When BOTH flags are set to different values, this must fail loudly
     (mirrors ServerArgs._handle_elastic_ep's --elastic-ep-rejoin conflict
