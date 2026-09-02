@@ -38,7 +38,6 @@ __all__ = [
     "NOT_HANDLED",
     "maybe_init_peft_manager",
     "reconstruct_oft_staging",
-    "maybe_load_adapter",
     "maybe_load_adapter_from_tensors",
     "maybe_unload_adapter",
     "maybe_dummy_ids",
@@ -228,23 +227,6 @@ def activate_adapter(model_runner: "ModelRunner", adapter_name: str, version):
         return model_runner.oft_manager.activate_adapter(adapter_name, version)
 
     return NOT_HANDLED
-
-
-def maybe_load_adapter(model_runner: "ModelRunner", oft_ref: "OFTRef"):
-    """Body of the former ``ModelRunner.load_oft_adapter``."""
-    logger.info(
-        f"OFT adapter loading starts: {oft_ref}. "
-        f"avail mem={get_available_gpu_memory(model_runner.device, model_runner.gpu_id):.2f} GB"
-    )
-
-    result = model_runner.oft_manager.load_oft_adapter(oft_ref)
-
-    logger.info(
-        f"OFT adapter loading completes: {oft_ref}. "
-        f"avail mem={get_available_gpu_memory(model_runner.device, model_runner.gpu_id):.2f} GB"
-    )
-
-    return result
 
 
 def maybe_load_adapter_from_tensors(

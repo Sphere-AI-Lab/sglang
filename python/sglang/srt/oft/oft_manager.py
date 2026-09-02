@@ -29,7 +29,6 @@ from sglang.srt.oft.base.manager import AdapterManager
 from sglang.srt.oft.backend.base_backend import BaseOFTBackend
 from sglang.srt.oft.backend.oft_registry import get_backend_from_name
 from sglang.srt.oft.layers import BaseLayerWithOFT, get_oft_layer
-from sglang.srt.oft.oft import OFTAdapter
 from sglang.srt.oft.oft_config import OFTConfig
 from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.oft.mem_pool import (
@@ -387,9 +386,6 @@ class OFTManager(AdapterManager):
                     return False
         return any_expert_oft
 
-    def load_oft_adapter(self, oft_ref: OFTRef) -> "OFTUpdateOutput":
-        return self.load_adapter(oft_ref)
-
     def unload_oft_adapter(self, oft_ref: OFTRef) -> "OFTUpdateOutput":
         return self.unload_adapter(oft_ref)
 
@@ -405,9 +401,6 @@ class OFTManager(AdapterManager):
 
     def _build_config(self, path):
         return OFTConfig(path)
-
-    def _load_weights(self, ref):
-        self.load_oft_weights(ref)
 
     def _clear_expert_on_unload(self, adapter):
         if adapter is not None and any(
@@ -1320,51 +1313,6 @@ class OFTManager(AdapterManager):
                 )
             self.oft_added_tokens_size = inferred_extra_vocab_size
 
-    def load_oft_weights(self, oft_ref: OFTRef):
-        """
-        Load the weights of an OFT adapter to CPU memory.
-        """
-        oft_adapter = OFTAdapter(
-            oft_ref.adapter_id,
-            self.configs[oft_ref.adapter_id],
-            self.base_hf_config,
-            self.load_config,
-            self.oft_backend,
-        )
-        oft_adapter.initialize_weights()
-
-        self.adapters[oft_ref.adapter_id] = oft_adapter
-
-        # Set expert OFT weights on FusedMoE layers if present
-        if any(
-            hasattr(layer, "expert_weights") and layer.expert_weights
-            for layer in oft_adapter.layers
-        ):
-            self._set_expert_oft(oft_adapter)
-
-    def load_oft_weights_from_tensors(
-        self, oft_ref: OFTRef, tensors: Dict[str, torch.Tensor]
-    ):
-        """
-        Load the weights of an OFT adapter from tensors to CPU memory.
-        """
-        oft_adapter = OFTAdapter(
-            oft_ref.adapter_id,
-            self.configs[oft_ref.adapter_id],
-            self.base_hf_config,
-            self.load_config,
-            self.oft_backend,
-        )
-        oft_adapter.initialize_weights_from_tensors(tensors)
-        self.adapters[oft_ref.adapter_id] = oft_adapter
-
-        # Set expert OFT weights on FusedMoE layers if present
-        if any(
-            hasattr(layer, "expert_weights") and layer.expert_weights
-            for layer in oft_adapter.layers
-        ):
-            self._set_expert_oft(oft_adapter)
-
     def load_oft_adapter_from_tensors(
         self,
         oft_ref: OFTRef,
@@ -1372,14 +1320,15 @@ class OFTManager(AdapterManager):
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
     ) -> "OFTUpdateOutput":
-        """Not supported. Pure-inference users should register adapters via
-        ``/load_oft_adapter`` (disk path); training-time adapter sync goes
-        through ``update_weights_from_tensor(load_format='oft_adapter')``."""
+        """Not supported. Adapter loading from tensors goes through the
+        native OFT adapter RPC (``load_adapter_from_tensors``/
+        ``load_adapter_from_distributed``, reached via the
+        ``load_oft_adapter_from_tensors``/``_from_distributed`` HTTP routes),
+        not this method."""
         raise NotImplementedError(
-            "OFT load-from-tensors over HTTP is not supported. Use "
-            "/load_oft_adapter with a disk path for pure inference, or "
-            "update_weights_from_tensor(load_format='oft_adapter') for "
-            "orbit/verl-style streamed sync."
+            "OFT load-from-tensors via this method is not supported. Use "
+            "the native OFT adapter RPC (load_oft_adapter_from_tensors/"
+            "_from_distributed) instead."
         )
 
     def init_memory_pool(self):

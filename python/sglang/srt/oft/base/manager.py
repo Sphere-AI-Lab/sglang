@@ -23,9 +23,6 @@ class AdapterManager:
     def _build_config(self, path):
         raise NotImplementedError
 
-    def _load_weights(self, ref):
-        raise NotImplementedError
-
     def _clear_expert_on_unload(self, adapter):
         raise NotImplementedError
 
@@ -73,36 +70,11 @@ class AdapterManager:
             },
         )
 
-    def init_adapters(self, refs=None):
+    def init_adapters(self):
         self.configs = {}
         self.adapters = {}
         self.refs = {}
         self.num_pinned = 0
-        if refs:
-            for ref in refs:
-                result = self.load_adapter(ref)
-                if not result.success:
-                    raise RuntimeError(
-                        f"Failed to load adapter {ref.adapter_name}: {result.error_message}"
-                    )
-
-    def load_adapter(self, ref):
-        assert ref.adapter_name is not None and ref.adapter_path is not None, (
-            "Adapter ref must have both name and path set for loading."
-        )
-        assert ref.adapter_id not in self.adapters, (
-            f"Adapter with ID {ref.adapter_id} is already loaded. This should have been verified before request is sent to the backend."
-        )
-        try:
-            new_adapter = self._build_config(ref.adapter_path)
-            self.validate_new_adapter(new_adapter, ref)
-            self.configs[ref.adapter_id] = new_adapter
-            self._load_weights(ref)
-            self.refs[ref.adapter_id] = ref
-            self.num_pinned += int(ref.pinned)
-        except Exception as e:
-            return self._make_update_result(success=False, error_message=str(e))
-        return self._make_update_result(success=True)
 
     def unload_adapter(self, ref):
         adapter = self.configs.get(ref.adapter_id)
