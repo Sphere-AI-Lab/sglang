@@ -259,7 +259,7 @@ def detect_canonical_split_active() -> bool:
     gate/up group layout (``oft/mem_pool.py``'s ``_declare_expert_groups``)
     and the dense split-buffer forward (``oft/layers.py``'s
     ``_split_stacked_R``), so this helper simply reads that one flag rather
-    than re-deriving split-vs-fused from ``peft_target_modules`` (which cannot
+    than re-deriving split-vs-fused from ``oft_target_modules`` (which cannot
     disambiguate: a FusedMoE/QKV/gate-up module collapses both a legacy and a
     split adapter's leaves to the same fused target name).
 

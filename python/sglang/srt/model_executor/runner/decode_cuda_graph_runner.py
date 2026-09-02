@@ -705,9 +705,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 MOE_EXPERT_TARGET_MODULES,
             )
 
-            peft_target_modules = set(server_args.peft_target_modules or ())
+            oft_target_modules = set(server_args.oft_target_modules or ())
             targets_moe_experts = bool(
-                MOE_EXPERT_TARGET_MODULES & peft_target_modules
+                MOE_EXPERT_TARGET_MODULES & oft_target_modules
             )
             model_has_moe_layers = any(
                 hasattr(model_config.hf_text_config, attr)

@@ -1,12 +1,9 @@
-import logging
 from contextlib import nullcontext
 
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.lora.eviction_policy import get_eviction_policy
-
-logger = logging.getLogger(__name__)
 
 
 class EmptySlot:
@@ -138,59 +135,3 @@ class AdapterMemPool:
 
     def _fill_slot(self, slot_idx, named_tensors):
         raise NotImplementedError
-
-    def _acquire_buffer_slot(self, cur_uids, refs):
-        # 1. Prioritize empty slots
-        for buffer_id in range(self.max_adapters_per_batch):
-            if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
-                return buffer_id
-
-        # 2. Memory pool is full, need to evict
-        candidates = set()
-        for buffer_id in range(self.max_adapters_per_batch):
-            uid = self.buffer_id_to_uid[buffer_id]
-            if uid in cur_uids:
-                continue
-            if uid is None:
-                # The base/identity placeholder is never an eviction
-                # candidate here -- mirrors allocate_buffer_slot_with_
-                # eviction's own protection (oft/mem_pool.py). Without this,
-                # whenever every OTHER resident adapter is pinned,
-                # non-reloadable, or already referenced by cur_uids, None
-                # would be the only remaining candidate and get evicted --
-                # reachable at ANY capacity (not just a pool full of only the
-                # base slot), letting a real adapter silently take over
-                # buffer slot 0 (self.active_idx). Task 4b review fix: this
-                # is unsafe for MoE-target OFT under CUDA-graph replay (see
-                # peft/config.py's decode-CUDA-graph guard and oft_manager.
-                # py's _compute_moe_multi_tenant_slot_ids, which both rely on
-                # slot 0 never holding a real adapter).
-                continue
-            ref = refs.get(uid)
-            if ref and (ref.pinned or not ref.reloadable):
-                continue
-            candidates.add(uid)
-
-        if not candidates:
-            raise ValueError(
-                "No available buffer slots found. Please ensure the number of "
-                "active (pinned) adapters and adapters loaded over the wire "
-                "(no on-disk artifact to reload from, never evicted) is less "
-                "than max_adapters_per_batch. This can also happen when the "
-                "current batch itself references more distinct real (non-"
-                "None) adapters than max_adapters_per_batch - 1 (buffer slot "
-                "0 is always reserved for the base/identity placeholder, "
-                "never a candidate here) -- callers should reject or defer "
-                "such a batch at admission time (see AdapterManager."
-                "validate_batch) rather than let it reach here."
-            )
-
-        victim_uid = self.eviction_policy.select_victim(candidates)
-        victim_buffer_id = self.uid_to_buffer_id[victim_uid]
-        self.uid_to_buffer_id.pop(victim_uid)
-        self.eviction_policy.remove(victim_uid)
-        self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
-        logger.debug(
-            f"Evicting adapter {victim_uid} from buffer slot {victim_buffer_id}."
-        )
-        return victim_buffer_id

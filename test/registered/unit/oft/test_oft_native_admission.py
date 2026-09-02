@@ -33,7 +33,7 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.oft.base.manager import AdapterManager
-from sglang.srt.oft.base.mem_pool import EMPTY_SLOT, AdapterMemPool
+from sglang.srt.oft.base.mem_pool import EMPTY_SLOT
 from sglang.srt.oft.mem_pool import OFTMemoryPool
 from sglang.srt.oft.oft_manager import OFTManager
 from sglang.srt.oft.oft_registry import OFTRef
@@ -73,6 +73,7 @@ def _make_pool(max_ofts_per_batch, max_block_size=BLOCK_SIZE):
         OFTMemoryPool.allocate_buffer_slot_with_eviction, pool
     )
     pool.allocate_buffer_slot = MethodType(OFTMemoryPool.allocate_buffer_slot, pool)
+    pool.prepare_oft_batch = MethodType(OFTMemoryPool.prepare_oft_batch, pool)
     return pool
 
 
@@ -87,25 +88,6 @@ def _make_manager(max_ofts_per_batch=4, max_block_size=BLOCK_SIZE):
     mgr.num_pinned = 0
     mgr.memory_pool = _make_pool(max_ofts_per_batch, max_block_size)
     return mgr
-
-
-def _make_base_pool(max_adapters_per_batch):
-    """A lightweight stand-in carrying exactly the attributes
-    AdapterMemPool._acquire_buffer_slot touches (bookkeeping dict/list + the
-    shared eviction_policy) -- no R_buffer/torch tensors, since none of this
-    logic reads or writes them. The REAL (unbound) AdapterMemPool method is
-    bound onto it via MethodType, so what's under test is the actual
-    production code, not a reimplementation. This is the generic base-class
-    admission path shared by OFTMemoryPool AND StagedOFTMemoryPool, used by
-    prepare_oft_batch's lazy per-batch admission (oft/mem_pool.py:698)."""
-    pool = SimpleNamespace(
-        max_adapters_per_batch=max_adapters_per_batch,
-        uid_to_buffer_id={},
-        buffer_id_to_uid=[EMPTY_SLOT] * max_adapters_per_batch,
-        eviction_policy=get_eviction_policy("lru"),
-    )
-    pool._acquire_buffer_slot = MethodType(AdapterMemPool._acquire_buffer_slot, pool)
-    return pool
 
 
 def _make_ref(name, adapter_id=None, pinned=False, reloadable=True):
@@ -266,6 +248,70 @@ class TestAllocateBufferSlotWithEviction(unittest.TestCase):
         pool.buffer_id_to_uid = ["x"]
         with self.assertRaises(ValueError):
             pool.allocate_buffer_slot()
+
+
+class TestPrepareOftBatchAdmission(unittest.TestCase):
+    """--peft-paths (on-disk adapter preload) has been retired, along with
+    the lazy per-batch admission (_acquire_buffer_slot / load_oft_weight_
+    to_buffer) it depended on -- OFTMemoryPool.prepare_oft_batch's per-uid
+    loop must now do exactly two things for a uid not yet resident: (1) the
+    base/identity placeholder (uid=None) gets its own one-time boot
+    registration (unrelated to the retired disk path, and the only reason
+    prepare_oft_batch still ever assigns a fresh slot at all); (2) any real
+    uid must already be resident from the native-RPC path -- a real uid
+    reaching here unresident means it was never loaded, so this must fail
+    loudly rather than silently proceed with a stale/missing buffer_id."""
+
+    def test_base_placeholder_gets_boot_registered_into_first_empty_slot(self):
+        pool = _make_pool(max_ofts_per_batch=2)
+        pool.prepare_oft_batch(
+            cur_uids={None},
+            oft_adapters={},
+            oft_modules=[],
+            oft_refs={},
+            oft_embed_tokens_module=None,
+            oft_lm_head_module=None,
+        )
+        self.assertEqual(pool.uid_to_buffer_id[None], 0)
+        self.assertEqual(pool.buffer_id_to_uid[0], None)
+        pool.reset_buffer_slot_to_identity.assert_called_once_with(0)
+
+    def test_base_placeholder_already_resident_is_not_re_registered(self):
+        # Boot registration only ever fires once -- a later call with None
+        # already resident (the normal case for every subsequent batch) must
+        # not re-fill or re-assign its slot.
+        pool = _make_pool(max_ofts_per_batch=2)
+        pool.uid_to_buffer_id = {None: 0}
+        pool.buffer_id_to_uid = [None, EMPTY_SLOT]
+        pool.prepare_oft_batch(
+            cur_uids={None},
+            oft_adapters={},
+            oft_modules=[],
+            oft_refs={},
+            oft_embed_tokens_module=None,
+            oft_lm_head_module=None,
+        )
+        pool.reset_buffer_slot_to_identity.assert_not_called()
+
+    def test_unresident_real_adapter_raises_loudly(self):
+        # No on-disk preload path exists anymore to lazily seat a real uid
+        # -- a batch naming one that was never loaded via the native-RPC
+        # path must fail loudly, not silently proceed with a missing
+        # buffer_id.
+        pool = _make_pool(max_ofts_per_batch=2)
+        pool.uid_to_buffer_id = {None: 0}
+        pool.buffer_id_to_uid = [None, EMPTY_SLOT]
+        with self.assertRaises(ValueError) as ctx:
+            pool.prepare_oft_batch(
+                cur_uids={"never_loaded"},
+                oft_adapters={},
+                oft_modules=[],
+                oft_refs={},
+                oft_embed_tokens_module=None,
+                oft_lm_head_module=None,
+            )
+        self.assertIn("never_loaded", str(ctx.exception))
+        self.assertIn("never loaded", str(ctx.exception))
 
 
 class TestSelectVictimNeverUsedEdgeCase(unittest.TestCase):
@@ -596,154 +642,6 @@ class TestUpsertRejectsDiskBackedToWireLoadedTransition(unittest.TestCase):
         self.assertTrue(result.success, result.error_message)
 
 
-class TestAcquireBufferSlotExcludesNonReloadable(unittest.TestCase):
-    """Second-round fix: AdapterMemPool._acquire_buffer_slot (the regular
-    per-forward-step admission path, called from prepare_oft_batch via
-    oft/mem_pool.py:698 -- used by both OFTMemoryPool and the legacy staged
-    path's StagedOFTMemoryPool) previously excluded only `ref.pinned` from
-    eviction candidacy, missing the `not ref.reloadable` exclusion its
-    sibling `allocate_buffer_slot_with_eviction` already had. A wire-loaded
-    (non-reloadable, no CPU-side copy) resident adapter could therefore be
-    silently evicted here to make room for a different adapter -- and,
-    unlike the native-RPC admission path, this call path has no try/except
-    wrapper: an uncaught ValueError here reaches run_scheduler_process's
-    outermost handler, which SIGQUITs the whole engine."""
-
-    def test_non_reloadable_unpinned_resident_never_evicted(self):
-        pool = _make_base_pool(max_adapters_per_batch=1)
-        refs = {"wire_loaded": _make_ref("wire_loaded", pinned=False, reloadable=False)}
-        pool.uid_to_buffer_id = {"wire_loaded": 0}
-        pool.buffer_id_to_uid = ["wire_loaded"]
-        with self.assertRaises(ValueError):
-            pool._acquire_buffer_slot(cur_uids=set(), refs=refs)
-        # untouched on failure
-        self.assertIn("wire_loaded", pool.uid_to_buffer_id)
-        self.assertEqual(pool.buffer_id_to_uid[0], "wire_loaded")
-
-    def test_mixed_pool_of_wire_loaded_residents_raises_instead_of_evicting(self):
-        """The scenario that reproduced the original crash: a memory pool
-        entirely full of wire-loaded (non-reloadable, UNPINNED) resident
-        adapters, then a request that needs to admit a different adapter
-        (e.g. disk-backed) not yet resident. Before this fix, the missing
-        `not ref.reloadable` check let the OLD (pinned-only) exclusion treat
-        both wire-loaded residents as legal eviction candidates -- one of
-        them would be silently evicted. Must now raise a clean ValueError
-        instead, mentioning both pinned and non-reloadable adapters."""
-        pool = _make_base_pool(max_adapters_per_batch=2)
-        refs = {
-            "wire_a": _make_ref("wire_a", pinned=False, reloadable=False),
-            "wire_b": _make_ref("wire_b", pinned=False, reloadable=False),
-        }
-        pool.uid_to_buffer_id = {"wire_a": 0, "wire_b": 1}
-        pool.buffer_id_to_uid = ["wire_a", "wire_b"]
-        pool.eviction_policy.mark_used("wire_a")
-        pool.eviction_policy.mark_used("wire_b")
-
-        # cur_uids models prepare_oft_batch's current-batch uid set: it
-        # contains the new (not-yet-resident, disk-backed) adapter's uid,
-        # but neither wire-loaded resident is needed by this batch.
-        with self.assertRaises(ValueError) as ctx:
-            pool._acquire_buffer_slot(cur_uids={"disk_backed_new"}, refs=refs)
-        message = str(ctx.exception)
-        self.assertIn("pinned", message)
-        self.assertIn("wire", message)
-        # Neither wire-loaded resident was evicted.
-        self.assertIn("wire_a", pool.uid_to_buffer_id)
-        self.assertIn("wire_b", pool.uid_to_buffer_id)
-        self.assertEqual(pool.buffer_id_to_uid, ["wire_a", "wire_b"])
-
-    def test_pinned_still_excluded_unchanged(self):
-        # Regression guard: the pre-existing `pinned` exclusion (unrelated to
-        # this fix) must keep working.
-        pool = _make_base_pool(max_adapters_per_batch=1)
-        refs = {"pinned_one": _make_ref("pinned_one", pinned=True, reloadable=True)}
-        pool.uid_to_buffer_id = {"pinned_one": 0}
-        pool.buffer_id_to_uid = ["pinned_one"]
-        with self.assertRaises(ValueError):
-            pool._acquire_buffer_slot(cur_uids=set(), refs=refs)
-        self.assertIn("pinned_one", pool.uid_to_buffer_id)
-
-    def test_reloadable_unpinned_resident_is_still_evicted(self):
-        # Sanity: a genuinely evictable (disk-backed, unpinned) resident is
-        # still evicted normally -- the fix must not be over-broad.
-        pool = _make_base_pool(max_adapters_per_batch=1)
-        refs = {"disk_backed": _make_ref("disk_backed", pinned=False, reloadable=True)}
-        pool.uid_to_buffer_id = {"disk_backed": 0}
-        pool.buffer_id_to_uid = ["disk_backed"]
-        pool.eviction_policy.mark_used("disk_backed")
-        buffer_id = pool._acquire_buffer_slot(cur_uids=set(), refs=refs)
-        self.assertEqual(buffer_id, 0)
-        self.assertNotIn("disk_backed", pool.uid_to_buffer_id)
-        self.assertEqual(pool.buffer_id_to_uid[0], EMPTY_SLOT)
-
-    def test_empty_slot_used_first_no_eviction_needed(self):
-        pool = _make_base_pool(max_adapters_per_batch=2)
-        pool.uid_to_buffer_id = {"resident": 0}
-        pool.buffer_id_to_uid = ["resident", EMPTY_SLOT]
-        buffer_id = pool._acquire_buffer_slot(cur_uids=set(), refs={})
-        self.assertEqual(buffer_id, 1)
-
-
-class TestAcquireBufferSlotNeverEvictsBasePlaceholder(unittest.TestCase):
-    """Critical fix (Task 4b review): AdapterMemPool._acquire_buffer_slot's
-    candidate-building loop only DEPRIORITIZED uid=None (preferring to evict
-    a real adapter over the base placeholder when both were candidates), it
-    never EXCLUDED None outright -- unlike its sibling
-    allocate_buffer_slot_with_eviction, which already has `if uid is None:
-    continue` (oft/mem_pool.py). Whenever every OTHER resident real adapter
-    was pinned, non-reloadable, or already referenced by the current batch
-    (cur_uids), None became the only remaining candidate and got evicted --
-    reachable at ANY capacity (not just a pool full of only the base slot),
-    an ordinary multi-tenant admission scenario, not an edge case. Once a
-    real adapter lands at buffer slot 0 (self.active_idx),
-    OFTManager._compute_moe_multi_tenant_slot_ids's slot-index-based check
-    (idx != 0) treats it identically to "no real adapter", so its per-token
-    CUDA-graph persistent buffer is never refreshed for that batch -- while
-    the host's own uid-based replay selector (_resolve_oft_variant) still
-    selects the general "oft_multi" graph, replaying stale routing data:
-    silently applying the wrong adapter's rotation. Exactly the failure mode
-    the whole 2026-09-01-oft-moe-cuda-graph-dual-capture plan exists to
-    prevent, made reachable in production by Task 4b's own relaxation of
-    peft/config.py's decode-CUDA-graph guard for capacity >= 1 sibling
-    MoE-target deployments."""
-
-    def test_base_placeholder_never_evicted_when_all_other_residents_are_referenced(
-        self,
-    ):
-        # Reviewer's repro: capacity 3 (max_adapters_per_batch=3), None@0,
-        # A@1, D1@2 all resident; a batch referencing {A, D1, D2} needs a
-        # slot for the new adapter D2. A and D1 are excluded as candidates
-        # because they're in cur_uids -- before the fix, None was the only
-        # remaining candidate and got evicted (D2 would silently land at
-        # slot 0/active_idx). Must now raise instead.
-        pool = _make_base_pool(max_adapters_per_batch=3)
-        refs = {
-            "A": _make_ref("A", pinned=False, reloadable=True),
-            "D1": _make_ref("D1", pinned=False, reloadable=True),
-        }
-        pool.uid_to_buffer_id = {None: 0, "A": 1, "D1": 2}
-        pool.buffer_id_to_uid = [None, "A", "D1"]
-        with self.assertRaises(ValueError):
-            pool._acquire_buffer_slot(cur_uids={"A", "D1", "D2"}, refs=refs)
-        # The base/identity placeholder must still be resident at slot 0.
-        self.assertIn(None, pool.uid_to_buffer_id)
-        self.assertEqual(pool.buffer_id_to_uid[0], None)
-
-    def test_real_adapter_still_evicted_normally_ahead_of_base_placeholder(self):
-        # Sanity: the fix must not be over-broad -- a genuinely evictable
-        # (unpinned, reloadable, not-in-cur_uids) real adapter is still
-        # evicted normally even though None is nominally also present.
-        pool = _make_base_pool(max_adapters_per_batch=2)
-        refs = {"evict_me": _make_ref("evict_me", pinned=False, reloadable=True)}
-        pool.uid_to_buffer_id = {None: 0, "evict_me": 1}
-        pool.buffer_id_to_uid = [None, "evict_me"]
-        pool.eviction_policy.mark_used("evict_me")
-        buffer_id = pool._acquire_buffer_slot(cur_uids={"new_adapter"}, refs=refs)
-        self.assertEqual(buffer_id, 1)
-        self.assertNotIn("evict_me", pool.uid_to_buffer_id)
-        self.assertIn(None, pool.uid_to_buffer_id)
-
-
 class TestNumPinnedBookkeeping(unittest.TestCase):
     """I6 fix: register_streamed_adapter/unload_streamed_adapter must keep
     num_pinned in sync for pinned wire-loaded adapters -- previously
@@ -814,19 +712,6 @@ class TestGracefulFailureInsteadOfAssert(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("not loaded", result.error_message)
 
-    def test_load_oft_weight_to_buffer_raises_value_error_for_missing_adapter(self):
-        # A bound-but-unbacked stand-in, mirroring _make_pool's pattern: the
-        # real (unbound) OFTMemoryPool method is bound via MethodType, so
-        # this exercises the actual production code. The oft_adapter=None
-        # check fires before any R_buffer access, so no buffer state is
-        # needed for this branch.
-        pool = SimpleNamespace()
-        pool.load_oft_weight_to_buffer = MethodType(
-            OFTMemoryPool.load_oft_weight_to_buffer, pool
-        )
-        with self.assertRaises(ValueError):
-            pool.load_oft_weight_to_buffer("some_uid", 0, None, [], None, None)
-
 
 class TestResolveCommitSplit(unittest.TestCase):
     """The resolve/commit split itself (streamed_weight_loader.py): resolve
@@ -888,12 +773,9 @@ class TestResolveCommitSplit(unittest.TestCase):
 
 
 def _make_admission_manager(max_adapters_per_batch):
-    """Stand-in wiring AdapterManager.validate_batch/fetch_new_adapters
-    (oft/base/manager.py) to a REAL AdapterMemPool-shaped memory pool
-    (oft/base/mem_pool.py, its actual _acquire_buffer_slot bound via
-    MethodType) -- so the admission-layer capacity check and the pool's own
-    seating logic can be exercised together, proving the former actually
-    prevents batches the latter cannot seat, not just approximating it.
+    """Stand-in wiring AdapterManager.validate_batch (oft/base/manager.py) to
+    a REAL AdapterMemPool-shaped memory pool -- so the admission-layer
+    capacity check can be exercised against realistic pool bookkeeping.
     Boot-registers uid=None at buffer slot 0, mirroring
     OFTManager.init_memory_pool's real `fetch_new_ofts({None})` call."""
     pool = SimpleNamespace(
@@ -902,7 +784,6 @@ def _make_admission_manager(max_adapters_per_batch):
         buffer_id_to_uid=[None] + [EMPTY_SLOT] * (max_adapters_per_batch - 1),
         eviction_policy=get_eviction_policy("lru"),
     )
-    pool._acquire_buffer_slot = MethodType(AdapterMemPool._acquire_buffer_slot, pool)
 
     mgr = SimpleNamespace(
         max_adapters_per_batch=max_adapters_per_batch,
@@ -914,19 +795,6 @@ def _make_admission_manager(max_adapters_per_batch):
     return mgr
 
 
-def _seat_batch_or_raise(pool, cur_uids, refs=None):
-    """Drives the same lazy per-batch admission loop
-    OFTMemoryPool.prepare_oft_batch runs (oft/mem_pool.py) for every uid in
-    cur_uids not yet resident -- without the weight-loading machinery, since
-    only the slot-acquisition outcome (success vs. ValueError) matters here."""
-    refs = refs or {}
-    for uid in sorted(cur_uids, key=lambda uid: (uid is not None, uid or "")):
-        if uid not in pool.uid_to_buffer_id:
-            buffer_id = pool._acquire_buffer_slot(cur_uids, refs)
-            pool.uid_to_buffer_id[uid] = buffer_id
-            pool.buffer_id_to_uid[buffer_id] = uid
-
-
 class TestValidateBatchEnforcesRealAdapterCapacity(unittest.TestCase):
     """Important finding (Task 4b re-review): AdapterManager.validate_batch
     (oft/base/manager.py) validated batch size against the FULL
@@ -935,11 +803,13 @@ class TestValidateBatchEnforcesRealAdapterCapacity(unittest.TestCase):
     reserved for the base/identity placeholder and genuinely unavailable to
     real adapters. A batch referencing max_adapters_per_batch distinct real
     (non-None) adapters passed validate_batch (which thought there was
-    room) but then crashed inside _acquire_buffer_slot while seating the
-    last one (no candidates left to evict) -- an unhandled ValueError that
-    reaches no try/except and SIGQUITs the whole engine (same crash
-    severity as TestAcquireBufferSlotExcludesNonReloadable's docstring
-    above describes)."""
+    room) but then had no real slot to seat the last one into (no on-disk
+    preload path exists anymore to lazily page it in from either) --
+    reaching OFTMemoryPool.prepare_oft_batch's loud ValueError with no
+    handler, SIGQUITing the whole engine. This bound is still fully
+    load-bearing for the native-RPC path: every real adapter it admits
+    occupies a fixed slot for as long as it's resident, so the same
+    real-capacity arithmetic applies regardless of how adapters get loaded."""
 
     def test_reviewer_repro_two_distinct_real_adapters_at_capacity_two(self):
         # Reviewer's exact repro: max_adapters_per_batch=2 (1 real slot), a
@@ -948,25 +818,11 @@ class TestValidateBatchEnforcesRealAdapterCapacity(unittest.TestCase):
         mgr = _make_admission_manager(max_adapters_per_batch=2)
         self.assertFalse(mgr.validate_batch({"A1", "A2"}))
 
-    def test_pre_fix_shape_would_have_crashed_inside_acquire_buffer_slot(self):
-        # Demonstrates WHY the rejection above matters: reproduces what
-        # happens if this exact batch is admitted anyway (the pre-fix bug's
-        # actual failure mode) -- seating "A1" succeeds (empty slot 1), but
-        # seating "A2" then raises, because slot 0 (None) is correctly
-        # protected (Task 4b's Critical fix) and slot 1 (A1) is excluded as
-        # a candidate by cur_uids.
-        mgr = _make_admission_manager(max_adapters_per_batch=2)
-        with self.assertRaises(ValueError):
-            _seat_batch_or_raise(mgr.memory_pool, {"A1", "A2"})
-
     def test_single_real_adapter_at_capacity_two_is_admitted(self):
         # Sanity: the fix must not be over-broad -- a batch within the real
-        # (max_adapters_per_batch - 1) bound is still admitted and seats
-        # cleanly.
+        # (max_adapters_per_batch - 1) bound is still admitted.
         mgr = _make_admission_manager(max_adapters_per_batch=2)
         self.assertTrue(mgr.validate_batch({"A1"}))
-        _seat_batch_or_raise(mgr.memory_pool, {"A1"})  # must not raise
-        self.assertIn("A1", mgr.memory_pool.uid_to_buffer_id)
 
     def test_none_in_batch_does_not_count_toward_real_capacity(self):
         # A base/no-adapter request mixed into the batch must not itself

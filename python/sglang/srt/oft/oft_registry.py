@@ -52,7 +52,7 @@ class OFTRegistry(AdapterRegistry):
         assert adapter_paths is None or all(
             isinstance(oft, OFTRef) for oft in adapter_paths
         ), (
-            "server_args.peft_paths should have been normalized to OFTRef objects during server initialization. "
+            "OFTRegistry's initial adapter refs must be OFTRef instances. "
             "Please file an issue if you see this error."
         )
         super().__init__(adapter_paths)

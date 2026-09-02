@@ -2,6 +2,13 @@ from types import SimpleNamespace
 
 import pytest
 
+# Sentinel distinguishing "caller didn't pass oft_target_modules" (auto-fill
+# a valid default so unrelated tests don't need to restate it) from "caller
+# explicitly passed None" (needed to test the --peft-target-modules
+# deprecated-alias copy, which only fires when oft_target_modules is
+# genuinely unset).
+_UNSET = object()
+
 
 def _args(
     peft_method,
@@ -10,7 +17,9 @@ def _args(
     max_loaded_ofts=None,
     max_ofts_per_batch=2,
     peft_paths=None,
+    oft_target_modules=_UNSET,
     peft_target_modules=None,
+    max_oft_block_size=None,
     oft_impl="sibling",
     cuda_graph_config=None,
     model_has_moe=False,
@@ -20,13 +29,24 @@ def _args(
         enable_lora=enable_lora,
         enable_dp_attention=enable_dp_attention,
         peft_method=peft_method,
-        peft_paths=(
-            peft_paths
-            if peft_paths is not None
-            else (["/models/adapter"] if peft_method is not None else None)
-        ),
+        peft_paths=peft_paths,
         peft_target_modules=peft_target_modules,
-        max_oft_block_size=None,
+        # --peft-paths is retired, so validate_peft_args's "either paths or
+        # (block_size and target_modules)" requirement collapses to always
+        # needing block_size+target_modules -- default both to a valid value
+        # whenever OFT is enabled and the caller didn't override them, so
+        # tests that aren't specifically exercising that assertion don't
+        # need to restate it every time.
+        oft_target_modules=(
+            oft_target_modules
+            if oft_target_modules is not _UNSET
+            else (["o_proj"] if peft_method is not None else None)
+        ),
+        max_oft_block_size=(
+            max_oft_block_size
+            if max_oft_block_size is not None
+            else (32 if peft_method is not None else None)
+        ),
         max_ofts_per_batch=max_ofts_per_batch,
         max_loaded_ofts=max_loaded_ofts,
         oft_backend="triton",
@@ -39,8 +59,8 @@ def _args(
         oft_impl=oft_impl,
     )
     # Stand-in for ServerArgs._late_resolution: validate_peft_args writes its
-    # normalized peft_paths/peft_target_modules through this (real ServerArgs
-    # is read-only by plain assignment once __post_init__ resolves it).
+    # normalized oft_target_modules through this (real ServerArgs is
+    # read-only by plain assignment once __post_init__ resolves it).
     ns._late_resolution = lambda source, **fields: ns.__dict__.update(fields)
     # Stand-in for ServerArgs.get_model_config(): the MoE decode-graph guard
     # reads hf_text_config's per-token expert count to tell an actual MoE model
@@ -120,25 +140,79 @@ def test_max_loaded_ofts_equal_to_max_ofts_per_batch_minus_one_is_legal():
             enable_lora=False,
             max_loaded_ofts=3,
             max_ofts_per_batch=4,
-            peft_paths=["/models/adapter"],
         )
     )
 
 
-def test_peft_paths_count_must_not_exceed_max_loaded_ofts():
-    """Validate the second (previously untested) branch of the
-    max_loaded_ofts checks: the number of --peft-paths entries must not
-    exceed max_loaded_ofts."""
+def test_peft_paths_is_rejected_as_retired():
+    """--peft-paths has been retired: on-disk adapter preload is no longer
+    supported. Any truthy value must raise a clear retirement error pointing
+    at the native RPC adapter-load mechanism, instead of parsing into
+    OFTRef objects (the removed normalization logic) or silently no-op'ing."""
     from sglang.srt.peft.config import validate_peft_args
 
-    with pytest.raises(AssertionError, match=r"should not exceed max_loaded_ofts"):
+    with pytest.raises(ValueError, match=r"--peft-paths has been retired"):
         validate_peft_args(
             _args(
                 "oft",
                 enable_lora=False,
-                max_loaded_ofts=3,
-                max_ofts_per_batch=4,
-                peft_paths=["/models/a", "/models/b", "/models/c", "/models/d"],
+                peft_paths=["/models/adapter"],
+            )
+        )
+
+
+def test_oft_target_modules_alone_works_as_canonical_flag():
+    """--oft-target-modules, with no deprecated --peft-target-modules alias
+    involved at all, must work as the new canonical flag: the value lands on
+    oft_target_modules unchanged (as a normalized set)."""
+    from sglang.srt.peft.config import validate_peft_args
+
+    args = _args(
+        "oft",
+        enable_lora=False,
+        oft_target_modules=["o_proj", "down_proj"],
+    )
+    validate_peft_args(args)
+    assert args.oft_target_modules == {"o_proj", "down_proj"}
+
+
+def test_peft_target_modules_deprecated_alias_still_works_and_warns(caplog):
+    """--peft-target-modules is deprecated in favor of --oft-target-modules,
+    but must still work as an alias: when only the old flag is set, a
+    warning is logged and the value is copied across to oft_target_modules."""
+    import logging
+
+    from sglang.srt.peft.config import validate_peft_args
+
+    args = _args(
+        "oft",
+        enable_lora=False,
+        oft_target_modules=None,
+        peft_target_modules=["o_proj", "down_proj"],
+    )
+    with caplog.at_level(logging.WARNING, logger="sglang.srt.peft.config"):
+        validate_peft_args(args)
+
+    assert any(
+        "--peft-target-modules is deprecated" in message
+        for message in caplog.messages
+    )
+    assert args.oft_target_modules == {"o_proj", "down_proj"}
+
+
+def test_peft_target_modules_conflicting_with_oft_target_modules_is_rejected():
+    """When BOTH flags are set to different values, this must fail loudly
+    (mirrors ServerArgs._handle_elastic_ep's --elastic-ep-rejoin conflict
+    check) rather than silently picking one and hiding the ambiguity."""
+    from sglang.srt.peft.config import validate_peft_args
+
+    with pytest.raises(ValueError, match=r"--peft-target-modules.*conflicts with.*--oft-target-modules"):
+        validate_peft_args(
+            _args(
+                "oft",
+                enable_lora=False,
+                oft_target_modules=["o_proj"],
+                peft_target_modules=["down_proj"],
             )
         )
 
@@ -175,7 +249,7 @@ def test_moe_target_oft_sibling_with_zero_capacity_disables_decode_cuda_graph():
     args = _args(
         "oft",
         enable_lora=False,
-        peft_target_modules=["gate_proj", "up_proj", "down_proj"],
+        oft_target_modules=["gate_proj", "up_proj", "down_proj"],
         oft_impl="sibling",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
         model_has_moe=True,
@@ -204,7 +278,7 @@ def test_moe_target_oft_sibling_with_real_capacity_keeps_decode_cuda_graph_enabl
     args = _args(
         "oft",
         enable_lora=False,
-        peft_target_modules=["gate_proj", "up_proj", "down_proj"],
+        oft_target_modules=["gate_proj", "up_proj", "down_proj"],
         oft_impl="sibling",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
         model_has_moe=True,
@@ -230,7 +304,7 @@ def test_dense_target_oft_leaves_decode_cuda_graph_enabled():
     args = _args(
         "oft",
         enable_lora=False,
-        peft_target_modules=["o_proj"],
+        oft_target_modules=["o_proj"],
         oft_impl="sibling",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
         max_ofts_per_batch=1,
@@ -240,20 +314,20 @@ def test_dense_target_oft_leaves_decode_cuda_graph_enabled():
     assert args.cuda_graph_config.decode.backend == Backend.FULL
 
 
-@pytest.mark.parametrize("peft_target_modules", [["down_proj"], ["all"]])
+@pytest.mark.parametrize("oft_target_modules", [["down_proj"], ["all"]])
 def test_dense_model_targeting_mlp_module_names_keeps_decode_cuda_graph(
-    peft_target_modules,
+    oft_target_modules,
 ):
     """Regression guard: the MoE decode-graph guard checked target-module
     NAMES only, never whether the model has any MoE layer -- so it also fired
     for dense models, whose MLP uses those very same names
-    (gate_proj/up_proj/down_proj), and for every --peft-target-modules=all
+    (gate_proj/up_proj/down_proj), and for every --oft-target-modules=all
     deployment (``all`` expands to include them). Those deployments have no
     expert-OFT buffers at all and never reach the unstable per-token routing
     path, so they must keep their decode CUDA graphs; silently disabling them
     cost real throughput and stripped decode-graph coverage from
     test/registered/rl/test_oft_load_from_tensor.py (dense Qwen3-0.6B,
-    peft_target_modules=["down_proj"], sibling, decode graphs enabled)
+    oft_target_modules=["down_proj"], sibling, decode graphs enabled)
     without failing anything. max_ofts_per_batch=1 (effective capacity 0) so
     the capacity term alone (which by itself would WANT to disable) can't be
     what's keeping this enabled -- the model_has_moe=False check must be."""
@@ -263,7 +337,7 @@ def test_dense_model_targeting_mlp_module_names_keeps_decode_cuda_graph(
     args = _args(
         "oft",
         enable_lora=False,
-        peft_target_modules=peft_target_modules,
+        oft_target_modules=oft_target_modules,
         oft_impl="sibling",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
         model_has_moe=False,
@@ -287,7 +361,7 @@ def test_moe_target_oft_staged_impl_leaves_decode_cuda_graph_enabled():
     args = _args(
         "oft",
         enable_lora=False,
-        peft_target_modules=["gate_proj", "up_proj", "down_proj"],
+        oft_target_modules=["gate_proj", "up_proj", "down_proj"],
         oft_impl="staged",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
         # Real MoE model: oft_impl=staged is the ONLY reason the guard must
@@ -318,7 +392,7 @@ def test_moe_target_oft_sibling_with_dp_attention_disables_decode_cuda_graph_eve
     args = _args(
         "oft",
         enable_lora=False,
-        peft_target_modules=["gate_proj", "up_proj", "down_proj"],
+        oft_target_modules=["gate_proj", "up_proj", "down_proj"],
         oft_impl="sibling",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
         model_has_moe=True,
@@ -340,7 +414,7 @@ def test_moe_target_oft_sibling_without_dp_attention_and_with_capacity_keeps_dec
     args = _args(
         "oft",
         enable_lora=False,
-        peft_target_modules=["gate_proj", "up_proj", "down_proj"],
+        oft_target_modules=["gate_proj", "up_proj", "down_proj"],
         oft_impl="sibling",
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
         model_has_moe=True,

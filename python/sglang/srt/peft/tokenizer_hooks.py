@@ -50,13 +50,9 @@ def init_tokenizer_peft(tm):
     tm._logged_peft_base_only_request = False
 
     if kind == "oft":
-        # Its ctor asserts the refs are its own OFTRef class, which
-        # validate_peft_args normalized with the same class.
         from sglang.srt.oft.oft_registry import OFTRegistry
 
-        tm.peft_registry = OFTRegistry(tm.server_args.peft_paths)
-        for ref in tm.server_args.peft_paths or []:
-            tm.peft_ref_cache[ref.adapter_name] = ref
+        tm.peft_registry = OFTRegistry()
 
     if kind is not None:
         logger.info(

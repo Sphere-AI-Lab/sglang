@@ -133,7 +133,7 @@ class TestResolveRecordOftVariantGraph(unittest.TestCase):
     def _server_args(self, **overrides):
         defaults = dict(
             peft_method="oft",
-            peft_target_modules={"gate_up_proj", "down_proj"},
+            oft_target_modules={"gate_up_proj", "down_proj"},
             max_ofts_per_batch=8,
             enable_dp_attention=False,
         )
@@ -174,7 +174,7 @@ class TestResolveRecordOftVariantGraph(unittest.TestCase):
         )
 
     def test_false_when_not_targeting_moe_expert_modules(self):
-        server_args = self._server_args(peft_target_modules={"q_proj", "k_proj"})
+        server_args = self._server_args(oft_target_modules={"q_proj", "k_proj"})
         model_config = self._model_config(has_moe_layers=True)
         self.assertFalse(
             DecodeCudaGraphRunner._resolve_record_oft_variant_graph(
@@ -282,16 +282,15 @@ class TestResolveRecordOftVariantGraph(unittest.TestCase):
         )
 
     def test_manager_path_ignores_stale_server_args_target_modules(self):
-        """Final whole-branch review I2/I3: when --peft-target-modules is
-        not given explicitly and target modules are instead inferred from
-        --peft-paths adapter configs, server_args.peft_target_modules stays
-        None/empty -- the server_args-only fallback branch cannot see this
-        (a pre-existing blind spot), but the manager-derived ground truth
-        must not be fooled by it: moe_expert_oft_multi_tenant_ready() alone
-        decides eligibility once a manager is available, regardless of what
-        server_args.peft_target_modules says."""
+        """Final whole-branch review I2/I3: whenever server_args.
+        oft_target_modules is empty/unset for any reason (this fixture's
+        SimpleNamespace omits it here), the server_args-only fallback branch
+        cannot see the model's real target modules, but the manager-derived
+        ground truth must not be fooled by it: moe_expert_oft_multi_tenant_
+        ready() alone decides eligibility once a manager is available,
+        regardless of what server_args.oft_target_modules says."""
         server_args = self._server_args(
-            max_ofts_per_batch=2, peft_target_modules=None
+            max_ofts_per_batch=2, oft_target_modules=None
         )
         model_config = self._model_config(has_moe_layers=True)
         oft_manager = self._fake_oft_manager(ready=True)

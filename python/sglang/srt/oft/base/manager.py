@@ -193,14 +193,16 @@ class AdapterManager:
         Validate if the OFT IDs in the batch can be loaded into the current OFT memory pool.
         """
         # Buffer slot 0 is always reserved for the base/identity placeholder
-        # (uid=None) -- AdapterMemPool._acquire_buffer_slot never evicts it
+        # (uid=None) -- allocate_buffer_slot_with_eviction never evicts it
         # (Task 4b review fix) -- so real per-batch adapter capacity is
         # max_adapters_per_batch - 1, not max_adapters_per_batch. A None in
         # adapter_ids never competes for a slot, so it must not count toward
         # this bound either; admitting it here without correcting for that
-        # let a batch that _acquire_buffer_slot could not actually seat reach
-        # prepare_oft_batch, which has no handler for the resulting
-        # ValueError -- SIGQUITs the whole engine.
+        # let a batch referencing more distinct real adapters than the pool
+        # could ever hold resident simultaneously reach prepare_oft_batch,
+        # which raises ValueError for any adapter not already resident (no
+        # on-disk preload path exists anymore to lazily seat it) with no
+        # handler for that error -- SIGQUITs the whole engine.
         real_adapter_ids = {a for a in adapter_ids if a is not None}
         if len(real_adapter_ids) > self.max_adapters_per_batch - 1:
             return False

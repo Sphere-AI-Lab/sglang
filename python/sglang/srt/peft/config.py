@@ -12,7 +12,6 @@ keyword-only OFT fields construct fine.
 """
 
 import argparse
-import json
 import logging
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -39,9 +38,12 @@ class PEFTArgs:
     peft_method: A[Optional[str], NS("lora")] = None
 
     # Shared single-active PEFT inputs (the active method is `peft_method`):
-    #   peft_paths          adapter path map; normalized to OFTRef by
-    #                       peft_method in validate_peft_args.
-    #   peft_target_modules module allow-list; method-specific normalization
+    #   peft_paths          retired disk-preload flag; kept only so a value
+    #                       CAN still be captured if set programmatically or
+    #                       via a stale script -- validate_peft_args rejects
+    #                       it immediately (see the native RPC adapter-load
+    #                       mechanism instead).
+    #   oft_target_modules  module allow-list; method-specific normalization
     #                       ("all"/embed/lm_head handling is OFT-only) in validate.
     peft_paths: A[
         Optional[
@@ -54,6 +56,10 @@ class PEFTArgs:
         ],
         NS("lora"),
     ] = None
+    oft_target_modules: A[Optional[Union[set[str], List[str]]], NS("lora")] = None
+    # Deprecated alias for oft_target_modules, kept only for backward-
+    # compatible input capture -- validate_peft_args copies it across (with a
+    # warning) when oft_target_modules is unset.
     peft_target_modules: A[Optional[Union[set[str], List[str]]], NS("lora")] = None
 
     max_oft_block_size: A[Optional[int], NS("lora")] = None
@@ -110,25 +116,6 @@ class PEFTArgs:
         return self.peft_method is not None
 
 
-class PeftPathAction(argparse.Action):
-    """Collect --peft-paths entries (strings or JSON dicts). Dict entries use
-    {adapter_name, adapter_path} keys; key validation is deferred to
-    validate_peft_args, which knows the active peft_method."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        paths = []
-        if values:
-            assert isinstance(values, list), "Expected a list of peft paths."
-            for path in values:
-                path = path.strip()
-                if path.startswith("{") and path.endswith("}"):
-                    paths.append(json.loads(path))
-                else:
-                    paths.append(path)
-
-        setattr(namespace, self.dest, paths)
-
-
 def register_peft_args(parser: argparse.ArgumentParser) -> None:
     """Register all OFT CLI flags on ``parser`` (was the OFT block of add_cli_args)."""
     # Single-active PEFT method selector (replaces the former --enable-oft /
@@ -139,32 +126,38 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         default=PEFTArgs.peft_method,
         choices=["oft"],
         help="Single-active PEFT method: 'oft' (Orthogonal Finetuning). "
-        "Required when --peft-paths is given. Distinct from upstream "
-        "--enable-lora (multi-tenant).",
+        "Distinct from upstream --enable-lora (multi-tenant).",
     )
     parser.add_argument(
         "--max-oft-block-size",
         default=PEFTArgs.max_oft_block_size,
         type=int,
-        help="The maximum block size of OFT adapters. If not specified, it will be automatically inferred from the adapters provided in --peft-paths.",
+        help="The maximum block size of OFT adapters. Required (together with "
+        "--oft-target-modules) for OFT initialization.",
+    )
+    parser.add_argument(
+        "--oft-target-modules",
+        type=str,
+        nargs="*",
+        default=None,
+        help="The set of target modules where the active PEFT method is applied. "
+        "'all' selects all supported modules (validated per-method in "
+        "validate_peft_args).",
     )
     parser.add_argument(
         "--peft-target-modules",
         type=str,
         nargs="*",
         default=None,
-        help="The set of target modules where the active PEFT method is applied. "
-        "If not specified, inferred from the adapters in --peft-paths. For OFT, "
-        "'all' selects all supported modules (validated per-method in validate_peft_args).",
+        help="Deprecated alias for --oft-target-modules; use --oft-target-modules instead.",
     )
     parser.add_argument(
         "--peft-paths",
         type=str,
         nargs="*",
         default=None,
-        action=PeftPathAction,
-        help='The list of PEFT adapters to load (requires --peft-method). Each adapter: '
-        '<PATH> | <NAME>=<PATH> | JSON {"adapter_name":str,"adapter_path":str,"pinned":bool}',
+        help="Retired: on-disk adapter preload is no longer supported. Load "
+        "adapters via the native RPC adapter-load mechanism instead.",
     )
     parser.add_argument(
         "--max-ofts-per-batch",
@@ -296,6 +289,39 @@ def validate_peft_args(server_args) -> None:
             "multi-tenant LoRA and single-active PEFT cannot be initialized together."
         )
 
+    # --peft-target-modules is a deprecated alias for --oft-target-modules
+    # (mirrors ServerArgs._handle_deprecated_args's --grpc-mode /
+    # --smg-grpc-mode pattern): copy the value across (with a warning) when
+    # only the old flag is set, and reject an explicit conflict outright
+    # (mirrors _handle_elastic_ep's --elastic-ep-rejoin conflict check) rather
+    # than silently picking one.
+    if server_args.peft_target_modules is not None:
+        if server_args.oft_target_modules is None:
+            logger.warning(
+                "--peft-target-modules is deprecated; use --oft-target-modules "
+                "instead."
+            )
+            server_args.oft_target_modules = server_args.peft_target_modules
+        elif set(server_args.oft_target_modules) != set(server_args.peft_target_modules):
+            raise ValueError(
+                "--peft-target-modules (deprecated) conflicts with "
+                f"--oft-target-modules: {server_args.peft_target_modules!r} vs "
+                f"{server_args.oft_target_modules!r}. Specify only "
+                "--oft-target-modules."
+            )
+
+    # --peft-paths (on-disk adapter preload) has been retired: the native RPC
+    # adapter-load mechanism (load_oft_adapter_from_tensors/_from_distributed)
+    # now fully supersedes it functionally. Reject loudly rather than parse
+    # something that no admission code path consumes anymore.
+    if server_args.peft_paths:
+        raise ValueError(
+            "--peft-paths has been retired: on-disk adapter preload is no "
+            "longer supported. Load adapters via the native RPC adapter-load "
+            "mechanism instead (load_oft_adapter_from_tensors / "
+            "load_oft_adapter_from_distributed)."
+        )
+
     from sglang.srt.utils.common import SUPPORTED_OFT_TARGET_MODULES
 
     assert server_args.max_ofts_per_batch > 0, "max_ofts_per_batch must be positive"
@@ -317,19 +343,6 @@ def validate_peft_args(server_args) -> None:
             "capacity is max_ofts_per_batch - 1). "
             f"max_loaded_ofts={server_args.max_loaded_ofts}, "
             f"max_ofts_per_batch={server_args.max_ofts_per_batch}"
-        )
-        if server_args.peft_paths:
-            assert len(server_args.peft_paths) <= server_args.max_loaded_ofts, (
-                "The number of OFT paths should not exceed max_loaded_ofts. "
-                f"max_loaded_ofts={server_args.max_loaded_ofts}, "
-                f"peft_paths={len(server_args.peft_paths)}"
-            )
-
-    # peft_paths is method-agnostic, so the method can no longer be inferred from
-    # which path field was set -- require it explicitly when paths are given.
-    if server_args.peft_paths and server_args.peft_method is None:
-        raise ValueError(
-            "--peft-paths requires --peft-method (oft) to be set explicitly."
         )
 
     if server_args.peft_method == "oft":
@@ -382,71 +395,28 @@ def validate_peft_args(server_args) -> None:
                 )
                 server_args.cuda_graph_config.prefill.backend = Backend.DISABLED
 
-        # Parse peft_paths -> List[OFTRef]. Normalize through locals -- not
-        # server_args.peft_paths directly -- because ServerArgs is read-only
-        # once __post_init__ reaches materialize_declarations() (well before
-        # this call), so writes must go through _late_resolution below.
-        peft_paths = server_args.peft_paths
-        if isinstance(peft_paths, list):
-            adapter_paths = peft_paths
-            peft_paths = []
-            for adapter_path in adapter_paths:
-                if isinstance(adapter_path, str):
-                    if "=" in adapter_path:
-                        name, path = adapter_path.split("=", 1)
-                        oft_ref = OFTRef(
-                            adapter_name=name, adapter_path=path, pinned=False
-                        )
-                    else:
-                        oft_ref = OFTRef(
-                            adapter_name=adapter_path, adapter_path=adapter_path, pinned=False
-                        )
-                elif isinstance(adapter_path, dict):
-                    assert (
-                        "adapter_name" in adapter_path and "adapter_path" in adapter_path
-                    ), f"When providing OFT paths as a list of dict, each dict should contain 'adapter_name' and 'adapter_path' keys. Got: {adapter_path}"
-                    oft_ref = OFTRef(
-                        adapter_name=adapter_path["adapter_name"],
-                        adapter_path=adapter_path["adapter_path"],
-                        pinned=adapter_path.get("pinned", False),
-                    )
-                else:
-                    raise ValueError(
-                        f"Invalid type for item in --peft-paths list: {type(adapter_path)}. "
-                        "Expected a string or a dictionary."
-                    )
-                peft_paths.append(oft_ref)
-        elif isinstance(peft_paths, dict):
-            peft_paths = [
-                OFTRef(adapter_name=k, adapter_path=v, pinned=False)
-                for k, v in peft_paths.items()
-            ]
-        elif peft_paths is None:
-            peft_paths = []
-        else:
-            raise ValueError(
-                f"Invalid type for --peft-paths: {type(peft_paths)}. "
-                "Expected a list or a dictionary."
-            )
-
-        # Expand target modules (OFT-specific "all"/embed/lm_head handling)
-        peft_target_modules = server_args.peft_target_modules
-        if peft_target_modules:
-            peft_target_modules = set(peft_target_modules)
-            if "all" in peft_target_modules:
+        # Expand target modules (OFT-specific "all"/embed/lm_head handling).
+        # Normalize through a local -- not server_args.oft_target_modules
+        # directly -- because ServerArgs is read-only once __post_init__
+        # reaches materialize_declarations() (well before this call), so
+        # writes must go through _late_resolution below.
+        oft_target_modules = server_args.oft_target_modules
+        if oft_target_modules:
+            oft_target_modules = set(oft_target_modules)
+            if "all" in oft_target_modules:
                 assert (
-                    len(peft_target_modules) == 1
-                ), "If 'all' is specified in --peft-target-modules, it should be the only module specified."
-                peft_target_modules = set(SUPPORTED_OFT_TARGET_MODULES)
+                    len(oft_target_modules) == 1
+                ), "If 'all' is specified in --oft-target-modules, it should be the only module specified."
+                oft_target_modules = set(SUPPORTED_OFT_TARGET_MODULES)
 
                 # OFT currently only supports torch_native backend,
                 # which does not support embedding / lm_head layers yet.
                 logger.warning(
                     "OFT backend does not yet support embedding or lm_head layers; "
-                    "dropping 'embed_tokens' and 'lm_head' from --peft-target-modules=all."
+                    "dropping 'embed_tokens' and 'lm_head' from --oft-target-modules=all."
                 )
-                peft_target_modules.discard("embed_tokens")
-                peft_target_modules.discard("lm_head")
+                oft_target_modules.discard("embed_tokens")
+                oft_target_modules.discard("lm_head")
 
         # OFT is not decode-CUDA-graph-safe either, but only for one specific
         # configuration: dynamically-loaded adapters served via the native-RPC
@@ -458,16 +428,17 @@ def validate_peft_args(server_args) -> None:
         # check plus their non-empty FusedMoE scan, which this pre-model-load
         # check approximates via _model_has_moe_layers above). The names alone
         # are not enough: a dense model's MLP uses those same names, and
-        # --peft-target-modules=all expands to include them, so checking only
+        # --oft-target-modules=all expands to include them, so checking only
         # the names would strip decode CUDA graphs from dense deployments that
         # have no expert-OFT buffers and never take the path below at all.
         #
         # In the plain native-RPC pool, buffer slot 0
         # (memory_pool.active_idx) is permanently reserved by the boot-time
-        # base-request registration -- AdapterMemPool._acquire_buffer_slot
-        # (oft/base/mem_pool.py) now excludes uid=None from its eviction
-        # candidates outright (mirroring allocate_buffer_slot_with_eviction's
-        # own protection; Task 4b review fix), so a real dynamically-loaded
+        # base-request registration -- OFTMemoryPool.
+        # allocate_buffer_slot_with_eviction (oft/mem_pool.py), the sole
+        # admission path since the on-disk (--peft-paths) lazy admission path
+        # was retired, excludes uid=None from its eviction candidates
+        # outright (Task 4b review fix), so a real dynamically-loaded
         # adapter can genuinely never occupy it -- meaning
         # OFTManager._compute_moe_multi_tenant_slot_ids always takes its
         # general, per-token multi-tenant branch for any real adapter. That
@@ -511,7 +482,7 @@ def validate_peft_args(server_args) -> None:
         # memory_pool.active_idx), so this must unconditionally disable,
         # exactly like the pre-plan behavior for this whole configuration.
         moe_expert_target_modules = MOE_EXPERT_TARGET_MODULES & (
-            peft_target_modules or set()
+            oft_target_modules or set()
         )
         if (
             server_args.oft_impl == "sibling"
@@ -561,9 +532,9 @@ def validate_peft_args(server_args) -> None:
                 server_args.cuda_graph_config.decode.backend = Backend.DISABLED
 
         # Ensure sufficient information is provided for OFT initialization.
-        assert peft_paths or (
-            server_args.max_oft_block_size and peft_target_modules
-        ), "When no initial --peft-paths is provided, you need to specify both --max-oft-block-size and --peft-target-modules for OFT initialization."
+        assert (
+            server_args.max_oft_block_size and oft_target_modules
+        ), "You need to specify both --max-oft-block-size and --oft-target-modules for OFT initialization."
 
         if server_args.max_oft_chunk_size is not None:
             assert (
@@ -573,6 +544,5 @@ def validate_peft_args(server_args) -> None:
 
         server_args._late_resolution(
             "validate_peft_args",
-            peft_paths=peft_paths,
-            peft_target_modules=peft_target_modules,
+            oft_target_modules=oft_target_modules,
         )

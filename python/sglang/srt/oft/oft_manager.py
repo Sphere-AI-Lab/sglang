@@ -202,7 +202,6 @@ class OFTManager(AdapterManager):
         tp_rank: int = 0,
         max_oft_block_size: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
-        adapter_paths: Optional[List[OFTRef]] = None,
         memory_saver_adapter=None,
         memory_saver_cpu_backup: bool = False,
     ):
@@ -263,7 +262,6 @@ class OFTManager(AdapterManager):
         self.init_state(
             max_oft_block_size=max_oft_block_size,
             target_modules=target_modules,
-            adapter_paths=adapter_paths,
         )
 
     @staticmethod
@@ -463,12 +461,12 @@ class OFTManager(AdapterManager):
         # Ensure pinned OFT adapters does not exceed maximal limit or cause starvation.
         # Buffer slot 0 is permanently reserved for the base/identity
         # placeholder and never available to real adapters (Task 4b review
-        # fix to AdapterMemPool._acquire_buffer_slot), so only
-        # max_ofts_per_batch - 1 real slots ever exist. The bound below
-        # reserves one more of those for unpinned adapters (max_ofts_per_
-        # batch - 2 pinned max) -- previously max_ofts_per_batch - 1 pinned
-        # adapters were allowed, which could now claim every real slot and
-        # leave zero room for any unpinned one.
+        # fix; enforced by allocate_buffer_slot_with_eviction's uid=None
+        # exclusion), so only max_ofts_per_batch - 1 real slots ever exist.
+        # The bound below reserves one more of those for unpinned adapters
+        # (max_ofts_per_batch - 2 pinned max) -- previously max_ofts_per_batch
+        # - 1 pinned adapters were allowed, which could now claim every real
+        # slot and leave zero room for any unpinned one.
         if oft_ref.pinned and self.num_pinned >= self.max_ofts_per_batch - 2:
             raise ValueError(
                 f"Failed to load OFT adapter {oft_ref.adapter_name} as a pinned adapter. It is not allowed to pin all "
@@ -648,19 +646,7 @@ class OFTManager(AdapterManager):
         tensor `_compute_moe_multi_tenant_slot_ids` builds is unsafe there
         (see that method's own docstring for the full mechanism), but
         because there is no dual-capture to make it safe in the first place.
-
-        SEPARATE, NARROWER CAVEAT for disk-loaded (`--peft-paths`) adapters:
-        the lazy per-batch admission path (`OFTMemoryPool.prepare_oft_batch`
-        -> `_acquire_buffer_slot` -> `load_oft_weight_to_buffer`) never
-        writes expert-OFT weights into a disk adapter's slot at all (it only
-        loads the dense `R_buffer`/embedding buffers) -- a disk-loaded
-        adapter's expert-OFT rotation therefore never applies, though its
-        slot is correctly identity-filled on admission (not uninitialized
-        memory), so a disk adapter resident alongside a real MoE-target
-        adapter loaded through THIS method reads a safe identity rotation,
-        never garbage or another adapter's weights. This is a pre-existing,
-        accepted limitation of the disk path specifically, unrelated to the
-        decode-CUDA-graph caveat above."""
+        """
         from sglang.srt.oft.streamed_weight_loader import (
             _commit_streamed_oft_tensor_groups,
             _resolve_streamed_oft_tensor_groups,
@@ -1103,8 +1089,10 @@ class OFTManager(AdapterManager):
             # The CUDA-graph replay path pads adapter_ids with None WITHOUT a
             # fetch too, but that padding no longer reaches this `continue`
             # branch at all: the base/identity placeholder (uid=None) is now
-            # permanently resident (AdapterMemPool._acquire_buffer_slot never
-            # evicts it, Task 4b review fix), so a padded None row resolves
+            # permanently resident (registered once at boot by OFTMemoryPool.
+            # prepare_oft_batch's own None-specific slot assignment, and never
+            # evicted -- allocate_buffer_slot_with_eviction's uid=None
+            # exclusion, Task 4b review fix), so a padded None row resolves
             # normally via its own always-registered slot 0 below -- slot 0's
             # contents are immaterial for those rows regardless, since
             # they're discarded downstream. This branch is now reachable only
@@ -1159,20 +1147,16 @@ class OFTManager(AdapterManager):
         self,
         max_oft_block_size: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
-        adapter_paths: Optional[List[OFTRef]] = None,
     ):
         """
         Initialize the internal (mutable) state of the OFTManager.
-
-        When `adapter_paths` is provided and not empty, it might be used for inferring OFT shape info such as
-        the target modules and max_oft_block_size.
         """
 
-        assert adapter_paths or (
+        assert (
             max_oft_block_size is not None and target_modules is not None
-        ), "When no initial --oft-paths is provided, you need to specify both --max-oft-block-size and --oft-target-modules for OFT initialization."
+        ), "You need to specify both --max-oft-block-size and --oft-target-modules for OFT initialization."
 
-        self.init_oft_adapters(adapter_paths)
+        self.init_oft_adapters()
         self.init_oft_shapes(
             max_oft_block_size=max_oft_block_size,
             target_modules=target_modules,
@@ -1227,8 +1211,8 @@ class OFTManager(AdapterManager):
             None in self.memory_pool.uid_to_buffer_id,
         )
 
-    def init_oft_adapters(self, adapter_paths: Optional[List[OFTRef]] = None):
-        return self.init_adapters(adapter_paths)
+    def init_oft_adapters(self):
+        return self.init_adapters()
 
     def init_oft_shapes(
         self,
@@ -2264,7 +2248,7 @@ class OFTManager(AdapterManager):
             # from (the trainer pushed R straight into the slot), so evicting it
             # is unrecoverable. Upstream LoRA needs no equivalent -- every one of
             # its adapters is disk-backed. Pinning excludes the slot from
-            # _acquire_buffer_slot's eviction candidates.
+            # allocate_buffer_slot_with_eviction's eviction candidates.
             pinned=True,
             adapter_version=version,
         )

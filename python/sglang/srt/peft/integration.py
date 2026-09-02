@@ -111,8 +111,7 @@ def _init_oft_manager(model_runner: "ModelRunner", server_args: "ServerArgs") ->
         tp_size=model_runner.ps.tp_size,
         tp_rank=model_runner.ps.tp_rank,
         max_oft_block_size=model_runner.server_args.max_oft_block_size,
-        target_modules=model_runner.server_args.peft_target_modules,
-        adapter_paths=model_runner.server_args.peft_paths,
+        target_modules=model_runner.server_args.oft_target_modules,
         memory_saver_adapter=model_runner.memory_saver_adapter,
         memory_saver_cpu_backup=model_runner.server_args.enable_weights_cpu_backup,
     )
@@ -190,10 +189,9 @@ def stage_adapter(
 
     ``double_buffer=False`` (distributed sync without ``--adapter-double-
     buffer``) is rejected for OFT: with DB-off sizing the pool inherits the
-    ``AdapterMemPool`` base defaults (active_idx=0, staging_idx=1), and
-    ``_acquire_buffer_slot`` gives the base-identity placeholder slot 0
-    (==active_idx) and the live per-token adapter gather slot 1
-    (==staging_idx). ``stage()`` correctly fills slot 1 (the adapter's own
+    ``AdapterMemPool`` base defaults (active_idx=0, staging_idx=1) -- the
+    base-identity placeholder boots into slot 0 (==active_idx), and
+    ``stage()`` correctly fills slot 1 (==staging_idx, the adapter's own
     gather slot), but ``activate()`` unconditionally copies every group's
     staging_idx->active_idx (slot1->slot0) -- CLOBBERING the base-identity
     slot with adapter data instead of updating the adapter in place (the
