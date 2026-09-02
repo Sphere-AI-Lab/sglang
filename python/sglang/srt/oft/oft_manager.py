@@ -1145,6 +1145,18 @@ class OFTManager(AdapterManager):
         if w2_oft_r is not None:
             _batched_cayley_assign(w2_oft_r, down_compacts, blocks_per_tp)
 
+        # Cayley ran in the compact weights' own dtype (bit-identical to
+        # Bridge's _cayley_batch), but the STORED buffers must match the
+        # rotation kernel's activation dtype: apply_oft_rotation_triton feeds
+        # A (model dtype) and R into one tl.dot, which rejects mixed dtypes —
+        # an fp32 disk adapter otherwise crashes every expert forward. The
+        # dense path already gets this cast for free by copying into the
+        # oft_r_dtype memory pool; mirror it here.
+        if self.oft_r_dtype is not None and dtype != self.oft_r_dtype:
+            w1_oft_r = w1_oft_r.to(self.oft_r_dtype) if w1_oft_r is not None else None
+            w3_oft_r = w3_oft_r.to(self.oft_r_dtype) if w3_oft_r is not None else None
+            w2_oft_r = w2_oft_r.to(self.oft_r_dtype) if w2_oft_r is not None else None
+
         if is_split:
             moe.w1_oft_r = w1_oft_r
             moe.w3_oft_r = w3_oft_r
