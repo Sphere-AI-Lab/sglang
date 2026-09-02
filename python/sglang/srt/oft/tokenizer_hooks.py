@@ -38,6 +38,8 @@ def init_tokenizer_oft(tm):
     tm.peft_update_lock = asyncio.Lock()
     tm.peft_ref_cache = {}
     tm.peft_registry = None
+    tm.pending_oft_stage = None
+    tm.failed_oft_activations = {}
     tm._logged_peft_base_only_request = False
 
     if tm.peft_kind != "oft":
@@ -103,6 +105,13 @@ async def resolve_oft_path(tm, obj):
     """Resolve a request's OFT path to its current adapter ID and version."""
     path = _request_oft_path(obj)
     unique_paths = {path} if isinstance(path, str) else set(path)
+
+    for adapter_name in unique_paths:
+        if adapter_name in tm.failed_oft_activations:
+            raise ValueError(
+                f"OFT adapter '{adapter_name}' is unavailable after a partial "
+                "activation failure; restart required"
+            )
 
     from sglang.srt.oft.io_types import LoadOFTAdapterReqInput
 

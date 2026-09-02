@@ -775,15 +775,14 @@ class OFTManager(AdapterManager):
         # the MoE modules, and invalidates the finder cache so later callers see
         # through the wrapper to base_layer.
         n_expert_wrapped = self._install_moe_oft_wrappers()
-        # Expert OFT has no adapter slot dimension (kernels index by expert
-        # only), so more than one resident adapter is unrepresentable on the
-        # expert path. Dense targets are unaffected.
-        if n_expert_wrapped and len(self.refs) > 1:
+        # Expert OFT buffers are global to each FusedMoE layer rather than
+        # selected per request. Until expert kernels route by adapter slot,
+        # even one expert adapter would affect base and mixed-adapter traffic.
+        if n_expert_wrapped:
             raise ValueError(
-                f"Multi-adapter OFT serving is unsupported on MoE expert "
-                f"targets: {len(self.refs)} adapters are loaded but expert OFT "
-                "buffers are single-adapter. Serve one adapter, or remove "
-                "expert projections from --peft-target-modules."
+                "OFT on MoE expert targets is unsupported until expert "
+                "rotations are request-aware. Remove expert projections "
+                "from --peft-target-modules."
             )
         self.init_memory_pool()
         self.update_oft_info()
@@ -1851,5 +1850,7 @@ class OFTManager(AdapterManager):
     def _clear_expert_oft(self):
         """Clear expert OFT tensors from all FusedMoE layers."""
         for moe in self._find_fused_moe_modules().values():
+            moe.w1_oft_r = None
+            moe.w3_oft_r = None
             moe.w13_oft_r = None
             moe.w2_oft_r = None

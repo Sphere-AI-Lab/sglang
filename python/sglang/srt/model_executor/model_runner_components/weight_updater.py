@@ -482,7 +482,10 @@ class WeightUpdater:
                 )
             else:
                 result = oft.activate_adapter(
-                    model_runner, adapter_name, int(adapter_version)
+                    model_runner,
+                    adapter_name,
+                    int(adapter_version),
+                    adapter_id=adapter_id,
                 )
                 if result is oft.NOT_HANDLED:
                     return False, "canonical OFT activation is not enabled"

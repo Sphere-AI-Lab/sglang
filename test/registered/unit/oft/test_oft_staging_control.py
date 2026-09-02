@@ -80,4 +80,6 @@ def test_oft_activation_propagates_manager_failure():
     )
 
     assert result == (False, "OFT activation rejected")
-    runner.oft_manager.activate_adapter.assert_called_once_with("policy", 8)
+    runner.oft_manager.activate_adapter.assert_called_once_with(
+        "policy", 8, adapter_id="id-a"
+    )

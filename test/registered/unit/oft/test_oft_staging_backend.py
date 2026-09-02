@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -172,6 +173,7 @@ class TestStreamedOFTUnload(unittest.TestCase):
             adapter_name="policy",
             adapter_path="__tensor__",
             adapter_version=7,
+            pinned=False,
         )
         manager.configs[uid] = MagicMock()
         manager.refs[uid] = ref
@@ -180,6 +182,8 @@ class TestStreamedOFTUnload(unittest.TestCase):
         pool._active_versions[uid] = 7
         pool.R_buffer[TARGET_MODULE][0][slot_id].zero_()
         expert_module = SimpleNamespace(
+            w1_oft_r=torch.ones(1),
+            w3_oft_r=torch.ones(1),
             w13_oft_r=torch.ones(1),
             w2_oft_r=torch.ones(1),
         )
@@ -201,6 +205,8 @@ class TestStreamedOFTUnload(unittest.TestCase):
         )
         self.assertIsNone(expert_module.w13_oft_r)
         self.assertIsNone(expert_module.w2_oft_r)
+        self.assertIsNone(expert_module.w1_oft_r)
+        self.assertIsNone(expert_module.w3_oft_r)
 
 
 def _manager_for_pool_construction(max_ofts_per_batch=4):
@@ -260,7 +266,10 @@ def _manager(max_ofts_per_batch=4):
     manager.configs = {}
     manager.adapters = {}
     manager.refs = {}
+    manager.num_pinned = 0
     manager._pending_oft_stage = None
+    manager.memory_pool.uid_to_buffer_id[None] = 0
+    manager.memory_pool.buffer_id_to_uid[0] = None
     return manager
 
 
@@ -385,6 +394,7 @@ class TestStagedOFTManagerStaging(unittest.TestCase):
             "a construction failure must never touch the pool",
         )
         self.assertIsNone(manager._pending_oft_stage)
+        self.assertNotIn("adapter-a", manager.memory_pool.uid_to_buffer_id)
 
         # The slot must not be jammed: a different uid can still stage.
         result = manager.stage_adapter(
@@ -442,6 +452,7 @@ class TestStagedOFTManagerStaging(unittest.TestCase):
             "an expert-apply failure must leave the pool clean, not jammed",
         )
         self.assertIsNone(manager._pending_oft_stage)
+        self.assertNotIn("adapter-a", manager.memory_pool.uid_to_buffer_id)
 
         # The slot must not be jammed: a different uid can still stage.
         result = manager.stage_adapter(
@@ -475,14 +486,18 @@ class TestStagedOFTManagerActivation(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("no OFT stage is pending", result.error_message)
 
-    def test_activate_requires_a_reserved_serving_slot(self):
+    def test_first_stage_reserves_a_serving_slot_for_the_minted_id(self):
         manager = _manager()
         self._staged(manager)
 
+        destination = manager.memory_pool.uid_to_buffer_id["adapter-a"]
         result = manager.activate_adapter("adapter-a", 1, "adapter-a")
 
-        self.assertFalse(result.success)
-        self.assertIn("No serving slot is reserved", result.error_message)
+        self.assertTrue(result.success, result.error_message)
+        self.assertNotEqual(destination, manager.memory_pool.staging_idx)
+        self.assertEqual(
+            manager.memory_pool.buffer_id_to_uid[destination], "adapter-a"
+        )
 
     def test_stage_then_activate_from_raw_tensors_lands_the_transformed_value(self):
         """End-to-end through the real transformation (mirrors Task 2's
@@ -499,12 +514,12 @@ class TestStagedOFTManagerActivation(unittest.TestCase):
         slot_0_before = manager.memory_pool.slot(f"R:{TARGET_MODULE}", 0, 0).clone()
 
         self._staged(manager, fill_value=9.0)
-        manager.memory_pool.uid_to_buffer_id["adapter-a"] = 2
+        destination = manager.memory_pool.uid_to_buffer_id["adapter-a"]
         result = manager.activate_adapter("adapter-a", 1, "adapter-a")
 
         self.assertTrue(result.success, result.error_message)
         expected_r = precompute_oft_r(compact, BLOCK_SIZE)[0]
-        actual = manager.memory_pool.slot(f"R:{TARGET_MODULE}", 0, 2)
+        actual = manager.memory_pool.slot(f"R:{TARGET_MODULE}", 0, destination)
         self.assertTrue(
             torch.allclose(actual, expected_r.expand_as(actual)),
             "activate must land the Cayley-transformed raw tensor, not the "
@@ -538,7 +553,6 @@ class TestActivateUpdatesManagerBookkeeping(unittest.TestCase):
             "adapter-a",
         )
         self.assertTrue(result.success, result.error_message)
-        manager.memory_pool.uid_to_buffer_id["adapter-a"] = 2
         self.assertNotIn("adapter-a", manager.configs)
         self.assertNotIn("adapter-a", manager.adapters)
 
@@ -569,12 +583,20 @@ class TestOFTStagingBackendPrepareActivation(unittest.TestCase):
     def test_resolves_adapter_id_from_the_ref_cache(self):
         from sglang.srt.oft.staged_manager import OFTStagingBackend
 
-        ref = MagicMock()
-        ref.adapter_id = "uuid-123"
+        from sglang.srt.oft.oft_registry import OFTRef
+
+        ref = OFTRef(
+            adapter_id="uuid-123",
+            adapter_name="adapter-a",
+            adapter_path="__distributed__",
+            adapter_version=7,
+            reloadable=False,
+        )
         tm = MagicMock()
-        tm.peft_ref_cache = {"adapter-a": ref}
+        tm.pending_oft_stage = ref
         obj = MagicMock()
         obj.adapter_name = "adapter-a"
+        obj.adapter_version = "7"
         obj.adapter_id = None
 
         OFTStagingBackend(tm).prepare_activation(obj)
@@ -585,12 +607,144 @@ class TestOFTStagingBackendPrepareActivation(unittest.TestCase):
         from sglang.srt.oft.staged_manager import OFTStagingBackend
 
         tm = MagicMock()
-        tm.peft_ref_cache = {}
+        tm.pending_oft_stage = None
         obj = MagicMock()
         obj.adapter_name = "adapter-a"
+        obj.adapter_version = "7"
 
         with self.assertRaises(ValueError):
             OFTStagingBackend(tm).prepare_activation(obj)
+
+
+class TestOFTStagingBackendVersioning(unittest.TestCase):
+    @staticmethod
+    def _tm():
+        from sglang.srt.oft.oft_registry import OFTRegistry
+
+        return SimpleNamespace(
+            peft_registry=OFTRegistry(),
+            peft_ref_cache={},
+            peft_update_lock=asyncio.Lock(),
+            pending_oft_stage=None,
+            failed_oft_activations={},
+        )
+
+    def test_rejects_equal_or_stale_versions_before_staging(self):
+        from sglang.srt.oft.oft_registry import OFTRef
+        from sglang.srt.oft.staged_manager import OFTStagingBackend
+
+        tm = self._tm()
+        active = OFTRef(
+            adapter_id="id-a",
+            adapter_name="policy",
+            adapter_path="__distributed__",
+            adapter_version=4,
+            reloadable=False,
+        )
+        asyncio.run(tm.peft_registry.register(active))
+        tm.peft_ref_cache[active.adapter_name] = active
+
+        for version in ("4", "3"):
+            obj = SimpleNamespace(
+                load_format="oft_adapter",
+                adapter_name="policy",
+                adapter_version=version,
+                adapter_id=None,
+            )
+            with self.assertRaisesRegex(ValueError, "newer than active version 4"):
+                asyncio.run(OFTStagingBackend(tm).reserve_stage(obj))
+
+    def test_publishes_the_exact_requested_version_only_after_worker_agreement(self):
+        from sglang.srt.managers.io_struct import ActivateAdapterVersionReqOutput
+        from sglang.srt.oft.oft_registry import OFTRef
+        from sglang.srt.oft.staged_manager import OFTStagingBackend
+
+        tm = self._tm()
+        active = OFTRef(
+            adapter_id="id-a",
+            adapter_name="policy",
+            adapter_path="__distributed__",
+            adapter_version=2,
+            reloadable=False,
+        )
+        asyncio.run(tm.peft_registry.register(active))
+        tm.peft_ref_cache[active.adapter_name] = active
+        backend = OFTStagingBackend(tm)
+        obj = SimpleNamespace(
+            load_format="oft_adapter",
+            adapter_name="policy",
+            adapter_version="7",
+            adapter_id=None,
+        )
+
+        asyncio.run(backend.reserve_stage(obj))
+        self.assertEqual(
+            tm.peft_registry.get_all_adapters()["policy"].adapter_version, 2
+        )
+        success, _ = asyncio.run(
+            backend.finish_activation(
+                obj,
+                [
+                    ActivateAdapterVersionReqOutput(
+                        success=True,
+                        message="activated",
+                        active_adapter_version="7",
+                    )
+                ],
+            )
+        )
+
+        self.assertTrue(success)
+        published = tm.peft_registry.get_all_adapters()["policy"]
+        self.assertEqual((published.adapter_id, published.adapter_version), ("id-a", 7))
+        self.assertIsNone(tm.pending_oft_stage)
+
+    def test_worker_version_disagreement_does_not_publish(self):
+        from sglang.srt.managers.io_struct import ActivateAdapterVersionReqOutput
+        from sglang.srt.oft.staged_manager import OFTStagingBackend
+
+        tm = self._tm()
+        backend = OFTStagingBackend(tm)
+        obj = SimpleNamespace(
+            load_format="oft_adapter",
+            adapter_name="policy",
+            adapter_version="7",
+            adapter_id=None,
+        )
+        asyncio.run(backend.reserve_stage(obj))
+
+        success, message = asyncio.run(
+            backend.finish_activation(
+                obj,
+                [
+                    ActivateAdapterVersionReqOutput(
+                        success=True,
+                        message="wrong version",
+                        active_adapter_version="6",
+                    )
+                ],
+            )
+        )
+
+        self.assertFalse(success)
+        self.assertIn("worker active versions", message)
+        self.assertEqual(tm.peft_registry.get_all_adapters(), {})
+        self.assertIn("policy", tm.failed_oft_activations)
+
+
+class TestExpertOFTRejection(unittest.TestCase):
+    def test_init_rejects_expert_targets_until_routing_is_request_aware(self):
+        from sglang.srt.oft.oft_manager import OFTManager
+
+        manager = object.__new__(OFTManager)
+        manager.refs = {}
+        manager.init_oft_adapters = MagicMock()
+        manager.init_oft_shapes = MagicMock()
+        manager.init_oft_modules = MagicMock()
+        manager._install_moe_oft_wrappers = MagicMock(return_value=1)
+
+        with self.assertRaisesRegex(ValueError, "request-aware"):
+            manager.init_state(max_oft_block_size=4, target_modules=["w1"])
 
 
 if __name__ == "__main__":

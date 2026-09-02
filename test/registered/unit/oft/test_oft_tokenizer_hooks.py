@@ -26,6 +26,7 @@ def test_evicted_wire_adapter_requires_a_fresh_native_load():
         tokenizer_manager = SimpleNamespace(
             peft_registry=registry,
             peft_ref_cache={ref.adapter_name: ref},
+            failed_oft_activations={},
             load_oft_adapter=reject_disk_load,
         )
         request = SimpleNamespace(
@@ -58,6 +59,7 @@ def test_resolver_uses_one_atomic_id_and_version_snapshot():
         tokenizer_manager = SimpleNamespace(
             peft_registry=registry,
             peft_ref_cache={ref.adapter_name: ref},
+            failed_oft_activations={},
         )
         request = SimpleNamespace(
             adapter_path=ref.adapter_name,
@@ -70,6 +72,33 @@ def test_resolver_uses_one_atomic_id_and_version_snapshot():
         assert request.adapter_id == ref.adapter_id
         assert request.adapter_version == 7
         await registry.release(request.adapter_id)
+
+    asyncio.run(run())
+
+
+def test_resolver_rejects_an_adapter_quarantined_after_partial_activation():
+    async def run():
+        registry = OFTRegistry()
+        ref = OFTRef(
+            adapter_name="adapter",
+            adapter_path="__distributed__",
+            adapter_version=7,
+            reloadable=False,
+        )
+        await registry.register(ref)
+        tokenizer_manager = SimpleNamespace(
+            peft_registry=registry,
+            peft_ref_cache={ref.adapter_name: ref},
+            failed_oft_activations={ref.adapter_name: "partial activation"},
+        )
+        request = SimpleNamespace(
+            adapter_path=ref.adapter_name,
+            adapter_id=None,
+            adapter_version=None,
+        )
+
+        with pytest.raises(ValueError, match="restart required"):
+            await resolve_oft_path(tokenizer_manager, request)
 
     asyncio.run(run())
 
@@ -88,6 +117,7 @@ def test_resolver_attaches_oft_identity_and_version_to_embedding_request():
         tokenizer_manager = SimpleNamespace(
             peft_registry=registry,
             peft_ref_cache={ref.adapter_name: ref},
+            failed_oft_activations={},
         )
         request = EmbeddingReqInput(text="hello", adapter_path="policy")
 

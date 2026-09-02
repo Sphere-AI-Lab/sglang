@@ -186,10 +186,14 @@ def stage_adapter(
     return NOT_HANDLED
 
 
-def activate_adapter(model_runner: "ModelRunner", adapter_name: str, version):
+def activate_adapter(
+    model_runner: "ModelRunner", adapter_name: str, version, adapter_id=None
+):
     """Activate the staged OFT identity, or return ``NOT_HANDLED`` if disabled."""
     if model_runner.server_args.peft_method == "oft":
-        return model_runner.oft_manager.activate_adapter(adapter_name, version)
+        return model_runner.oft_manager.activate_adapter(
+            adapter_name, version, adapter_id=adapter_id
+        )
     return NOT_HANDLED
 
 

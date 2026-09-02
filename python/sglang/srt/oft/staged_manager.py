@@ -3,13 +3,16 @@ hidden memory-pool slot, alongside B1's existing multi-tenant admission and
 eviction (unaffected by this file)."""
 
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.oft.base.mem_pool import EMPTY_SLOT
 from sglang.srt.oft.mem_pool import OFTMemoryPool
 from sglang.srt.oft.oft import OFTAdapter
 from sglang.srt.oft.oft_config import OFTConfig
 from sglang.srt.oft.oft_manager import OFTManager
+from sglang.srt.oft.oft_registry import OFTRef
 
 if TYPE_CHECKING:
     from sglang.srt.oft.io_types import OFTUpdateOutput
@@ -133,14 +136,22 @@ class PendingOFTStage:
     left to do after the pool-level copy has already succeeded.
     """
 
-    __slots__ = ("uid", "version", "config", "adapter", "name")
+    __slots__ = (
+        "uid",
+        "version",
+        "config",
+        "adapter",
+        "name",
+        "ref",
+    )
 
-    def __init__(self, uid, version, config, adapter, name):
+    def __init__(self, uid, version, config, adapter, name, ref):
         self.uid = uid
         self.version = version
         self.config = config
         self.adapter = adapter
         self.name = name
+        self.ref = ref
 
 
 class StagedOFTManager(OFTManager):
@@ -321,6 +332,12 @@ class StagedOFTManager(OFTManager):
             # from_dict -> validate -> _create_lora_adapter_from_tensors, all
             # strictly before memory_pool.stage(...).
             oft_config = OFTConfig.from_dict(config)
+            old_ref = self.refs.get(uid)
+            if old_ref is not None and version <= old_ref.adapter_version:
+                raise ValueError(
+                    f"OFT adapter version {version} must be newer than active "
+                    f"version {old_ref.adapter_version}."
+                )
             oft_adapter = OFTAdapter(
                 uid, oft_config, self.base_hf_config, self.load_config, self.oft_backend
             )
@@ -328,6 +345,24 @@ class StagedOFTManager(OFTManager):
 
             staged_dense, fused_expert_chunk, block_size = (
                 self._partition_and_precompute(named_tensors, config)
+            )
+            destination = self.memory_pool.uid_to_buffer_id.get(uid)
+            reserved_new_slot = destination is None
+            evicted_uid = None
+            if reserved_new_slot:
+                destination, evicted_uid = (
+                    self.memory_pool.allocate_buffer_slot_with_eviction(self.refs)
+                )
+                self.memory_pool.uid_to_buffer_id[uid] = destination
+                self.memory_pool.buffer_id_to_uid[destination] = uid
+
+            pending_ref = OFTRef(
+                adapter_id=uid,
+                adapter_name=name,
+                adapter_path="__distributed__",
+                pinned=old_ref.pinned if old_ref is not None else False,
+                adapter_version=version,
+                reloadable=False,
             )
             # memory_pool.stage()/apply_streamed_expert_oft() are the two
             # calls that actually mutate the hidden staging slot; either can
@@ -361,6 +396,14 @@ class StagedOFTManager(OFTManager):
                     # discard and this would raise "the staging slot is
                     # empty" -- the original mutation_error is what matters.
                     pass
+                if reserved_new_slot:
+                    self.memory_pool.uid_to_buffer_id.pop(uid, None)
+                    if evicted_uid is None:
+                        self.memory_pool.buffer_id_to_uid[destination] = EMPTY_SLOT
+                    else:
+                        self.memory_pool.uid_to_buffer_id[evicted_uid] = destination
+                        self.memory_pool.buffer_id_to_uid[destination] = evicted_uid
+                        self.memory_pool.eviction_policy.mark_used(evicted_uid)
                 raise mutation_error
 
             self._pending_oft_stage = PendingOFTStage(
@@ -369,6 +412,7 @@ class StagedOFTManager(OFTManager):
                 config=oft_config,
                 adapter=oft_adapter,
                 name=name,
+                ref=pending_ref,
             )
         except Exception as error:
             return self.create_oft_update_result(
@@ -425,6 +469,8 @@ class StagedOFTManager(OFTManager):
         # `self.configs[uid] = pending.config; self.loras[uid] = pending.adapter`.
         self.configs[uid] = pending.config
         self.adapters[uid] = pending.adapter
+        self.refs[uid] = pending.ref
+        self.memory_pool.eviction_policy.mark_used(uid)
 
         # No discard_stage() call here, unlike StagedLoRAManager: unlike
         # StagedLoRAMemoryPool.activate (which leaves _staged_uid/_staged_
@@ -441,39 +487,134 @@ from sglang.srt.adapter_sync.tokenizer_backend import AdapterStagingBackend
 
 
 class OFTStagingBackend(AdapterStagingBackend):
-    """Tokenizer-layer staging for OFT, wrapping the existing peft_tokenizer_hooks
-    registry logic rather than reimplementing it -- OFT's tokenizer-side
-    registration/version-bump behavior does not change with this refactor,
-    only how it's selected."""
+    """Tokenizer-layer two-phase staging for canonical OFT."""
 
     def __init__(self, tm):
         self._tm = tm
 
     async def reserve_stage(self, obj) -> None:
-        from sglang.srt.oft import tokenizer_hooks
+        async with self._tm.peft_update_lock:
+            await self._reserve_locked(obj)
 
-        await tokenizer_hooks.register_oft_ref(self._tm, obj)
+    async def _reserve_locked(self, obj) -> None:
+        if obj.load_format != "oft_adapter" or not obj.adapter_name:
+            raise ValueError(
+                "canonical OFT staging requires load_format=oft_adapter "
+                "and adapter_name"
+            )
+        try:
+            version = int(obj.adapter_version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "canonical OFT staging requires an integer adapter_version"
+            ) from exc
+        if obj.adapter_name in self._tm.failed_oft_activations:
+            raise ValueError(
+                f"OFT adapter '{obj.adapter_name}' is quarantined; restart required"
+            )
+
+        pending = self._tm.pending_oft_stage
+        if pending is not None:
+            if (
+                pending.adapter_name == obj.adapter_name
+                and pending.adapter_version == version
+            ):
+                obj.adapter_id = pending.adapter_id
+                return
+            raise ValueError(
+                "staging slot already reserved for "
+                f"name={pending.adapter_name} id={pending.adapter_id} "
+                f"version={pending.adapter_version}"
+            )
+
+        active = self._tm.peft_registry.get_all_adapters().get(obj.adapter_name)
+        if active is not None and version <= active.adapter_version:
+            raise ValueError(
+                f"OFT adapter version {version} must be newer than active "
+                f"version {active.adapter_version}."
+            )
+        if active is None:
+            candidate = OFTRef(
+                adapter_name=obj.adapter_name,
+                adapter_path="__distributed__",
+                pinned=False,
+                adapter_version=version,
+                reloadable=False,
+            )
+        else:
+            candidate = replace(
+                active,
+                adapter_path="__distributed__",
+                adapter_version=version,
+                reloadable=False,
+            )
+
+        self._tm.pending_oft_stage = candidate
+        obj.adapter_id = candidate.adapter_id
 
     def prepare_activation(self, obj) -> None:
-        # A real client's obj.adapter_id defaults to None -- it has no way to
-        # know the server-minted id -- so this must resolve it here the same
-        # way register_oft_ref does (oft/tokenizer_hooks.py), or
-        # StagedOFTManager.activate_adapter's `uid = adapter_id if adapter_id
-        # is not None else name` falls back to obj.adapter_name, which never
-        # matches the UUID stage_adapter recorded for this adapter. No
-        # separate pre-activation validation exists beyond this identity
-        # resolution in the current peft_tokenizer_hooks flow.
-        if obj.adapter_name not in self._tm.peft_ref_cache:
+        try:
+            version = int(obj.adapter_version)
+        except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"Cannot activate name={obj.adapter_name}; no OFT adapter "
-                "with that name is registered"
+                "canonical OFT activation requires an integer adapter_version"
+            ) from exc
+        pending = self._tm.pending_oft_stage
+        if pending is None or (
+            pending.adapter_name,
+            pending.adapter_version,
+        ) != (obj.adapter_name, version):
+            detail = (
+                "no OFT stage is pending"
+                if pending is None
+                else f"pending name={pending.adapter_name} id={pending.adapter_id} "
+                f"version={pending.adapter_version}"
             )
-        obj.adapter_id = self._tm.peft_ref_cache[obj.adapter_name].adapter_id
+            raise ValueError(
+                f"Cannot activate name={obj.adapter_name} version={version}; {detail}"
+            )
+        obj.adapter_id = pending.adapter_id
+
+    async def _publish(self) -> None:
+        pending = self._tm.pending_oft_stage
+        if pending is None:
+            raise RuntimeError("No OFT stage is pending for publication")
+        registered = self._tm.peft_registry.get_all_adapters().get(
+            pending.adapter_name
+        )
+        if registered is None:
+            await self._tm.peft_registry.register(pending)
+        else:
+            await self._tm.peft_registry.refresh(pending)
+        self._tm.peft_ref_cache[pending.adapter_name] = pending
+        self._tm.failed_oft_activations.pop(pending.adapter_name, None)
+        self._tm.pending_oft_stage = None
 
     async def finish_activation(self, obj, results):
         from sglang.srt.managers.communicator import FanOutCommunicator
-        from sglang.srt.oft import tokenizer_hooks
 
+        pending = self._tm.pending_oft_stage
+        if pending is None:
+            raise RuntimeError("No OFT stage is pending during activation")
         success, message = FanOutCommunicator.merge_results(results)
-        message += await tokenizer_hooks.bump_oft_version(self._tm, obj, success)
-        return success, message
+        expected_version = int(obj.adapter_version)
+
+        def version_matches(result) -> bool:
+            try:
+                return int(result.active_adapter_version) == expected_version
+            except (TypeError, ValueError):
+                return False
+
+        versions_match = bool(results) and all(version_matches(r) for r in results)
+        if success and versions_match:
+            await self._publish()
+            return True, message
+
+        active_versions = [getattr(r, "active_adapter_version", None) for r in results]
+        failure = (
+            "OFT activation consistency failure for "
+            f"adapter '{pending.adapter_name}' version={pending.adapter_version}: "
+            f"{message}; worker active versions={active_versions}; restart required"
+        )
+        self._tm.failed_oft_activations[pending.adapter_name] = failure
+        return False, failure
