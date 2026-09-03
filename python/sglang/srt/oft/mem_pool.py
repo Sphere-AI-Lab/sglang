@@ -691,6 +691,7 @@ class OFTMemoryPool(AdapterMemPool):
         oft_refs: Dict[str, OFTRef],
         oft_embed_tokens_module: Optional[BaseLayerWithOFT],
         oft_lm_head_module: Optional[BaseLayerWithOFT],
+        expert_loader: Optional[Callable[[OFTAdapter, int], None]] = None,
     ):
         # Mark all adapters in current batch as used (for LRU tracking)
         for uid in cur_uids:
@@ -704,14 +705,20 @@ class OFTMemoryPool(AdapterMemPool):
             if uid not in self.uid_to_buffer_id:
                 buffer_id = self._acquire_buffer_slot(cur_uids, oft_refs)
                 oft_adapter = oft_adapters.get(uid, None)
-                self.load_oft_weight_to_buffer(
-                    uid,
-                    buffer_id,
-                    oft_adapter,
-                    oft_modules,
-                    oft_embed_tokens_module,
-                    oft_lm_head_module,
-                )
+                try:
+                    self.load_oft_weight_to_buffer(
+                        uid,
+                        buffer_id,
+                        oft_adapter,
+                        oft_modules,
+                        oft_embed_tokens_module,
+                        oft_lm_head_module,
+                    )
+                    if expert_loader is not None and oft_adapter is not None:
+                        expert_loader(oft_adapter, buffer_id)
+                except Exception:
+                    self.reset_buffer_slot_to_identity(buffer_id)
+                    raise
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
 
@@ -1167,10 +1174,23 @@ class OFTMemoryPool(AdapterMemPool):
             _fill_identity(self.embedding_R_buffer[k][buffer_id], bs)
         for k in self.lm_head_R_buffer:
             _fill_identity(self.lm_head_R_buffer[k][buffer_id], bs)
+        for group_name in ("w1_oft_r", "w3_oft_r", "w13_oft_r", "w2_oft_r"):
+            for tensor in self._groups.get(group_name, {}).values():
+                slot = tensor[buffer_id]
+                slot.zero_()
+                if bs > 0:
+                    eye = torch.eye(bs, dtype=slot.dtype, device=slot.device)
+                    slot[:, :, :, :] = eye
 
     def get_tensor(self, target_module: str, layer_id: int) -> torch.Tensor:
         """Get the R buffer tensor for a given module and layer."""
         return self.R_buffer[target_module][layer_id]
+
+    def get_expert_tensor(
+        self, group_name: str, layer_id: int
+    ) -> Optional[torch.Tensor]:
+        """Get the full slot group for one expert OFT projection and layer."""
+        return self._groups.get(group_name, {}).get(layer_id)
 
     def get_embedding_tensor(
         self, target_module: str

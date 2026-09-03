@@ -1041,6 +1041,25 @@ class FusedMoEWithOFT(nn.Module):
         # The runner builds make_oft_invoke(self._peft_layer, ...) from the live buffers.
         self._oft_runner._peft_layer = base_layer
 
+        self.w13_oft_r = None
+        self.w1_oft_r = None
+        self.w3_oft_r = None
+        self.w2_oft_r = None
+
+    def set_oft_info(
+        self,
+        *,
+        w13_oft_r,
+        w1_oft_r,
+        w3_oft_r,
+        w2_oft_r,
+    ) -> None:
+        """Bind the full slot groups used for request-routed expert OFT."""
+        self.w13_oft_r = w13_oft_r
+        self.w1_oft_r = w1_oft_r
+        self.w3_oft_r = w3_oft_r
+        self.w2_oft_r = w2_oft_r
+
     def forward(self, hidden_states, topk_output, **kwargs):
         # KNOWN LIMITATION: this reads one shared set of expert-OFT weights
         # (base_layer.w13_oft_r/w2_oft_r etc.) for the whole batch -- no

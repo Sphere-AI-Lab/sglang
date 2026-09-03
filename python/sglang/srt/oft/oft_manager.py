@@ -701,6 +701,7 @@ class OFTManager(AdapterManager):
             oft_refs=self.refs.copy(),
             oft_embed_tokens_module=self.embed_tokens_module,
             oft_lm_head_module=self.lm_head_module,
+            expert_loader=self._set_expert_oft,
         )
 
     def prepare_oft_batch(self, forward_batch: ForwardBatch):
@@ -742,7 +743,22 @@ class OFTManager(AdapterManager):
         )
 
     def update_oft_info(self):
-        return self.update_info()
+        self.update_info()
+
+        from sglang.srt.oft.layers import FusedMoEWithOFT
+
+        for name, module in self.base_model.named_modules():
+            if not isinstance(module, FusedMoEWithOFT):
+                continue
+            layer_id = get_layer_id(name)
+            if layer_id is None:
+                continue
+            module.set_oft_info(
+                w13_oft_r=self.memory_pool.get_expert_tensor("w13_oft_r", layer_id),
+                w1_oft_r=self.memory_pool.get_expert_tensor("w1_oft_r", layer_id),
+                w3_oft_r=self.memory_pool.get_expert_tensor("w3_oft_r", layer_id),
+                w2_oft_r=self.memory_pool.get_expert_tensor("w2_oft_r", layer_id),
+            )
 
     def _set_module_info(self, module, target_module, layer_id):
         module.set_oft_info(
@@ -957,13 +973,6 @@ class OFTManager(AdapterManager):
 
         self.adapters[oft_ref.adapter_id] = oft_adapter
 
-        # Set expert OFT weights on FusedMoE layers if present
-        if any(
-            hasattr(layer, "expert_weights") and layer.expert_weights
-            for layer in oft_adapter.layers
-        ):
-            self._set_expert_oft(oft_adapter)
-
     def load_oft_weights_from_tensors(
         self, oft_ref: OFTRef, tensors: Dict[str, torch.Tensor]
     ):
@@ -979,13 +988,6 @@ class OFTManager(AdapterManager):
         )
         oft_adapter.initialize_weights_from_tensors(tensors)
         self.adapters[oft_ref.adapter_id] = oft_adapter
-
-        # Set expert OFT weights on FusedMoE layers if present
-        if any(
-            hasattr(layer, "expert_weights") and layer.expert_weights
-            for layer in oft_adapter.layers
-        ):
-            self._set_expert_oft(oft_adapter)
 
     def init_memory_pool(self):
         """(Re)initialize the OFT memory pool based on the current configurations."""
@@ -1283,13 +1285,15 @@ class OFTManager(AdapterManager):
                 "Initialized identity expert OFT buffers for CUDA graph capture."
             )
 
-    def _apply_expert_oft_to_module(self, moe, ew_dict, block_size, layer_id=None):
-        """Compute and assign w13_oft_r / w2_oft_r on a single FusedMoE module.
+    def _apply_expert_oft_to_module(
+        self, moe, ew_dict, block_size, layer_id, slot_idx
+    ):
+        """Compute and store expert OFT rotations in one pool slot.
 
         ew_dict: {global_expert_id: {"gate_proj.oft_R": tensor,
                                      "down_proj.oft_R": tensor}}.
-        Block-diagonal R is kept as external PEFT — only writes
-        moe.w13_oft_r / moe.w2_oft_r, never base w13_weight / w2_weight.
+        Block-diagonal R is kept as external PEFT — only writes the pool slot,
+        never base w13_weight / w2_weight or the legacy module-global reader.
 
         w13 R rotates hidden_size (input to gate/up); hidden_size is NOT
         TP-sharded, so no TP slicing. w2 R rotates intermediate_size
@@ -1408,20 +1412,19 @@ class OFTManager(AdapterManager):
             w2_oft_r = w2_oft_r.to(self.oft_r_dtype) if w2_oft_r is not None else None
 
         if is_split:
-            moe.w1_oft_r = w1_oft_r
-            moe.w3_oft_r = w3_oft_r
-            moe.w13_oft_r = None
+            self.memory_pool.slot("w1_oft_r", layer_id, slot_idx).copy_(w1_oft_r)
+            self.memory_pool.slot("w3_oft_r", layer_id, slot_idx).copy_(w3_oft_r)
         elif is_legacy:
-            # Legacy shared-R: promote the gate buffer to w13, clear w1/w3 so
-            # the runner does not enter the split path.
-            moe.w13_oft_r = w1_oft_r
-            moe.w1_oft_r = None
-            moe.w3_oft_r = None
+            self.memory_pool.slot("w13_oft_r", layer_id, slot_idx).copy_(w1_oft_r)
         if w2_oft_r is not None:
-            moe.w2_oft_r = w2_oft_r
+            self.memory_pool.slot("w2_oft_r", layer_id, slot_idx).copy_(w2_oft_r)
 
-    def _set_expert_oft(self, oft_adapter):
+    def _set_expert_oft(self, oft_adapter: OFTAdapter, slot_idx: int):
         """Set expert OFT R on FusedMoE layers from a disk-loaded adapter."""
+        if not any(
+            getattr(layer, "expert_weights", None) for layer in oft_adapter.layers
+        ):
+            return
         moe_modules = self._find_fused_moe_modules()
         if not moe_modules:
             return
@@ -1431,7 +1434,9 @@ class OFTManager(AdapterManager):
             if layer_id >= len(oft_adapter.layers):
                 continue
             ew_dict = oft_adapter.layers[layer_id].expert_weights
-            self._apply_expert_oft_to_module(moe, ew_dict, block_size, layer_id)
+            self._apply_expert_oft_to_module(
+                moe, ew_dict, block_size, layer_id, slot_idx
+            )
 
     def apply_streamed_expert_oft(self, expert_tensors, block_size, slot_idx=None):
         """Set FusedMoE expert OFT R from streamed-sync compact tensors.
