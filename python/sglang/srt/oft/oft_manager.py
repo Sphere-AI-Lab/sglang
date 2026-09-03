@@ -194,12 +194,12 @@ class OFTManager(AdapterManager):
         self.oft_r_dtype: torch.dtype = self._resolve_oft_r_dtype(
             dtype, server_args.oft_dtype
         )
-        # Single global split(canonical)-vs-fused signal (PEFTArgs.oft_type):
+        # Single global split(canonical)-vs-fused signal (OFTArgs.oft_type):
         # drives the MoE expert gate/up group layout the pool registers
         # (see OFTMemoryPool._declare_expert_groups) and the CUDA-graph
         # pre-alloc layout below (_init_identity_expert_oft_for_cuda_graph).
         self.oft_type: str = server_args.oft_type
-        # Double-buffer sizing signal (PEFTArgs.oft_double_buffer), threaded
+        # Double-buffer sizing signal (OFTArgs.oft_double_buffer), threaded
         # into OFTMemoryPool below so it reserves a staging slot iff set.
         self.oft_double_buffer: bool = server_args.oft_double_buffer
         # Read once here (Task 4's DP-attention guard in
@@ -320,7 +320,7 @@ class OFTManager(AdapterManager):
         False whenever no MoE-expert module has any OFT buffer at all
         (nothing to dual-capture for -- covers both "model has no MoE
         layers" and "OFT doesn't target expert modules", subsuming what
-        peft/config.py's pre-model-load _model_has_moe_layers probe can only
+        oft/config.py's pre-model-load _model_has_moe_layers probe can only
         approximate).
 
         Also False whenever a boot-loaded (--peft-paths) adapter already
@@ -604,15 +604,15 @@ class OFTManager(AdapterManager):
 
         REMAINING CAVEAT: the `2026-09-01-oft-moe-cuda-graph-dual-capture`
         plan's persistent routing buffer + dual-capture mechanism (Tasks
-        1-4, plus its Task 4b relaxation of `validate_peft_args`'s decode-
-        CUDA-graph guard in `peft/config.py`) makes decode-CUDA-graph replay
+        1-4, plus its Task 4b relaxation of `validate_oft_args`'s decode-
+        CUDA-graph guard in `oft/config.py`) makes decode-CUDA-graph replay
         safe for this (`oft_impl=sibling`) native-RPC path targeting MoE
         experts, PROVIDED the mechanism actually engages:
         `decode_cuda_graph_runner.py`'s `_resolve_record_oft_variant_graph`
         requires effective per-batch adapter capacity
         (`max_ofts_per_batch - 1`) to be >= 1. At `max_ofts_per_batch == 1`
         (no real adapter buffer slot exists at all), dual-capture never
-        engages and `validate_peft_args` still disables decode CUDA graphs
+        engages and `validate_oft_args` still disables decode CUDA graphs
         for that residual configuration -- not because the per-token routing
         tensor `_compute_moe_multi_tenant_slot_ids` builds is unsafe there
         (see that method's own docstring for the full mechanism), but
@@ -1507,7 +1507,7 @@ class OFTManager(AdapterManager):
         if not (init_w13 or init_w2):
             return
 
-        # oft_type (PEFTArgs.oft_type, threaded through server_args into
+        # oft_type (OFTArgs.oft_type, threaded through server_args into
         # self.oft_type) is the single global split-vs-fused signal -- see
         # plan Task 6. This layout HINT only applies to a module with nothing
         # loaded (CUDA-graph pre-alloc). The reliable signal for a module that

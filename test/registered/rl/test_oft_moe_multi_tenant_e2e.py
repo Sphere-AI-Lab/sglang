@@ -18,7 +18,7 @@
    currently impossible in this pool configuration (see final-review C1: a
    real dynamically-loaded adapter can never occupy buffer slot 0/active_idx
    in the plain native-RPC pool, so decode CUDA graphs are disabled for this
-   configuration entirely -- ``peft/config.py``'s ``validate_peft_args``)
+   configuration entirely -- ``oft/config.py``'s ``validate_oft_args``)
    and will get direct coverage once the ``2026-09-01-oft-moe-cuda-graph-
    dual-capture`` follow-up plan restores a working fast path for real
    adapters.

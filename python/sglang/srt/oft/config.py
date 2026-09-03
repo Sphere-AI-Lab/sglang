@@ -1,11 +1,11 @@
-"""PEFT (OFT) server-args config seam.
+"""OFT server-args config seam.
 
 Owns the OFT CLI flags, their defaults, the argparse Action, and validation, so
-``server_args.py`` shrinks to two call-outs — ``register_peft_args(parser)`` and
-``validate_peft_args(self)`` — and ``ServerArgs`` mixes in :class:`PEFTArgs` for the
+``server_args.py`` shrinks to two call-outs — ``register_oft_args(parser)`` and
+``validate_oft_args(self)`` — and ``ServerArgs`` mixes in :class:`OFTArgs` for the
 field declarations.
 
-``PEFTArgs`` is ``kw_only`` so it can be a base of ``ServerArgs`` (which has the
+``OFTArgs`` is ``kw_only`` so it can be a base of ``ServerArgs`` (which has the
 required positional ``model_path``) without the "non-default follows default"
 dataclass error; ``ServerArgs`` is built by keyword (``from_cli_args``), so the
 keyword-only OFT fields construct fine.
@@ -26,7 +26,7 @@ OFT_IMPL_CHOICES = ["sibling", "staged"]
 
 
 @dataclass(kw_only=True)
-class PEFTArgs:
+class OFTArgs:
     """OFT (Orthogonal Finetuning) server-arg fields, mixed into ServerArgs."""
 
     # Single-active PEFT method: None (off) | "oft". This one field replaces
@@ -95,21 +95,21 @@ class PEFTArgs:
         return self.peft_method is not None
 
 
-def register_peft_args(parser: argparse.ArgumentParser) -> None:
+def register_oft_args(parser: argparse.ArgumentParser) -> None:
     """Register all OFT CLI flags on ``parser`` (was the OFT block of add_cli_args)."""
     # Single-active PEFT method selector (replaces the former --enable-oft /
     # --enable-peft-lora store_true pair).
     parser.add_argument(
         "--peft-method",
         type=str,
-        default=PEFTArgs.peft_method,
+        default=OFTArgs.peft_method,
         choices=["oft"],
         help="Single-active PEFT method: 'oft' (Orthogonal Finetuning). "
         "Distinct from upstream --enable-lora (multi-tenant).",
     )
     parser.add_argument(
         "--max-oft-block-size",
-        default=PEFTArgs.max_oft_block_size,
+        default=OFTArgs.max_oft_block_size,
         type=int,
         help="The maximum block size of OFT adapters. Required (together with "
         "--oft-target-modules) for OFT initialization.",
@@ -121,39 +121,39 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="The set of target modules where the active PEFT method is applied. "
         "'all' selects all supported modules (validated per-method in "
-        "validate_peft_args).",
+        "validate_oft_args).",
     )
     parser.add_argument(
         "--max-ofts-per-batch",
         type=int,
-        default=PEFTArgs.max_ofts_per_batch,
+        default=OFTArgs.max_ofts_per_batch,
         help="Maximum number of OFT adapters for a running batch, include base-only request.",
     )
     parser.add_argument(
         "--max-loaded-ofts",
         type=int,
-        default=PEFTArgs.max_loaded_ofts,
+        default=OFTArgs.max_loaded_ofts,
         help="If specified, limits the maximum number of OFT adapters loaded in the tokenizer-side registry at a time. The value must be greater than or equal to `--max-ofts-per-batch - 1` (buffer slot 0 is always reserved for the base/identity placeholder, so real per-batch adapter capacity is `--max-ofts-per-batch - 1`).",
     )
     parser.add_argument(
         "--oft-backend",
         type=str,
         choices=OFT_BACKEND_CHOICES,
-        default=PEFTArgs.oft_backend,
+        default=OFTArgs.oft_backend,
         help="Choose the kernel backend for multi-OFT serving.",
     )
     parser.add_argument(
         "--oft-dtype",
         type=str,
         choices=["auto", "model", "float32", "fp32", "bfloat16", "bf16", "float16", "fp16"],
-        default=PEFTArgs.oft_dtype,
+        default=OFTArgs.oft_dtype,
         help="Dtype for precomputed OFT rotation buffers. Defaults to the model dtype.",
     )
     parser.add_argument(
         "--oft-type",
         type=str,
         choices=OFT_TYPE_CHOICES,
-        default=PEFTArgs.oft_type,
+        default=OFTArgs.oft_type,
         help="OFT variant: 'canonical_oft' (default) uses independent per-"
         "sub-projection SPLIT rotations (orbit's only trained variant); "
         "'oft' uses the legacy shared-R FUSED rotation. Single global "
@@ -163,7 +163,7 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-oft-chunk-size",
         type=int,
-        default=PEFTArgs.max_oft_chunk_size,
+        default=OFTArgs.max_oft_chunk_size,
         choices=[16, 32, 64, 128],
         help="Maximum chunk size for the OFT backend. Choosing a larger value might improve performance.",
     )
@@ -171,7 +171,7 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--oft-double-buffer",
         action="store_true",
-        default=PEFTArgs.oft_double_buffer,
+        default=OFTArgs.oft_double_buffer,
         help="Reserve a staging slot and enable the double-buffer stage/activate "
              "adapter endpoints (async-RL NCCL weight-sync).",
     )
@@ -234,7 +234,7 @@ def _model_has_moe_layers(server_args) -> bool:
     )
 
 
-def validate_peft_args(server_args) -> None:
+def validate_oft_args(server_args) -> None:
     """Validate + normalize OFT server args in place (was check_oft_server_args)."""
     if server_args.peft_method not in (None, "oft"):
         raise ValueError(
@@ -474,6 +474,6 @@ def validate_peft_args(server_args) -> None:
             ), "--max-oft-chunk-size must be a power of 2 between 16 and 128."
 
         server_args._late_resolution(
-            "validate_peft_args",
+            "validate_oft_args",
             oft_target_modules=oft_target_modules,
         )

@@ -348,7 +348,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
 
         Note this also makes the tokenizer-side max_loaded_ofts LRU-eviction
         loop unreachable for a pure wire-adapter workload in a *successful*
-        load: validate_peft_args now requires max_loaded_ofts >=
+        load: validate_oft_args now requires max_loaded_ofts >=
         max_ofts_per_batch - 1, so the tokenizer-side cap can never bind
         before the GPU-side one does for adapters that (unlike disk-backed
         ones) can never be paged out once resident -- attempting to exceed

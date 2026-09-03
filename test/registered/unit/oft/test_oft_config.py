@@ -52,7 +52,7 @@ def _args(
         cuda_graph_config=cuda_graph_config,
         oft_impl=oft_impl,
     )
-    # Stand-in for ServerArgs._late_resolution: validate_peft_args writes its
+    # Stand-in for ServerArgs._late_resolution: validate_oft_args writes its
     # normalized oft_target_modules through this (real ServerArgs is
     # read-only by plain assignment once __post_init__ resolves it).
     ns._late_resolution = lambda source, **fields: ns.__dict__.update(fields)
@@ -73,24 +73,24 @@ def test_removed_lora_method_is_rejected_even_when_set_programmatically():
     """Regression: argparse's ``choices=["oft"]`` rejects ``--peft-method lora``
     on the CLI, but a caller that builds ``ServerArgs`` directly (e.g. an RL
     launcher passing ``peft_method="lora"`` as a kwarg) bypasses argparse
-    entirely and used to sail through ``validate_peft_args`` uncaught after
+    entirely and used to sail through ``validate_oft_args`` uncaught after
     srt/peft/lora was deleted -- silently no-op'ing to base-model-only serving
     instead of failing loudly."""
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     with pytest.raises(ValueError, match=r"--peft-method 'lora' is no longer supported"):
-        validate_peft_args(_args("lora", enable_lora=False))
+        validate_oft_args(_args("lora", enable_lora=False))
 
 
 def test_native_lora_and_single_active_peft_are_mutually_exclusive():
     """Catch the PEFT method initializing alongside native LoRA."""
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     with pytest.raises(
         ValueError,
         match=r"--enable-lora.*--peft-method.*mutually exclusive",
     ):
-        validate_peft_args(_args("oft"))
+        validate_oft_args(_args("oft"))
 
 
 @pytest.mark.parametrize(
@@ -101,9 +101,9 @@ def test_native_lora_and_single_active_peft_validate_independently(
     enable_lora, peft_method
 ):
     """Catch an over-broad guard that rejects either system on its own."""
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
-    validate_peft_args(_args(peft_method, enable_lora=enable_lora))
+    validate_oft_args(_args(peft_method, enable_lora=enable_lora))
 
 
 def test_max_loaded_ofts_must_be_at_least_max_ofts_per_batch_minus_one():
@@ -113,22 +113,22 @@ def test_max_loaded_ofts_must_be_at_least_max_ofts_per_batch_minus_one():
     real per-batch adapter capacity is max_ofts_per_batch - 1, not
     max_ofts_per_batch -- the bound must be checked against that real
     capacity, or the minimum legal configuration silently overcommits by one
-    slot (see C1's fix in peft/config.py).
+    slot (see C1's fix in oft/config.py).
     """
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     # max_loaded_ofts=2 is below max_ofts_per_batch - 1 == 3: must still fail.
     with pytest.raises(AssertionError, match=r"max_loaded_ofts should be greater than or equal"):
-        validate_peft_args(_args("oft", enable_lora=False, max_loaded_ofts=2, max_ofts_per_batch=4))
+        validate_oft_args(_args("oft", enable_lora=False, max_loaded_ofts=2, max_ofts_per_batch=4))
 
 
 def test_max_loaded_ofts_equal_to_max_ofts_per_batch_minus_one_is_legal():
     """The new minimum legal boundary (max_loaded_ofts == max_ofts_per_batch
     - 1) must be accepted -- regression guard for the fix that moved the
     bound from max_ofts_per_batch to max_ofts_per_batch - 1."""
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
-    validate_peft_args(
+    validate_oft_args(
         _args(
             "oft",
             enable_lora=False,
@@ -141,21 +141,21 @@ def test_max_loaded_ofts_equal_to_max_ofts_per_batch_minus_one_is_legal():
 def test_oft_target_modules_alone_works_as_canonical_flag():
     """--oft-target-modules must work as the canonical flag: the value lands
     on oft_target_modules unchanged (as a normalized set)."""
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
         "oft",
         enable_lora=False,
         oft_target_modules=["o_proj", "down_proj"],
     )
-    validate_peft_args(args)
+    validate_oft_args(args)
     assert args.oft_target_modules == {"o_proj", "down_proj"}
 
 
 def test_oft_double_buffer_alone_works_as_canonical_flag():
     """--oft-double-buffer must work as the canonical flag: the value lands
     on oft_double_buffer unchanged."""
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
         "oft",
@@ -163,7 +163,7 @@ def test_oft_double_buffer_alone_works_as_canonical_flag():
         max_ofts_per_batch=3,
         oft_double_buffer=True,
     )
-    validate_peft_args(args)
+    validate_oft_args(args)
     assert args.oft_double_buffer is True
 
 
@@ -194,7 +194,7 @@ def test_moe_target_oft_sibling_with_zero_capacity_disables_decode_cuda_graph():
     fast-path graph is captured), so this guard must still disable decode
     CUDA graphs for exactly this configuration."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
         "oft",
@@ -205,7 +205,7 @@ def test_moe_target_oft_sibling_with_zero_capacity_disables_decode_cuda_graph():
         model_has_moe=True,
         max_ofts_per_batch=1,
     )
-    validate_peft_args(args)
+    validate_oft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.DISABLED
 
 
@@ -223,7 +223,7 @@ def test_moe_target_oft_sibling_with_real_capacity_keeps_decode_cuda_graph_enabl
     MoE experts on an MoE model, making Tasks 1-4's whole mechanism dead code
     in production."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
         "oft",
@@ -234,7 +234,7 @@ def test_moe_target_oft_sibling_with_real_capacity_keeps_decode_cuda_graph_enabl
         model_has_moe=True,
         max_ofts_per_batch=2,
     )
-    validate_peft_args(args)
+    validate_oft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.FULL
 
 
@@ -249,7 +249,7 @@ def test_dense_target_oft_leaves_decode_cuda_graph_enabled():
     target-module check ({"o_proj"} has no MoE-expert overlap) must be what's
     actually doing it."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
         "oft",
@@ -260,7 +260,7 @@ def test_dense_target_oft_leaves_decode_cuda_graph_enabled():
         max_ofts_per_batch=1,
         model_has_moe=True,
     )
-    validate_peft_args(args)
+    validate_oft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.FULL
 
 
@@ -282,7 +282,7 @@ def test_dense_model_targeting_mlp_module_names_keeps_decode_cuda_graph(
     the capacity term alone (which by itself would WANT to disable) can't be
     what's keeping this enabled -- the model_has_moe=False check must be."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
         "oft",
@@ -293,7 +293,7 @@ def test_dense_model_targeting_mlp_module_names_keeps_decode_cuda_graph(
         model_has_moe=False,
         max_ofts_per_batch=1,
     )
-    validate_peft_args(args)
+    validate_oft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.FULL
 
 
@@ -306,7 +306,7 @@ def test_moe_target_oft_staged_impl_leaves_decode_cuda_graph_enabled():
     capacity term alone (which by itself would WANT to disable for sibling)
     can't be what's keeping this enabled -- oft_impl=staged must be."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
         "oft",
@@ -319,7 +319,7 @@ def test_moe_target_oft_staged_impl_leaves_decode_cuda_graph_enabled():
         model_has_moe=True,
         max_ofts_per_batch=1,
     )
-    validate_peft_args(args)
+    validate_oft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.FULL
 
 
@@ -337,7 +337,7 @@ def test_moe_target_oft_sibling_with_dp_attention_disables_decode_cuda_graph_eve
     the single fast-path graph alone does not guarantee a real adapter lands
     at memory_pool.active_idx the way the capacity-only case does."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
         "oft",
@@ -349,7 +349,7 @@ def test_moe_target_oft_sibling_with_dp_attention_disables_decode_cuda_graph_eve
         max_ofts_per_batch=4,
         enable_dp_attention=True,
     )
-    validate_peft_args(args)
+    validate_oft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.DISABLED
 
 
@@ -359,7 +359,7 @@ def test_moe_target_oft_sibling_without_dp_attention_and_with_capacity_keeps_dec
     enabled (Task 4b's relaxation must not be silently re-broken by adding
     the DP-attention term)."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
         "oft",
@@ -371,7 +371,7 @@ def test_moe_target_oft_sibling_without_dp_attention_and_with_capacity_keeps_dec
         max_ofts_per_batch=4,
         enable_dp_attention=False,
     )
-    validate_peft_args(args)
+    validate_oft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.FULL
 
 
@@ -379,11 +379,11 @@ def test_non_oft_server_leaves_decode_cuda_graph_enabled():
     """Negative case: peft_method=None (OFT disabled entirely) must never
     trip the MoE decode-graph guard."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
-    from sglang.srt.peft.config import validate_peft_args
+    from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
         None,
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
     )
-    validate_peft_args(args)
+    validate_oft_args(args)
     assert args.cuda_graph_config.decode.backend == Backend.FULL

@@ -275,8 +275,8 @@ class OFTMemoryPool(AdapterMemPool):
         self.external_target_modules: Set[str] = external_target_modules or set()
         self.oft_modules: Optional[List[Dict[str, BaseLayerWithOFT]]] = oft_modules
         self.oft_added_tokens_size: int = oft_added_tokens_size
-        # Single global split(canonical)-vs-fused signal (sglang.srt.peft.config.
-        # PEFTArgs.oft_type); drives which MoE expert gate/up group layout
+        # Single global split(canonical)-vs-fused signal (sglang.srt.oft.config.
+        # OFTArgs.oft_type); drives which MoE expert gate/up group layout
         # _declare_expert_groups registers (w1_oft_r+w3_oft_r split vs w13_oft_r
         # fused).
         self.oft_type: str = oft_type
@@ -575,7 +575,7 @@ class OFTMemoryPool(AdapterMemPool):
 
         ``w2_oft_r`` is registered ALWAYS (both oft_type layouts use it
         identically). For gate/up, ``self.oft_type`` (the single global
-        split-vs-fused signal, ``sglang.srt.peft.config.PEFTArgs.oft_type``)
+        split-vs-fused signal, ``sglang.srt.oft.config.OFTArgs.oft_type``)
         selects EXACTLY ONE layout: ``oft_type=="canonical_oft"`` registers the
         per-sub-projection SPLIT groups ``w1_oft_r`` (gate) / ``w3_oft_r`` (up)
         -- orbit's only trained variant; ``oft_type=="oft"`` registers the

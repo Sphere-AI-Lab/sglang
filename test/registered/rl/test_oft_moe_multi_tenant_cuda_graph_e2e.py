@@ -25,7 +25,7 @@ set ``disable_cuda_graph=True``. The base plan's own e2e test deliberately
 disabled CUDA graphs to avoid the exact bug this plan (2026-09-01-oft-moe-
 cuda-graph-dual-capture) fixes -- this file's whole point is to prove decode
 CUDA graphs now work correctly for this configuration. Confirmed (see this
-plan's Task 5 report) that peft/config.py's validate_peft_args decode-graph
+plan's Task 5 report) that oft/config.py's validate_oft_args decode-graph
 guard does NOT disable decode CUDA graphs for this config: effective adapter
 capacity is max_ofts_per_batch - 1 = 3 >= 1, and decode CUDA-graph capture's
 default batch-size bucket list ([1, 2, 4, 8, 12, ...],
@@ -92,7 +92,7 @@ ENGINE_KWARGS = dict(
     mem_fraction_static=0.6,
     # THE deliberate difference from test_oft_moe_multi_tenant_e2e.py: no
     # disable_cuda_graph=True here. Decode CUDA graphs stay enabled (the
-    # default) -- see module docstring for why validate_peft_args's guard
+    # default) -- see module docstring for why validate_oft_args's guard
     # does not disable them for this config (max_ofts_per_batch=4 gives
     # effective adapter capacity 3 >= 1), which is exactly the configuration
     # this plan's dual-capture mechanism (oft_manager.py's

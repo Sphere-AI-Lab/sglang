@@ -64,8 +64,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
     parse_cuda_graph_config_arg,
 )
+from sglang.srt.oft.config import OFTArgs, register_oft_args, validate_oft_args
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.peft.config import PEFTArgs, register_peft_args, validate_peft_args
 from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.true_on_policy.contracts import (
@@ -450,7 +450,7 @@ def add_linear_attn_kernel_backend_choices(choices):
 
 
 @dataclasses.dataclass
-class ServerArgs(PEFTArgs):
+class ServerArgs(OFTArgs):
     """Server-wide configuration for SGLang.
 
     Adding new arguments
@@ -8748,9 +8748,9 @@ class ServerArgs(PEFTArgs):
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
 
-        # PEFT (OFT / peft-lora) fields are bare-typed on PEFTArgs, so the
-        # auto-generator above skips them; register them manually here.
-        register_peft_args(parser)
+        # OFT fields are bare-typed on OFTArgs, so the auto-generator above
+        # skips them; register them manually here.
+        register_oft_args(parser)
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
@@ -9281,7 +9281,7 @@ class ServerArgs(PEFTArgs):
         self.check_lora_server_args()
 
         # Check PEFT (OFT / peft-lora)
-        validate_peft_args(self)
+        validate_oft_args(self)
 
         # Check speculative decoding
         if self.speculative_algorithm is not None:

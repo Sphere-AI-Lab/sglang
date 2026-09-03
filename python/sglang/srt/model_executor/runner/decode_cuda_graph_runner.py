@@ -651,7 +651,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
              unconditionally, and capture-time forcing (see 3 below) would
              trip that raise AT BOOT (capture), not runtime, the moment
              dual-capture engaged (final whole-branch review's C1).
-             peft/config.py's validate_peft_args disables decode CUDA
+             oft/config.py's validate_oft_args disables decode CUDA
              graphs outright for this combination for the identical reason
              -- dual-capture never engages here, and the single fast-path
              graph alone is not safe for it either (unlike the
@@ -663,7 +663,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
              of truth: ``oft_manager.moe_expert_oft_multi_tenant_ready()``
              (oft_manager.py), which is ground truth for both "does this
              server actually have MoE-expert OFT buffers at all" (subsuming
-             peft/config.py's pre-model-load target-module-set +
+             oft/config.py's pre-model-load target-module-set +
              HF-config-probe approximation, including the --peft-paths
              -inferred target-modules case that approximation cannot see)
              and "did a boot-loaded adapter leave any buffer's per-slot view
@@ -672,7 +672,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
              boot-loaded adapter targeting down_proj, leaves a gap that
              oft_moe_runners.py's dispatch raises on the moment capture-time
              forcing makes slot_ids non-None, i.e. at boot). Falls back to
-             re-deriving from server_args (reusing peft/config.py's own
+             re-deriving from server_args (reusing oft/config.py's own
              shared constants, not a second hand-copied literal) only when
              oft_manager is not available -- this cannot see the I1 gap
              (no model is loaded yet at that point) or --peft-paths
@@ -700,7 +700,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if not oft_manager.moe_expert_oft_multi_tenant_ready():
                 return False
         else:
-            from sglang.srt.peft.config import (
+            from sglang.srt.oft.config import (
                 _MOE_EXPERT_COUNT_CONFIG_ATTRS,
                 MOE_EXPERT_TARGET_MODULES,
             )
@@ -716,7 +716,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if not (targets_moe_experts and model_has_moe_layers):
                 return False
 
-        from sglang.srt.peft.config import effective_oft_capacity
+        from sglang.srt.oft.config import effective_oft_capacity
 
         return effective_oft_capacity(server_args) >= 1
 
