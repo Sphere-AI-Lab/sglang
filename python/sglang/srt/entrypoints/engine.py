@@ -1705,6 +1705,19 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.unload_oft_adapter(obj, None)
         )
 
+    async def async_load_oft_adapter(
+        self, adapter_name: str, adapter_path: str, pinned: bool = False
+    ):
+        """Asynchronous version of load_oft_adapter."""
+        from sglang.srt.oft.io_types import LoadOFTAdapterReqInput
+
+        obj = LoadOFTAdapterReqInput(
+            adapter_name=adapter_name,
+            adapter_path=adapter_path,
+            pinned=pinned,
+        )
+        return await self.tokenizer_manager.load_oft_adapter(obj, None)
+
     async def async_load_lora_adapter(
         self, lora_name: str, lora_path: str, pinned: bool = False
     ):

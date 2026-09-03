@@ -29,7 +29,12 @@ class _TokenizerRecorder:
         self.result = result or OFTUpdateOutput(success=True)
         self.tensor_request = None
         self.distributed_request = None
+        self.path_request = None
         self.embedding_request = None
+
+    async def load_oft_adapter(self, request, http_request):
+        self.path_request = request
+        return self.result
 
     async def load_oft_adapter_from_tensors(self, request, http_request):
         self.tensor_request = request
@@ -104,6 +109,27 @@ def test_engine_distributed_load_preserves_native_admission_options():
     assert request.group_name == "adapter-group"
     assert request.pinned is True
     assert request.upsert is True
+
+
+def test_engine_async_path_load_preserves_native_admission_options():
+    recorder = _TokenizerRecorder()
+    engine = _engine(recorder)
+    try:
+        result = asyncio.run(
+            engine.async_load_oft_adapter(
+                "adapter-c",
+                "/models/adapter-c",
+                pinned=True,
+            )
+        )
+    finally:
+        engine.loop.close()
+
+    assert result.success
+    request = recorder.path_request
+    assert request.adapter_name == "adapter-c"
+    assert request.adapter_path == "/models/adapter-c"
+    assert request.pinned is True
 
 
 def test_engine_encode_forwards_oft_path_sync_and_async():
@@ -221,6 +247,7 @@ def test_http_server_registers_native_oft_routes():
         if hasattr(route, "methods")
     }
 
+    assert route_methods["/load_oft_adapter"] == {"POST"}
     assert route_methods["/load_oft_adapter_from_tensors"] == {"POST"}
     assert route_methods["/load_oft_adapter_from_distributed"] == {"POST"}
     assert route_methods["/unload_oft_adapter"] == {"POST"}
