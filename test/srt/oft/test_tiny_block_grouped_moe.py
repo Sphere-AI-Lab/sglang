@@ -9,6 +9,7 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
 from sglang.srt.oft.backend.triton_backend import TritonOFTBackend
+from sglang.srt.oft.mem_pool import OFTMemoryPool
 from sglang.srt.oft.oft_moe_runners import (
     OFTInfo,
     _compute_oft_alignment,
@@ -264,6 +265,54 @@ def test_grouped_moe_direct_and_packed_match_torch(block_size):
     packed_error = (packed.float() - reference.float()).abs().max().item()
     assert direct_error <= TOL, f"BS={block_size} direct max_abs={direct_error:.2e}"
     assert packed_error <= TOL, f"BS={block_size} packed max_abs={packed_error:.2e}"
+
+
+def test_canonical_expert_unload_restores_gate_up_base_output():
+    block_size = 4
+    hidden_states, w13, _, _, topk_ids, routing = _fixture(block_size)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = routing
+    identity = (
+        torch.eye(block_size, device="cuda", dtype=torch.bfloat16)
+        .view(1, 1, block_size, block_size)
+        .expand(EXPERTS, HIDDEN // block_size, block_size, block_size)
+        .clone()
+    )
+    adapter_w1 = identity.clone()
+    adapter_w1[..., 0, 0] = -1
+    adapter_w3 = torch.flip(identity, dims=[-1])
+
+    pool = object.__new__(OFTMemoryPool)
+    pool.max_oft_block_size = block_size
+    pool.num_layer = 0
+    pool.embedding_R_buffer = {}
+    pool.lm_head_R_buffer = {}
+    pool._groups = {
+        "w1_oft_r": {0: torch.stack((identity, adapter_w1))},
+        "w3_oft_r": {0: torch.stack((identity, adapter_w3))},
+    }
+
+    def run_slot(slot_id):
+        return fused_split_w13_oft_grouped_moe(
+            hidden_states=hidden_states,
+            w13=w13,
+            w1_oft_r=pool.get_expert_tensor("w1_oft_r", 0)[slot_id],
+            w3_oft_r=pool.get_expert_tensor("w3_oft_r", 0)[slot_id],
+            topk_ids=topk_ids,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            block_m=BLOCK_M,
+        )
+
+    base_output = run_slot(0)
+    adapter_output = run_slot(1)
+    assert not torch.equal(adapter_output, base_output)
+
+    pool.reset_buffer_slot_to_identity(1)
+    post_unload_output = run_slot(1)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(post_unload_output, base_output, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("block_size", [4, 8, 16])
