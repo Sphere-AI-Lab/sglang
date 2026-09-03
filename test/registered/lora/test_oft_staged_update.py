@@ -277,13 +277,12 @@ class StagedOFTTestHarness:
             "sampling_params": {"temperature": 0, "max_new_tokens": 24},
         }
         if adapter is not None:
-            # OFT's per-request adapter field (single-active PEFT's
-            # "adapter_path", not native LoRA's "lora_path" -- see
-            # peft/tokenizer_hooks.py's _request_peft_path and
-            # GenerateReqInput's adapter_path field; the value passed is the
-            # adapter's NAME (the same name passed to stage()/activate()),
-            # not an on-disk path, since tm.oft_ref_cache is keyed by name).
-            payload["adapter_path"] = adapter
+            # OFT's per-request adapter field (GenerateReqInput's "oft_path",
+            # not native LoRA's "lora_path" -- see oft/tokenizer_mixin.py's
+            # _request_oft_path); the value passed is the adapter's NAME (the
+            # same name passed to stage()/activate()), not an on-disk path,
+            # since tm.oft_ref_cache is keyed by name.
+            payload["oft_path"] = adapter
         body = self._post("/generate", payload).json()
         return body["output_ids"]
 
