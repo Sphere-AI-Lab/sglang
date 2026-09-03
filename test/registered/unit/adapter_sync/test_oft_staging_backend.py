@@ -785,14 +785,6 @@ class TestWeightUpdaterStagedRouting(unittest.TestCase):
         runner.oft_manager.activate_adapter.assert_not_called()
 
 
-class TestOFTStagingBackendIsSymmetric(unittest.TestCase):
-    def test_implements_the_shared_interface(self):
-        from sglang.srt.adapter_sync.tokenizer_backend import AdapterStagingBackend
-        from sglang.srt.oft.staged_manager import OFTStagingBackend
-
-        self.assertTrue(issubclass(OFTStagingBackend, AdapterStagingBackend))
-
-
 class TestOFTStagingBackendPrepareActivation(unittest.TestCase):
     """Regression for round-1 review: a real client's obj.adapter_id defaults
     to None, so prepare_activation must resolve it from tm.peft_ref_cache

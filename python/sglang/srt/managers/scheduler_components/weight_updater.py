@@ -145,7 +145,8 @@ class SchedulerWeightUpdaterManager:
 
         LoRA still needs the flush: our single-active LoRA path names no adapter
         per request, so its keys have nothing to version by. It gets per-request
-        identity with the adapter_sync extension; until then, flush.
+        identity once per-adapter versioned staging exists for LoRA; until then,
+        flush.
 
         Ordering note: this does NOT replace the tokenizer-side drain
         (model_update_lock.writer_lock around activate). That drain prevents a

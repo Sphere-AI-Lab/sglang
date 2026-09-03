@@ -452,10 +452,7 @@ class StagedOFTManager(OFTManager):
         return self.create_oft_update_result(success=True)
 
 
-from sglang.srt.adapter_sync.tokenizer_backend import AdapterStagingBackend
-
-
-class OFTStagingBackend(AdapterStagingBackend):
+class OFTStagingBackend:
     """Tokenizer-layer staging for OFT, wrapping the existing peft_tokenizer_hooks
     registry logic rather than reimplementing it -- OFT's tokenizer-side
     registration/version-bump behavior does not change with this refactor,

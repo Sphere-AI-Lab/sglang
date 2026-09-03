@@ -2032,7 +2032,8 @@ class OFTManager(AdapterManager):
                 f"Streamed OFT update for '{name}' while other adapters are "
                 f"resident ({other_adapters}) is unsupported: the staged-update "
                 "path targets the single active slot. Hot-swap combined with "
-                "multi-tenant serving lands with the adapter_sync extension."
+                "multi-tenant serving needs per-adapter versioned staging, "
+                "not yet implemented."
             )
 
         fused_expert_chunk, dsv4_expert_chunk, dense_named_tensors = (

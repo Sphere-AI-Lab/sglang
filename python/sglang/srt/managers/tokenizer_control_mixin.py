@@ -568,7 +568,7 @@ class TokenizerControlMixin:
                 )
 
     def _staging_backend_for(self, obj):
-        from sglang.srt.adapter_sync.tokenizer_backend import get_staging_backend
+        from sglang.srt.managers.staging_backend import get_staging_backend
 
         return get_staging_backend(self, obj)
 
