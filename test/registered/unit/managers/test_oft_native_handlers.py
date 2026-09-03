@@ -426,7 +426,8 @@ class TestFinalizeOftLeaseNoOp(CustomTestCase):
         tm = SimpleNamespace(oft_registry=MagicMock())
         tm.oft_registry.release = AsyncMock()
         state = SimpleNamespace(
-            oft_lease_released=False, obj=SimpleNamespace(oft_id=None)
+            oft_lease_released=False,
+            obj=SimpleNamespace(oft_path=None, oft_id=None),
         )
 
         self._run(OFTTokenizerMixin.finalize_oft_lease, tm, state)
@@ -434,12 +435,11 @@ class TestFinalizeOftLeaseNoOp(CustomTestCase):
         tm.oft_registry.release.assert_not_awaited()
         self.assertFalse(state.oft_lease_released)
 
-    def test_no_op_when_request_type_has_no_adapter_id_field(self):
-        # EmbeddingReqInput never declares oft_id at all (OFT has no
-        # embedding support -- generate_request only calls
-        # maybe_resolve_oft_path under isinstance(obj, GenerateReqInput)),
-        # so state.obj can genuinely lack the attribute. Must getattr-guard
-        # this rather than assume the field exists.
+    def test_no_op_for_base_only_embedding_request(self):
+        # A base-only embedding request (oft_path/oft_id both default None)
+        # has nothing to release. EmbeddingReqInput declares both fields
+        # directly (mirrors GenerateReqInput), so this is a plain None
+        # check, not a getattr-guard against a genuinely missing attribute.
         tm = SimpleNamespace(oft_registry=MagicMock())
         tm.oft_registry.release = AsyncMock()
         state = SimpleNamespace(
@@ -457,6 +457,32 @@ class TestFinalizeOftLeaseNoOp(CustomTestCase):
             await asyncio.sleep(0)
 
         asyncio.run(run())
+
+
+class TestFinalizeOftLeaseReleasesForEmbeddingRequests(CustomTestCase):
+    """Regression guard for task #7 (OFT embedding support): before this,
+    EmbeddingReqInput never carried oft_path/oft_id at all, so an embedding
+    request naming an OFT adapter could never acquire (or release) a lease
+    -- max_loaded_ofts LRU eviction and unload_oft_adapter's wait_for_unload
+    would then wait forever for a usage count that could never reach zero
+    for adapters only ever served via /v1/embeddings."""
+
+    def test_releases_lease_for_embedding_request_naming_an_adapter(self):
+        tm = SimpleNamespace(oft_registry=MagicMock(), enable_oft=True)
+        tm.oft_registry.release = AsyncMock()
+        state = SimpleNamespace(
+            oft_lease_released=False,
+            obj=EmbeddingReqInput(text="hi", oft_path="a", oft_id="adapter-1"),
+        )
+
+        async def run():
+            OFTTokenizerMixin.finalize_oft_lease(tm, state)
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+
+        tm.oft_registry.release.assert_awaited_once_with("adapter-1")
+        self.assertTrue(state.oft_lease_released)
 
 
 class TestRegisterOftRefRollback(CustomTestCase):

@@ -257,6 +257,8 @@ class GenerateReqInput:
     # The path and resolved identity of single-active OFT adapters.
     oft_path: Optional[Union[List[Optional[str]], str]] = None
     oft_id: Optional[Union[List[Optional[str]], str]] = None
+    # Adapter weight version, resolved atomically with oft_id by tokenizer manager.
+    oft_version: Optional[Union[List[Optional[int]], int]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -926,6 +928,11 @@ class GenerateReqInput:
             ),
             oft_path=self.oft_path[i] if self.oft_path is not None else None,
             oft_id=self.oft_id[i] if self.oft_id is not None else None,
+            oft_version=(
+                self.oft_version[i]
+                if isinstance(self.oft_version, list)
+                else self.oft_version
+            ),
             custom_logit_processor=(
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
@@ -1162,6 +1169,11 @@ class EmbeddingReqInput:
     lora_id: Optional[Union[List[Optional[str]], str]] = None
     # Active weight version, resolved atomically with lora_id by tokenizer manager.
     lora_version: Optional[Union[List[Optional[int]], int]] = None
+    # The path and resolved identity of single-active OFT adapters.
+    oft_path: Optional[Union[List[Optional[str]], str]] = None
+    oft_id: Optional[Union[List[Optional[str]], str]] = None
+    # Adapter weight version, resolved atomically with oft_id by tokenizer manager.
+    oft_version: Optional[Union[List[Optional[int]], int]] = None
     # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     positional_embed_overrides: Any = None
@@ -1262,8 +1274,22 @@ class EmbeddingReqInput:
 
             self._normalize_lora_paths(self.batch_size)
             self._normalize_lora_versions(self.batch_size)
+            self._normalize_oft_paths(self.batch_size)
 
         self._validate_rid_uniqueness()
+
+    def _normalize_oft_paths(self, num):
+        """Normalize single-active OFT paths for batch processing."""
+        if self.oft_path is not None:
+            if isinstance(self.oft_path, str):
+                self.oft_path = [self.oft_path] * num
+            elif isinstance(self.oft_path, list):
+                if len(self.oft_path) != num:
+                    raise ValueError(
+                        f"oft_path list length ({len(self.oft_path)}) must match batch size ({num})"
+                    )
+            else:
+                raise ValueError("oft_path should be a list or a string.")
 
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
@@ -1328,6 +1354,13 @@ class EmbeddingReqInput:
                     if isinstance(self.lora_version, list)
                     else self.lora_version
                 ),
+                oft_path=self.oft_path[i] if self.oft_path is not None else None,
+                oft_id=self.oft_id[i] if self.oft_id is not None else None,
+                oft_version=(
+                    self.oft_version[i]
+                    if isinstance(self.oft_version, list)
+                    else self.oft_version
+                ),
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
@@ -1361,6 +1394,13 @@ class EmbeddingReqInput:
                     if isinstance(self.lora_version, list)
                     else self.lora_version
                 ),
+                oft_path=self.oft_path[i] if self.oft_path is not None else None,
+                oft_id=self.oft_id[i] if self.oft_id is not None else None,
+                oft_version=(
+                    self.oft_version[i]
+                    if isinstance(self.oft_version, list)
+                    else self.oft_version
+                ),
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
@@ -1391,6 +1431,13 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     sampling_params: SamplingParams
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
+
+    # Single-active OFT related
+    oft_id: Optional[str] = None  # None means just use the base model
+    # Adapter weight version at admission time, resolved tokenizer-side from
+    # the registry. Mirrors TokenizedGenerateReqInput.oft_version exactly.
+    oft_version: Optional[int] = None
+
     # Embedding overrides to place at specific token positions.
     positional_embed_overrides: Optional[PositionalEmbeds] = None
     # For DP routing

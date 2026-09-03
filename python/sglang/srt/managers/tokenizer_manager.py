@@ -840,8 +840,10 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                 # through upstream _validate_and_resolve_lora (which requires
                 # enable_lora). Upstream multi-tenant LoRA keeps the old path.
                 if self.enable_oft:
-                    # OFT adapter path only on GenerateReqInput (no embedding support).
-                    if isinstance(obj, GenerateReqInput):
+                    # Mirrors _resolve_lora_path's Union[GenerateReqInput,
+                    # EmbeddingReqInput] coverage -- obj is always one of these
+                    # two types at this call site.
+                    if isinstance(obj, (GenerateReqInput, EmbeddingReqInput)):
                         await self.maybe_resolve_oft_path(obj)
                 else:
                     await self._validate_and_resolve_lora(obj)
@@ -1469,7 +1471,7 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                 lora_id=obj.lora_id,
                 lora_version=obj.lora_version,
                 oft_id=obj.oft_id,
-                oft_version=getattr(obj, "oft_version", None),
+                oft_version=obj.oft_version,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
@@ -1517,6 +1519,8 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                 dimensions=obj.dimensions,
                 lora_id=obj.lora_id,
                 lora_version=obj.lora_version,
+                oft_id=obj.oft_id,
+                oft_version=obj.oft_version,
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,

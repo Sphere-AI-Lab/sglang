@@ -251,7 +251,7 @@ def _model_has_moe_layers(server_args) -> bool:
 
 def validate_oft_args(server_args) -> None:
     """Validate + normalize OFT server args in place (was check_oft_server_args)."""
-    if getattr(server_args, "oft_impl", "sibling") not in OFT_IMPL_CHOICES:
+    if server_args.oft_impl not in OFT_IMPL_CHOICES:
         raise ValueError(
             f"Invalid --oft-impl {server_args.oft_impl!r}; choose from {OFT_IMPL_CHOICES}."
         )

@@ -99,10 +99,13 @@ class OFTTokenizerMixin:
 
     def _request_oft_path(self: TokenizerManager, obj):
         """The peft adapter path a request carries (single-active: at most one of
-        oft_path/lora_path is set)."""
-        if getattr(obj, "oft_path", None):
+        oft_path/lora_path is set). oft_path/lora_path are declared on both
+        GenerateReqInput and EmbeddingReqInput with default None, so plain
+        attribute access is the contract (mirrors _finalize_lora_lease's
+        lora_path/lora_id None checks)."""
+        if obj.oft_path:
             return obj.oft_path
-        return getattr(obj, "lora_path", None)
+        return obj.lora_path
 
     def init_tokenizer_oft(self: TokenizerManager):
         """OFT registry bootstrap (replaces the former init_oft / init_lora split for
@@ -284,26 +287,23 @@ class OFTTokenizerMixin:
         unload_oft_adapter and the max_loaded_ofts LRU-eviction loop) would
         block forever on any adapter that ever served a request.
 
-        ``oft_path``/``oft_id`` live only on GenerateReqInput (peft has
-        no embedding support, see generate_request's isinstance guard), hence
-        the getattr instead of direct attribute access -- state.obj may be an
-        EmbeddingReqInput, which never declares either field. State-derived
-        checks come first, mirroring _finalize_lora_lease exactly: a request
-        without a lease has nothing to release, whatever the server config
-        says, and only then does the enable-check (self.enable_oft, mirroring
+        ``oft_path``/``oft_id`` are declared on both GenerateReqInput and
+        EmbeddingReqInput with default None, so plain attribute access is the
+        contract (mirrors _finalize_lora_lease's lora_path/lora_id None
+        checks exactly). State-derived checks come first: a request without a
+        lease has nothing to release, whatever the server config says, and
+        only then does the enable-check (self.enable_oft, mirroring
         _finalize_lora_lease's `not self.enable_lora`) gate the actual
         registry touch.
         """
         if state is None or state.oft_lease_released:
             return
-        oft_path = getattr(state.obj, "oft_path", None)
-        oft_id = getattr(state.obj, "oft_id", None)
-        if oft_path is None or oft_id is None:
+        if state.obj.oft_path is None or state.obj.oft_id is None:
             return
         if not self.enable_oft:
             return
         state.oft_lease_released = True
-        asyncio.create_task(self.oft_registry.release(oft_id))
+        asyncio.create_task(self.oft_registry.release(state.obj.oft_id))
 
     async def load_oft_adapter(
         self: TokenizerManager,
