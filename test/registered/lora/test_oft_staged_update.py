@@ -175,7 +175,7 @@ class StagedOFTTestHarness:
         self.base_gpu_id = base_gpu_id
         self.tp_size = tp_size
         self.url = url
-        self.master_port = _free_port()
+        self.master_port = None
         self.group = None
 
         args = [
@@ -214,29 +214,46 @@ class StagedOFTTestHarness:
         response.raise_for_status()
         return response
 
-    def _init_group(self):
+    def _init_group(self, max_attempts=5):
+        """Retries with a fresh port on failure: a port that _free_port()
+        found free can still lose a bind race to an unrelated process on a
+        busy shared machine between the probe and the real NCCL rendezvous
+        bind moments later. Each attempt is a clean, independent try -- a
+        failed attempt never establishes self.group, so there is nothing to
+        tear down before retrying with a new port."""
         world_size = self.tp_size + 1
-        payload = {
-            "master_address": "127.0.0.1",
-            "master_port": str(self.master_port),
-            "rank_offset": self.base_gpu_id,
-            "world_size": world_size,
-            "group_name": GROUP_NAME,
-            "backend": "nccl",
-        }
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                self._post, "/init_weights_update_group", payload
-            )
-            self.group = init_custom_process_group(
-                backend="nccl",
-                init_method=f"tcp://127.0.0.1:{self.master_port}",
-                world_size=world_size,
-                rank=0,
-                group_name=GROUP_NAME,
-            )
-            result = future.result().json()
-        self.testcase.assertTrue(result["success"], result)
+        last_error = None
+        for _ in range(max_attempts):
+            self.master_port = _free_port()
+            payload = {
+                "master_address": "127.0.0.1",
+                "master_port": str(self.master_port),
+                "rank_offset": self.base_gpu_id,
+                "world_size": world_size,
+                "group_name": GROUP_NAME,
+                "backend": "nccl",
+            }
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        self._post, "/init_weights_update_group", payload
+                    )
+                    self.group = init_custom_process_group(
+                        backend="nccl",
+                        init_method=f"tcp://127.0.0.1:{self.master_port}",
+                        world_size=world_size,
+                        rank=0,
+                        group_name=GROUP_NAME,
+                    )
+                    result = future.result().json()
+                self.testcase.assertTrue(result["success"], result)
+                return
+            except Exception as e:
+                last_error = e
+        raise RuntimeError(
+            f"Failed to init the weights-update process group after "
+            f"{max_attempts} attempts (last port {self.master_port}): {last_error}"
+        )
 
     def stage(self, name, version, tensors, *, double_buffer=True):
         payload = _stage_payload(name, version, tensors, double_buffer=double_buffer)
