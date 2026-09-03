@@ -17,6 +17,7 @@ from sglang.srt.oft.io_types import (
 )
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
+    GenerateReqInput,
     TokenizedEmbeddingReqInput,
 )
 
@@ -145,6 +146,39 @@ def test_batched_embedding_preserves_resolved_oft_identity_per_item():
         None,
         None,
     )
+
+
+def test_batched_generation_preserves_resolved_oft_version_per_item():
+    request = GenerateReqInput(text=["adapted", "base"])
+    request.normalize_batch_and_arguments()
+    request.adapter_id = ["id-a", None]
+    request.adapter_version = [7, None]
+
+    assert request[0].adapter_version == 7
+    assert request[1].adapter_version is None
+
+
+def test_parallel_generation_expands_oft_versions_with_requests():
+    request = GenerateReqInput(
+        text=["first", "second"],
+        sampling_params={"n": 2},
+        adapter_version=[7, 8],
+    )
+
+    request.normalize_batch_and_arguments()
+
+    assert request.adapter_version == [7, 8, 7, 8]
+
+
+def test_batched_embedding_normalizes_scalar_oft_version():
+    request = EmbeddingReqInput(
+        text=["first", "second"],
+        adapter_version=7,
+    )
+
+    request.normalize_batch_and_arguments()
+
+    assert request.adapter_version == [7, 7]
 
 
 def test_scheduler_forwards_oft_identity_from_tokenized_embedding_to_request():

@@ -260,9 +260,10 @@ class GenerateReqInput:
     # Active weight version, resolved atomically with lora_id.
     lora_version: Optional[Union[List[Optional[int]], int]] = None
 
-    # The path and resolved identity of canonical OFT adapters.
+    # The path and resolved identity/version of canonical OFT adapters.
     adapter_path: Optional[Union[List[Optional[str]], str]] = None
     adapter_id: Optional[Union[List[Optional[str]], str]] = None
+    adapter_version: Optional[Union[List[Optional[int]], int]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -547,6 +548,7 @@ class GenerateReqInput:
         self._normalize_lora_paths(num)
         self._normalize_lora_versions(num)
         self._normalize_adapter_paths(num)
+        self._normalize_adapter_versions(num)
         self._normalize_image_data(num)
         self._normalize_mm_hashes(num)
         self._normalize_video_data(num)
@@ -629,6 +631,17 @@ class GenerateReqInput:
                 self.adapter_path = self.adapter_path * self.parallel_sample_num
             else:
                 raise ValueError("adapter_path should be a list or a string.")
+
+    def _normalize_adapter_versions(self, num):
+        """Normalize resolved OFT versions for batch processing."""
+        if self.adapter_version is None:
+            return
+        if isinstance(self.adapter_version, int):
+            self.adapter_version = [self.adapter_version] * num
+        elif isinstance(self.adapter_version, list):
+            self.adapter_version = self.adapter_version * self.parallel_sample_num
+        else:
+            raise ValueError("adapter_version should be a list or an integer.")
 
     def _normalize_image_data(self, num):
         """Normalize image data for batch processing."""
@@ -972,6 +985,11 @@ class GenerateReqInput:
                 self.adapter_path[i] if self.adapter_path is not None else None
             ),
             adapter_id=self.adapter_id[i] if self.adapter_id is not None else None,
+            adapter_version=(
+                self.adapter_version[i]
+                if isinstance(self.adapter_version, list)
+                else self.adapter_version
+            ),
             custom_logit_processor=(
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
@@ -1315,6 +1333,7 @@ class EmbeddingReqInput:
             self._normalize_lora_paths(self.batch_size)
             self._normalize_lora_versions(self.batch_size)
             self._normalize_adapter_paths(self.batch_size)
+            self._normalize_adapter_versions(self.batch_size)
 
         self._validate_rid_uniqueness()
 
@@ -1359,6 +1378,21 @@ class EmbeddingReqInput:
                 )
         else:
             raise ValueError("adapter_path should be a list or a string.")
+
+    def _normalize_adapter_versions(self, num):
+        """Normalize resolved OFT versions for batch processing."""
+        if self.adapter_version is None:
+            return
+        if isinstance(self.adapter_version, int):
+            self.adapter_version = [self.adapter_version] * num
+        elif isinstance(self.adapter_version, list):
+            if len(self.adapter_version) != num:
+                raise ValueError(
+                    f"adapter_version list length ({len(self.adapter_version)}) "
+                    f"must match batch size ({num})"
+                )
+        else:
+            raise ValueError("adapter_version should be a list or an integer.")
 
     def contains_mm_input(self) -> bool:
         return (
