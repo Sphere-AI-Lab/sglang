@@ -301,6 +301,14 @@ def maybe_admit_request(scheduler: "Scheduler", req: "Req", running_ofts) -> boo
     if scheduler.oft_drainer and not scheduler.oft_drainer.can_schedule(req):
         return False
 
+    if req.adapter_id in running_ofts:
+        return True
+
+    if scheduler.enable_oft_overlap_loading:
+        return scheduler.oft_overlap_loader.try_overlap_load_oft(
+            req.adapter_id, running_ofts
+        )
+
     new_oft_set = {req.adapter_id} | running_ofts
     return scheduler.tp_worker.model_runner.oft_manager.validate_oft_batch(
         new_oft_set

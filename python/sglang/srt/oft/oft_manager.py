@@ -282,6 +282,16 @@ class OFTManager(AdapterManager):
         return self.load_adapter(oft_ref)
 
     def unload_oft_adapter(self, oft_ref: OFTRef) -> "OFTUpdateOutput":
+        try:
+            pending_event = self.pending_oft_load_events.pop(
+                oft_ref.adapter_id, None
+            )
+            if pending_event is not None:
+                pending_event.synchronize()
+        except Exception as exc:
+            return self.create_oft_update_result(
+                success=False, error_message=str(exc)
+            )
         return self.unload_adapter(oft_ref)
 
     def create_oft_update_result(
@@ -812,6 +822,7 @@ class OFTManager(AdapterManager):
         )
 
     def init_oft_adapters(self, adapter_paths: Optional[List[OFTRef]] = None):
+        self.pending_oft_load_events = {}
         return self.init_adapters(adapter_paths)
 
     def init_oft_shapes(

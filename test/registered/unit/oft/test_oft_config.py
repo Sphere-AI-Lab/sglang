@@ -17,6 +17,7 @@ def _args(
     max_ofts_per_batch=2,
     peft_paths=None,
     oft_drain_wait_threshold=0.0,
+    enable_oft_overlap_loading=False,
 ):
     ns = SimpleNamespace(
         enable_lora=enable_lora,
@@ -35,6 +36,7 @@ def _args(
         oft_type="canonical_oft",
         max_oft_chunk_size=16,
         oft_drain_wait_threshold=oft_drain_wait_threshold,
+        enable_oft_overlap_loading=enable_oft_overlap_loading,
         speculative_algorithm=None,
         cuda_graph_config=None,
     )
@@ -108,6 +110,17 @@ def test_register_oft_args_exposes_drain_wait_threshold():
         .oft_drain_wait_threshold
         == 2.5
     )
+
+
+def test_register_oft_args_exposes_overlap_loading():
+    from sglang.srt.oft.config import register_oft_args
+
+    parser = argparse.ArgumentParser()
+    register_oft_args(parser)
+
+    assert parser.parse_args(
+        ["--enable-oft-overlap-loading"]
+    ).enable_oft_overlap_loading
 
 
 def test_oft_drain_wait_threshold_must_be_non_negative():

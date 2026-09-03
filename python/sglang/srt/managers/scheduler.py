@@ -111,7 +111,6 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
-from sglang.srt.oft.oft_drainer import OFTDrainer
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -297,8 +296,10 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.oft import integration as oft
+from sglang.srt.oft.oft_drainer import OFTDrainer
+from sglang.srt.oft.oft_overlap_loader import OFTOverlapLoader
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import get_context, publish
@@ -503,6 +504,7 @@ class Scheduler(
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_oft = server_args.peft_method == "oft"
         self.max_ofts_per_batch = server_args.max_ofts_per_batch
+        self.enable_oft_overlap_loading = server_args.enable_oft_overlap_loading
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
@@ -704,11 +706,14 @@ class Scheduler(
         # Init LoRA drainer for fair scheduling
         self.init_lora_drainer()
 
+        # Init LoRA overlap loader
+        self.init_lora_overlap_loader()
+
         # Init OFT drainer for fair scheduling
         self.init_oft_drainer()
 
-        # Init LoRA overlap loader
-        self.init_lora_overlap_loader()
+        # Init OFT overlap loader
+        self.init_oft_overlap_loader()
 
         # Init the grammar backend for constrained generation
         self.init_grammar_manager()
@@ -2096,6 +2101,12 @@ class Scheduler(
             )
         else:
             self.oft_drainer = None
+
+    def init_oft_overlap_loader(self) -> None:
+        if self.enable_oft_overlap_loading:
+            self.oft_overlap_loader = OFTOverlapLoader(
+                self.tp_worker.model_runner.oft_manager
+            )
 
     def init_lora_overlap_loader(self) -> None:
         if self.enable_lora_overlap_loading:

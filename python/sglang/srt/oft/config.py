@@ -65,6 +65,7 @@ class OFTArgs:
     oft_type: A[str, NS("lora")] = "canonical_oft"
     max_oft_chunk_size: A[Optional[int], NS("lora")] = 16
     oft_drain_wait_threshold: A[float, NS("lora")] = 0.0
+    enable_oft_overlap_loading: A[bool, NS("lora")] = False
 
     @property
     def enable_oft(self) -> bool:
@@ -179,6 +180,15 @@ def register_oft_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Maximum seconds an OFT request may wait before a running adapter "
             "is drained to make room for it. Disabled when set to 0."
+        ),
+    )
+    parser.add_argument(
+        "--enable-oft-overlap-loading",
+        action="store_true",
+        default=OFTArgs.enable_oft_overlap_loading,
+        help=(
+            "Overlap OFT adapter materialization with ongoing GPU computation "
+            "instead of blocking the first request that names the adapter."
         ),
     )
 
