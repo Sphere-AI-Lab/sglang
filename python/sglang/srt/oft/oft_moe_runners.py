@@ -30,9 +30,13 @@ identity boot (buffers injected after the wrapper is built) is picked up. It is
 self-gating: with no OFT buffer present it delegates straight to the real kernel.
 """
 
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
+
+from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.oft.utils import MoEOFTBatchInfo
 
 _QUANT_KWARGS = (
     "use_fp8_w8a8",
@@ -43,9 +47,103 @@ _QUANT_KWARGS = (
 )
 
 
+@dataclass
+class OFTInfo:
+    w13_oft_r: torch.Tensor | None
+    w1_oft_r: torch.Tensor | None
+    w3_oft_r: torch.Tensor | None
+    w2_oft_r: torch.Tensor | None
+    batch_info: MoEOFTBatchInfo
+    num_experts: int
+    max_ofts: int
+    has_active_oft: bool
+    cg_buffers: dict | None = None
+
+
+def _compute_oft_alignment(
+    topk_ids: torch.Tensor,
+    oft_info: OFTInfo,
+    row_group_factor: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Group routed rows by adapter slot and expert for OFT rotation."""
+    from sglang.kernels.ops.moe.moe_lora_align import moe_lora_align_block_size
+
+    if row_group_factor < 1:
+        raise ValueError(f"row_group_factor must be positive, got {row_group_factor}")
+
+    block_size_m = 64
+    max_ofts = oft_info.max_ofts
+    max_num_tokens_padded = topk_ids.numel() + oft_info.num_experts * (
+        block_size_m - 1
+    )
+    max_num_tokens_padded = (
+        (max_num_tokens_padded + block_size_m - 1) // block_size_m
+    ) * block_size_m
+    max_num_m_blocks = max_num_tokens_padded // block_size_m
+    device = topk_ids.device
+    cg = oft_info.cg_buffers if get_is_capture_mode() else None
+
+    if cg is None:
+        sorted_token_ids = torch.empty(
+            max_ofts * max_num_tokens_padded,
+            dtype=torch.int32,
+            device=device,
+        )
+        expert_ids = torch.empty(
+            max_ofts * max_num_m_blocks,
+            dtype=torch.int32,
+            device=device,
+        )
+        num_tokens_post_padded = torch.zeros(
+            max_ofts,
+            dtype=torch.int32,
+            device=device,
+        )
+        oft_ids = torch.arange(max_ofts, dtype=torch.int32, device=device)
+    else:
+        sorted_token_ids = cg["sorted_token_ids_oft"][
+            : max_ofts * max_num_tokens_padded
+        ]
+        expert_ids = cg["expert_ids_oft"][: max_ofts * max_num_m_blocks]
+        num_tokens_post_padded = cg["num_tokens_post_padded_oft"][:max_ofts]
+        num_tokens_post_padded.zero_()
+        oft_ids = cg["oft_ids"][:max_ofts]
+
+    batch = oft_info.batch_info
+    seg_indptr = batch.seg_indptr
+    if row_group_factor != 1:
+        seg_indptr = seg_indptr * row_group_factor
+
+    moe_lora_align_block_size(
+        topk_ids,
+        seg_indptr,
+        batch.req_to_oft,
+        int(oft_info.num_experts),
+        block_size_m,
+        int(max_ofts),
+        int(max_num_tokens_padded),
+        int(max_num_m_blocks),
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        batch.adapter_enabled,
+        oft_ids,
+        cumsum_buffer=cg.get("cumsum_buffer") if cg is not None else None,
+        token_mask=cg.get("token_mask") if cg is not None else None,
+    )
+
+    return (
+        sorted_token_ids.view(max_ofts, max_num_tokens_padded),
+        expert_ids.view(max_ofts, max_num_m_blocks),
+        num_tokens_post_padded,
+        oft_ids,
+    )
+
+
 def _oft_prerotate(
     A,
     oft_r,
+    oft_info,
     C,
     topk_weights,
     topk_ids,
@@ -68,14 +166,35 @@ def _oft_prerotate(
     )
     from sglang.srt.oft.triton_ops import apply_oft_rotation_triton
 
+    if oft_info is None:
+        raise RuntimeError("MoE OFT rotation requires request-aware OFTInfo")
+    num_batch_tokens = oft_info.batch_info.num_tokens
+    if num_batch_tokens <= 0 or A.shape[0] % num_batch_tokens != 0:
+        raise ValueError(
+            f"OFT MoE rows {A.shape[0]} are not grouped by {num_batch_tokens} batch tokens"
+        )
+    row_group_factor = A.shape[0] // num_batch_tokens
+    (
+        oft_sorted_token_ids,
+        oft_expert_ids,
+        oft_num_tokens_post_padded,
+        oft_ids,
+    ) = _compute_oft_alignment(
+        topk_ids,
+        oft_info,
+        row_group_factor=row_group_factor,
+    )
+
     A = apply_oft_rotation_triton(
         A,
         oft_r,
         topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        top_k,
+        oft_sorted_token_ids,
+        oft_expert_ids,
+        oft_num_tokens_post_padded,
+        oft_ids,
+        oft_info.batch_info.adapter_enabled,
+        top_k=top_k,
         block_m=block_size_m,
     )
     C = C.reshape(-1, 1, C.shape[-1])
@@ -110,6 +229,7 @@ def _assert_unquantized(kw):
 def _run_gate_up_split(
     layer,
     real_invoke,
+    oft_info,
     A,
     B,
     bias,
@@ -171,6 +291,7 @@ def _run_gate_up_split(
         ) = _oft_prerotate(
             A,
             oft_r,
+            oft_info,
             half_cache,
             topk_weights,
             topk_ids,
@@ -211,7 +332,11 @@ def _run_gate_up_split(
         C[:, half_slice].copy_(half_cache)
 
 
-def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
+def make_oft_invoke(
+    layer: Any,
+    real_invoke: Callable,
+    oft_info: OFTInfo | None = None,
+) -> Callable:
     """Build the OFT-rotating replacement for ``invoke_fused_moe_kernel``.
 
     Dispatches on the WEIGHT TENSOR IDENTITY: ``triton.py`` passes
@@ -269,9 +394,25 @@ def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
             if w1 is not None:
                 _assert_unquantized(kw)
                 return _run_gate_up_split(
-                    layer, real_invoke, A, B, bias, C, A_scale, B_scale, B_zp,
-                    topk_weights, topk_ids, sorted_token_ids, expert_ids,
-                    num_tokens_post_padded, mul_routed_weight, top_k, config, kw,
+                    layer,
+                    real_invoke,
+                    oft_info,
+                    A,
+                    B,
+                    bias,
+                    C,
+                    A_scale,
+                    B_scale,
+                    B_zp,
+                    topk_weights,
+                    topk_ids,
+                    sorted_token_ids,
+                    expert_ids,
+                    num_tokens_post_padded,
+                    mul_routed_weight,
+                    top_k,
+                    config,
+                    kw,
                 )
             oft_r = w13
         else:
@@ -313,6 +454,7 @@ def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
         a, c, tw, ti, sti, ei, ntpp = _oft_prerotate(
             A,
             oft_r,
+            oft_info,
             C,
             topk_weights,
             topk_ids,

@@ -34,9 +34,14 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
-from sglang.srt.oft.oft_moe_runners import make_oft_invoke
+from sglang.srt.oft.oft_moe_runners import (
+    OFTInfo,
+    _compute_oft_alignment,
+    make_oft_invoke,
+)
 from sglang.srt.oft.triton_ops.block_rotate import apply_oft_rotation_triton
 from sglang.srt.oft.triton_ops.parity_dequant_fp8 import dequant_fp8_block_triton
+from sglang.srt.oft.utils import MoEOFTBatchInfo
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -44,7 +49,7 @@ M = 8
 K = 256
 EXPERTS = 2
 TOP_K = 1
-BLOCK_M = 8
+BLOCK_M = 64
 GROUP = 128
 # fp8 e4m3's ~3 mantissa bits give per-element relative error up to ~1/16;
 # the rotation is a bounded (orthogonal-ish) linear combination so error
@@ -65,7 +70,32 @@ def _random_oft_r(block_size: int, seed: int) -> torch.Tensor:
         * 0.02
     )
     skew = noise - noise.transpose(-1, -2)
-    return (eye + skew).to(torch.bfloat16).contiguous()
+    adapted = (eye + skew).to(torch.bfloat16).contiguous()
+    base = eye.to(torch.bfloat16).view(1, 1, block_size, block_size).expand_as(
+        adapted
+    )
+    return torch.stack((base, adapted), dim=0).contiguous()
+
+
+def _oft_info(oft_r: torch.Tensor) -> OFTInfo:
+    request_slots = torch.ones(M, device="cuda", dtype=torch.int32)
+    batch = MoEOFTBatchInfo(
+        seg_indptr=torch.tensor([0, M], device="cuda", dtype=torch.int32),
+        req_to_oft=torch.tensor([1], device="cuda", dtype=torch.int32),
+        adapter_enabled=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        token_oft_mapping=request_slots,
+        num_tokens=M,
+    )
+    return OFTInfo(
+        w13_oft_r=oft_r,
+        w1_oft_r=None,
+        w3_oft_r=None,
+        w2_oft_r=oft_r,
+        batch_info=batch,
+        num_experts=EXPERTS,
+        max_ofts=2,
+        has_active_oft=True,
+    )
 
 
 def _routing(seed: int):
@@ -89,6 +119,10 @@ def test_dequant_then_rotate_matches_direct_rotate(block_size):
         _routing(seed=100 + block_size)
     )
     oft_r = _random_oft_r(block_size, seed=200 + block_size)
+    oft_info = _oft_info(oft_r)
+    sorted_token_ids, expert_ids, num_tokens_post_padded, oft_ids = (
+        _compute_oft_alignment(topk_ids, oft_info)
+    )
 
     a1_q, a1_scale = sglang_per_token_group_quant_fp8(hidden_states, GROUP)
     dequantized = dequant_fp8_block_triton(a1_q, a1_scale, out_dtype=torch.bfloat16)
@@ -99,6 +133,8 @@ def test_dequant_then_rotate_matches_direct_rotate(block_size):
         sorted_token_ids=sorted_token_ids,
         expert_ids=expert_ids,
         num_tokens_post_padded=num_tokens_post_padded,
+        oft_ids=oft_ids,
+        adapter_enabled=oft_info.batch_info.adapter_enabled,
         top_k=TOP_K,
         block_m=BLOCK_M,
     )
@@ -120,6 +156,7 @@ def test_moe_invoke_dequantizes_fp8_activation_before_rotating():
         _routing(seed=42)
     )
     oft_r = _random_oft_r(block_size=16, seed=43)
+    oft_info = _oft_info(oft_r)
 
     a1_q, a1_scale = sglang_per_token_group_quant_fp8(hidden_states, GROUP)
 
@@ -144,7 +181,7 @@ def test_moe_invoke_dequantizes_fp8_activation_before_rotating():
         captured["A_scale"] = A_scale
         captured["top_k"] = top_k
 
-    invoke = make_oft_invoke(layer, fake_real_invoke)
+    invoke = make_oft_invoke(layer, fake_real_invoke, oft_info)
 
     EM = sorted_token_ids.shape[0]
     C = torch.zeros(EM, K, device="cuda", dtype=torch.bfloat16)
@@ -180,11 +217,10 @@ def test_moe_invoke_dequantizes_fp8_activation_before_rotating():
         dequantized,
         oft_r,
         topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        TOP_K,
-        BLOCK_M,
+        *_compute_oft_alignment(topk_ids, oft_info),
+        oft_info.batch_info.adapter_enabled,
+        top_k=TOP_K,
+        block_m=BLOCK_M,
     )
     torch.cuda.synchronize()
     max_abs = (captured["A"].float() - expected.float()).abs().max().item()

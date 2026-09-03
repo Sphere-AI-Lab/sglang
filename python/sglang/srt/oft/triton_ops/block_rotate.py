@@ -13,16 +13,24 @@ def _oft_block_rotate_kernel(
     A_rot_ptr,
     stride_arm,
     stride_ark,
-    # R matrices: (E, num_blocks, bs, bs)
+    # R matrices: (S, E, num_blocks, bs, bs)
     R_ptr,
+    stride_rs,
     stride_re,
     stride_rb,
     stride_ri,
     stride_rj,
     # Token routing
     sorted_token_ids_ptr,
+    stride_sts,
+    stride_stm,
     expert_ids_ptr,
+    stride_eis,
+    stride_eim,
     num_tokens_post_padded_ptr,
+    stride_ntpp,
+    oft_ids_ptr,
+    adapter_enabled_ptr,
     num_valid_tokens,
     # Dimensions
     top_k: tl.constexpr,
@@ -33,7 +41,8 @@ def _oft_block_rotate_kernel(
 ):
     """Apply per-expert block-diagonal OFT rotation to input features.
 
-    Grid: (cdiv(EM, BLOCK_M), num_blocks)
+    Grid: (slot, cdiv(EM, BLOCK_M), num_blocks)
+    - pid_slot: adapter-slot launch index
     - pid_m: block of sorted tokens (all same expert via moe_align_block_size)
     - pid_blk: which OFT block (0 .. K // OFT_BLOCK_SIZE - 1)
 
@@ -41,21 +50,36 @@ def _oft_block_rotate_kernel(
     loads the expert's R matrix block, computes rotation via tl.dot, and
     writes the rotated result to A_rot.
     """
-    pid_m = tl.program_id(0)
-    pid_blk = tl.program_id(1)
+    pid_slot = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_blk = tl.program_id(2)
+
+    slot_id = tl.load(oft_ids_ptr + pid_slot).to(tl.int64)
+    if slot_id < 0:
+        return
+    if tl.load(adapter_enabled_ptr + slot_id) == 0:
+        return
 
     # Bounds check
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    num_tokens_post_padded = tl.load(
+        num_tokens_post_padded_ptr + slot_id * stride_ntpp
+    )
     if pid_m * BLOCK_M >= num_tokens_post_padded:
         return
 
     # Load sorted token ids and expert for this block
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
-    sorted_ids = tl.load(sorted_token_ids_ptr + offs_m)
+    sorted_ids = tl.load(
+        sorted_token_ids_ptr
+        + slot_id * stride_sts
+        + offs_m * stride_stm
+    )
     sorted_ids = sorted_ids.to(tl.int64)
     token_mask = sorted_ids < num_valid_tokens
 
-    expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    expert = tl.load(
+        expert_ids_ptr + slot_id * stride_eis + pid_m * stride_eim
+    ).to(tl.int64)
 
     # Original token ids (A is indexed by token, not token*top_k)
     orig_ids = sorted_ids // top_k
@@ -73,7 +97,8 @@ def _oft_block_rotate_kernel(
     # by iterating over TILE_K chunks of the inner k dimension.
     #
     # OFT convention: rot_accum[t, c] = sum_k A[t, k_base+k] * R[k, c]
-    # i.e. A_rot[:, k_base:k_base+bs] = A[:, k_base:k_base+bs] @ R[expert, pid_blk]
+    # i.e. A_rot[:, k_base:k_base+bs] = A[:, k_base:k_base+bs]
+    #      @ R[slot_id, expert, pid_blk]
     # (NOT R^T — the dense OFT kernel `sgemm_oft_r.py` and `apply_block_diag_orth`
     # both apply x @ R; matching that here keeps train/inference parity).
 
@@ -92,6 +117,7 @@ def _oft_block_rotate_kernel(
             r_col_offs = tl.arange(0, OFT_BLOCK_SIZE).to(tl.int64)
             r_ptrs = (
                 R_ptr
+                + slot_id * stride_rs
                 + expert * stride_re
                 + pid_blk * stride_rb
                 + r_row_offs[:, None] * stride_ri
@@ -115,6 +141,7 @@ def _oft_block_rotate_kernel(
             ).to(tl.float32)
             r_row = tl.load(
                 R_ptr
+                + slot_id * stride_rs
                 + expert * stride_re
                 + pid_blk * stride_rb
                 + k * stride_ri
@@ -130,11 +157,13 @@ def _oft_block_rotate_kernel(
 
 def apply_oft_rotation_triton(
     A: torch.Tensor,           # (M, K)
-    oft_r: torch.Tensor,       # (E, num_blocks, bs, bs)
+    oft_r: torch.Tensor,       # (S, E, num_blocks, bs, bs)
     topk_ids: torch.Tensor,    # (M, top_k)
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
+    oft_ids: torch.Tensor,
+    adapter_enabled: torch.Tensor,
     top_k: int,
     block_m: int = 64,
 ) -> torch.Tensor:
@@ -144,9 +173,10 @@ def apply_oft_rotation_triton(
     by its assigned expert's block-diagonal R matrix.
     """
     M, K = A.shape
-    if oft_r.dim() != 4:
+    if oft_r.dim() != 5:
         raise ValueError(
-            f"oft_r must be 4D (experts, blocks, bs, bs), got {tuple(oft_r.shape)}"
+            "oft_r must be 5D (slots, experts, blocks, bs, bs), "
+            f"got {tuple(oft_r.shape)}"
         )
     bs = oft_r.shape[-1]
     from sglang.srt.oft.utils import validate_oft_block_size
@@ -157,25 +187,37 @@ def apply_oft_rotation_triton(
     if K % bs != 0:
         raise ValueError(f"OFT hidden size {K} must be divisible by block size {bs}")
     num_blocks = K // bs
-    if oft_r.shape[1] != num_blocks:
+    if oft_r.shape[2] != num_blocks:
         raise ValueError(
-            f"oft_r has {oft_r.shape[1]} blocks, expected {num_blocks} for K={K}, BS={bs}"
+            f"oft_r has {oft_r.shape[2]} blocks, expected {num_blocks} for K={K}, BS={bs}"
         )
+    if sorted_token_ids.dim() != 2 or expert_ids.dim() != 2:
+        raise ValueError("adapter-aware alignment tensors must be two-dimensional")
+    if num_tokens_post_padded.dim() != 1 or oft_ids.dim() != 1:
+        raise ValueError("per-slot padded counts and slot IDs must be one-dimensional")
+    if sorted_token_ids.shape[0] != oft_ids.numel():
+        raise ValueError("alignment slot dimension must match oft_ids")
 
-    # Output buffer: one row per token-expert pair
-    A_rot = torch.empty(M * top_k, K, device=A.device, dtype=A.dtype)
+    # Base rows remain unchanged; only enabled adapter slots overwrite their
+    # aligned token-expert rows.
+    A_rot = A[:, None, :].expand(-1, top_k, -1).reshape(-1, K).clone()
 
     # TILE_K: chunk size for the inner dimension of the rotation matmul
     tile_k = min(64, bs)
 
-    EM = sorted_token_ids.shape[0]
-    grid = (triton.cdiv(EM, block_m), num_blocks)
+    max_num_m_blocks = expert_ids.shape[1]
+    grid = (oft_ids.numel(), max_num_m_blocks, num_blocks)
 
     _oft_block_rotate_kernel[grid](
         A, A.stride(0), A.stride(1),
         A_rot, A_rot.stride(0), A_rot.stride(1),
-        oft_r, oft_r.stride(0), oft_r.stride(1), oft_r.stride(2), oft_r.stride(3),
-        sorted_token_ids, expert_ids, num_tokens_post_padded,
+        oft_r,
+        oft_r.stride(0), oft_r.stride(1), oft_r.stride(2),
+        oft_r.stride(3), oft_r.stride(4),
+        sorted_token_ids, sorted_token_ids.stride(0), sorted_token_ids.stride(1),
+        expert_ids, expert_ids.stride(0), expert_ids.stride(1),
+        num_tokens_post_padded, num_tokens_post_padded.stride(0),
+        oft_ids, adapter_enabled,
         topk_ids.numel(),
         top_k=top_k,
         K=K,

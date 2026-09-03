@@ -6,6 +6,7 @@ import torch
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
+from sglang.srt.oft.oft_moe_runners import OFTInfo, _compute_oft_alignment
 from sglang.srt.oft.triton_ops.block_rotate import (
     apply_oft_rotation_triton,
 )
@@ -13,6 +14,7 @@ from sglang.srt.oft.triton_ops.grouped_moe_rotate_project import (
     fused_split_w13_oft_grouped_moe,
     packed_bmm_split_w13_oft_grouped_moe,
 )
+from sglang.srt.oft.utils import MoEOFTBatchInfo
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -95,6 +97,31 @@ def _project_reference(hidden_states, w13, w1_oft_r, w3_oft_r, topk_ids):
     return torch.stack(rows).to(torch.bfloat16).unsqueeze(1)
 
 
+def _assert_alignment_blocks_are_homogeneous(
+    sorted_token_ids,
+    expert_ids,
+    oft_ids,
+    num_tokens_post_padded,
+    topk_ids,
+    row_slots,
+    block_m,
+):
+    flat_experts = topk_ids.reshape(-1)
+    for slot_id in oft_ids:
+        num_blocks = int(num_tokens_post_padded[int(slot_id)].item()) // block_m
+        for block_idx in range(num_blocks):
+            row_ids = sorted_token_ids[
+                int(slot_id), block_idx * block_m : (block_idx + 1) * block_m
+            ]
+            row_ids = row_ids[row_ids < flat_experts.numel()].long()
+            if row_ids.numel() == 0:
+                continue
+            assert torch.all(
+                flat_experts[row_ids] == expert_ids[int(slot_id), block_idx]
+            )
+            assert torch.all(row_slots[row_ids] == slot_id)
+
+
 @pytest.mark.parametrize("block_size", [4, 8, 16])
 def test_grouped_moe_direct_and_packed_match_torch(block_size):
     hidden_states, w13, w1_oft_r, w3_oft_r, topk_ids, routing = _fixture(
@@ -131,17 +158,45 @@ def test_grouped_moe_direct_and_packed_match_torch(block_size):
 
 @pytest.mark.parametrize("block_size", [4, 8, 16])
 def test_shared_grouped_rotation_matches_torch(block_size):
-    hidden_states, _, w1_oft_r, _, topk_ids, routing = _fixture(block_size)
-    sorted_token_ids, expert_ids, num_tokens_post_padded = routing
+    hidden_states, _, w1_oft_r, _, topk_ids, _ = _fixture(block_size)
+    identity = torch.eye(
+        block_size, device="cuda", dtype=torch.bfloat16
+    ).view(1, 1, block_size, block_size)
+    rotations = torch.stack(
+        (identity.expand_as(w1_oft_r), w1_oft_r), dim=0
+    ).contiguous()
+    request_slots = torch.ones(M, device="cuda", dtype=torch.int32)
+    batch = MoEOFTBatchInfo(
+        seg_indptr=torch.tensor([0, M], device="cuda", dtype=torch.int32),
+        req_to_oft=torch.tensor([1], device="cuda", dtype=torch.int32),
+        adapter_enabled=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        token_oft_mapping=request_slots,
+        num_tokens=M,
+    )
+    oft_info = OFTInfo(
+        w13_oft_r=rotations,
+        w1_oft_r=None,
+        w3_oft_r=None,
+        w2_oft_r=rotations,
+        batch_info=batch,
+        num_experts=EXPERTS,
+        max_ofts=2,
+        has_active_oft=True,
+    )
+    sorted_token_ids, expert_ids, num_tokens_post_padded, oft_ids = (
+        _compute_oft_alignment(topk_ids, oft_info)
+    )
     rotated = apply_oft_rotation_triton(
         hidden_states,
-        w1_oft_r,
+        rotations,
         topk_ids,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        TOP_K,
-        block_m=BLOCK_M,
+        oft_ids,
+        batch.adapter_enabled,
+        top_k=TOP_K,
+        block_m=64,
     )
     torch.cuda.synchronize()
 
@@ -154,6 +209,136 @@ def test_shared_grouped_rotation_matches_torch(block_size):
     assert rotated.shape == (M * TOP_K, HIDDEN)
     error = (rotated.float() - reference.float()).abs().max().item()
     assert error <= TOL, f"BS={block_size} shared max_abs={error:.2e}"
+
+
+@pytest.mark.parametrize("block_size", [4, 8, 16])
+def test_rotation_routes_base_and_two_adapters_through_both_moe_stages(
+    block_size,
+):
+    num_tokens, top_k, num_experts, block_m = 4, 2, 3, 64
+    eye = torch.eye(block_size, device="cuda", dtype=torch.bfloat16)
+    rotations = eye.view(1, 1, 1, block_size, block_size).expand(
+        3, num_experts, 1, block_size, block_size
+    ).clone()
+    rotations[1, :, 0] = torch.diag(
+        torch.tensor(
+            [-1 if i % 2 == 0 else 1 for i in range(block_size)],
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+    )
+    rotations[2, :, 0] = torch.flip(eye, dims=[1])
+    topk_ids = torch.tensor(
+        [[0, 1], [1, 2], [2, 0], [0, 2]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    request_slots = torch.tensor([0, 1, 2, 1], device="cuda")
+    batch = MoEOFTBatchInfo(
+        seg_indptr=torch.tensor([0, 1, 2, 3, 4], device="cuda", dtype=torch.int32),
+        req_to_oft=request_slots.to(torch.int32),
+        adapter_enabled=torch.tensor([0, 1, 1], device="cuda", dtype=torch.int32),
+        token_oft_mapping=request_slots.to(torch.int32),
+        num_tokens=num_tokens,
+    )
+    oft_info = OFTInfo(
+        w13_oft_r=rotations,
+        w1_oft_r=None,
+        w3_oft_r=None,
+        w2_oft_r=rotations,
+        batch_info=batch,
+        num_experts=num_experts,
+        max_ofts=3,
+        has_active_oft=True,
+    )
+
+    # Gate/up starts from one row per request and expands to one row per route.
+    gate_up_input = torch.arange(
+        num_tokens * block_size, device="cuda", dtype=torch.bfloat16
+    ).view(num_tokens, block_size)
+    sorted_ids, expert_ids, padded, oft_ids = _compute_oft_alignment(
+        topk_ids, oft_info, row_group_factor=1
+    )
+    expanded_slots = request_slots.repeat_interleave(top_k)
+    _assert_alignment_blocks_are_homogeneous(
+        sorted_ids,
+        expert_ids,
+        oft_ids,
+        padded,
+        topk_ids,
+        expanded_slots,
+        block_m,
+    )
+    actual_gate_up = apply_oft_rotation_triton(
+        gate_up_input,
+        rotations,
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        padded,
+        oft_ids,
+        batch.adapter_enabled,
+        top_k=top_k,
+        block_m=block_m,
+    )
+    expected_gate_up = torch.stack(
+        [
+            gate_up_input[token]
+            if int(request_slots[token]) == 0
+            else gate_up_input[token]
+            @ rotations[
+                int(request_slots[token]), int(topk_ids[token, route]), 0
+            ]
+            for token in range(num_tokens)
+            for route in range(top_k)
+        ]
+    )
+    torch.testing.assert_close(actual_gate_up, expected_gate_up, rtol=0, atol=0)
+
+    # Down starts from M * top_k rows. Scaling segment boundaries by top_k
+    # repeats each request's adapter slot for both routed expert rows.
+    down_input = torch.arange(
+        num_tokens * top_k * block_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).view(num_tokens * top_k, block_size)
+    down_topk_ids = topk_ids.reshape(-1, 1)
+    sorted_ids, expert_ids, padded, oft_ids = _compute_oft_alignment(
+        down_topk_ids, oft_info, row_group_factor=top_k
+    )
+    _assert_alignment_blocks_are_homogeneous(
+        sorted_ids,
+        expert_ids,
+        oft_ids,
+        padded,
+        down_topk_ids,
+        expanded_slots,
+        block_m,
+    )
+    actual_down = apply_oft_rotation_triton(
+        down_input,
+        rotations,
+        down_topk_ids,
+        sorted_ids,
+        expert_ids,
+        padded,
+        oft_ids,
+        batch.adapter_enabled,
+        top_k=1,
+        block_m=block_m,
+    )
+    expected_down = torch.stack(
+        [
+            down_input[row]
+            if int(expanded_slots[row]) == 0
+            else down_input[row]
+            @ rotations[
+                int(expanded_slots[row]), int(down_topk_ids[row, 0]), 0
+            ]
+            for row in range(num_tokens * top_k)
+        ]
+    )
+    torch.testing.assert_close(actual_down, expected_down, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("block_size", [4, 8, 16])
