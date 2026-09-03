@@ -1,8 +1,12 @@
 from dataclasses import replace
+from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.oft.utils import MoEOFTBatchInfo, OFTBatchInfo
 
 
 class BaseOFTBackend:
@@ -24,6 +28,55 @@ class BaseOFTBackend:
         self.max_ofts_per_batch = max_ofts_per_batch
         self.device = device
         self._cuda_graph_grouped_batch_infos = {}
+        self._is_moe_oft = False
+        self.moe_cg_buffers: Optional[dict[str, torch.Tensor]] = None
+
+    @property
+    def is_moe_oft(self) -> bool:
+        return self._is_moe_oft
+
+    @is_moe_oft.setter
+    def is_moe_oft(self, value: bool):
+        self._is_moe_oft = value
+
+    def _init_cuda_graph_moe_buffers(self, max_num_tokens: int) -> None:
+        self.moe_cg_buffers = {
+            "adapter_enabled": torch.zeros(
+                self.max_ofts_per_batch, dtype=torch.int32, device=self.device
+            ),
+            "token_oft_mapping": torch.zeros(
+                max_num_tokens, dtype=torch.int32, device=self.device
+            ),
+        }
+
+    def _add_moe_oft_info(
+        self, forward_batch: ForwardBatch, batch_info: OFTBatchInfo
+    ) -> OFTBatchInfo:
+        if not self.is_moe_oft:
+            return batch_info
+
+        adapter_enabled = None
+        token_oft_mapping = None
+        if batch_info.use_cuda_graph:
+            assert self.moe_cg_buffers is not None
+            adapter_enabled = self.moe_cg_buffers["adapter_enabled"]
+            token_oft_mapping = self.moe_cg_buffers["token_oft_mapping"]
+
+        num_tokens = (
+            sum(forward_batch.extend_seq_lens_cpu)
+            if forward_batch.forward_mode.is_extend()
+            else forward_batch.batch_size
+        )
+        num_requests = batch_info.bs
+        batch_info.moe_oft_info = _compute_moe_oft_info(
+            num_tokens=num_tokens,
+            seg_indptr=batch_info.seg_indptr[: num_requests + 1],
+            weight_indices=batch_info.weight_indices[:num_requests],
+            max_ofts=self.max_ofts_per_batch,
+            adapter_enabled=adapter_enabled,
+            token_oft_mapping=token_oft_mapping,
+        )
+        return batch_info
 
     def run_extra_token_embedding(
         self,
@@ -249,3 +302,92 @@ class BaseOFTBackend:
             use_cuda_graph: whether to use CUDA Graph for this batch
         """
         pass
+
+
+@triton.jit
+def _compute_moe_oft_info_kernel(
+    seg_indptr_ptr,
+    weight_indices_ptr,
+    adapter_enabled_ptr,
+    token_oft_mapping_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    segment_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    segment_start = tl.load(seg_indptr_ptr + segment_idx)
+    segment_end = tl.load(seg_indptr_ptr + segment_idx + 1)
+    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    adapter_idx = tl.load(weight_indices_ptr + segment_idx)
+    tl.store(
+        token_oft_mapping_ptr + segment_start + offsets,
+        adapter_idx,
+        mask=segment_start + offsets < segment_end,
+    )
+    tl.store(
+        adapter_enabled_ptr + adapter_idx,
+        1,
+        mask=(block_idx == 0) & (adapter_idx != 0),
+    )
+
+
+def _compute_moe_oft_info(
+    num_tokens: int,
+    seg_indptr: torch.Tensor,
+    weight_indices: torch.Tensor,
+    max_ofts: int,
+    adapter_enabled: torch.Tensor | None = None,
+    token_oft_mapping: torch.Tensor | None = None,
+) -> MoEOFTBatchInfo:
+    if adapter_enabled is None:
+        adapter_enabled = torch.zeros(
+            max_ofts, dtype=torch.int32, device=seg_indptr.device
+        )
+    else:
+        assert max_ofts <= adapter_enabled.shape[0]
+        adapter_enabled = adapter_enabled[:max_ofts]
+        adapter_enabled.zero_()
+
+    if token_oft_mapping is None:
+        token_oft_mapping = torch.zeros(
+            num_tokens, dtype=torch.int32, device=seg_indptr.device
+        )
+    else:
+        assert num_tokens <= token_oft_mapping.shape[0]
+        token_oft_mapping = token_oft_mapping[:num_tokens]
+        token_oft_mapping.zero_()
+
+    if num_tokens == 0 or weight_indices.numel() == 0:
+        return MoEOFTBatchInfo(
+            seg_indptr=seg_indptr,
+            req_to_oft=weight_indices,
+            adapter_enabled=adapter_enabled,
+            token_oft_mapping=token_oft_mapping,
+            num_tokens=num_tokens,
+        )
+
+    if seg_indptr.device.type == "cuda":
+        _compute_moe_oft_info_kernel[
+            (weight_indices.numel(), triton.cdiv(num_tokens, 256))
+        ](
+            seg_indptr,
+            weight_indices,
+            adapter_enabled,
+            token_oft_mapping,
+            BLOCK_SIZE=256,
+        )
+    else:
+        segment_lengths = seg_indptr[1:] - seg_indptr[:-1]
+        token_oft_mapping.copy_(
+            torch.repeat_interleave(weight_indices, segment_lengths)
+        )
+        active = torch.unique(weight_indices)
+        active = active[active != 0]
+        adapter_enabled[active.to(torch.long)] = 1
+
+    return MoEOFTBatchInfo(
+        seg_indptr=seg_indptr,
+        req_to_oft=weight_indices,
+        adapter_enabled=adapter_enabled,
+        token_oft_mapping=token_oft_mapping,
+        num_tokens=num_tokens,
+    )

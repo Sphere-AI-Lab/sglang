@@ -44,6 +44,15 @@ def get_hf_text_config(config: AutoConfig) -> AutoConfig:
 
 
 @dataclass
+class MoEOFTBatchInfo:
+    seg_indptr: torch.Tensor
+    req_to_oft: torch.Tensor
+    adapter_enabled: torch.Tensor
+    token_oft_mapping: torch.Tensor
+    num_tokens: int
+
+
+@dataclass
 class OFTBatchInfo:
     # The forward mode is using CUDA Graph.
     use_cuda_graph: bool
@@ -72,6 +81,12 @@ class OFTBatchInfo:
 
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
     permutation: Optional[torch.Tensor]
+
+    # Request-aware OFT metadata consumed by MoE OFT execution.
+    moe_oft_info: Optional[MoEOFTBatchInfo] = None
+
+    # CPU-side flag that at least one request in the batch uses OFT.
+    has_active_oft: bool = False
 
 
 def _intermediate_for_layer(config: AutoConfig, layer_idx: int) -> int:
