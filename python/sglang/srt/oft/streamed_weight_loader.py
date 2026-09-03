@@ -241,7 +241,7 @@ def _resolve_streamed_oft_tensor_groups(
     from sglang.srt.layers.utils import get_layer_id
 
     memory_pool = oft_manager.memory_pool
-    oft_modules = oft_manager.adapter_modules
+    oft_modules = oft_manager.oft_modules
 
     # MoE expert OFT R cannot share the dense per-layer R_buffer slots
     # (those have no expert dimension and would silently overwrite each
@@ -386,7 +386,7 @@ def _commit_streamed_oft_tensor_groups(
     """
     fused_expert_chunk, non_row_groups, row_parallel_groups, direct_writes = plan
     memory_pool = oft_manager.memory_pool
-    oft_modules = oft_manager.adapter_modules
+    oft_modules = oft_manager.oft_modules
 
     if os.getenv("ORBIT_LOG_WEIGHT_SYNC", "").strip().lower() not in {"", "0", "false", "no"}:
         samples = []

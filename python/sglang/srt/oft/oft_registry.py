@@ -48,14 +48,14 @@ class OFTRegistry(AdapterRegistry):
     update / eventual consistency model between the tokenizer manager process and the scheduler processes.
     """
 
-    def __init__(self, adapter_paths: Optional[List[OFTRef]] = None):
-        assert adapter_paths is None or all(
-            isinstance(oft, OFTRef) for oft in adapter_paths
+    def __init__(self, oft_paths: Optional[List[OFTRef]] = None):
+        assert oft_paths is None or all(
+            isinstance(oft, OFTRef) for oft in oft_paths
         ), (
             "OFTRegistry's initial adapter refs must be OFTRef instances. "
             "Please file an issue if you see this error."
         )
-        super().__init__(adapter_paths)
+        super().__init__(oft_paths)
 
     async def bump_version_by_id(self, oft_id: str) -> OFTRef:
         """

@@ -726,7 +726,7 @@ class TestResolveCommitSplit(unittest.TestCase):
             )
         oft_manager = MagicMock()
         oft_manager.memory_pool = memory_pool
-        oft_manager.adapter_modules = []
+        oft_manager.oft_modules = []
         return oft_manager
 
     def test_unresolved_name_fails_without_mutation(self):

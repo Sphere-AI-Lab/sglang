@@ -854,7 +854,7 @@ class OFTManager(AdapterManager):
         self.memory_pool.prepare_oft_batch(
             cur_uids=cur_uids,
             oft_adapters=self.adapters,
-            oft_modules=self.adapter_modules,
+            oft_modules=self.oft_modules,
             oft_refs=self.oft_refs.copy(),
             oft_embed_tokens_module=self.embed_tokens_module,
             oft_lm_head_module=self.lm_head_module,
@@ -1218,10 +1218,10 @@ class OFTManager(AdapterManager):
             self.memory_pool._init_staging_from_active()
 
         wrapped_module_count = sum(
-            len(layer_modules) for layer_modules in self.adapter_modules
+            len(layer_modules) for layer_modules in self.oft_modules
         )
         wrapped_layer_count = sum(
-            1 for layer_modules in self.adapter_modules if layer_modules
+            1 for layer_modules in self.oft_modules if layer_modules
         )
         loaded_adapter_names = sorted(
             str(oft_ref.oft_name) for oft_ref in self.oft_refs.values()
@@ -1373,7 +1373,7 @@ class OFTManager(AdapterManager):
             target_modules=self.target_modules,
             base_model=self.base_model,
             oft_type=self.oft_type,
-            oft_modules=self.adapter_modules,
+            oft_modules=self.oft_modules,
             external_target_modules=external_target_modules,
             eviction_policy=self.eviction_policy,
             oft_added_tokens_size=self.oft_added_tokens_size,
@@ -1440,7 +1440,7 @@ class OFTManager(AdapterManager):
         num_hidden_layers = get_hf_config_attr(
             self.base_hf_config, "num_hidden_layers"
         )
-        self.adapter_modules: List[Dict[str, BaseLayerWithOFT]] = [
+        self.oft_modules: List[Dict[str, BaseLayerWithOFT]] = [
             {} for _ in range(num_hidden_layers)
         ]
 
@@ -1519,7 +1519,7 @@ class OFTManager(AdapterManager):
                 if layer_id is None:
                     skipped_without_layer_id.append(module_name)
                     continue
-                self.adapter_modules[layer_id][module_name] = self.set_oft_module(
+                self.oft_modules[layer_id][module_name] = self.set_oft_module(
                     module_name, module
                 )
                 wrapped_modules.append(module_name)
@@ -2132,7 +2132,7 @@ class OFTManager(AdapterManager):
                 )
 
         staged_dense = {}
-        oft_modules = self.adapter_modules
+        oft_modules = self.oft_modules
         for tensor_name, tensor in dense_named_tensors:
             layer_id = get_layer_id(tensor_name)
             if layer_id is None:

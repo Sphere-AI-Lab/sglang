@@ -188,7 +188,7 @@ class StagedOFTManager(OFTManager):
             target_modules=self.target_modules,
             base_model=self.base_model,
             oft_type=self.oft_type,
-            oft_modules=self.adapter_modules,
+            oft_modules=self.oft_modules,
             external_target_modules=external_target_modules,
             eviction_policy=self.eviction_policy,
             oft_added_tokens_size=self.oft_added_tokens_size,
@@ -261,7 +261,7 @@ class StagedOFTManager(OFTManager):
                 )
 
         staged_dense = {}
-        oft_modules = self.adapter_modules
+        oft_modules = self.oft_modules
         for tensor_name, tensor in dense_named_tensors:
             layer_id = get_layer_id(tensor_name)
             if layer_id is None:

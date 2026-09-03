@@ -224,7 +224,7 @@ class AdapterManager:
 
     def update_info(self):
         """Associate all adapter modules with the latest memory buffer."""
-        for layer_id, layer_modules in enumerate(self.adapter_modules):
+        for layer_id, layer_modules in enumerate(self.oft_modules):
             for module_name, module in layer_modules.items():
                 target_module = get_target_module_name(
                     module_name, self.memory_pool.target_modules

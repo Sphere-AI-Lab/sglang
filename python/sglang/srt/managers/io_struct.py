@@ -530,7 +530,8 @@ class GenerateReqInput:
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_lora_versions(num)
-        self._normalize_adapter_paths(num)
+        self._normalize_oft_paths(num)
+        self._normalize_oft_versions(num)
         self._normalize_image_data(num)
         self._normalize_mm_hashes(num)
         self._normalize_video_data(num)
@@ -583,8 +584,8 @@ class GenerateReqInput:
         else:
             raise ValueError("lora_version should be a list or an integer.")
 
-    def _normalize_adapter_paths(self, num):
-        """Normalize single-active adapter paths for batch processing."""
+    def _normalize_oft_paths(self, num):
+        """Normalize single-active OFT paths for batch processing."""
         if self.oft_path is not None:
             if isinstance(self.oft_path, str):
                 self.oft_path = [self.oft_path] * num
@@ -592,6 +593,17 @@ class GenerateReqInput:
                 self.oft_path = self.oft_path * self.parallel_sample_num
             else:
                 raise ValueError("oft_path should be a list or a string.")
+
+    def _normalize_oft_versions(self, num):
+        """Normalize resolved OFT versions for batch processing."""
+        if self.oft_version is None:
+            return
+        if isinstance(self.oft_version, int):
+            self.oft_version = [self.oft_version] * num
+        elif isinstance(self.oft_version, list):
+            self.oft_version = self.oft_version * self.parallel_sample_num
+        else:
+            raise ValueError("oft_version should be a list or an integer.")
 
     def _normalize_image_data(self, num):
         """Normalize image data for batch processing."""
@@ -1275,6 +1287,7 @@ class EmbeddingReqInput:
             self._normalize_lora_paths(self.batch_size)
             self._normalize_lora_versions(self.batch_size)
             self._normalize_oft_paths(self.batch_size)
+            self._normalize_oft_versions(self.batch_size)
 
         self._validate_rid_uniqueness()
 
@@ -1290,6 +1303,20 @@ class EmbeddingReqInput:
                     )
             else:
                 raise ValueError("oft_path should be a list or a string.")
+
+    def _normalize_oft_versions(self, num):
+        """Normalize resolved OFT versions for batch processing."""
+        if self.oft_version is None:
+            return
+        if isinstance(self.oft_version, int):
+            self.oft_version = [self.oft_version] * num
+        elif isinstance(self.oft_version, list):
+            if len(self.oft_version) != num:
+                raise ValueError(
+                    f"oft_version list length ({len(self.oft_version)}) must match batch size ({num})"
+                )
+        else:
+            raise ValueError("oft_version should be a list or an integer.")
 
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
