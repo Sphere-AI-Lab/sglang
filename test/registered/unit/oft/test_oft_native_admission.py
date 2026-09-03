@@ -32,8 +32,7 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.lora.eviction_policy import get_eviction_policy
-from sglang.srt.oft.base.mem_pool import EMPTY_SLOT
-from sglang.srt.oft.mem_pool import OFTMemoryPool
+from sglang.srt.oft.mem_pool import EMPTY_SLOT, OFTMemoryPool
 from sglang.srt.oft.oft_manager import OFTManager
 from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.oft.streamed_weight_loader import (
@@ -765,7 +764,7 @@ class TestResolveCommitSplit(unittest.TestCase):
 
 def _make_admission_manager(max_adapters_per_batch):
     """Stand-in wiring OFTManager.validate_oft_batch (oft/oft_manager.py) to
-    a REAL AdapterMemPool-shaped memory pool -- so the admission-layer
+    a REAL OFTMemoryPool-shaped memory pool -- so the admission-layer
     capacity check can be exercised against realistic pool bookkeeping.
     Boot-registers uid=None at buffer slot 0, mirroring
     OFTManager.init_memory_pool's real `fetch_new_ofts({None})` call."""

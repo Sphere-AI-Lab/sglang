@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class StagedOFTMemoryPool(OFTMemoryPool):
     """OFT pool with one physical slot hidden from serving, and per-uid
-    stage/activate (unlike the inherited AdapterMemPool.stage/activate,
+    stage/activate (unlike the inherited OFTMemoryPool.stage/activate,
     which are pool-wide single-slot and used only by the non-multi-tenant
     double-buffer path)."""
 
@@ -41,7 +41,7 @@ class StagedOFTMemoryPool(OFTMemoryPool):
         ``OFTMemoryPool``'s buffer families are sized off two independent
         fields:
 
-        - ``AdapterMemPool.register_buffer_group`` (called from
+        - ``register_buffer_group`` (called from
           ``_declare_groups``/``_declare_expert_groups``) allocates the dense
           ``R:{target}`` groups and the expert ``w1/w3/w13/w2`` groups using
           ``self.max_adapters_per_batch`` as the leading (slot) dimension.
@@ -160,7 +160,7 @@ class StagedOFTManager(OFTManager):
     ``precompute_oft_r``, and the inherited ``apply_streamed_expert_oft`` --
     only the orchestration loop is duplicated here (see
     ``_partition_and_precompute``), because ``_stage_fill`` itself ends by
-    calling the OLD pool-wide, single-slot ``AdapterMemPool.stage(version,
+    calling the OLD pool-wide, single-slot ``OFTMemoryPool.stage(version,
     named_tensors)`` (2 args), which is incompatible with
     ``StagedOFTMemoryPool.stage(uid, version, named_tensors)`` (3 args,
     per-uid). ``_stage_fill`` is untouched and still serves the original

@@ -395,7 +395,7 @@ class WeightUpdater:
         as a string and is converted to int at this boundary.
 
         The OFT sibling route rejects ``double_buffer=False``: with DB-off
-        sizing the pool inherits the ``AdapterMemPool`` base defaults
+        sizing the pool inherits ``OFTMemoryPool``'s base defaults
         (active_idx=0, staging_idx=1) -- the base-identity placeholder boots
         into slot 0 (==active_idx), and ``stage()`` correctly fills slot 1
         (==staging_idx, the adapter's own gather slot), but ``activate()``

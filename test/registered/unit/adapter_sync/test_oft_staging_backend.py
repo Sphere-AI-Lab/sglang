@@ -127,7 +127,7 @@ class TestOFTStagingTransaction(unittest.TestCase):
 
 
 class TestStagingCoexistsWithMultiTenancy(unittest.TestCase):
-    """Guards the exact gap found while designing this: AdapterMemPool.activate()
+    """Guards the exact gap found while designing this: OFTMemoryPool.activate()
     is pool-wide (one _active_version for the whole pool); StagedOFTMemoryPool
     must NOT have that property, or admitting a second adapter while a first
     is being staged would corrupt the first's serving slot."""
