@@ -146,14 +146,13 @@ class TorchNativeOFTBackend(BaseOFTBackend):
                 )
                 .pin_memory()
             )
+            weight_indices_tensor = unique_weight_indices_tensor.pin_memory()
 
         seg_indptr = torch.zeros(
             (len(seg_lens) + 1,), dtype=torch.int32, pin_memory=True
         )
         seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
 
-            # Use pinned memory to avoid synchronizations during host-to-device transfer
-            weight_indices_tensor = unique_weight_indices_tensor.pin_memory()
         oft_block_sizes_tensor = torch.tensor(
             oft_block_sizes, dtype=torch.int32, pin_memory=True, device="cpu"
         )
