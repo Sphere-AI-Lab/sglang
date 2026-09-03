@@ -195,6 +195,7 @@ class MoeRunner:
                     quant_info,
                     self.config,
                     peft_layer=self._peft_layer,
+                    oft_info=oft_info,
                 )
             hooks = _maybe_build_lora_hooks(dispatch_output)
             return self.runner_core.run_from_dispatch(

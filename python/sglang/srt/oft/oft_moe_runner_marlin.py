@@ -23,10 +23,10 @@ So although ``w13_oft_r`` / ``w2_oft_r`` are stored per-expert
 
 Because the rotation is a single shared ``R`` applied to the layer INPUT (outside
 the expert GEMM), it composes trivially with the native marlin kernel: rotate the
-UN-EXPANDED input by ``R`` (``y = x @ R``, block-diagonal, via the reusable
-``apply_block_diag_orth`` OFT primitive), then run the native marlin GEMM in its
-proven shapes. Buffers are read LIVE per call; an absent/None buffer (identity
-boot / not-yet-loaded) falls through to the un-rotated GEMM for that stage.
+UN-EXPANDED input by the request-segmented OFT backend, then run the native
+marlin GEMM in its proven shapes. Immutable request state selects the adapter
+slot for each request; an absent/None buffer falls through to the un-rotated
+GEMM for that stage.
 """
 
 from __future__ import annotations
@@ -76,47 +76,43 @@ def _select_gate_up_oft_r(peft_layer):
     """
     w13 = getattr(peft_layer, "w13_oft_r", None)
     w1 = getattr(peft_layer, "w1_oft_r", None)
-    if w13 is not None and w1 is not None:
-        # Invariant (enforced by the OFT manager via oft_type): a layer carries
-        # EITHER the legacy fused w13 rotation OR the split w1/w3 rotation.
+    w3 = getattr(peft_layer, "w3_oft_r", None)
+    if w1 is not None or w3 is not None:
         raise RuntimeError(
-            "Split expert gate/up OFT (w1/w3_oft_r) cannot be active together "
-            "with legacy w13_oft_r on the same MoE layer"
-        )
-    if w1 is not None:
-        raise RuntimeError(
-            "Split expert gate/up OFT is per-expert / BF16-only; the Marlin "
-            "(quantized) MoE path supports only the legacy merged shared-R "
-            "w13_oft_r rotation. Per-expert (canonical/split) OFT must use the "
-            "triton MoE runner."
+            "canonical OFT split-expert rotations are not supported by the "
+            "Marlin MoE runner; use the triton MoE runner instead"
         )
     return w13
 
 
-def _shared_r(oft_r: torch.Tensor, name: str) -> torch.Tensor:
-    """Return the single shared rotation ``R`` (``(num_blocks, bs, bs)``) from a
-    per-expert OFT buffer ``(num_local, num_blocks, bs, bs)``.
+def _shared_r_by_slot(oft_r: torch.Tensor, name: str) -> torch.Tensor:
+    """Return one shared rotation per adapter slot.
 
-    The legacy/merged adapter fans ONE R across every expert, so all slots are
-    identical and slot 0 is representative. Verify that invariant so a genuinely
-    per-expert adapter reaching this path fails LOUD instead of silently using
-    expert 0's R for every token. The value check syncs (returns a Python bool),
-    so it is skipped under CUDA-graph capture -- it runs during eager warmup /
-    non-graph batches, which is enough to catch a mis-loaded adapter.
+    ``oft_r`` has shape ``[slot, expert, block, bs, bs]``. Legacy/shared-R
+    adapters must agree across experts independently within every slot. Retain
+    the slot dimension so request routing can still choose base, A, B, etc.
     """
-    if oft_r.shape[0] > 1 and not (
+    if oft_r.shape[1] > 1 and not (
         oft_r.is_cuda and torch.cuda.is_current_stream_capturing()
     ):
-        if not (
-            torch.equal(oft_r[0], oft_r[1]) and torch.equal(oft_r[0], oft_r[-1])
-        ):
+        first_expert = oft_r[:, :1]
+        if not torch.equal(oft_r, first_expert.expand_as(oft_r)):
             raise RuntimeError(
                 f"{name} differs across experts, but the Marlin OFT path only "
                 f"supports the legacy merged SHARED-R adapter (one R fanned out "
                 f"identically across experts). A per-expert (canonical/split) "
                 f"adapter must use the triton MoE runner, not Marlin."
             )
-    return oft_r[0]
+    return oft_r[:, 0]
+
+
+def _rotate_shared_by_request(
+    oft_backend, x: torch.Tensor, oft_r: torch.Tensor, n_groups: int = 1
+) -> torch.Tensor:
+    shared_by_slot = _shared_r_by_slot(oft_r, "shared OFT rotation")
+    return oft_backend.run_grouped_oft_r_sgemm(
+        x, shared_by_slot, n_groups=n_groups
+    )
 
 
 class MarlinOFTRunnerCore:
@@ -131,10 +127,10 @@ class MarlinOFTRunnerCore:
         quant_info: MarlinMoeQuantInfo,
         runner_config: MoeRunnerConfig,
         peft_layer,
+        oft_info,
     ) -> StandardCombineInput:
         from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-        from sglang.srt.oft.torch_ops.oft_ops import apply_block_diag_orth
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -237,10 +233,10 @@ class MarlinOFTRunnerCore:
         # ---- Gate/Up (Marlin) with shared-R input rotation ----
         # Rotate the UN-EXPANDED hidden_states by the layer's single shared gate-up
         # R, then run the native fused_marlin_moe gate-up GEMM on the rotated input.
-        gate_up_oft_r = _select_gate_up_oft_r(peft_layer)
+        gate_up_oft_r = _select_gate_up_oft_r(oft_info)
         if gate_up_oft_r is not None:
-            gate_up_input = apply_block_diag_orth(
-                hidden_states, _shared_r(gate_up_oft_r, "w13_oft_r")
+            gate_up_input = _rotate_shared_by_request(
+                peft_layer.oft_backend, hidden_states, gate_up_oft_r, n_groups=1
             )
         else:
             gate_up_input = hidden_states
@@ -284,10 +280,13 @@ class MarlinOFTRunnerCore:
             intermediate_cache3.zero_()
 
         # ---- Down (Marlin) with shared-R input rotation ----
-        w2_oft_r = getattr(peft_layer, "w2_oft_r", None)
+        w2_oft_r = getattr(oft_info, "w2_oft_r", None)
         if w2_oft_r is not None:
-            down_input = apply_block_diag_orth(
-                intermediate_cache2, _shared_r(w2_oft_r, "w2_oft_r")
+            down_input = _rotate_shared_by_request(
+                peft_layer.oft_backend,
+                intermediate_cache2,
+                w2_oft_r,
+                n_groups=topk,
             )
         else:
             down_input = intermediate_cache2

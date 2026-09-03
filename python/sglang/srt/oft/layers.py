@@ -962,19 +962,11 @@ class ReplicatedLinearWithOFT(BaseLayerWithOFT):
 class FusedMoEWithOFT(nn.Module):
     """Wrapper around FusedMoE with request-routed, pool-backed OFT."""
 
-    def __init__(self, base_layer, oft_backend: BaseOFTBackend):
+    def __init__(self, base_layer, oft_backend: BaseOFTBackend, oft_type: str):
         super().__init__()
         self.base_layer = base_layer
         self.oft_backend = oft_backend
-        self.oft_backend.is_moe_oft = True
-        self.oft_backend._moe_num_experts = max(
-            getattr(self.oft_backend, "_moe_num_experts", 0) or 0,
-            base_layer.num_experts,
-        )
-        self.oft_backend._moe_top_k = max(
-            getattr(self.oft_backend, "_moe_top_k", 0) or 0,
-            base_layer.top_k,
-        )
+        self.oft_type = oft_type
         # Copy the config the runner path reads (mirror FusedMoEWithLoRA).
         self.quant_method = base_layer.quant_method
         self.moe_runner_config = base_layer.moe_runner_config
@@ -1018,6 +1010,22 @@ class FusedMoEWithOFT(nn.Module):
                 if runner is not None
                 else MoeRunnerBackend.TRITON
             )
+
+        if runner_backend.is_marlin() and oft_type == "canonical_oft":
+            raise NotImplementedError(
+                "canonical OFT split-expert rotations are not supported by the "
+                "Marlin MoE runner"
+            )
+
+        self.oft_backend.is_moe_oft = True
+        self.oft_backend._moe_num_experts = max(
+            getattr(self.oft_backend, "_moe_num_experts", 0) or 0,
+            base_layer.num_experts,
+        )
+        self.oft_backend._moe_top_k = max(
+            getattr(self.oft_backend, "_moe_top_k", 0) or 0,
+            base_layer.top_k,
+        )
 
         # Cache the BASE quant_info (no oft_r -- OFT rides the hook). Base weights
         # are stable tensors, so caching once is safe (mirror FusedMoEWithLoRA).
@@ -1094,11 +1102,13 @@ class FusedMoEWithOFT(nn.Module):
         return base_layer.dispatcher.combine(combine_input=combine_input)
 
 
-def get_oft_layer(layer: nn.Module, oft_backend: BaseOFTBackend) -> nn.Module:
+def get_oft_layer(
+    layer: nn.Module, oft_backend: BaseOFTBackend, oft_type: str
+) -> nn.Module:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     if isinstance(layer, FusedMoE):
-        return FusedMoEWithOFT(layer, oft_backend)
+        return FusedMoEWithOFT(layer, oft_backend, oft_type)
 
     supported_layer_types = {
         # the order matters

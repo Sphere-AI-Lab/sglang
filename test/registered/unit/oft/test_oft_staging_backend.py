@@ -181,14 +181,6 @@ class TestStreamedOFTUnload(unittest.TestCase):
         pool.buffer_id_to_uid[slot_id] = uid
         pool._active_versions[uid] = 7
         pool.R_buffer[TARGET_MODULE][0][slot_id].zero_()
-        expert_module = SimpleNamespace(
-            w1_oft_r=torch.ones(1),
-            w3_oft_r=torch.ones(1),
-            w13_oft_r=torch.ones(1),
-            w2_oft_r=torch.ones(1),
-        )
-        manager._moe_modules = {0: expert_module}
-
         result = manager.unload_streamed_adapter(ref)
 
         self.assertTrue(result.success, result.error_message)
@@ -203,10 +195,6 @@ class TestStreamedOFTUnload(unittest.TestCase):
         self.assertTrue(
             torch.equal(pool.R_buffer[TARGET_MODULE][0][slot_id], identity)
         )
-        self.assertIsNone(expert_module.w13_oft_r)
-        self.assertIsNone(expert_module.w2_oft_r)
-        self.assertIsNone(expert_module.w1_oft_r)
-        self.assertIsNone(expert_module.w3_oft_r)
 
 
 def _manager_for_pool_construction(max_ofts_per_batch=4):
@@ -784,18 +772,31 @@ class TestOFTStagingBackendVersioning(unittest.TestCase):
 
 
 class TestExpertOFTRejection(unittest.TestCase):
-    def test_init_rejects_expert_targets_until_routing_is_request_aware(self):
+    def test_triton_moe_oft_is_admitted(self):
         from sglang.srt.oft.oft_manager import OFTManager
 
         manager = object.__new__(OFTManager)
         manager.refs = {}
+        manager.adapter_modules = []
+        manager.target_modules = {"gate_proj"}
+        manager.max_oft_block_size = 4
+        manager.max_ofts_per_batch = 3
+        manager.oft_backend = SimpleNamespace()
         manager.init_oft_adapters = MagicMock()
         manager.init_oft_shapes = MagicMock()
         manager.init_oft_modules = MagicMock()
         manager._install_moe_oft_wrappers = MagicMock(return_value=1)
+        manager.init_memory_pool = MagicMock()
+        manager.update_oft_info = MagicMock()
+        manager._init_identity_expert_oft_for_cuda_graph = MagicMock()
+        manager.memory_pool = SimpleNamespace(
+            uid_to_buffer_id={None: 0},
+            _init_staging_from_active=MagicMock(),
+        )
 
-        with self.assertRaisesRegex(ValueError, "request-aware"):
-            manager.init_state(max_oft_block_size=4, target_modules=["w1"])
+        manager.init_state(max_oft_block_size=4, target_modules=["gate_proj"])
+
+        manager.init_memory_pool.assert_called_once_with()
 
 
 if __name__ == "__main__":

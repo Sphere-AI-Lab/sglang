@@ -787,15 +787,7 @@ class OFTManager(AdapterManager):
         # LoRA. Runs after init_oft_modules (dense) and before anything that walks
         # the MoE modules, and invalidates the finder cache so later callers see
         # through the wrapper to base_layer.
-        n_expert_wrapped = self._install_moe_oft_wrappers()
-        # Keep expert-target admission disabled while the request-routing
-        # plumbing lands. Backend-specific admission is enabled separately.
-        if n_expert_wrapped:
-            raise ValueError(
-                "OFT on MoE expert targets is unsupported until expert "
-                "rotations are request-aware. Remove expert projections "
-                "from --peft-target-modules."
-            )
+        self._install_moe_oft_wrappers()
         self.init_memory_pool()
         self.update_oft_info()
         self._init_identity_expert_oft_for_cuda_graph()
@@ -1008,7 +1000,7 @@ class OFTManager(AdapterManager):
         return self.set_adapter_module(module_name, module)
 
     def _get_adapter_layer(self, module):
-        return get_oft_layer(module, self.oft_backend)
+        return get_oft_layer(module, self.oft_backend, self.oft_type)
 
     def _install_moe_oft_wrappers(self):
         """Replace each expert-OFT-target FusedMoE with a FusedMoEWithOFT wrapper
@@ -1041,7 +1033,7 @@ class OFTManager(AdapterManager):
         ]
         for name in moe_names:
             base = self.base_model.get_submodule(name)
-            wrapper = FusedMoEWithOFT(base, self.oft_backend)
+            wrapper = FusedMoEWithOFT(base, self.oft_backend, self.oft_type)
             replace_submodule(self.base_model, name, wrapper)
         # Drop any cache built before wrapping (e.g. if init_oft_modules touched it).
         if hasattr(self, "_moe_modules"):

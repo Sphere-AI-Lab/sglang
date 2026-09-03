@@ -6,11 +6,13 @@ import torch
 
 from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.oft import oft_moe_runner_marlin
 from sglang.srt.oft.backend.base_backend import _compute_moe_oft_info
 from sglang.srt.oft.backend.torch_backend import TorchNativeOFTBackend
 from sglang.srt.oft.backend.triton_backend import TritonOFTBackend
 from sglang.srt.oft.layers import FusedMoEWithOFT
 from sglang.srt.oft.mem_pool import EMPTY_SLOT, OFTMemoryPool
+from sglang.srt.oft.oft_moe_runner_marlin import _select_gate_up_oft_r
 from sglang.srt.oft.oft_manager import OFTManager
 from sglang.srt.oft.streamed_weight_loader import (
     _commit_streamed_oft_tensor_groups,
@@ -31,7 +33,7 @@ def _block_identity_like(slot):
     return torch.eye(slot.shape[-1], dtype=slot.dtype).expand_as(slot)
 
 
-def _make_oft_wrapper():
+def make_fake_fused_moe(runner_backend=MoeRunnerBackend.TRITON):
     config = MoeRunnerConfig(
         num_experts=3,
         num_local_experts=3,
@@ -45,8 +47,9 @@ def _make_oft_wrapper():
         inplace=False,
     )
     quant_method = MagicMock()
-    quant_method.runner = None
+    quant_method.runner = SimpleNamespace(runner_backend=runner_backend)
     quant_method.get_triton_quant_info.return_value = SimpleNamespace()
+    quant_method.get_marlin_quant_info.return_value = SimpleNamespace()
     dispatcher = MagicMock()
     dispatch_output = object()
     combine_input = object()
@@ -69,6 +72,14 @@ def _make_oft_wrapper():
     }.items():
         setattr(base_layer, name, value)
     base_layer.forward = MagicMock()
+    return base_layer
+
+
+def _make_oft_wrapper():
+    base_layer = make_fake_fused_moe()
+    dispatcher = base_layer.dispatcher
+    dispatch_output = dispatcher.dispatch.return_value
+    combine_input = dispatcher.combine.return_value
 
     backend = TorchNativeOFTBackend(
         max_ofts_per_batch=3, device=torch.device("cpu")
@@ -87,7 +98,7 @@ def _make_oft_wrapper():
         "sglang.srt.layers.moe.utils.get_moe_runner_backend",
         return_value=MoeRunnerBackend.TRITON,
     ):
-        wrapper = FusedMoEWithOFT(base_layer, backend)
+        wrapper = FusedMoEWithOFT(base_layer, backend, oft_type="canonical_oft")
     rotations = torch.eye(4).view(1, 1, 1, 4, 4).expand(3, 3, 1, 4, 4)
     wrapper.set_oft_info(
         w13_oft_r=rotations,
@@ -97,6 +108,64 @@ def _make_oft_wrapper():
     )
     wrapper._oft_runner.run = MagicMock(return_value=combine_input)
     return wrapper, dispatch_output, combine_input
+
+
+def test_shared_r_by_slot_retains_adapter_dimension():
+    eye = torch.eye(4).view(1, 1, 1, 4, 4)
+    full = eye.expand(3, 2, 1, 4, 4).clone()
+
+    shared = oft_moe_runner_marlin._shared_r_by_slot(full, "w13_oft_r")
+
+    assert shared.shape == (3, 1, 4, 4)
+    torch.testing.assert_close(shared, full[:, 0])
+
+
+def test_shared_r_by_slot_rejects_per_expert_values():
+    full = torch.eye(4).view(1, 1, 1, 4, 4).expand(3, 2, 1, 4, 4).clone()
+    full[2, 1, 0, 0, 0] = 2
+
+    with pytest.raises(RuntimeError, match="differs across experts"):
+        oft_moe_runner_marlin._shared_r_by_slot(full, "w13_oft_r")
+
+
+def test_shared_rotation_uses_segmented_backend():
+    backend = MagicMock()
+    x = torch.randn(6, 4)
+    full = torch.eye(4).view(1, 1, 1, 4, 4).expand(3, 2, 1, 4, 4).clone()
+
+    oft_moe_runner_marlin._rotate_shared_by_request(backend, x, full, n_groups=2)
+
+    args = backend.run_grouped_oft_r_sgemm.call_args
+    assert args.args[0] is x
+    assert args.args[1].shape == (3, 1, 4, 4)
+    assert args.kwargs["n_groups"] == 2
+
+
+def test_canonical_split_marlin_reports_specific_limitation():
+    split = SimpleNamespace(
+        w13_oft_r=None,
+        w1_oft_r=torch.empty(3, 2, 1, 4, 4),
+        w3_oft_r=torch.empty(3, 2, 1, 4, 4),
+    )
+
+    with pytest.raises(RuntimeError, match="canonical.*split.*Marlin"):
+        _select_gate_up_oft_r(split)
+
+
+def test_canonical_oft_is_rejected_at_marlin_wrapper_startup():
+    base_layer = make_fake_fused_moe(runner_backend=MoeRunnerBackend.MARLIN)
+
+    with pytest.raises(
+        NotImplementedError,
+        match="canonical.*split-expert.*Marlin",
+    ):
+        FusedMoEWithOFT(
+            base_layer,
+            oft_backend=MagicMock(),
+            oft_type="canonical_oft",
+        )
+
+    base_layer.quant_method.get_marlin_quant_info.assert_not_called()
 
 
 def test_expert_group_exposes_all_adapter_slots():
