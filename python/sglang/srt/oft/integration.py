@@ -21,7 +21,7 @@ forward_batch_info.py's inline ``ForwardBatch.init_new`` block (next to the
 with ``DecodeCudaGraphRunner._prepare_oft_replay_batch`` the one exception --
 its multi-step temporary-swap logic has no LoRA equivalent, since LoRA's
 ``lora_ids`` restores generically via ``buffer_registry.fill_from`` while
-``adapter_ids`` isn't a registered buffer field), and
+``oft_ids`` isn't a registered buffer field), and
 model_runner_components/weight_updater.py's direct
 ``model_runner.oft_manager.stage_adapter``/``activate_adapter`` calls (next
 to the native-LoRA and OFT-staged branches).

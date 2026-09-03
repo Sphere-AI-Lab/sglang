@@ -10,7 +10,7 @@ class TestResolveOrReuse(unittest.IsolatedAsyncioTestCase):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
         registry = AdapterRegistry()
-        ref = AdapterRef(adapter_name="a", adapter_path="a")
+        ref = AdapterRef(oft_name="a", oft_path="a")
         resolved, reused = await registry.resolve_or_reuse(ref, upsert=False)
         self.assertIs(resolved, ref)
         self.assertFalse(reused)
@@ -19,7 +19,7 @@ class TestResolveOrReuse(unittest.IsolatedAsyncioTestCase):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
         registry = AdapterRegistry()
-        ref = AdapterRef(adapter_name="a", adapter_path="a")
+        ref = AdapterRef(oft_name="a", oft_path="a")
         resolved, reused = await registry.resolve_or_reuse(ref, upsert=True)
         self.assertIs(resolved, ref)
         self.assertFalse(reused)
@@ -28,19 +28,19 @@ class TestResolveOrReuse(unittest.IsolatedAsyncioTestCase):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
         registry = AdapterRegistry()
-        existing = AdapterRef(adapter_name="a", adapter_path="old")
+        existing = AdapterRef(oft_name="a", oft_path="old")
         await registry.register(existing)
-        new_ref = AdapterRef(adapter_name="a", adapter_path="new")
+        new_ref = AdapterRef(oft_name="a", oft_path="new")
         resolved, reused = await registry.resolve_or_reuse(new_ref, upsert=True)
         self.assertTrue(reused)
-        self.assertEqual(resolved.adapter_id, existing.adapter_id)
-        self.assertEqual(resolved.adapter_path, "new")
+        self.assertEqual(resolved.oft_id, existing.oft_id)
+        self.assertEqual(resolved.oft_path, "new")
         # resolve_or_reuse must not mutate the registry itself.
         self.assertIs(registry.get_all_adapters()["a"], existing)
 
     async def test_upsert_bumps_adapter_version(self):
         """Regression guard for C2: an in-place upsert must bump
-        adapter_version past the existing entry's, so the radix cache key
+        version past the existing entry's, so the radix cache key
         (which is extended with the adapter's version) changes across the
         refresh. Without this, repeated in-place upserts of the same
         adapter name never change the radix key, and a prompt re-served
@@ -49,30 +49,30 @@ class TestResolveOrReuse(unittest.IsolatedAsyncioTestCase):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
         registry = AdapterRegistry()
-        existing = AdapterRef(adapter_name="a", adapter_path="old", adapter_version=1)
+        existing = AdapterRef(oft_name="a", oft_path="old", version=1)
         await registry.register(existing)
-        new_ref = AdapterRef(adapter_name="a", adapter_path="new")
+        new_ref = AdapterRef(oft_name="a", oft_path="new")
         resolved, reused = await registry.resolve_or_reuse(new_ref, upsert=True)
         self.assertTrue(reused)
-        self.assertEqual(resolved.adapter_version, existing.adapter_version + 1)
+        self.assertEqual(resolved.version, existing.version + 1)
 
         # A second round of upserts must keep bumping past the CURRENT
         # registered version, not the original one.
         await registry.refresh(resolved)
-        second_new_ref = AdapterRef(adapter_name="a", adapter_path="newer")
+        second_new_ref = AdapterRef(oft_name="a", oft_path="newer")
         resolved_again, reused_again = await registry.resolve_or_reuse(
             second_new_ref, upsert=True
         )
         self.assertTrue(reused_again)
-        self.assertEqual(resolved_again.adapter_version, resolved.adapter_version + 1)
+        self.assertEqual(resolved_again.version, resolved.version + 1)
 
     async def test_upsert_preserve_pinned(self):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
         registry = AdapterRegistry()
-        existing = AdapterRef(adapter_name="a", adapter_path="old", pinned=True)
+        existing = AdapterRef(oft_name="a", oft_path="old", pinned=True)
         await registry.register(existing)
-        new_ref = AdapterRef(adapter_name="a", adapter_path="new", pinned=False)
+        new_ref = AdapterRef(oft_name="a", oft_path="new", pinned=False)
         resolved, _ = await registry.resolve_or_reuse(
             new_ref, upsert=True, preserve_pinned=True
         )
@@ -84,21 +84,21 @@ class TestRefresh(unittest.IsolatedAsyncioTestCase):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
         registry = AdapterRegistry()
-        existing = AdapterRef(adapter_name="a", adapter_path="old")
+        existing = AdapterRef(oft_name="a", oft_path="old")
         await registry.register(existing)
         updated = AdapterRef(
-            adapter_id=existing.adapter_id, adapter_name="a", adapter_path="new"
+            oft_id=existing.oft_id, oft_name="a", oft_path="new"
         )
         await registry.refresh(updated)
-        self.assertEqual(registry.get_all_adapters()["a"].adapter_path, "new")
+        self.assertEqual(registry.get_all_adapters()["a"].oft_path, "new")
 
     async def test_refresh_asserts_matching_id(self):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
         registry = AdapterRegistry()
-        existing = AdapterRef(adapter_name="a", adapter_path="old")
+        existing = AdapterRef(oft_name="a", oft_path="old")
         await registry.register(existing)
-        wrong_id_ref = AdapterRef(adapter_name="a", adapter_path="new")
+        wrong_id_ref = AdapterRef(oft_name="a", oft_path="new")
         with self.assertRaises(AssertionError):
             await registry.refresh(wrong_id_ref)
 
@@ -106,7 +106,7 @@ class TestRefresh(unittest.IsolatedAsyncioTestCase):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
         registry = AdapterRegistry()
-        ref = AdapterRef(adapter_name="a", adapter_path="a")
+        ref = AdapterRef(oft_name="a", oft_path="a")
         with self.assertRaises(AssertionError):
             await registry.refresh(ref)
 
@@ -116,22 +116,22 @@ class TestAcquireWithVersion(unittest.IsolatedAsyncioTestCase):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
         registry = AdapterRegistry()
-        ref = AdapterRef(adapter_name="a", adapter_path="a", adapter_version=3)
+        ref = AdapterRef(oft_name="a", oft_path="a", version=3)
         await registry.register(ref)
         uid, version = await registry.acquire_with_version("a")
-        self.assertEqual(uid, ref.adapter_id)
+        self.assertEqual(uid, ref.oft_id)
         self.assertEqual(version, 3)
 
     async def test_list_of_names_returns_parallel_lists(self):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
         registry = AdapterRegistry()
-        a = AdapterRef(adapter_name="a", adapter_path="a", adapter_version=1)
-        b = AdapterRef(adapter_name="b", adapter_path="b", adapter_version=2)
+        a = AdapterRef(oft_name="a", oft_path="a", version=1)
+        b = AdapterRef(oft_name="b", oft_path="b", version=2)
         await registry.register(a)
         await registry.register(b)
         uids, versions = await registry.acquire_with_version(["a", None, "b"])
-        self.assertEqual(uids, [a.adapter_id, None, b.adapter_id])
+        self.assertEqual(uids, [a.oft_id, None, b.oft_id])
         self.assertEqual(versions, [1, None, 2])
 
     async def test_acquire_with_version_rejects_invalid_input_type(self):
@@ -147,13 +147,13 @@ class TestAcquireWithVersion(unittest.IsolatedAsyncioTestCase):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
         registry = AdapterRegistry()
-        ref = AdapterRef(adapter_name="a", adapter_path="a", adapter_version=5)
+        ref = AdapterRef(oft_name="a", oft_path="a", version=5)
         await registry.register(ref)
         # Single string input should return scalar tuple
         uid, version = await registry.acquire_with_version("a")
         self.assertIsInstance(uid, str)
         self.assertIsInstance(version, int)
-        self.assertEqual(uid, ref.adapter_id)
+        self.assertEqual(uid, ref.oft_id)
         self.assertEqual(version, 5)
 
     async def test_acquire_with_version_counter_incremented(self):
@@ -166,7 +166,7 @@ class TestAcquireWithVersion(unittest.IsolatedAsyncioTestCase):
         from sglang.srt.oft.base.registry import AdapterRef, AdapterRegistry
 
         registry = AdapterRegistry()
-        ref = AdapterRef(adapter_name="a", adapter_path="a", adapter_version=1)
+        ref = AdapterRef(oft_name="a", oft_path="a", version=1)
         await registry.register(ref)
 
         # Acquire the adapter

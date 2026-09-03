@@ -141,7 +141,7 @@ class TestMoeMultiTenancyDecision(unittest.TestCase):
 class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
     """The multi-tenant MoE kernel indexes slot_ids by TOKEN (MoE routing is
     per token), but ``weight_indices`` is built per REQUEST from
-    ``forward_batch.adapter_ids`` (``[req.adapter_id for req in batch.reqs]``).
+    ``forward_batch.oft_ids`` (``[req.oft_id for req in batch.reqs]``).
 
     Regression guard for the bug that shipped in this plan's Task 1: the
     per-request array was handed to the kernel unexpanded, so every extend /
@@ -202,7 +202,7 @@ class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
         """Regression guard: under decode-CUDA-graph replay,
         ``DecodeCudaGraphRunner._prepare_oft_replay_batch`` temporarily
         sets ``forward_batch.batch_size`` to the padded capture-bucket size and
-        pads ``adapter_ids`` with ``None`` (so ``weight_indices`` is padded
+        pads ``oft_ids`` with ``None`` (so ``weight_indices`` is padded
         too), but leaves ``forward_batch.input_ids`` at the RAW, pre-pad token
         count. The per-request expansion computed here therefore legitimately
         sums to the PADDED batch size while ``input_ids.shape[0]`` is the raw
@@ -218,7 +218,7 @@ class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
         """
         tm = self._make_tm()
         # raw_bs=3 real requests padded to capture bucket bs=4; the padded row
-        # carries adapter_id None -> weight_indices 0 (the base/identity slot).
+        # carries oft_id None -> weight_indices 0 (the base/identity slot).
         weight_indices = [1, 1, 1, 0]
         result = tm._compute_moe_multi_tenant_slot_ids(
             weight_indices,
@@ -1031,7 +1031,7 @@ class TestPrepareOftBatchEagerDemotionOnOverflow(unittest.TestCase):
         return SimpleNamespace(
             batch_size=batch_size,
             forward_mode=ForwardMode.TARGET_VERIFY,
-            adapter_ids=["adapterA", "adapterB"][:batch_size],
+            oft_ids=["adapterA", "adapterB"][:batch_size],
             input_ids=torch.zeros(batch_size * draft_token_num, dtype=torch.int32),
             spec_info=SimpleNamespace(draft_token_num=draft_token_num),
         )

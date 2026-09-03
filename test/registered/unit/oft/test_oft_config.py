@@ -48,6 +48,8 @@ def _args(
         oft_type="canonical_oft",
         max_oft_chunk_size=16,
         oft_double_buffer=oft_double_buffer,
+        oft_drain_wait_threshold=0.0,
+        enable_oft_overlap_loading=False,
         speculative_algorithm=None,
         cuda_graph_config=cuda_graph_config,
         oft_impl=oft_impl,

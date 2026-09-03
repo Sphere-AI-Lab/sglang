@@ -704,10 +704,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # mirroring decode_cuda_graph_runner and the normal forward
         # (forward_batch_info.py). Self-guards on enable_oft; without it the
         # OFT triton backend reads an unset batch_info during the
-        # tc-piecewise compile pass. fb carries dummy adapter_ids (base) from
+        # tc-piecewise compile pass. fb carries dummy oft_ids (base) from
         # capture_prepare; load_batch re-preps OFT with the real ids at
         # replay.
-        if fb.adapter_ids is not None:
+        if fb.oft_ids is not None:
             self.model_runner.oft_manager.prepare_oft_batch(fb)
         self._run_forward(fb, num_tokens)
 
@@ -1260,13 +1260,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_gpu = None
             global_num_tokens_for_logprob_gpu = None
 
-        # OFT: dummy adapter_ids so prepare_oft_batch binds the OFT batch_info
+        # OFT: dummy oft_ids so prepare_oft_batch binds the OFT batch_info
         # during the compile/capture pass (mirrors decode_cuda_graph_runner's
-        # dummy lora_ids/adapter_ids capture). [None]*bs when enable_oft is set
+        # dummy lora_ids/oft_ids capture). [None]*bs when enable_oft is set
         # (-> base slot at capture), else None. load_batch threads the real
-        # adapter_ids back in at replay, flipping the single-active idx
+        # oft_ids back in at replay, flipping the single-active idx
         # base->active.
-        adapter_dummy_ids = (
+        oft_dummy_ids = (
             [None] * bs if self.model_runner.server_args.enable_oft else None
         )
         with torch.device(self.device):
@@ -1331,7 +1331,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # All-None ids are safe: kernels no-op at rank 0 and replay
                 # refreshes the static batch info with live values.
                 lora_ids=([None] * bs if self._capture_lora else None),
-                adapter_ids=adapter_dummy_ids,
+                oft_ids=oft_dummy_ids,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
@@ -1425,8 +1425,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # exactly as run_dummy_forward does for the tc-piecewise compile
         # pass. Without it the breakable backend's capture reads an unset
         # TritonOFTBackend.batch_info (AttributeError at the first OFT-wrapped
-        # projection). load_batch re-preps with the real adapter_ids at replay.
-        if forward_batch.adapter_ids is not None:
+        # projection). load_batch re-preps with the real oft_ids at replay.
+        if forward_batch.oft_ids is not None:
             self.model_runner.oft_manager.prepare_oft_batch(forward_batch)
 
         def run_once():
@@ -1593,7 +1593,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
-            adapter_ids=forward_batch.adapter_ids,
+            oft_ids=forward_batch.oft_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
             temperature=forward_batch.temperature,
@@ -1676,10 +1676,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         # Re-prep the OFT adapter batch_info for replay with the REAL
-        # adapter_ids (capture used dummy base ids): the captured single-
+        # oft_ids (capture used dummy base ids): the captured single-
         # adapter idx flips base->active here. Runs eagerly outside the
         # compiled region, same as decode's replay re-prep.
-        if static_forward_batch.adapter_ids is not None:
+        if static_forward_batch.oft_ids is not None:
             self.model_runner.oft_manager.prepare_oft_batch(static_forward_batch)
 
         return static_forward_batch

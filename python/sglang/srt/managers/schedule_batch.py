@@ -815,7 +815,7 @@ def _extend_lora_extra_key(
 
 
 def _extend_oft_extra_key(
-    extra_key: Optional[str], adapter_id: Optional[str], adapter_version: Optional[int]
+    extra_key: Optional[str], oft_id: Optional[str], oft_version: Optional[int]
 ) -> Optional[str]:
     """Separate radix entries by OFT adapter identity and weight VERSION.
 
@@ -825,10 +825,10 @@ def _extend_oft_extra_key(
     version half, under RL the same adapter id is re-pushed with new weights
     every step, so id alone would let a prefix cached under version k be
     reused under k+1."""
-    if adapter_id is None:
+    if oft_id is None:
         return extra_key
-    version = 0 if adapter_version is None else adapter_version
-    return (extra_key or "") + f"|oft:{adapter_id}:v{version}"
+    version = 0 if oft_version is None else oft_version
+    return (extra_key or "") + f"|oft:{oft_id}:v{version}"
 
 
 class Req(ReqDllmMixin):
@@ -850,8 +850,8 @@ class Req(ReqDllmMixin):
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
         lora_version: Optional[int] = None,
-        adapter_id: Optional[str] = None,
-        adapter_version: Optional[int] = None,
+        oft_id: Optional[str] = None,
+        oft_version: Optional[int] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
         token_type_ids: List[int] = None,
@@ -955,14 +955,14 @@ class Req(ReqDllmMixin):
 
         # Extra key for caller-defined request classification.
         extra_key = _extend_lora_extra_key(extra_key, lora_id, lora_version)
-        extra_key = _extend_oft_extra_key(extra_key, adapter_id, adapter_version)
+        extra_key = _extend_oft_extra_key(extra_key, oft_id, oft_version)
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
         self.lora_id = lora_id
         self.lora_version = lora_version
-        self.adapter_id = adapter_id
-        self.adapter_version = adapter_version
+        self.oft_id = oft_id
+        self.oft_version = oft_version
         self.routing_key = routing_key
 
         # Memory pool info

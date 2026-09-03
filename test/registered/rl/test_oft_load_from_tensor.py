@@ -118,11 +118,11 @@ class TestOFTLoadFromTensor(CustomTestCase):
         return _oft_named_tensors(self.num_layers, self.intermediate_size, seed)
 
     @staticmethod
-    def _generate(engine, adapter_name=None) -> str:
+    def _generate(engine, oft_name=None) -> str:
         output = engine.generate(
             prompt=[TEST_PROMPT],
             sampling_params={"max_new_tokens": MAX_NEW_TOKENS, "temperature": 0.0},
-            adapter_path=[adapter_name] if adapter_name is not None else None,
+            oft_path=[oft_name] if oft_name is not None else None,
         )
         return output[0]["text"]
 
@@ -130,7 +130,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
         print("[Test]Testing fresh OFT adapter load + generate...")
         name = "oft_fresh_load"
         result = self.engine.load_oft_adapter_from_tensors(
-            adapter_name=name,
+            oft_name=name,
             tensors=self._tensors(seed=1),
             config_dict=_adapter_config_dict(),
         )
@@ -138,7 +138,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
             result.success, f"Failed to load OFT adapter from tensors: {result.error_message}"
         )
         base_text = self._generate(self.engine)
-        adapter_text = self._generate(self.engine, adapter_name=name)
+        adapter_text = self._generate(self.engine, oft_name=name)
         print(f"[Without OFT] {base_text}")
         print(f"[With OFT]    {adapter_text}")
         self.assertTrue(
@@ -167,7 +167,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
         (upsert=True). OFT's from_tensors route fully supports upsert=True
         (unlike LoRA's, which explicitly rejects it)."""
         return engine.load_oft_adapter_from_tensors(
-            adapter_name=name,
+            oft_name=name,
             tensors=_oft_named_tensors(self.num_layers, self.intermediate_size, seed),
             config_dict=_adapter_config_dict(),
             upsert=True,
@@ -181,7 +181,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
         cover a different (secondary) use case. Runs several in-place
         rounds (not just one load-then-upsert pair) and, for every round,
         verifies: the update actually changes generation output, the
-        adapter_id stays stable (resolve_or_reuse/refresh reusing the same
+        oft_id stays stable (resolve_or_reuse/refresh reusing the same
         identity, never minting a new one), and the tokenizer-side registry
         never grows past a single entry. Uses a dedicated engine with the
         tightest config the current implementation's own invariants allow
@@ -228,7 +228,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
             seed = 200 + round_idx
             if round_idx == 0:
                 result = engine.load_oft_adapter_from_tensors(
-                    adapter_name=name,
+                    oft_name=name,
                     tensors=_oft_named_tensors(
                         self.num_layers, self.intermediate_size, seed
                     ),
@@ -252,19 +252,19 @@ class TestOFTLoadFromTensor(CustomTestCase):
                 f"would mean this path isn't actually update-in-place -- "
                 f"got {list(all_adapters)}",
             )
-            adapter_id = all_adapters[name].adapter_id
+            oft_id = all_adapters[name].oft_id
             if prev_adapter_id is None:
-                prev_adapter_id = adapter_id
+                prev_adapter_id = oft_id
             else:
                 self.assertEqual(
-                    adapter_id,
+                    oft_id,
                     prev_adapter_id,
                     f"Round {round_idx}: in-place upsert must reuse the same "
-                    f"adapter_id via resolve_or_reuse/refresh, got a new id "
-                    f"{adapter_id!r} != {prev_adapter_id!r}",
+                    f"oft_id via resolve_or_reuse/refresh, got a new id "
+                    f"{oft_id!r} != {prev_adapter_id!r}",
                 )
 
-            text = self._generate(engine, adapter_name=name)
+            text = self._generate(engine, oft_name=name)
             print(f"[Round {round_idx}] {text!r}")
             self.assertTrue(text, f"Round {round_idx}: generation produced no text")
             self.assertNotEqual(
@@ -279,7 +279,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
 
     def test_upsert_invalidates_radix_cache(self):
         """Regression test for C2: an in-place upsert must bump
-        adapter_version so its radix cache key changes -- otherwise
+        oft_version so its radix cache key changes -- otherwise
         re-issuing the SAME prompt after an upsert can be served from a
         stale KV prefix cached under the pre-upsert weights' key (see
         weight_updater.py's documented invariant: KV produced under version
@@ -288,7 +288,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
 
         Unlike test_upsert_refresh (which uses a different prompt each
         round, so a stale-cache hit would never be observable there), this
-        reuses the exact same prompt/adapter_name across both rounds, so a
+        reuses the exact same prompt/oft_name across both rounds, so a
         cache hit is directly observable as unchanged output despite the
         weights differing.
         """
@@ -307,12 +307,12 @@ class TestOFTLoadFromTensor(CustomTestCase):
             }
         )
         result = engine.load_oft_adapter_from_tensors(
-            adapter_name=name,
+            oft_name=name,
             tensors=_oft_named_tensors(self.num_layers, self.intermediate_size, seed=400),
             config_dict=_adapter_config_dict(),
         )
         self.assertTrue(result.success, f"Failed to load OFT adapter: {result.error_message}")
-        text_v1 = self._generate(engine, adapter_name=name)
+        text_v1 = self._generate(engine, oft_name=name)
         self.assertTrue(text_v1, "Generation before upsert produced no text")
 
         upsert_result = self._upsert(engine, name, seed=401)
@@ -321,15 +321,15 @@ class TestOFTLoadFromTensor(CustomTestCase):
         # SAME prompt, SAME adapter name -- if the radix cache key didn't
         # change across the upsert, this could be served from the
         # pre-upsert KV prefix instead of reflecting the new weights.
-        text_v2 = self._generate(engine, adapter_name=name)
+        text_v2 = self._generate(engine, oft_name=name)
         self.assertTrue(text_v2, "Generation after upsert produced no text")
         self.assertNotEqual(
             text_v1,
             text_v2,
             "Re-issuing the SAME prompt after an in-place OFT upsert produced "
             "identical output -- the radix cache may have served a stale KV "
-            "prefix cached under the pre-upsert adapter_version (i.e. "
-            "adapter_version was not bumped on upsert).",
+            "prefix cached under the pre-upsert oft_version (i.e. "
+            "oft_version was not bumped on upsert).",
         )
 
     def test_lru_eviction_past_max_loaded_ofts(self):
@@ -384,7 +384,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
         for i, name in enumerate(names[:real_capacity]):
             print(f"[Test]Loading OFT adapter {i + 1}/{real_capacity}: {name}")
             result = engine.load_oft_adapter_from_tensors(
-                adapter_name=name,
+                oft_name=name,
                 tensors=_oft_named_tensors(
                     self.num_layers, self.intermediate_size, seed=100 + i
                 ),
@@ -400,7 +400,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
         # evict an unrecoverable adapter (the pre-fix behavior) or crash.
         overflow_name = names[real_capacity]
         overflow_result = engine.load_oft_adapter_from_tensors(
-            adapter_name=overflow_name,
+            oft_name=overflow_name,
             tensors=_oft_named_tensors(
                 self.num_layers, self.intermediate_size, seed=999
             ),
@@ -435,7 +435,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
         # fixed by finalize_peft_lease releasing the request's adapter lease
         # on completion).
         for name in names[:real_capacity]:
-            text = self._generate(engine, adapter_name=name)
+            text = self._generate(engine, oft_name=name)
             self.assertTrue(
                 text, f"Generation with resident adapter {name!r} produced no text"
             )
@@ -450,13 +450,13 @@ class TestOFTLoadFromTensor(CustomTestCase):
         print("[Test]Testing concurrent residency of multiple OFT adapters...")
         name_a, name_b = "oft_multi_a", "oft_multi_b"
         result_a = self.engine.load_oft_adapter_from_tensors(
-            adapter_name=name_a,
+            oft_name=name_a,
             tensors=self._tensors(seed=20),
             config_dict=_adapter_config_dict(),
         )
         self.assertTrue(result_a.success, f"Failed to load {name_a}: {result_a.error_message}")
         result_b = self.engine.load_oft_adapter_from_tensors(
-            adapter_name=name_b,
+            oft_name=name_b,
             tensors=self._tensors(seed=21),
             config_dict=_adapter_config_dict(),
         )
@@ -467,8 +467,8 @@ class TestOFTLoadFromTensor(CustomTestCase):
         # removing the old single-active restriction). The unload path
         # itself is covered by test_fresh_load_and_generate and
         # test_lru_eviction_past_max_loaded_ofts.
-        text_a = self._generate(self.engine, adapter_name=name_a)
-        text_b = self._generate(self.engine, adapter_name=name_b)
+        text_a = self._generate(self.engine, oft_name=name_a)
+        text_b = self._generate(self.engine, oft_name=name_b)
         print(f"[Adapter A] {text_a}")
         print(f"[Adapter B] {text_b}")
         self.assertTrue(text_a, f"Generation with {name_a} produced no text")
@@ -476,7 +476,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
 
         # Re-issuing against A after serving B must reproduce the same
         # output: B's residency/serving must not have disturbed A.
-        text_a_again = self._generate(self.engine, adapter_name=name_a)
+        text_a_again = self._generate(self.engine, oft_name=name_a)
         self.assertEqual(
             text_a,
             text_a_again,

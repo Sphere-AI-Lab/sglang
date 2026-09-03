@@ -58,7 +58,7 @@ def _make_communicator(preloaded: dict = None) -> AsyncMock:
         if isinstance(obj, UnloadOFTAdapterReqInput):
             return [OFTUpdateOutput(success=True)]
         merged = dict(preloaded)
-        merged[obj.adapter_name] = obj.adapter_id
+        merged[obj.oft_name] = obj.oft_id
         return [OFTUpdateOutput(success=True, loaded_adapters=merged)]
 
     return AsyncMock(side_effect=_side_effect)
@@ -84,10 +84,10 @@ def _make_tokenizer_manager(
 
 
 def _make_tensors_req(
-    adapter_name: str = "a", upsert: bool = False, pinned: bool = False
+    oft_name: str = "a", upsert: bool = False, pinned: bool = False
 ) -> LoadOFTAdapterFromTensorsReqInput:
     return LoadOFTAdapterFromTensorsReqInput(
-        adapter_name=adapter_name,
+        oft_name=oft_name,
         config_dict=CONFIG_DICT,
         serialized_named_tensors=[],
         pinned=pinned,
@@ -96,10 +96,10 @@ def _make_tensors_req(
 
 
 def _make_distributed_req(
-    adapter_name: str = "a", upsert: bool = False, pinned: bool = False
+    oft_name: str = "a", upsert: bool = False, pinned: bool = False
 ) -> LoadOFTAdapterFromDistributedReqInput:
     return LoadOFTAdapterFromDistributedReqInput(
-        adapter_name=adapter_name,
+        oft_name=oft_name,
         config_dict=CONFIG_DICT,
         names=[],
         dtypes=[],
@@ -117,10 +117,10 @@ class TestFreshLoadRegisters(CustomTestCase):
         result = asyncio.run(tm.load_oft_adapter_from_tensors(obj))
 
         self.assertTrue(result.success)
-        self.assertIsNotNone(obj.adapter_id)
+        self.assertIsNotNone(obj.oft_id)
         self.assertEqual(tm.oft_registry.num_registered_ofts, 1)
         self.assertEqual(
-            tm.oft_registry.get_all_adapters()["a"].adapter_id, obj.adapter_id
+            tm.oft_registry.get_all_adapters()["a"].oft_id, obj.oft_id
         )
         self.assertIs(tm.oft_ref_cache["a"], tm.oft_registry.get_all_adapters()["a"])
 
@@ -131,16 +131,16 @@ class TestFreshLoadRegisters(CustomTestCase):
         result = asyncio.run(tm.load_oft_adapter_from_distributed(obj))
 
         self.assertTrue(result.success)
-        self.assertIsNotNone(obj.adapter_id)
+        self.assertIsNotNone(obj.oft_id)
         self.assertEqual(tm.oft_registry.num_registered_ofts, 1)
-        self.assertEqual(tm.oft_ref_cache["a"].adapter_id, obj.adapter_id)
+        self.assertEqual(tm.oft_ref_cache["a"].oft_id, obj.oft_id)
 
 
 class TestUpsertReusesId(CustomTestCase):
     def test_from_distributed_upsert_reuses_existing_id(self):
         tm = _make_tokenizer_manager()
         existing = OFTRef(
-            adapter_name="a", adapter_path="__distributed__", reloadable=False
+            oft_name="a", oft_path="__distributed__", reloadable=False
         )
         asyncio.run(tm.oft_registry.register(existing))
 
@@ -148,10 +148,10 @@ class TestUpsertReusesId(CustomTestCase):
         result = asyncio.run(tm.load_oft_adapter_from_distributed(obj))
 
         self.assertTrue(result.success)
-        self.assertEqual(obj.adapter_id, existing.adapter_id)
+        self.assertEqual(obj.oft_id, existing.oft_id)
         # Refreshed in place, not re-registered as a second entry.
         self.assertEqual(tm.oft_registry.num_registered_ofts, 1)
-        self.assertEqual(tm.oft_ref_cache["a"].adapter_id, existing.adapter_id)
+        self.assertEqual(tm.oft_ref_cache["a"].oft_id, existing.oft_id)
 
     def test_from_tensors_upsert_reuses_existing_id(self):
         # Unlike LoRA's from_tensors route (which rejects upsert outright),
@@ -159,7 +159,7 @@ class TestUpsertReusesId(CustomTestCase):
         # from_distributed does -- this pins that intentional behavior.
         tm = _make_tokenizer_manager()
         existing = OFTRef(
-            adapter_name="a", adapter_path="__tensor__", reloadable=False
+            oft_name="a", oft_path="__tensor__", reloadable=False
         )
         asyncio.run(tm.oft_registry.register(existing))
 
@@ -167,20 +167,20 @@ class TestUpsertReusesId(CustomTestCase):
         result = asyncio.run(tm.load_oft_adapter_from_tensors(obj))
 
         self.assertTrue(result.success)
-        self.assertEqual(obj.adapter_id, existing.adapter_id)
+        self.assertEqual(obj.oft_id, existing.oft_id)
         self.assertEqual(tm.oft_registry.num_registered_ofts, 1)
 
     def test_from_distributed_upsert_bumps_adapter_version(self):
         """Regression guard for C2: the native handler's upsert path must
-        bump adapter_version on the registered/cached ref -- otherwise the
+        bump version on the registered/cached ref -- otherwise the
         radix cache key never changes across in-place refreshes and a
         request could be served from a stale, pre-refresh KV prefix."""
         tm = _make_tokenizer_manager()
         existing = OFTRef(
-            adapter_name="a",
-            adapter_path="__distributed__",
+            oft_name="a",
+            oft_path="__distributed__",
             reloadable=False,
-            adapter_version=1,
+            version=1,
         )
         asyncio.run(tm.oft_registry.register(existing))
 
@@ -190,16 +190,16 @@ class TestUpsertReusesId(CustomTestCase):
 
         self.assertTrue(result.success)
         updated = tm.oft_registry.get_all_adapters()["a"]
-        self.assertEqual(updated.adapter_version, existing.adapter_version + 1)
-        self.assertEqual(tm.oft_ref_cache["a"].adapter_version, updated.adapter_version)
+        self.assertEqual(updated.version, existing.version + 1)
+        self.assertEqual(tm.oft_ref_cache["a"].version, updated.version)
 
     def test_from_tensors_upsert_bumps_adapter_version(self):
         tm = _make_tokenizer_manager()
         existing = OFTRef(
-            adapter_name="a",
-            adapter_path="__tensor__",
+            oft_name="a",
+            oft_path="__tensor__",
             reloadable=False,
-            adapter_version=1,
+            version=1,
         )
         asyncio.run(tm.oft_registry.register(existing))
 
@@ -209,13 +209,13 @@ class TestUpsertReusesId(CustomTestCase):
 
         self.assertTrue(result.success)
         updated = tm.oft_registry.get_all_adapters()["a"]
-        self.assertEqual(updated.adapter_version, existing.adapter_version + 1)
+        self.assertEqual(updated.version, existing.version + 1)
 
     def test_non_upsert_duplicate_fails(self):
         tm = _make_tokenizer_manager()
         asyncio.run(
             tm.oft_registry.register(
-                OFTRef(adapter_name="a", adapter_path="__tensor__")
+                OFTRef(oft_name="a", oft_path="__tensor__")
             )
         )
 
@@ -230,11 +230,11 @@ class TestUpsertReusesId(CustomTestCase):
 class TestLRUEviction(CustomTestCase):
     def test_eviction_fires_when_max_loaded_ofts_exceeded(self):
         tm = _make_tokenizer_manager(max_loaded_ofts=1)
-        old_ref = OFTRef(adapter_name="old", adapter_path="/old")
+        old_ref = OFTRef(oft_name="old", oft_path="/old")
         asyncio.run(tm.oft_registry.register(old_ref))
         tm.oft_ref_cache["old"] = old_ref
         tm.update_oft_adapter_communicator = _make_communicator(
-            {"old": old_ref.adapter_id}
+            {"old": old_ref.oft_id}
         )
 
         result = asyncio.run(
@@ -258,11 +258,11 @@ class TestLRUEviction(CustomTestCase):
 
     def test_no_eviction_when_under_limit(self):
         tm = _make_tokenizer_manager(max_loaded_ofts=2)
-        old_ref = OFTRef(adapter_name="old", adapter_path="/old")
+        old_ref = OFTRef(oft_name="old", oft_path="/old")
         asyncio.run(tm.oft_registry.register(old_ref))
         tm.oft_ref_cache["old"] = old_ref
         tm.update_oft_adapter_communicator = _make_communicator(
-            {"old": old_ref.adapter_id}
+            {"old": old_ref.oft_id}
         )
 
         result = asyncio.run(
@@ -277,12 +277,12 @@ class TestLRUEviction(CustomTestCase):
 class TestUnloadDeleteVsEvictSemantics(CustomTestCase):
     def test_explicit_unload_drops_ref_cache_entry(self):
         tm = _make_tokenizer_manager()
-        ref = OFTRef(adapter_name="a", adapter_path="/x")
+        ref = OFTRef(oft_name="a", oft_path="/x")
         asyncio.run(tm.oft_registry.register(ref))
         tm.oft_ref_cache["a"] = ref
 
         result = asyncio.run(
-            tm.unload_oft_adapter(UnloadOFTAdapterReqInput(adapter_name="a"))
+            tm.unload_oft_adapter(UnloadOFTAdapterReqInput(oft_name="a"))
         )
 
         self.assertTrue(result.success)
@@ -300,7 +300,7 @@ class TestUnloadWaitsBeforeCommunicatorDispatch(CustomTestCase):
 
     def test_wait_for_unload_precedes_communicator_call(self):
         tm = _make_tokenizer_manager()
-        ref = OFTRef(adapter_name="a", adapter_path="/x")
+        ref = OFTRef(oft_name="a", oft_path="/x")
         asyncio.run(tm.oft_registry.register(ref))
         tm.oft_ref_cache["a"] = ref
 
@@ -322,7 +322,7 @@ class TestUnloadWaitsBeforeCommunicatorDispatch(CustomTestCase):
         )
 
         result = asyncio.run(
-            tm.unload_oft_adapter(UnloadOFTAdapterReqInput(adapter_name="a"))
+            tm.unload_oft_adapter(UnloadOFTAdapterReqInput(oft_name="a"))
         )
 
         self.assertTrue(result.success)
@@ -337,7 +337,7 @@ class TestMultiRankFailureNotSwallowed(CustomTestCase):
 
     def test_unload_reports_non_first_rank_failure(self):
         tm = _make_tokenizer_manager()
-        ref = OFTRef(adapter_name="a", adapter_path="/x")
+        ref = OFTRef(oft_name="a", oft_path="/x")
         asyncio.run(tm.oft_registry.register(ref))
         tm.oft_ref_cache["a"] = ref
         tm.update_oft_adapter_communicator = AsyncMock(
@@ -348,7 +348,7 @@ class TestMultiRankFailureNotSwallowed(CustomTestCase):
         )
 
         result = asyncio.run(
-            tm.unload_oft_adapter(UnloadOFTAdapterReqInput(adapter_name="a"))
+            tm.unload_oft_adapter(UnloadOFTAdapterReqInput(oft_name="a"))
         )
 
         self.assertFalse(result.success)
@@ -397,7 +397,7 @@ class TestFinalizeOftLeaseIdempotency(CustomTestCase):
         tm.oft_registry.release = AsyncMock()
         state = SimpleNamespace(
             oft_lease_released=False,
-            obj=SimpleNamespace(adapter_id="adapter-1", adapter_path="a"),
+            obj=SimpleNamespace(oft_id="adapter-1", oft_path="a"),
         )
 
         self._finalize(tm, state, times=3)
@@ -421,12 +421,12 @@ class TestFinalizeOftLeaseNoOp(CustomTestCase):
         tm.oft_registry.release.assert_not_awaited()
 
     def test_no_op_when_adapter_id_is_none(self):
-        # Base-only request (OFT enabled, no adapter named): adapter_id
+        # Base-only request (OFT enabled, no adapter named): oft_id
         # stays None, so there is no lease to release.
         tm = SimpleNamespace(oft_registry=MagicMock())
         tm.oft_registry.release = AsyncMock()
         state = SimpleNamespace(
-            oft_lease_released=False, obj=SimpleNamespace(adapter_id=None)
+            oft_lease_released=False, obj=SimpleNamespace(oft_id=None)
         )
 
         self._run(OFTTokenizerMixin.finalize_oft_lease, tm, state)
@@ -435,7 +435,7 @@ class TestFinalizeOftLeaseNoOp(CustomTestCase):
         self.assertFalse(state.oft_lease_released)
 
     def test_no_op_when_request_type_has_no_adapter_id_field(self):
-        # EmbeddingReqInput never declares adapter_id at all (OFT has no
+        # EmbeddingReqInput never declares oft_id at all (OFT has no
         # embedding support -- generate_request only calls
         # maybe_resolve_oft_path under isinstance(obj, GenerateReqInput)),
         # so state.obj can genuinely lack the attribute. Must getattr-guard
@@ -478,6 +478,10 @@ class TestRegisterOftRefRollback(CustomTestCase):
 
     def test_register_oft_ref_reports_newly_registered(self):
         tm = self._make_tm()
+        # register_oft_ref's obj is the shared UpdateAdapterFromDistributedReqInput/
+        # UpdateWeightsFromTensorReqInput type, whose fields stay adapter_name/
+        # adapter_id (not renamed to oft_name/oft_id -- see oft/integration.py's
+        # module docstring for why).
         obj = SimpleNamespace(adapter_name="a", adapter_id=None)
         newly_registered = asyncio.run(OFTTokenizerMixin.register_oft_ref(tm, obj))
         self.assertTrue(newly_registered)
@@ -550,7 +554,7 @@ class TestWrongPeftConfigRejected(CustomTestCase):
         tm = _make_tokenizer_manager(enable_oft=False)
 
         result = asyncio.run(
-            tm.unload_oft_adapter(UnloadOFTAdapterReqInput(adapter_name="a"))
+            tm.unload_oft_adapter(UnloadOFTAdapterReqInput(oft_name="a"))
         )
 
         self.assertFalse(result.success)
@@ -588,7 +592,7 @@ class TestMintRefIsNotReloadable(CustomTestCase):
             server_args=SimpleNamespace(max_loaded_ofts=None),
         )
         tm._request_oft_path = MethodType(OFTTokenizerMixin._request_oft_path, tm)
-        obj = SimpleNamespace(adapter_path="a", lora_path=None)
+        obj = SimpleNamespace(oft_path="a", lora_path=None)
 
         with self.assertRaisesRegex(ValueError, "no on-disk artifact"):
             asyncio.run(OFTTokenizerMixin.resolve_oft_path(tm, obj))

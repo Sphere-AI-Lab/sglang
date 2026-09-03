@@ -295,9 +295,9 @@ class StagedOFTManager(OFTManager):
         return staged_dense, fused_expert_chunk, block_size
 
     def stage_adapter(
-        self, named_tensors, config, name, version, adapter_id=None
+        self, named_tensors, config, name, version, oft_id=None
     ) -> "OFTUpdateOutput":
-        uid = adapter_id if adapter_id is not None else name
+        uid = oft_id if oft_id is not None else name
         try:
             version = int(version)
             pending = self._pending_oft_stage
@@ -377,9 +377,9 @@ class StagedOFTManager(OFTManager):
         return self.create_oft_update_result(success=True)
 
     def activate_adapter(
-        self, name, version, adapter_id=None
+        self, name, version, oft_id=None
     ) -> "OFTUpdateOutput":
-        uid = adapter_id if adapter_id is not None else name
+        uid = oft_id if oft_id is not None else name
         try:
             version = int(version)
         except Exception as error:
@@ -468,7 +468,7 @@ class OFTStagingBackend:
         # A real client's obj.adapter_id defaults to None -- it has no way to
         # know the server-minted id -- so this must resolve it here the same
         # way register_oft_ref does (oft/tokenizer_mixin.py), or
-        # StagedOFTManager.activate_adapter's `uid = adapter_id if adapter_id
+        # StagedOFTManager.activate_adapter's `uid = oft_id if oft_id
         # is not None else name` falls back to obj.adapter_name, which never
         # matches the UUID stage_adapter recorded for this adapter. No
         # separate pre-activation validation exists beyond this identity
@@ -478,7 +478,7 @@ class OFTStagingBackend:
                 f"Cannot activate name={obj.adapter_name}; no OFT adapter "
                 "with that name is registered"
             )
-        obj.adapter_id = self._tm.oft_ref_cache[obj.adapter_name].adapter_id
+        obj.adapter_id = self._tm.oft_ref_cache[obj.adapter_name].oft_id
 
     async def finish_activation(self, obj, results):
         from sglang.srt.managers.communicator import FanOutCommunicator

@@ -410,21 +410,21 @@ class OFTManager(AdapterManager):
         """Load a single OFT adapter from the specified path. Mirrors
         LoRAManager._load_lora_adapter exactly."""
         assert (
-            oft_ref.adapter_name is not None and oft_ref.adapter_path is not None
-        ), "OFTRef must have both adapter_name and adapter_path set for loading."
-        assert oft_ref.adapter_id not in self.adapters, (
-            f"OFT adapter with ID {oft_ref.adapter_id} is already loaded. This "
+            oft_ref.oft_name is not None and oft_ref.oft_path is not None
+        ), "OFTRef must have both oft_name and oft_path set for loading."
+        assert oft_ref.oft_id not in self.adapters, (
+            f"OFT adapter with ID {oft_ref.oft_id} is already loaded. This "
             "should have been verified before request is sent to the backend."
         )
 
         try:
-            new_config = self._build_config(oft_ref.adapter_path)
+            new_config = self._build_config(oft_ref.oft_path)
             self.validate_new_adapter(new_config, oft_ref)
-            self.configs[oft_ref.adapter_id] = new_config
+            self.configs[oft_ref.oft_id] = new_config
 
             self.load_oft_weights(oft_ref)
 
-            self.refs[oft_ref.adapter_id] = oft_ref
+            self.refs[oft_ref.oft_id] = oft_ref
             self.num_pinned += int(oft_ref.pinned)
         except Exception as e:
             return self.create_oft_update_result(success=False, error_message=str(e))
@@ -439,15 +439,15 @@ class OFTManager(AdapterManager):
         time a request actually names this adapter, the same way it already
         does for tensor/distributed-streamed adapters."""
         oft_adapter = OFTAdapter(
-            oft_ref.adapter_id,
-            self.configs[oft_ref.adapter_id],
+            oft_ref.oft_id,
+            self.configs[oft_ref.oft_id],
             self.base_hf_config,
             self.load_config,
             self.oft_backend,
         )
         oft_adapter.initialize_weights()
 
-        self.adapters[oft_ref.adapter_id] = oft_adapter
+        self.adapters[oft_ref.oft_id] = oft_adapter
 
     def validate_new_adapter(self, oft_config: OFTConfig, oft_ref: OFTRef):
         """
@@ -460,22 +460,22 @@ class OFTManager(AdapterManager):
 
         # Check if this OFT adapter is already loaded
         for existing_oft_ref in self.refs.values():
-            if oft_ref.adapter_name == existing_oft_ref.adapter_name:
+            if oft_ref.oft_name == existing_oft_ref.oft_name:
                 raise ValueError(
-                    f"Failed to load OFT adapter {oft_ref.adapter_name} because it is already loaded"
+                    f"Failed to load OFT adapter {oft_ref.oft_name} because it is already loaded"
                 )
 
-            if oft_ref.adapter_path == existing_oft_ref.adapter_path:
+            if oft_ref.oft_path == existing_oft_ref.oft_path:
                 logger.warning(
-                    f"{oft_ref.adapter_path} is already loaded with name: {existing_oft_ref.adapter_name}, "
-                    f"but another copy is being loaded with name: {oft_ref.adapter_name}"
+                    f"{oft_ref.oft_path} is already loaded with name: {existing_oft_ref.oft_name}, "
+                    f"but another copy is being loaded with name: {oft_ref.oft_name}"
                 )
 
         if isinstance(oft_config.target_modules, list):
             validate_model_oft_target_modules(
                 self.base_model,
                 get_normalized_target_modules(oft_config.target_modules),
-                source=f"adapter '{oft_ref.adapter_name}' PEFT config",
+                source=f"adapter '{oft_ref.oft_name}' PEFT config",
             )
 
         # Check if the OFT adapter shape is compatible with the current OFT memory pool configuration.
@@ -483,7 +483,7 @@ class OFTManager(AdapterManager):
         incompatible = memory_pool and not memory_pool.can_support(oft_config)
         if incompatible:
             raise ValueError(
-                f"OFT adapter {oft_ref.adapter_name} with block_size {oft_config.block_size} is incompatible with the current "
+                f"OFT adapter {oft_ref.oft_name} with block_size {oft_config.block_size} is incompatible with the current "
                 "OFT memory pool configuration. Please ensure that the OFT adapter's block_size is within the configured "
                 "`--max-oft-block-size` and that the target modules are included in `--oft-target-modules`."
             )
@@ -499,7 +499,7 @@ class OFTManager(AdapterManager):
         # slot and leave zero room for any unpinned one.
         if oft_ref.pinned and self.num_pinned >= self.max_ofts_per_batch - 2:
             raise ValueError(
-                f"Failed to load OFT adapter {oft_ref.adapter_name} as a pinned adapter. It is not allowed to pin all "
+                f"Failed to load OFT adapter {oft_ref.oft_name} as a pinned adapter. It is not allowed to pin all "
                 "real slots in the OFT memory pool (buffer slot 0 is reserved for the base/identity placeholder) to "
                 "avoid starvation for unpinned adapters. Please increase your `--max-ofts-per-batch` or load it as "
                 "unpinned OFT adapters."
@@ -521,13 +521,13 @@ class OFTManager(AdapterManager):
             # Guards against double-counting if this is ever called twice for
             # the same ref -- mirrors unload_streamed_adapter's symmetric
             # was_registered guard.
-            was_already_registered = oft_ref.adapter_id in self.refs
+            was_already_registered = oft_ref.oft_id in self.refs
             config = OFTConfig.from_dict(config_dict)
-            self.configs[oft_ref.adapter_id] = config
-            self.refs[oft_ref.adapter_id] = oft_ref
+            self.configs[oft_ref.oft_id] = config
+            self.refs[oft_ref.oft_id] = oft_ref
             # Register buffer slot mapping so inference can find this adapter
-            self.memory_pool.uid_to_buffer_id[oft_ref.adapter_id] = buffer_id
-            self.memory_pool.buffer_id_to_uid[buffer_id] = oft_ref.adapter_id
+            self.memory_pool.uid_to_buffer_id[oft_ref.oft_id] = buffer_id
+            self.memory_pool.buffer_id_to_uid[buffer_id] = oft_ref.oft_id
             if not was_already_registered:
                 # Keeps num_pinned accurate for pinned adapters loaded over
                 # the wire -- this used to never be counted here, silently
@@ -556,24 +556,24 @@ class OFTManager(AdapterManager):
             # same ref -- this method already tolerates being called more
             # than once, via the `in self.configs`/`in self.refs` checks --
             # can't double-decrement and drive num_pinned negative.
-            was_registered = oft_ref.adapter_id in self.refs
-            if oft_ref.adapter_id in self.configs:
-                del self.configs[oft_ref.adapter_id]
-            if oft_ref.adapter_id in self.refs:
-                del self.refs[oft_ref.adapter_id]
+            was_registered = oft_ref.oft_id in self.refs
+            if oft_ref.oft_id in self.configs:
+                del self.configs[oft_ref.oft_id]
+            if oft_ref.oft_id in self.refs:
+                del self.refs[oft_ref.oft_id]
             if was_registered:
                 self.num_pinned -= int(oft_ref.pinned)
             # Clean up buffer slot mapping
-            if oft_ref.adapter_id in self.memory_pool.uid_to_buffer_id:
-                buffer_id = self.memory_pool.uid_to_buffer_id[oft_ref.adapter_id]
-                del self.memory_pool.uid_to_buffer_id[oft_ref.adapter_id]
+            if oft_ref.oft_id in self.memory_pool.uid_to_buffer_id:
+                buffer_id = self.memory_pool.uid_to_buffer_id[oft_ref.oft_id]
+                del self.memory_pool.uid_to_buffer_id[oft_ref.oft_id]
                 self.memory_pool.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
                 # Drop LRU tracking too, else the native RPC admission path's
                 # eviction_policy.mark_used(...) calls would leak an entry
                 # per unloaded adapter (harmless for victim selection, since
                 # candidates are scanned from uid_to_buffer_id, but unbounded
                 # growth in a long-running server otherwise).
-                self.memory_pool.eviction_policy.remove(oft_ref.adapter_id)
+                self.memory_pool.eviction_policy.remove(oft_ref.oft_id)
         except Exception as e:
             return self.create_oft_update_result(
                 success=False,
@@ -595,7 +595,7 @@ class OFTManager(AdapterManager):
         while leaving ``self.adapters[uid]`` behind and ``num_pinned``
         un-decremented -- a half-unloaded state that later confuses
         ``AdapterManager.unload_adapter``'s disk-vs-streamed dispatch (it
-        would find ``adapter_id in self.adapters`` still true but
+        would find ``oft_id in self.adapters`` still true but
         ``configs``/``refs`` already gone). A disk-backed adapter simply
         losing its GPU buffer slot (already done by the caller, for the
         eviction case, via ``allocate_buffer_slot_with_eviction``) is fine on
@@ -603,13 +603,13 @@ class OFTManager(AdapterManager):
         yet been admitted into a batch, and it will be paged back into a
         fresh slot the next time a batch needs it.
         """
-        if oft_ref.adapter_id in self.adapters:
+        if oft_ref.oft_id in self.adapters:
             logger.info(
                 "Freeing the GPU buffer slot of disk-backed OFT adapter "
                 "'%s' (%s) without unloading it -- it remains loaded and "
                 "will be re-admitted into a fresh slot when next "
                 "referenced.",
-                oft_ref.adapter_name,
+                oft_ref.oft_name,
                 context,
             )
             return self._make_update_result(success=True)
@@ -701,7 +701,7 @@ class OFTManager(AdapterManager):
                 return self._make_update_result(
                     success=False,
                     error_message=(
-                        f"OFT adapter '{ref.adapter_name}' has block_size="
+                        f"OFT adapter '{ref.oft_name}' has block_size="
                         f"{block_size}, but the server pool is allocated for "
                         f"--max-oft-block-size={max_block_size}; smaller or "
                         "mixed block sizes are unsupported."
@@ -718,7 +718,7 @@ class OFTManager(AdapterManager):
 
             existing_id = None
             for ref_id, existing_ref in list(self.refs.items()):
-                if existing_ref.adapter_name == ref.adapter_name:
+                if existing_ref.oft_name == ref.oft_name:
                     existing_id = ref_id
                     break
             if existing_id is not None:
@@ -726,7 +726,7 @@ class OFTManager(AdapterManager):
                     return self._make_update_result(
                         success=False,
                         error_message=(
-                            f"OFT adapter '{ref.adapter_name}' is already "
+                            f"OFT adapter '{ref.oft_name}' is already "
                             "loaded; pass upsert=True to refresh it in place."
                         ),
                     )
@@ -741,7 +741,7 @@ class OFTManager(AdapterManager):
                     return self._make_update_result(
                         success=False,
                         error_message=(
-                            f"OFT adapter '{ref.adapter_name}' is currently loaded "
+                            f"OFT adapter '{ref.oft_name}' is currently loaded "
                             "from disk (--peft-paths) and cannot be converted to a "
                             "wire-loaded adapter via upsert. Use a different adapter "
                             "name for the wire-loaded adapter."
@@ -755,7 +755,7 @@ class OFTManager(AdapterManager):
                 self.refs
             )
             evicted_name = (
-                self.refs[evicted_uid].adapter_name if evicted_uid is not None else None
+                self.refs[evicted_uid].oft_name if evicted_uid is not None else None
             )
             if evicted_uid is not None:
                 evict_result = self._unload_streamed_adapter_if_not_disk_backed(
@@ -772,7 +772,7 @@ class OFTManager(AdapterManager):
             # from the moment it's admitted, or a later admission-time
             # eviction attempt could pick among only just-loaded,
             # never-served adapters and find nothing tracked to select.
-            self.memory_pool.eviction_policy.mark_used(ref.adapter_id)
+            self.memory_pool.eviction_policy.mark_used(ref.oft_id)
 
             success, error_message = _commit_streamed_oft_tensor_groups(
                 self,
@@ -780,8 +780,8 @@ class OFTManager(AdapterManager):
                 plan,
                 buffer_id,
                 block_size,
-                ref.adapter_name,
-                ref.adapter_id,
+                ref.oft_name,
+                ref.oft_id,
             )
             if not success:
                 # Undo the registration/mark_used above: without this, refs/
@@ -799,7 +799,7 @@ class OFTManager(AdapterManager):
                     logger.error(
                         "Failed to clean up OFT adapter '%s' after a failed "
                         "commit: %s",
-                        ref.adapter_name,
+                        ref.oft_name,
                         cleanup_result.error_message,
                     )
                 if evicted_name is not None:
@@ -842,8 +842,8 @@ class OFTManager(AdapterManager):
             ref, tensors, config_dict, upsert=upsert
         )
 
-    def validate_oft_batch(self, adapter_ids: set[Optional[str]]) -> bool:
-        return self.validate_batch(adapter_ids)
+    def validate_oft_batch(self, oft_ids: set[Optional[str]]) -> bool:
+        return self.validate_batch(oft_ids)
 
     def fetch_new_ofts(
         self, new_ofts: set[Optional[str]], running_ofts: set[Optional[str]] = set()
@@ -872,7 +872,7 @@ class OFTManager(AdapterManager):
         ``weight_indices`` is the same buffer-slot list ``prepare_oft_batch``
         already computes for the dense path (0 = identity/base slot, no real
         adapter). It is indexed PER REQUEST -- it is built by iterating
-        ``forward_batch.adapter_ids``, which is ``[req.adapter_id for req in
+        ``forward_batch.oft_ids``, which is ``[req.oft_id for req in
         batch.reqs]`` -- because an adapter assignment is inherently per
         request: one request uses one adapter for its whole generation. The
         dense path consumes it at that granularity via its ``seg_indptr``
@@ -1017,7 +1017,7 @@ class OFTManager(AdapterManager):
         # (the obvious candidate) is the RAW token count, but under
         # decode-CUDA-graph replay DecodeCudaGraphRunner's
         # _prepare_oft_replay_batch pads forward_batch.batch_size and
-        # adapter_ids up to the capture-bucket size WITHOUT touching
+        # oft_ids up to the capture-bucket size WITHOUT touching
         # input_ids, so tokens_per_request (built off batch_size) legitimately
         # sums to the PADDED count instead. A mismatch there is not a
         # catchable error on CUDA -- it is a device-side assert that poisons
@@ -1110,13 +1110,13 @@ class OFTManager(AdapterManager):
             if estimated_num_tokens > self._moe_cg_slot_ids_buffer.shape[0]:
                 use_cuda_graph = False
 
-        weight_indices = [0] * len(forward_batch.adapter_ids)
+        weight_indices = [0] * len(forward_batch.oft_ids)
         oft_block_sizes = [0] * self.max_ofts_per_batch
-        for i, uid in enumerate(forward_batch.adapter_ids):
+        for i, uid in enumerate(forward_batch.oft_ids):
             # Mirrors upstream LoRAManager.prepare_lora_batch: a uid with no
             # resident slot keeps weight_indices[i] = 0 rather than raising.
             # Real requests are always resident (fetch_new_ofts runs first).
-            # The CUDA-graph replay path pads adapter_ids with None WITHOUT a
+            # The CUDA-graph replay path pads oft_ids with None WITHOUT a
             # fetch too, but that padding no longer reaches this `continue`
             # branch at all: the base/identity placeholder (uid=None) is now
             # permanently resident (registered once at boot by OFTMemoryPool.
@@ -1224,7 +1224,7 @@ class OFTManager(AdapterManager):
             1 for layer_modules in self.adapter_modules if layer_modules
         )
         loaded_adapter_names = sorted(
-            str(oft_ref.adapter_name) for oft_ref in self.refs.values()
+            str(oft_ref.oft_name) for oft_ref in self.refs.values()
         )
         logger.info(
             "event=oft_manager_initialized target_modules=%s "
@@ -1261,7 +1261,7 @@ class OFTManager(AdapterManager):
                 source="server --oft-target-modules",
             )
 
-        for adapter_id, config in self.configs.items():
+        for oft_id, config in self.configs.items():
             # Handle PEFT shorthand strings like "all-linear" or "all".
             # These cannot be resolved to concrete module names without
             # inspecting the base model, so we require the user to specify
@@ -1273,9 +1273,9 @@ class OFTManager(AdapterManager):
                         # per-adapter inference for this adapter.
                         continue
                     else:
-                        adapter_name = self.refs[adapter_id].adapter_name
+                        oft_name = self.refs[oft_id].oft_name
                         raise ValueError(
-                            f"OFT adapter '{adapter_name}' uses "
+                            f"OFT adapter '{oft_name}' uses "
                             f"target_modules='{config.target_modules}' which cannot "
                             "be resolved automatically. Please explicitly specify "
                             "--oft-target-modules during server startup. You can "
@@ -1300,11 +1300,11 @@ class OFTManager(AdapterManager):
             adapter_target_modules = get_normalized_target_modules(
                 config.target_modules
             )
-            adapter_name = self.refs[adapter_id].adapter_name
+            oft_name = self.refs[oft_id].oft_name
             validate_model_oft_target_modules(
                 self.base_model,
                 adapter_target_modules,
-                source=f"adapter '{adapter_name}' PEFT config",
+                source=f"adapter '{oft_name}' PEFT config",
             )
 
             if target_modules is not None:
@@ -1312,7 +1312,7 @@ class OFTManager(AdapterManager):
                 if not adapter_target_modules.issubset(self.target_modules):
                     unsupported_modules = adapter_target_modules - self.target_modules
                     raise ValueError(
-                        f"OFT adapter '{adapter_name}' contains target modules {sorted(unsupported_modules)} "
+                        f"OFT adapter '{oft_name}' contains target modules {sorted(unsupported_modules)} "
                         f"that are not included in the specified --oft-target-modules {sorted(self.target_modules)}. "
                         f"Please update --oft-target-modules to include all required modules: "
                         f"{sorted(self.target_modules | adapter_target_modules)}, or use 'all' to enable all supported modules."
@@ -2084,7 +2084,7 @@ class OFTManager(AdapterManager):
                 f"sizes are unsupported."
             )
         other_adapters = sorted(
-            r.adapter_name for r in self.refs.values() if r.adapter_name != name
+            r.oft_name for r in self.refs.values() if r.oft_name != name
         )
         if other_adapters:
             raise ValueError(
@@ -2181,38 +2181,38 @@ class OFTManager(AdapterManager):
             )
 
     def _bump_ref_version(self, name, version):
-        for adapter_id, ref in self.refs.items():
-            if ref.adapter_name == name:
-                self.refs[adapter_id] = replace(ref, adapter_version=version)
+        for oft_id, ref in self.refs.items():
+            if ref.oft_name == name:
+                self.refs[oft_id] = replace(ref, version=version)
                 return
         raise ValueError(
             f"OFT adapter {name!r} not found in refs; cannot bump version"
         )
 
-    def _make_streamed_ref(self, name, version, adapter_id=None, config=None):
+    def _make_streamed_ref(self, name, version, oft_id=None, config=None):
         from sglang.srt.oft.oft_registry import OFTRef
 
         # Single-active convention: the id IS the name when the tokenizer supplies
-        # none. OFTRef rejects a None adapter_id.
-        if adapter_id is None:
-            adapter_id = name
+        # none. OFTRef rejects a None oft_id.
+        if oft_id is None:
+            oft_id = name
         oft_ref = OFTRef(
-            adapter_id=adapter_id,
-            adapter_name=name,
-            adapter_path=name,
+            oft_id=oft_id,
+            oft_name=name,
+            oft_path=name,
             # Pinned: a streamed adapter has no CPU-side OFTAdapter to re-page
             # from (the trainer pushed R straight into the slot), so evicting it
             # is unrecoverable. Upstream LoRA needs no equivalent -- every one of
             # its adapters is disk-backed. Pinning excludes the slot from
             # allocate_buffer_slot_with_eviction's eviction candidates.
             pinned=True,
-            adapter_version=version,
+            version=version,
         )
         # Register per-request serving routing at the FIXED double-buffer
         # active_idx (NOT a dynamically-allocated slot: the DB
         # pool stages into staging_idx then copies into the fixed active_idx on
-        # activate). This sets uid_to_buffer_id[adapter_id]=active_idx +
-        # refs[adapter_id]=oft_ref, so the forward gather (get_buffer_id(uid))
+        # activate). This sets uid_to_buffer_id[oft_id]=active_idx +
+        # refs[oft_id]=oft_ref, so the forward gather (get_buffer_id(uid))
         # resolves a /generate naming this adapter. Mirrors the proven IPC path's
         # register_streamed_adapter.
         result = self.register_streamed_adapter(

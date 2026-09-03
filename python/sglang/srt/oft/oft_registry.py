@@ -24,8 +24,8 @@ class OFTRef(AdapterRef):
     """
     Reference record for an OFT adapter.
 
-    Inherits the unified adapter identity (adapter_id/adapter_name/adapter_path/
-    adapter_version/pinned) from AdapterRef. The unique ``adapter_id`` eliminates
+    Inherits the unified adapter identity (oft_id/oft_name/oft_path/
+    version/pinned) from AdapterRef. The unique ``oft_id`` eliminates
     conflicts from reused names or paths and can be used to generate deterministic
     cache keys (e.g., radix cache).
     """
@@ -57,23 +57,23 @@ class OFTRegistry(AdapterRegistry):
         )
         super().__init__(adapter_paths)
 
-    async def bump_version_by_id(self, adapter_id: str) -> OFTRef:
+    async def bump_version_by_id(self, oft_id: str) -> OFTRef:
         """
         Increment the version for an already-registered adapter ID.
 
-        This keeps the stable ``adapter_id`` used by the OFT memory pool while
+        This keeps the stable ``oft_id`` used by the OFT memory pool while
         invalidating radix-cache keys after streamed on-policy updates.
         """
 
         async with self._registry_lock.writer_lock:
-            for adapter_name, oft_ref in self._registry.items():
-                if oft_ref.adapter_id == adapter_id:
+            for oft_name, oft_ref in self._registry.items():
+                if oft_ref.oft_id == oft_id:
                     new_ref = replace(
-                        oft_ref, adapter_version=oft_ref.adapter_version + 1
+                        oft_ref, version=oft_ref.version + 1
                     )
-                    self._registry[adapter_name] = new_ref
+                    self._registry[oft_name] = new_ref
                     return new_ref
-        raise ValueError(f"OFT ID {adapter_id} does not exist.")
+        raise ValueError(f"OFT ID {oft_id} does not exist.")
 
     async def lru_oft_name(self, exclude_pinned=False):
         return await self.lru_adapter_name(exclude_pinned=exclude_pinned)

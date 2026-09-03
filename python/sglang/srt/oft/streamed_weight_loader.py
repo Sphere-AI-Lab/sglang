@@ -376,8 +376,8 @@ def _commit_streamed_oft_tensor_groups(
     plan,
     buffer_id: int,
     block_size: int,
-    adapter_name: str,
-    adapter_id: str | None,
+    oft_name: str,
+    oft_id: str | None,
 ) -> tuple[bool, str]:
     """Write an already-resolved plan (see _resolve_streamed_oft_tensor_groups)
     into buffer_id's R_buffer slots. named_tensors is the ORIGINAL raw
@@ -407,10 +407,10 @@ def _commit_streamed_oft_tensor_groups(
                     f"max={cur_max:.3e} mean={cur_mean:.3e} nonzero={cur_nonzero}"
                 )
         logger.info(
-            "OFT streamed payload adapter=%s adapter_id=%s buffer_id=%s "
+            "OFT streamed payload adapter=%s oft_id=%s buffer_id=%s "
             "tensor_count=%s max_abs=%.6e total_nonzero=%s samples=%s",
-            adapter_name,
-            adapter_id,
+            oft_name,
+            oft_id,
             buffer_id,
             len(named_tensors),
             max_abs,

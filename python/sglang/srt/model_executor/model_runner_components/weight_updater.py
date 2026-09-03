@@ -458,7 +458,7 @@ class WeightUpdater:
                     adapter_config,
                     adapter_name,
                     int(adapter_version),
-                    adapter_id=adapter_id,
+                    oft_id=adapter_id,
                 )
                 if not result.success:
                     return False, result.error_message
@@ -482,7 +482,7 @@ class WeightUpdater:
                     # Single-active convention: the tokenizer-registered adapter_id
                     # (== adapter_name == "orbit_oft"); fall back to adapter_name when
                     # the tokenizer supplied none.
-                    adapter_id=adapter_id if adapter_id is not None else adapter_name,
+                    oft_id=adapter_id if adapter_id is not None else adapter_name,
                 )
                 if not result.success:
                     return False, result.error_message
@@ -520,7 +520,7 @@ class WeightUpdater:
                 result = model_runner.oft_manager.activate_adapter(
                     adapter_name,
                     int(adapter_version),
-                    adapter_id=adapter_id,
+                    oft_id=adapter_id,
                 )
                 if not result.success:
                     return False, result.error_message

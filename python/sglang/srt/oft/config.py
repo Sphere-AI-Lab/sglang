@@ -84,6 +84,15 @@ class OFTArgs:
     # single-active sync (IPC/colocate), byte-identical to today.
     oft_double_buffer: A[bool, NS("lora")] = False
 
+    # Starvation-prevention scheduling (mirrors --lora-drain-wait-threshold).
+    # Help text lives on the manual parser.add_argument in register_oft_args
+    # below, like every other OFTArgs field.
+    oft_drain_wait_threshold: A[float, NS("lora")] = 0.0
+
+    # Overlap the GPU-side cost of materializing a not-yet-resident adapter's
+    # weights with ongoing compute (mirrors --enable-lora-overlap-loading).
+    enable_oft_overlap_loading: A[bool, NS("lora")] = False
+
 
 def register_oft_args(parser: argparse.ArgumentParser) -> None:
     """Register all OFT CLI flags on ``parser`` (was the OFT block of add_cli_args)."""
@@ -172,6 +181,25 @@ def register_oft_args(parser: argparse.ArgumentParser) -> None:
         "'staged' = srt/oft's StagedOFTManager (explicit stage/activate "
         "transaction for async-RL weight sync).",
     )
+    parser.add_argument(
+        "--oft-drain-wait-threshold",
+        type=float,
+        default=OFTArgs.oft_drain_wait_threshold,
+        help="When any OFT adapter request waits longer than this threshold "
+        "(in seconds), the scheduler will selectively drain one running "
+        "adapter to make room. This mitigates extreme tail latency under "
+        "high or skewed workloads by preventing a small set of adapters "
+        "from monopolizing batch slots. Set to 0 to disable draining "
+        "(default).",
+    )
+    parser.add_argument(
+        "--enable-oft-overlap-loading",
+        action="store_true",
+        default=OFTArgs.enable_oft_overlap_loading,
+        help="Overlap the GPU-side cost of materializing a not-yet-resident "
+        "OFT adapter's weights with ongoing compute, instead of stalling "
+        "the forward pass that first names it.",
+    )
 
 
 # Attribute names the MoE architectures in this repo use for their per-token
@@ -236,6 +264,9 @@ def validate_oft_args(server_args) -> None:
     from sglang.srt.utils.common import SUPPORTED_OFT_TARGET_MODULES
 
     assert server_args.max_ofts_per_batch > 0, "max_ofts_per_batch must be positive"
+    assert (
+        server_args.oft_drain_wait_threshold >= 0.0
+    ), "--oft-drain-wait-threshold must be non-negative."
 
     if server_args.max_loaded_ofts is not None:
         # Buffer slot 0 is always reserved for the base/identity placeholder

@@ -155,14 +155,14 @@ class TestMoeMultiTenantCudaGraphEndToEnd(CustomTestCase):
     def tearDownClass(cls):
         cls.engine.shutdown()
 
-    def _generate(self, adapter_name=None):
+    def _generate(self, oft_name=None):
         """Single-request generate. Returns (text, per-token output
         logprobs) -- see module docstring for why logprobs (not text) are
         this file's comparison signal."""
         output = self.engine.generate(
             prompt=[TEST_PROMPT],
             sampling_params={"max_new_tokens": MAX_NEW_TOKENS, "temperature": 0.0},
-            adapter_path=[adapter_name] if adapter_name is not None else None,
+            oft_path=[oft_name] if oft_name is not None else None,
             return_logprob=True,
         )
         text = output[0]["text"]
@@ -182,7 +182,7 @@ class TestMoeMultiTenantCudaGraphEndToEnd(CustomTestCase):
         output = self.engine.generate(
             prompt=[TEST_PROMPT, TEST_PROMPT],
             sampling_params={"max_new_tokens": MAX_NEW_TOKENS, "temperature": 0.0},
-            adapter_path=[adapter_name_a, adapter_name_b],
+            oft_path=[adapter_name_a, adapter_name_b],
             return_logprob=True,
         )
         results = []
@@ -209,7 +209,7 @@ class TestMoeMultiTenantCudaGraphEndToEnd(CustomTestCase):
 
         name = "lone_resident_adapter"
         result = self.engine.load_oft_adapter_from_tensors(
-            adapter_name=name,
+            oft_name=name,
             tensors=_expert_named_tensors(seed=1),
             config_dict=_moe_config_dict(),
         )
@@ -217,7 +217,7 @@ class TestMoeMultiTenantCudaGraphEndToEnd(CustomTestCase):
             result.success, f"Failed to load MoE-target adapter: {result.error_message}"
         )
 
-        adapter_text, adapter_logprobs = self._generate(adapter_name=name)
+        adapter_text, adapter_logprobs = self._generate(oft_name=name)
         print(f"[Without OFT] {base_text} logprobs={base_logprobs}")
         print(
             f"[With single MoE-target adapter] {adapter_text} logprobs={adapter_logprobs}"
@@ -238,7 +238,7 @@ class TestMoeMultiTenantCudaGraphEndToEnd(CustomTestCase):
         # (a second generate() call against the same resident adapter) must
         # reproduce identical output -- proving the graph itself, not just a
         # one-off eager-mode-lucky pass, is what is being exercised.
-        adapter_text_again, adapter_logprobs_again = self._generate(adapter_name=name)
+        adapter_text_again, adapter_logprobs_again = self._generate(oft_name=name)
         self.assertEqual(
             adapter_logprobs,
             adapter_logprobs_again,
@@ -274,14 +274,14 @@ class TestMoeMultiTenantCudaGraphEndToEnd(CustomTestCase):
 
         # (a) Adapter A alone.
         result_a = self.engine.load_oft_adapter_from_tensors(
-            adapter_name=name_a,
+            oft_name=name_a,
             tensors=_expert_named_tensors(seed=10),
             config_dict=_moe_config_dict(),
         )
         self.assertTrue(
             result_a.success, f"Failed to load adapter A: {result_a.error_message}"
         )
-        text_a_alone, logprobs_a_alone = self._generate(adapter_name=name_a)
+        text_a_alone, logprobs_a_alone = self._generate(oft_name=name_a)
 
         unload_a_result = self.engine.unload_oft_adapter(name_a)
         self.assertTrue(
@@ -292,14 +292,14 @@ class TestMoeMultiTenantCudaGraphEndToEnd(CustomTestCase):
         # (b) Adapter B alone -- A is unloaded, so B is the sole resident
         # real adapter here.
         result_b = self.engine.load_oft_adapter_from_tensors(
-            adapter_name=name_b,
+            oft_name=name_b,
             tensors=_expert_named_tensors(seed=20),
             config_dict=_moe_config_dict(),
         )
         self.assertTrue(
             result_b.success, f"Failed to load adapter B: {result_b.error_message}"
         )
-        text_b_alone, logprobs_b_alone = self._generate(adapter_name=name_b)
+        text_b_alone, logprobs_b_alone = self._generate(oft_name=name_b)
 
         # Sanity: if these two "different" adapters happened to produce
         # identical output in isolation, the concurrent-residency comparison
@@ -319,7 +319,7 @@ class TestMoeMultiTenantCudaGraphEndToEnd(CustomTestCase):
         # within the default decode CUDA-graph capture bucket list), and
         # decode replay must apply each request's own adapter correctly.
         reload_a_result = self.engine.load_oft_adapter_from_tensors(
-            adapter_name=name_a,
+            oft_name=name_a,
             tensors=_expert_named_tensors(seed=10),
             config_dict=_moe_config_dict(),
         )

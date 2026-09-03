@@ -244,7 +244,7 @@ class TestStagedOFTManagerStaging(unittest.TestCase):
             CONFIG_DICT,
             name="adapter-a",
             version=1,
-            adapter_id="adapter-a",
+            oft_id="adapter-a",
         )
 
         self.assertTrue(result.success, result.error_message)
@@ -685,7 +685,7 @@ class TestWeightUpdaterStagedRouting(unittest.TestCase):
         self.assertEqual(
             call.args[1:], (self._stage_kwargs()["adapter_config"], "policy", 8)
         )
-        self.assertEqual(call.kwargs, {"adapter_id": "id-a"})
+        self.assertEqual(call.kwargs, {"oft_id": "id-a"})
 
     def test_non_staged_stage_calls_oft_manager_directly(self):
         """Regression: oft_impl="sibling" used to route through a separate
@@ -715,7 +715,7 @@ class TestWeightUpdaterStagedRouting(unittest.TestCase):
         self.assertEqual(
             call.args[1:], (self._stage_kwargs()["adapter_config"], "policy", 8)
         )
-        self.assertEqual(call.kwargs, {"adapter_id": "id-a"})
+        self.assertEqual(call.kwargs, {"oft_id": "id-a"})
 
     def test_non_staged_stage_rejects_non_double_buffer(self):
         """Regression guard for the memory-safety check
@@ -764,14 +764,14 @@ class TestWeightUpdaterStagedRouting(unittest.TestCase):
 
         self.assertEqual(result, (False, "staged activation rejected"))
         runner.oft_manager.activate_adapter.assert_called_once_with(
-            "policy", 8, adapter_id="id-a"
+            "policy", 8, oft_id="id-a"
         )
 
     def test_non_staged_activation_calls_oft_manager_directly(self):
         """Regression: oft_impl="sibling" used to route through a separate
         activate_adapter façade function; now it calls
         model_runner.oft_manager.activate_adapter directly, matching the
-        staged branch above (minus the staged-only adapter_id kwarg, which
+        staged branch above (minus the staged-only oft_id kwarg, which
         the sibling manager's activate_adapter signature doesn't take)."""
         from sglang.srt.model_executor.model_runner_components.weight_updater import (
             WeightUpdater,
@@ -807,7 +807,7 @@ class TestOFTStagingBackendPrepareActivation(unittest.TestCase):
         from sglang.srt.oft.staged_manager import OFTStagingBackend
 
         ref = MagicMock()
-        ref.adapter_id = "uuid-123"
+        ref.oft_id = "uuid-123"
         tm = MagicMock()
         tm.oft_ref_cache = {"adapter-a": ref}
         obj = MagicMock()

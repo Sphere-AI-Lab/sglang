@@ -255,8 +255,8 @@ class GenerateReqInput:
     lora_version: Optional[Union[List[Optional[int]], int]] = None
 
     # The path and resolved identity of single-active OFT adapters.
-    adapter_path: Optional[Union[List[Optional[str]], str]] = None
-    adapter_id: Optional[Union[List[Optional[str]], str]] = None
+    oft_path: Optional[Union[List[Optional[str]], str]] = None
+    oft_id: Optional[Union[List[Optional[str]], str]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -583,13 +583,13 @@ class GenerateReqInput:
 
     def _normalize_adapter_paths(self, num):
         """Normalize single-active adapter paths for batch processing."""
-        if self.adapter_path is not None:
-            if isinstance(self.adapter_path, str):
-                self.adapter_path = [self.adapter_path] * num
-            elif isinstance(self.adapter_path, list):
-                self.adapter_path = self.adapter_path * self.parallel_sample_num
+        if self.oft_path is not None:
+            if isinstance(self.oft_path, str):
+                self.oft_path = [self.oft_path] * num
+            elif isinstance(self.oft_path, list):
+                self.oft_path = self.oft_path * self.parallel_sample_num
             else:
-                raise ValueError("adapter_path should be a list or a string.")
+                raise ValueError("oft_path should be a list or a string.")
 
     def _normalize_image_data(self, num):
         """Normalize image data for batch processing."""
@@ -924,8 +924,8 @@ class GenerateReqInput:
                 if isinstance(self.lora_version, list)
                 else self.lora_version
             ),
-            adapter_path=self.adapter_path[i] if self.adapter_path is not None else None,
-            adapter_id=self.adapter_id[i] if self.adapter_id is not None else None,
+            oft_path=self.oft_path[i] if self.oft_path is not None else None,
+            oft_id=self.oft_id[i] if self.oft_id is not None else None,
             custom_logit_processor=(
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
@@ -1021,12 +1021,12 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     lora_id: Optional[str] = None  # None means just use the base model
 
     # Single-active OFT related
-    adapter_id: Optional[str] = None  # None means just use the base model
+    oft_id: Optional[str] = None  # None means just use the base model
     # Adapter weight version at admission time, resolved tokenizer-side from the
     # registry. Carried so the radix key can separate KV computed under different
     # on-policy weights of the SAME adapter (see Req.__init__). None for base
     # requests. Native LoRA carries its independent version in the final field.
-    adapter_version: Optional[int] = None
+    oft_version: Optional[int] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -1911,7 +1911,7 @@ class UpdateAdapterFromDistributedReqInput(BaseReq, kw_only=True):
     # UpdateWeightsFromDistributedReqInput; adds adapter metadata + the
     # double_buffer flag. Versions arrive as STRINGS on the orbit wire
     # (adapter_version == weight_version invariant); the model_runner boundary
-    # converts to int for the manager's int OFTRef.adapter_version/LoRARef.version.
+    # converts to int for the manager's int OFTRef.version/LoRARef.version.
     names: List[str]
     dtypes: List[str]
     shapes: List[List[int]]
@@ -2522,71 +2522,71 @@ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
 
 class LoadOFTAdapterReqInput(BaseReq, kw_only=True):
     # The name of the OFT adapter to newly loaded.
-    adapter_name: str
+    oft_name: str
     # The path of loading.
-    adapter_path: str
+    oft_path: str
     # Whether to pin the OFT adapter in memory.
     pinned: bool = False
     # The unique identifier for the OFT adapter, automatically generated in the `TokenizerManager`.
-    adapter_id: Optional[str] = None
+    oft_id: Optional[str] = None
 
     def to_ref(self) -> OFTRef:
         return OFTRef(
-            adapter_id=self.adapter_id,
-            adapter_name=self.adapter_name,
-            adapter_path=self.adapter_path,
+            oft_id=self.oft_id,
+            oft_name=self.oft_name,
+            oft_path=self.oft_path,
             pinned=self.pinned,
         )
 
 
 class UnloadOFTAdapterReqInput(BaseReq, kw_only=True):
-    adapter_name: str
-    adapter_id: Optional[str] = None
+    oft_name: str
+    oft_id: Optional[str] = None
 
     def to_ref(self) -> OFTRef:
-        return OFTRef(adapter_id=self.adapter_id, adapter_name=self.adapter_name)
+        return OFTRef(oft_id=self.oft_id, oft_name=self.oft_name)
 
 
 class LoadOFTAdapterFromTensorsReqInput(BaseReq, kw_only=True):
-    adapter_name: str
+    oft_name: str
     # The PEFT adapter_config.json, already JSON.
     config_dict: Dict[str, Any]
     # One serialized copy of the adapter tensors per TP rank; each rank
     # deserializes only its own copy.
     serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
     pinned: bool = False
-    adapter_id: Optional[str] = None
+    oft_id: Optional[str] = None
     load_format: Optional[str] = None
     # If already loaded, refresh weights in place instead of failing.
     upsert: bool = False
 
     def to_ref(self) -> OFTRef:
         return OFTRef(
-            adapter_id=self.adapter_id,
-            adapter_name=self.adapter_name,
-            adapter_path="__tensor__",
+            oft_id=self.oft_id,
+            oft_name=self.oft_name,
+            oft_path="__tensor__",
             pinned=self.pinned,
             reloadable=False,
         )
 
 
 class LoadOFTAdapterFromDistributedReqInput(BaseReq, kw_only=True):
-    adapter_name: str
+    oft_name: str
     config_dict: Dict[str, Any]
     names: List[str]
     dtypes: List[str]
     shapes: List[List[int]]
     group_name: str = "weight_update_group"
     pinned: bool = False
-    adapter_id: Optional[str] = None
+    oft_id: Optional[str] = None
     # If already loaded, refresh weights in place instead of failing.
     upsert: bool = False
 
     def to_ref(self) -> OFTRef:
         return OFTRef(
-            adapter_id=self.adapter_id,
-            adapter_name=self.adapter_name,
-            adapter_path="__distributed__",
+            oft_id=self.oft_id,
+            oft_name=self.oft_name,
+            oft_path="__distributed__",
             pinned=self.pinned,
             reloadable=False,
         )

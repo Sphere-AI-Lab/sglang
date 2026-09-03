@@ -94,14 +94,14 @@ class OFTTokenizerMixin:
         from sglang.srt.oft.oft_registry import OFTRef
 
         return OFTRef(
-            adapter_name=name, adapter_path=name, pinned=False, reloadable=False
+            oft_name=name, oft_path=name, pinned=False, reloadable=False
         )
 
     def _request_oft_path(self: TokenizerManager, obj):
         """The peft adapter path a request carries (single-active: at most one of
-        adapter_path/lora_path is set)."""
-        if getattr(obj, "adapter_path", None):
-            return obj.adapter_path
+        oft_path/lora_path is set)."""
+        if getattr(obj, "oft_path", None):
+            return obj.oft_path
         return getattr(obj, "lora_path", None)
 
     def init_tokenizer_oft(self: TokenizerManager):
@@ -145,7 +145,7 @@ class OFTTokenizerMixin:
             ref = self._mint_ref(name)
             await self.oft_registry.register(ref)
             self.oft_ref_cache[name] = ref
-        obj.adapter_id = self.oft_ref_cache[name].adapter_id
+        obj.adapter_id = self.oft_ref_cache[name].oft_id
         return newly_registered
 
     async def rollback_oft_ref(self: TokenizerManager, name):
@@ -179,10 +179,10 @@ class OFTTokenizerMixin:
         reg = self.oft_registry
         if obj.adapter_id is not None and hasattr(reg, "bump_version_by_id"):
             updated = await reg.bump_version_by_id(obj.adapter_id)
-            self.oft_ref_cache[updated.adapter_name] = updated
+            self.oft_ref_cache[updated.oft_name] = updated
             return (
-                f" PEFT adapter {updated.adapter_name} version updated to "
-                f"{updated.adapter_version}."
+                f" PEFT adapter {updated.oft_name} version updated to "
+                f"{updated.version}."
             )
         return ""
 
@@ -206,18 +206,18 @@ class OFTTokenizerMixin:
 
         # Reload adapters that were dynamically evicted (OFT eviction; no-op single-active).
         unregistered = await self.oft_registry.get_unregistered_adapters(unique_paths)
-        for adapter_path in unregistered:
-            if adapter_path is None:
+        for oft_path in unregistered:
+            if oft_path is None:
                 continue
-            if adapter_path not in self.oft_ref_cache:
+            if oft_path not in self.oft_ref_cache:
                 raise ValueError(
-                    f"Got PEFT adapter that has never been loaded: {adapter_path}\n"
+                    f"Got PEFT adapter that has never been loaded: {oft_path}\n"
                     f"All loaded adapters: {self.oft_ref_cache.keys()}."
                 )
-            ref = self.oft_ref_cache[adapter_path]
+            ref = self.oft_ref_cache[oft_path]
             if not ref.reloadable:
                 raise ValueError(
-                    f"OFT adapter '{adapter_path}' was loaded dynamically (via "
+                    f"OFT adapter '{oft_path}' was loaded dynamically (via "
                     "tensors/distributed, or streamed via "
                     "update_weights_from_tensor) and was evicted from the "
                     "registry; it has no on-disk artifact to reload from and "
@@ -227,11 +227,11 @@ class OFTTokenizerMixin:
                 )
             # Mirrors TokenizerManager._resolve_lora_path's implicit reload of
             # a disk/HF-path adapter LRU-evicted from the tokenizer registry.
-            logger.info(f"Reloading evicted adapter: {adapter_path}")
+            logger.info(f"Reloading evicted adapter: {oft_path}")
             load_result = await self.load_oft_adapter(
                 LoadOFTAdapterReqInput(
-                    adapter_name=ref.adapter_name,
-                    adapter_path=ref.adapter_path,
+                    oft_name=ref.oft_name,
+                    oft_path=ref.oft_path,
                     pinned=ref.pinned,
                 )
             )
@@ -240,20 +240,20 @@ class OFTTokenizerMixin:
                 and "already loaded" not in load_result.error_message
             ):
                 raise ValueError(
-                    f"Failed to implicitly load OFT adapter {adapter_path}: "
+                    f"Failed to implicitly load OFT adapter {oft_path}: "
                     f"{load_result.error_message}"
                 )
 
-        adapter_id, adapter_version = await self.oft_registry.acquire_with_version(path)
+        oft_id, oft_version = await self.oft_registry.acquire_with_version(path)
         # Set the request-side id/version fields the scheduler reads.
-        obj.adapter_id = adapter_id
-        obj.adapter_version = adapter_version
-        _propagate_id_to_cached_sub_objs(obj, field="adapter_id", resolved=adapter_id)
+        obj.oft_id = oft_id
+        obj.oft_version = oft_version
+        _propagate_id_to_cached_sub_objs(obj, field="oft_id", resolved=oft_id)
         # The version needs the same propagation as the id: batched sub-objects
         # are materialized before this resolver runs, so a version set only on
         # the parent never reaches the tokenized requests built from them.
         _propagate_id_to_cached_sub_objs(
-            obj, field="adapter_version", resolved=adapter_version
+            obj, field="oft_version", resolved=oft_version
         )
 
     async def maybe_resolve_oft_path(self: TokenizerManager, obj):
@@ -284,7 +284,7 @@ class OFTTokenizerMixin:
         unload_oft_adapter and the max_loaded_ofts LRU-eviction loop) would
         block forever on any adapter that ever served a request.
 
-        ``adapter_path``/``adapter_id`` live only on GenerateReqInput (peft has
+        ``oft_path``/``oft_id`` live only on GenerateReqInput (peft has
         no embedding support, see generate_request's isinstance guard), hence
         the getattr instead of direct attribute access -- state.obj may be an
         EmbeddingReqInput, which never declares either field. State-derived
@@ -296,14 +296,14 @@ class OFTTokenizerMixin:
         """
         if state is None or state.oft_lease_released:
             return
-        adapter_path = getattr(state.obj, "adapter_path", None)
-        adapter_id = getattr(state.obj, "adapter_id", None)
-        if adapter_path is None or adapter_id is None:
+        oft_path = getattr(state.obj, "oft_path", None)
+        oft_id = getattr(state.obj, "oft_id", None)
+        if oft_path is None or oft_id is None:
             return
         if not self.enable_oft:
             return
         state.oft_lease_released = True
-        asyncio.create_task(self.oft_registry.release(adapter_id))
+        asyncio.create_task(self.oft_registry.release(oft_id))
 
     async def load_oft_adapter(
         self: TokenizerManager,
@@ -326,25 +326,25 @@ class OFTTokenizerMixin:
                 )
             logger.info(
                 "Start load OFT adapter. Adapter name=%s, path=%s",
-                obj.adapter_name,
-                obj.adapter_path,
+                obj.oft_name,
+                obj.oft_path,
             )
 
             async with self.oft_update_lock:
                 new_adapter = OFTRef(
-                    adapter_name=obj.adapter_name,
-                    adapter_path=obj.adapter_path,
+                    oft_name=obj.oft_name,
+                    oft_path=obj.oft_path,
                     pinned=obj.pinned,
                 )
 
-                obj.adapter_id = new_adapter.adapter_id
+                obj.oft_id = new_adapter.oft_id
                 result = _merge_oft_update_results(
                     await self.update_oft_adapter_communicator(obj)
                 )
 
                 if result.success:
                     await self.oft_registry.register(new_adapter)
-                    self.oft_ref_cache[obj.adapter_name] = new_adapter
+                    self.oft_ref_cache[obj.oft_name] = new_adapter
 
                 if self.server_args.max_loaded_ofts is not None:
                     while (
@@ -366,7 +366,7 @@ class OFTTokenizerMixin:
                             f"max allowed: {self.server_args.max_loaded_ofts})"
                         )
                         unload_result = await self._unload_oft_adapter_locked(
-                            UnloadOFTAdapterReqInput(adapter_name=lru_name)
+                            UnloadOFTAdapterReqInput(oft_name=lru_name)
                         )
                         if not unload_result.success:
                             raise ValueError(
@@ -396,24 +396,24 @@ class OFTTokenizerMixin:
             )
             logger.info(
                 "Start load OFT adapter from tensors. Adapter name=%s",
-                obj.adapter_name,
+                obj.oft_name,
             )
             async with self.oft_update_lock:
                 # Built inline (not via obj.to_ref()): to_ref() passes
-                # obj.adapter_id through explicitly, which is None on a fresh
+                # obj.oft_id through explicitly, which is None on a fresh
                 # load and would short-circuit OFTRef's default_factory,
-                # tripping its "adapter_id cannot be None" guard. Mirrors
+                # tripping its "oft_id cannot be None" guard. Mirrors
                 # load_lora_adapter_from_distributed's LoRARef(...) construction.
                 new_ref, reused = await self.oft_registry.resolve_or_reuse(
                     OFTRef(
-                        adapter_name=obj.adapter_name,
-                        adapter_path="__tensor__",
+                        oft_name=obj.oft_name,
+                        oft_path="__tensor__",
                         pinned=obj.pinned,
                         reloadable=False,
                     ),
                     upsert=obj.upsert,
                 )
-                obj.adapter_id = new_ref.adapter_id
+                obj.oft_id = new_ref.oft_id
                 results = await self.update_oft_adapter_communicator(obj)
                 result = _merge_oft_update_results(results)
 
@@ -422,7 +422,7 @@ class OFTTokenizerMixin:
                         await self.oft_registry.refresh(new_ref)
                     else:
                         await self.oft_registry.register(new_ref)
-                    self.oft_ref_cache[obj.adapter_name] = new_ref
+                    self.oft_ref_cache[obj.oft_name] = new_ref
                 if self.server_args.max_loaded_ofts is not None:
                     while (
                         self.oft_registry.num_registered_ofts
@@ -443,7 +443,7 @@ class OFTTokenizerMixin:
                             f"max allowed: {self.server_args.max_loaded_ofts})"
                         )
                         unload_result = await self._unload_oft_adapter_locked(
-                            UnloadOFTAdapterReqInput(adapter_name=lru_name)
+                            UnloadOFTAdapterReqInput(oft_name=lru_name)
                         )
                         if not unload_result.success:
                             raise ValueError(
@@ -471,26 +471,26 @@ class OFTTokenizerMixin:
                 )
             logger.info(
                 "Start load OFT adapter from distributed. Adapter name=%s, group=%s",
-                obj.adapter_name,
+                obj.oft_name,
                 obj.group_name,
             )
             async with self.oft_update_lock:
                 # See load_oft_adapter_from_tensors: built inline rather than
                 # via obj.to_ref(), which would pass the not-yet-minted
-                # obj.adapter_id (None) straight through and trip OFTRef's
-                # "adapter_id cannot be None" guard instead of minting a
+                # obj.oft_id (None) straight through and trip OFTRef's
+                # "oft_id cannot be None" guard instead of minting a
                 # fresh id. Mirrors load_lora_adapter_from_distributed's
                 # LoRARef(...) construction.
                 new_ref, reused = await self.oft_registry.resolve_or_reuse(
                     OFTRef(
-                        adapter_name=obj.adapter_name,
-                        adapter_path="__distributed__",
+                        oft_name=obj.oft_name,
+                        oft_path="__distributed__",
                         pinned=obj.pinned,
                         reloadable=False,
                     ),
                     upsert=obj.upsert,
                 )
-                obj.adapter_id = new_ref.adapter_id
+                obj.oft_id = new_ref.oft_id
                 # Merge (not [0]): unlike LoRA's from_distributed route, this
                 # handler has no dp_size == 1 guard, so a non-rank-0 failure
                 # must not be silently reported as success.
@@ -503,7 +503,7 @@ class OFTTokenizerMixin:
                         await self.oft_registry.refresh(new_ref)
                     else:
                         await self.oft_registry.register(new_ref)
-                    self.oft_ref_cache[obj.adapter_name] = new_ref
+                    self.oft_ref_cache[obj.oft_name] = new_ref
                 if self.server_args.max_loaded_ofts is not None:
                     while (
                         self.oft_registry.num_registered_ofts
@@ -524,7 +524,7 @@ class OFTTokenizerMixin:
                             f"max allowed: {self.server_args.max_loaded_ofts})"
                         )
                         unload_result = await self._unload_oft_adapter_locked(
-                            UnloadOFTAdapterReqInput(adapter_name=lru_name)
+                            UnloadOFTAdapterReqInput(oft_name=lru_name)
                         )
                         if not unload_result.success:
                             raise ValueError(
@@ -547,12 +547,12 @@ class OFTTokenizerMixin:
         _unload_lora_adapter_locked)."""
         # Unregister the OFT adapter from the registry to stop new requests
         # for this adapter from being started.
-        adapter_id = await self.oft_registry.unregister(obj.adapter_name)
+        oft_id = await self.oft_registry.unregister(obj.oft_name)
 
         # Initiate the actual unloading operation at the backend processes
         # only after all ongoing requests using this adapter are finished.
-        await self.oft_registry.wait_for_unload(adapter_id)
-        obj.adapter_id = adapter_id
+        await self.oft_registry.wait_for_unload(oft_id)
+        obj.oft_id = oft_id
         result = _merge_oft_update_results(
             await self.update_oft_adapter_communicator(obj)
         )
@@ -573,14 +573,14 @@ class OFTTokenizerMixin:
                 )
             logger.info(
                 "Start unload OFT adapter. Adapter name=%s",
-                obj.adapter_name,
+                obj.oft_name,
             )
             async with self.oft_update_lock:
                 result = await self._unload_oft_adapter_locked(obj)
                 # Explicit unload is a DELETE: drop the ref_cache entry too
                 # (mirrors unload_lora_adapter's explicit-vs-evict distinction).
                 if result.success:
-                    self.oft_ref_cache.pop(obj.adapter_name, None)
+                    self.oft_ref_cache.pop(obj.oft_name, None)
                 return result
         except ValueError as e:
             return UnloadOFTAdapterReqOutput(success=False, error_message=str(e))

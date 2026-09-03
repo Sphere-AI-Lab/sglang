@@ -476,7 +476,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For LoRA
     lora_ids: Optional[List[str]] = None
     # For OFT
-    adapter_ids: Optional[List[str]] = None
+    oft_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
@@ -801,7 +801,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
-            adapter_ids=[req.adapter_id for req in batch.reqs],
+            oft_ids=[req.oft_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
@@ -943,7 +943,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init OFT (single-active) batch info. Distinct namespace/guard from
         # the upstream enable_lora block above.
         if model_runner.server_args.enable_oft:
-            model_runner.oft_manager.fetch_new_ofts(set(ret.adapter_ids))
+            model_runner.oft_manager.fetch_new_ofts(set(ret.oft_ids))
             model_runner.oft_manager.prepare_oft_batch(ret)
 
         if (

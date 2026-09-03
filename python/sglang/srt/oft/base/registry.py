@@ -31,24 +31,24 @@ class AdapterRef:
     this. Holds the unified adapter identity; AdapterRegistry accesses
     adapters only through these members.
 
-    The unique ``adapter_id`` eliminates conflicts from reused names/paths and can
+    The unique ``oft_id`` eliminates conflicts from reused names/paths and can
     be used to generate deterministic cache keys (e.g. radix cache)."""
 
-    adapter_id: str = field(default_factory=lambda: uuid4().hex)
-    adapter_name: Optional[str] = None
-    adapter_path: Optional[str] = None
+    oft_id: str = field(default_factory=lambda: uuid4().hex)
+    oft_name: Optional[str] = None
+    oft_path: Optional[str] = None
     pinned: Optional[bool] = None
-    adapter_version: int = 1
+    version: int = 1
     # False for adapters whose weights arrived over the wire (no on-disk
     # artifact to reload from): they must never be LRU-evicted nor
     # implicitly reloaded. Mirrors LoRARef.reloadable exactly.
     reloadable: bool = True
 
     def __post_init__(self):
-        if self.adapter_id is None:
-            raise ValueError("adapter_id cannot be None")
-        if self.adapter_version < 0:
-            raise ValueError("adapter_version must be non-negative")
+        if self.oft_id is None:
+            raise ValueError("oft_id cannot be None")
+        if self.version < 0:
+            raise ValueError("version must be non-negative")
 
 
 class AdapterRegistry:
@@ -103,7 +103,7 @@ class AdapterRegistry:
                 )
             del self._registry[name]
 
-        return ref.adapter_id
+        return ref.oft_id
 
     async def resolve_or_reuse(
         self,
@@ -116,13 +116,13 @@ class AdapterRegistry:
 
         Returns ``(ref, reused)``. With ``upsert`` and a same-name adapter
         already registered, the returned ref adopts the existing
-        ``adapter_id`` (``reused=True``) so the backend refreshes that
+        ``oft_id`` (``reused=True``) so the backend refreshes that
         adapter in place; otherwise ``ref`` is returned unchanged
         (``reused=False``). Nothing is registered here: the caller commits
         the resolved ref with ``register``/``refresh`` once the backend load
         succeeded, keeping failed loads invisible to the registry.
 
-        Also bumps ``adapter_version`` past the existing entry's on reuse:
+        Also bumps ``version`` past the existing entry's on reuse:
         the radix cache key is extended with the adapter's version (see
         ``maybe_extend_extra_key``), so KV produced under the old weights
         must live under a different key than requests arriving after this
@@ -133,12 +133,12 @@ class AdapterRegistry:
         if not upsert:
             return ref, False
         async with self._registry_lock.reader_lock:
-            existing = self._registry.get(ref.adapter_name)
+            existing = self._registry.get(ref.oft_name)
             if existing is None:
                 return ref, False
             updates = {
-                "adapter_id": existing.adapter_id,
-                "adapter_version": existing.adapter_version + 1,
+                "oft_id": existing.oft_id,
+                "version": existing.version + 1,
             }
             if preserve_pinned:
                 updates["pinned"] = existing.pinned
@@ -151,13 +151,13 @@ class AdapterRegistry:
         and counts as a use for LRU ordering.
         """
         async with self._registry_lock.writer_lock:
-            existing = self._registry.get(ref.adapter_name)
-            assert existing is not None and existing.adapter_id == ref.adapter_id, (
+            existing = self._registry.get(ref.oft_name)
+            assert existing is not None and existing.oft_id == ref.oft_id, (
                 f"refresh() must target a registered adapter with the same "
-                f"adapter_id; got {ref}, registered: {existing}"
+                f"oft_id; got {ref}, registered: {existing}"
             )
-            self._registry[ref.adapter_name] = ref
-            self._registry.move_to_end(ref.adapter_name)
+            self._registry[ref.oft_name] = ref
+            self._registry.move_to_end(ref.oft_name)
 
     async def acquire(self, name: Union[str, List[str]]) -> Union[str, List[str]]:
         """
@@ -176,7 +176,7 @@ class AdapterRegistry:
                     f"Loaded adapters: {self._registry.keys()}."
                 )
             self._registry.move_to_end(n)
-            return ref.adapter_id
+            return ref.oft_id
 
         if isinstance(name, str):
             async with self._registry_lock.writer_lock:
@@ -232,7 +232,7 @@ class AdapterRegistry:
         """Increment usage counters for non-None refs."""
         await asyncio.gather(
             *[
-                self._counters[ref.adapter_id].increment(notify_all=False)
+                self._counters[ref.oft_id].increment(notify_all=False)
                 for ref in refs
                 if ref is not None
             ]
@@ -261,8 +261,8 @@ class AdapterRegistry:
     ]:
         """Acquire request leases and atomically snapshot ids and versions."""
         refs = await self._acquire_refs(name)
-        ids = [ref.adapter_id if ref is not None else None for ref in refs]
-        versions = [ref.adapter_version if ref is not None else None for ref in refs]
+        ids = [ref.oft_id if ref is not None else None for ref in refs]
+        versions = [ref.version if ref is not None else None for ref in refs]
         if isinstance(name, str):
             return ids[0], versions[0]
         return ids, versions
@@ -341,12 +341,12 @@ class AdapterRegistry:
         Internal helper method to register an adapter.
         """
 
-        if ref.adapter_name in self._registry:
+        if ref.oft_name in self._registry:
             raise ValueError(
-                f"adapter with name {ref.adapter_name} already exists. Loaded adapters: {self._registry.keys()}"
+                f"adapter with name {ref.oft_name} already exists. Loaded adapters: {self._registry.keys()}"
             )
-        self._registry[ref.adapter_name] = ref
-        self._counters[ref.adapter_id] = ConcurrentCounter()
+        self._registry[ref.oft_name] = ref
+        self._counters[ref.oft_id] = ConcurrentCounter()
         return ref
 
     @property

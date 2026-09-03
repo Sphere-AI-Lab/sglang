@@ -723,7 +723,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         to replay, from the batch's real per-request adapter identity.
 
         Mirrors _resolve_lora_variant's shape deliberately: reads
-        forward_batch.adapter_ids directly rather than reaching into
+        forward_batch.oft_ids directly rather than reaching into
         OFTManager, matching how _resolve_lora_variant reads
         forward_batch.lora_ids directly rather than reaching into
         LoRAManager. Returns None when OFT dual-graph capture is not enabled
@@ -740,9 +740,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         per-token path for ANY batch with a real adapter, not just 2+."""
         if not getattr(self, "record_oft_variant_graph", False):
             return None
-        if forward_batch.adapter_ids is None:
+        if forward_batch.oft_ids is None:
             return None
-        distinct_real = {uid for uid in forward_batch.adapter_ids if uid is not None}
+        distinct_real = {uid for uid in forward_batch.oft_ids if uid is not None}
         return "oft_multi" if len(distinct_real) >= 1 else "oft_single"
 
     @staticmethod
@@ -1102,13 +1102,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             lora_ids = None
 
-        # OFT: dummy adapter_ids so prepare_oft_batch runs during capture (mirrors the
-        # empty-lora_ids capture above); ForwardBatch carries adapter_ids so the
+        # OFT: dummy oft_ids so prepare_oft_batch runs during capture (mirrors the
+        # empty-lora_ids capture above); ForwardBatch carries oft_ids so the
         # capture block below can prep the OFT batch_info.
         if self.model_runner.server_args.enable_oft:
-            adapter_ids = [None] * bs
+            oft_ids = [None] * bs
         else:
-            adapter_ids = None
+            oft_ids = None
 
         # mamba state tracking (registry-owned when enabled)
         mamba_track_indices = (
@@ -1155,7 +1155,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
-            adapter_ids=adapter_ids,
+            oft_ids=oft_ids,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
@@ -1379,7 +1379,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # being single-active, does not depend on forward_batch.lora_ids.
             # Without this, FusedMoEWithLoRA._get_lora_info reads an unset
             # batch_info during capture.
-            if forward_batch.adapter_ids is not None:
+            if forward_batch.oft_ids is not None:
                 self.model_runner.oft_manager.prepare_oft_batch(forward_batch)
 
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
@@ -1479,26 +1479,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self, forward_batch: ForwardBatch, bs: int, raw_bs: int
     ) -> None:
         """Re-prep the OFT batch_info for the real replay batch (padded bs,
-        the request's real adapter_ids -- capture used dummy base ids).
+        the request's real oft_ids -- capture used dummy base ids).
         No-op unless enable_oft. Mirrors v0.5.9 CudaGraphRunner.replay_prepare.
 
         Unlike LoRA's lora_ids (restored generically by buffer_registry.
-        fill_from above), adapter_ids isn't a registered buffer field, so
-        prepare_oft_batch needs the real padded batch_size/adapter_ids
+        fill_from above), oft_ids isn't a registered buffer field, so
+        prepare_oft_batch needs the real padded batch_size/oft_ids
         temporarily swapped in, then the originals restored.
         """
         if (
             not self.model_runner.server_args.enable_oft
-            or forward_batch.adapter_ids is None
+            or forward_batch.oft_ids is None
         ):
             return
         original_batch_size = forward_batch.batch_size
-        original_oft_ids = forward_batch.adapter_ids
+        original_oft_ids = forward_batch.oft_ids
         forward_batch.batch_size = bs
-        forward_batch.adapter_ids = original_oft_ids + [None] * (bs - raw_bs)
+        forward_batch.oft_ids = original_oft_ids + [None] * (bs - raw_bs)
         self.model_runner.oft_manager.prepare_oft_batch(forward_batch)
         forward_batch.batch_size = original_batch_size
-        forward_batch.adapter_ids = original_oft_ids
+        forward_batch.oft_ids = original_oft_ids
 
     def load_batch(
         self,
