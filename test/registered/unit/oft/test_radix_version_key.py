@@ -5,7 +5,7 @@ id-only key would let a prefix cached at version k be reused at k+1."""
 import unittest
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.peft.integration import maybe_extend_extra_key
+from sglang.srt.managers.schedule_batch import _extend_oft_extra_key as maybe_extend_extra_key
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 

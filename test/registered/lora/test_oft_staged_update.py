@@ -23,7 +23,7 @@ registration (self.configs/self.adapters) is deferred but unconditional; the
 real GPU admission for a genuinely new uid happens lazily, the next time
 OFTMemoryPool.prepare_oft_batch sees it referenced by a batch. Since
 fetch_new_ofts (which drives that admission) runs before every forward pass
-(peft/integration.py's maybe_apply_forward), the FIRST real /generate request
+(ForwardBatch.init_new, forward_batch_info.py), the FIRST real /generate request
 naming the new adapter both triggers admission and immediately serves off
 the newly-written real weights -- see StagedOFTTestHarness.generate(), used
 directly (no extra warmup call) throughout this file.

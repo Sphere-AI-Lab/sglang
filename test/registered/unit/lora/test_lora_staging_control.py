@@ -185,11 +185,10 @@ class TestWeightUpdaterRouting(unittest.TestCase):
         with (
             patch.object(torch.distributed, "broadcast", return_value=handle),
             patch.object(
-                weight_updater.peft,
+                weight_updater.oft_integration,
                 "reconstruct_oft_staging",
                 return_value=reconstructed,
             ) as reconstruct,
-            patch.object(weight_updater.peft, "stage_adapter") as fallback,
         ):
             result = WeightUpdater.stage_adapter(updater, **_stage_kwargs())
 
@@ -203,28 +202,31 @@ class TestWeightUpdaterRouting(unittest.TestCase):
             8,
             adapter_id="id-a",
         )
-        fallback.assert_not_called()
+        runner.oft_manager.stage_adapter.assert_not_called()
 
-    def test_non_native_stage_keeps_peft_fallback(self):
+    def test_non_native_stage_calls_oft_manager_directly(self):
+        """When LoRA isn't using native staging, an OFT-format request for the
+        sibling implementation must still reach model_runner.oft_manager
+        directly (no separate façade function in between -- see
+        test_oft_staging_backend.py's TestWeightUpdaterStagedRouting for the
+        OFT-side coverage) and must never touch the LoRA manager."""
         runner = MagicMock()
         runner.server_args.enable_lora_staging = False
+        runner.server_args.oft_impl = "sibling"
+        runner.oft_manager.stage_adapter.return_value = SimpleNamespace(
+            success=True, error_message=None
+        )
         updater = _weight_updater(runner)
         handle = MagicMock()
 
-        with (
-            patch.object(torch.distributed, "broadcast", return_value=handle),
-            patch.object(
-                weight_updater.peft,
-                "stage_adapter",
-                return_value=sentinel.peft_result,
-            ) as fallback,
-        ):
+        with patch.object(torch.distributed, "broadcast", return_value=handle):
             result = WeightUpdater.stage_adapter(
-                updater, **_stage_kwargs(load_format="oft_adapter")
+                updater,
+                **_stage_kwargs(load_format="oft_adapter", payload_metadata=None),
             )
 
         self.assertEqual(result, (True, "Succeeded to stage adapter online."))
-        fallback.assert_called_once()
+        runner.oft_manager.stage_adapter.assert_called_once()
         runner.lora_manager.stage_adapter.assert_not_called()
 
     def test_native_activation_forwards_id_and_returns_manager_result(self):
@@ -235,39 +237,41 @@ class TestWeightUpdaterRouting(unittest.TestCase):
         )
         updater = _weight_updater(runner)
 
-        with patch.object(weight_updater.peft, "activate_adapter") as fallback:
-            result = WeightUpdater.activate_adapter_version(
-                updater,
-                adapter_name="policy",
-                adapter_id="id-a",
-                adapter_version="8",
-            )
+        result = WeightUpdater.activate_adapter_version(
+            updater,
+            adapter_name="policy",
+            adapter_id="id-a",
+            adapter_version="8",
+        )
 
         self.assertEqual(result, (False, "native activation rejected"))
         runner.lora_manager.activate_adapter.assert_called_once_with(
             "policy", 8, adapter_id="id-a"
         )
-        fallback.assert_not_called()
+        runner.oft_manager.activate_adapter.assert_not_called()
 
-    def test_non_native_activation_keeps_peft_fallback(self):
+    def test_non_native_activation_calls_oft_manager_directly(self):
+        """Counterpart to test_non_native_stage_calls_oft_manager_directly for
+        activate_adapter_version."""
         runner = MagicMock()
         runner.server_args.enable_lora_staging = False
+        runner.server_args.oft_impl = "sibling"
+        runner.server_args.enable_oft = True
+        runner.oft_manager.activate_adapter.return_value = SimpleNamespace(
+            success=True, error_message=None
+        )
         updater = _weight_updater(runner)
 
-        with patch.object(
-            weight_updater.peft,
-            "activate_adapter",
-            return_value=sentinel.peft_result,
-        ) as fallback:
-            result = WeightUpdater.activate_adapter_version(
-                updater,
-                adapter_name="policy",
-                adapter_id="id-a",
-                adapter_version="8",
-            )
+        result = WeightUpdater.activate_adapter_version(
+            updater,
+            adapter_name="policy",
+            adapter_id="id-a",
+            adapter_version="8",
+        )
 
         self.assertEqual(result, (True, "Succeeded to activate adapter version."))
-        fallback.assert_called_once_with(runner, "policy", 8)
+        runner.oft_manager.activate_adapter.assert_called_once_with("policy", 8)
+        runner.lora_manager.activate_adapter.assert_not_called()
 
 
 class TestTokenizerNativeStaging(unittest.TestCase):

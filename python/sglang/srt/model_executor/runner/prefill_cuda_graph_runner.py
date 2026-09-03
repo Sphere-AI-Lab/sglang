@@ -700,16 +700,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         fb, attn_backend = self.capture_prepare(num_tokens)
         attn_backend.init_forward_metadata(fb)
-        # peft (OFT or single-active LoRA): set the adapter batch_info before the
-        # compile/capture forward, mirroring decode_cuda_graph_runner and the
-        # normal forward (forward_batch_info.py). Self-guards on enable_oft;
-        # without it FusedMoEWithLoRA._get_lora_info / the OFT triton backend read
-        # an unset batch_info during the tc-piecewise compile pass. fb carries
-        # dummy adapter_ids (base) from capture_prepare; load_batch re-preps OFT
-        # with the real ids at replay.
-        from sglang.srt.peft import integration as peft
-
-        peft.maybe_prepare_peft_batch(self.model_runner, fb)
+        # OFT: set the adapter batch_info before the compile/capture forward,
+        # mirroring decode_cuda_graph_runner and the normal forward
+        # (forward_batch_info.py). Self-guards on enable_oft; without it the
+        # OFT triton backend reads an unset batch_info during the
+        # tc-piecewise compile pass. fb carries dummy adapter_ids (base) from
+        # capture_prepare; load_batch re-preps OFT with the real ids at
+        # replay.
+        if fb.adapter_ids is not None:
+            self.model_runner.oft_manager.prepare_oft_batch(fb)
         self._run_forward(fb, num_tokens)
 
     def run_dummy_multimodal_deepstack_forward(
@@ -1263,12 +1262,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # OFT: dummy adapter_ids so prepare_oft_batch binds the OFT batch_info
         # during the compile/capture pass (mirrors decode_cuda_graph_runner's
-        # maybe_dummy_ids). [None]*bs when enable_oft is set (-> base slot at
-        # capture), else None. load_batch threads the real adapter_ids back in at
-        # replay, flipping the single-active idx base->active.
-        from sglang.srt.peft import integration as peft
-
-        adapter_dummy_ids = peft.maybe_dummy_ids(self.model_runner.server_args, bs)
+        # dummy lora_ids/adapter_ids capture). [None]*bs when enable_oft is set
+        # (-> base slot at capture), else None. load_batch threads the real
+        # adapter_ids back in at replay, flipping the single-active idx
+        # base->active.
+        adapter_dummy_ids = (
+            [None] * bs if self.model_runner.server_args.enable_oft else None
+        )
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -1421,14 +1421,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         else:
             self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
-        # peft (OFT or single-active LoRA): bind the adapter batch_info before the
-        # captured forward, exactly as run_dummy_forward does for the tc-piecewise
-        # compile pass. Without it the breakable backend's capture reads an unset
+        # OFT: bind the adapter batch_info before the captured forward,
+        # exactly as run_dummy_forward does for the tc-piecewise compile
+        # pass. Without it the breakable backend's capture reads an unset
         # TritonOFTBackend.batch_info (AttributeError at the first OFT-wrapped
         # projection). load_batch re-preps with the real adapter_ids at replay.
-        from sglang.srt.peft import integration as peft
-
-        peft.maybe_prepare_peft_batch(self.model_runner, forward_batch)
+        if forward_batch.adapter_ids is not None:
+            self.model_runner.oft_manager.prepare_oft_batch(forward_batch)
 
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
@@ -1676,14 +1675,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             metadata_forward_batch, static_forward_batch, static_num_tokens
         )
 
-        # Re-prep the peft adapter batch_info for replay with the REAL adapter_ids
-        # (capture used dummy base ids). Required for single-active OFT, whose
-        # captured single-adapter idx flips base->active here; a harmless idempotent
-        # re-prep for single-active LoRA (constant batch_info). Runs eagerly
-        # outside the compiled region, same as decode's replay re-prep.
-        from sglang.srt.peft import integration as peft
-
-        peft.maybe_prepare_peft_batch(self.model_runner, static_forward_batch)
+        # Re-prep the OFT adapter batch_info for replay with the REAL
+        # adapter_ids (capture used dummy base ids): the captured single-
+        # adapter idx flips base->active here. Runs eagerly outside the
+        # compiled region, same as decode's replay re-prep.
+        if static_forward_batch.adapter_ids is not None:
+            self.model_runner.oft_manager.prepare_oft_batch(static_forward_batch)
 
         return static_forward_batch
 

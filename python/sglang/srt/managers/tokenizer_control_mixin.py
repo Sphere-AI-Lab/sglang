@@ -554,7 +554,7 @@ class TokenizerControlMixin:
         obj: UpdateAdapterFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        """Double-buffer PEFT STAGE over NCCL.
+        """Double-buffer OFT/LoRA STAGE over NCCL.
 
         double_buffer=True: LOCK-FREE stage into the reserved staging slot while
         generation continues (overlaps decode); no writer_lock. double_buffer=
@@ -570,7 +570,7 @@ class TokenizerControlMixin:
         if backend is not None:
             await backend.reserve_stage(obj)
         else:
-            # The existing PEFT path remains register-before-dispatch.
+            # The existing OFT path remains register-before-dispatch.
             await self.register_oft_ref(obj)
 
         if obj.double_buffer:
@@ -607,7 +607,7 @@ class TokenizerControlMixin:
         obj: ActivateAdapterVersionReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        """Double-buffer PEFT ACTIVATE (the drained atomic swap). The drain lives
+        """Double-buffer OFT/LoRA ACTIVATE (the drained atomic swap). The drain lives
         HERE: model_update_lock.writer_lock waits for all in-flight generation
         reader_locks to release (drain running_batch to empty) and blocks new
         admission -- exactly what update_weights_from_disk/from_distributed use.

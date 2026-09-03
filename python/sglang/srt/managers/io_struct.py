@@ -1907,7 +1907,7 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
 
 
 class UpdateAdapterFromDistributedReqInput(BaseReq, kw_only=True):
-    # Double-buffer PEFT (OFT/LoRA) weight-sync STAGE over NCCL. Mirrors
+    # Double-buffer OFT/LoRA weight-sync STAGE over NCCL. Mirrors
     # UpdateWeightsFromDistributedReqInput; adds adapter metadata + the
     # double_buffer flag. Versions arrive as STRINGS on the orbit wire
     # (adapter_version == weight_version invariant); the model_runner boundary
@@ -1923,7 +1923,7 @@ class UpdateAdapterFromDistributedReqInput(BaseReq, kw_only=True):
     load_format: Optional[str] = None
     adapter_config: Optional[dict] = None
     adapter_name: Optional[str] = None
-    # Stable per-adapter id set tokenizer-side by register_peft_ref (single-active
+    # Stable per-adapter id set tokenizer-side by register_oft_ref (single-active
     # OFT: id == adapter_name == "orbit_oft"). Threaded to the manager so the DB
     # stage registers memory_pool.uid_to_buffer_id[adapter_id]=active_idx, which
     # per-request /generate routing resolves against (LoRA ignores it).
@@ -1946,7 +1946,7 @@ class UpdateAdapterFromDistributedReqOutput(BaseReq, kw_only=True):
 
 
 class ActivateAdapterVersionReqInput(BaseReq, kw_only=True):
-    # Double-buffer PEFT weight-sync ACTIVATE (the drained atomic swap). The
+    # Double-buffer OFT/LoRA weight-sync ACTIVATE (the drained atomic swap). The
     # drain-to-empty lives tokenizer-side (model_update_lock.writer_lock);
     # by the time this reaches the scheduler the running batch is drained, so
     # the handler is a simple staging->active flip.
@@ -1954,7 +1954,7 @@ class ActivateAdapterVersionReqInput(BaseReq, kw_only=True):
     adapter_version: str
     weight_version: Optional[str] = None
     load_format: Optional[str] = None
-    # Symmetric with UpdateAdapterFromDistributedReqInput (set by register_peft_ref);
+    # Symmetric with UpdateAdapterFromDistributedReqInput (set by register_oft_ref);
     # carried for the activate-side version bump.
     adapter_id: Optional[str] = None
 
@@ -1987,7 +1987,7 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
-    # Optional: streamed adapter (peft LoRA/OFT) metadata for
+    # Optional: streamed adapter (LoRA/OFT) metadata for
     # load_format in {"lora_adapter", "oft_adapter"}
     adapter_config: Optional[dict] = None
     adapter_name: Optional[str] = None

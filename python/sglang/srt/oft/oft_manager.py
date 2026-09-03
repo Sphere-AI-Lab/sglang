@@ -1015,8 +1015,8 @@ class OFTManager(AdapterManager):
         # own output from a CUDA `repeats` tensor: there is no host-side value
         # that is correct for every batch. forward_batch.input_ids.shape[0]
         # (the obvious candidate) is the RAW token count, but under
-        # decode-CUDA-graph replay peft/integration.py's
-        # maybe_prepare_replay_batch pads forward_batch.batch_size and
+        # decode-CUDA-graph replay DecodeCudaGraphRunner's
+        # _prepare_oft_replay_batch pads forward_batch.batch_size and
         # adapter_ids up to the capture-bucket size WITHOUT touching
         # input_ids, so tokens_per_request (built off batch_size) legitimately
         # sums to the PADDED count instead. A mismatch there is not a

@@ -1,5 +1,5 @@
-"""Staged-adapter backend dispatch, shared by every PEFT method that
-supports staged (RL) weight updates.
+"""Staged-adapter backend dispatch, shared by every adapter method (LoRA,
+OFT) that supports staged (RL) weight updates.
 
 TokenizerControlMixin.update_adapter_from_distributed / activate_adapter_
 version resolve the active backend through ``get_staging_backend`` and call

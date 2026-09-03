@@ -411,7 +411,7 @@ class TestFinalizeOftLeaseNoOp(CustomTestCase):
     release, rather than raising or releasing something bogus."""
 
     def test_no_op_when_state_is_none(self):
-        # A request whose peft acquire failed before state existed (or was
+        # A request whose OFT acquire failed before state existed (or was
         # already dropped by another terminal path) has nothing to release.
         tm = SimpleNamespace(oft_registry=MagicMock())
         tm.oft_registry.release = AsyncMock()
@@ -421,7 +421,7 @@ class TestFinalizeOftLeaseNoOp(CustomTestCase):
         tm.oft_registry.release.assert_not_awaited()
 
     def test_no_op_when_adapter_id_is_none(self):
-        # Base-only request (peft enabled, no adapter named): adapter_id
+        # Base-only request (OFT enabled, no adapter named): adapter_id
         # stays None, so there is no lease to release.
         tm = SimpleNamespace(oft_registry=MagicMock())
         tm.oft_registry.release = AsyncMock()
@@ -435,7 +435,7 @@ class TestFinalizeOftLeaseNoOp(CustomTestCase):
         self.assertFalse(state.oft_lease_released)
 
     def test_no_op_when_request_type_has_no_adapter_id_field(self):
-        # EmbeddingReqInput never declares adapter_id at all (peft has no
+        # EmbeddingReqInput never declares adapter_id at all (OFT has no
         # embedding support -- generate_request only calls
         # maybe_resolve_oft_path under isinstance(obj, GenerateReqInput)),
         # so state.obj can genuinely lack the attribute. Must getattr-guard

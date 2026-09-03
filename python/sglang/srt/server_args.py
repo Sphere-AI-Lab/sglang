@@ -9280,7 +9280,7 @@ class ServerArgs(OFTArgs):
         # Check LoRA
         self.check_lora_server_args()
 
-        # Check PEFT (OFT / peft-lora)
+        # Check OFT args
         validate_oft_args(self)
 
         # Check speculative decoding

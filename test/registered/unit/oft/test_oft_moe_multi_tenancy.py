@@ -200,7 +200,7 @@ class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
 
     def test_cuda_graph_padded_decode_batch_expands_to_padded_batch_size(self):
         """Regression guard: under decode-CUDA-graph replay,
-        ``peft/integration.py``'s ``maybe_prepare_replay_batch`` temporarily
+        ``DecodeCudaGraphRunner._prepare_oft_replay_batch`` temporarily
         sets ``forward_batch.batch_size`` to the padded capture-bucket size and
         pads ``adapter_ids`` with ``None`` (so ``weight_indices`` is padded
         too), but leaves ``forward_batch.input_ids`` at the RAW, pre-pad token

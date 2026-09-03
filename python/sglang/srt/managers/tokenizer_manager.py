@@ -464,8 +464,8 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
         # Init LoRA status
         self.init_lora()
 
-        # Init single-active PEFT registry (our LoRA/OFT)
-        self.init_peft()
+        # Init single-active OFT registry
+        self.init_oft()
 
         # Init PD disaggregation and encoder disaggregation
         self.init_disaggregation(start_pd_bootstrap_service=start_pd_bootstrap_service)
@@ -681,9 +681,9 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
             for lora_ref in get_lora().lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
-    def init_peft(self):
-        # Single-active PEFT registry bootstrap (LoRA or OFT). Body lives in the
-        # peft.tokenizer_hooks façade to keep this file peft-free.
+    def init_oft(self):
+        # Single-active OFT registry bootstrap. Body lives in OFTTokenizerMixin
+        # (oft/tokenizer_mixin.py) to keep this file thin.
         self.init_tokenizer_oft()
 
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):

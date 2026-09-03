@@ -70,9 +70,9 @@ def _named_tensors_for_layer_0(fill_value: float):
 def _raw_named_tensors_for_layer_0(fill_value: float):
     """Raw checkpoint-name compact OFT weight for layer 0's target module --
     the actual shape StagedOFTManager.stage_adapter's named_tensors argument
-    takes in production (weight_updater.py -> peft/integration.py ->
-    oft_manager.stage_adapter(tensors, ...), and OFTManager._stage_fill's own
-    docstring: "raw checkpoint-name tensors"). A single compact block
+    takes in production (weight_updater.py -> oft_manager.stage_adapter(
+    tensors, ...), and OFTManager._stage_fill's own docstring: "raw
+    checkpoint-name tensors"). A single compact block
     (num_blocks=1) so precompute_oft_r's result broadcasts to every block
     position in the runtime buffer regardless of that buffer's own block
     count -- the same "block_share" case _write_oft_r_block already handles
@@ -484,9 +484,9 @@ class TestStagedOFTManagerActivation(unittest.TestCase):
         TestOFTStagingTransaction.test_stage_then_activate_writes_only_the_
         destination_slot, but driven through StagedOFTManager.stage_adapter/
         activate_adapter with a RAW checkpoint-name tensor -- the shape a
-        real weight_updater.py -> peft/integration.py ->
-        oft_manager.stage_adapter(...) call actually supplies -- rather than
-        the pool's internal format directly)."""
+        real weight_updater.py -> oft_manager.stage_adapter(...) call
+        actually supplies -- rather than the pool's internal format
+        directly)."""
         from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
 
         manager = _manager()
@@ -578,7 +578,7 @@ class TestPrepareOftBatchLazilyAdmitsAStagedAdapter(unittest.TestCase):
         self.assertNotIn("adapter-a", manager.memory_pool.uid_to_buffer_id)
 
         # The real call chain OFTManager.fetch_new_ofts's caller
-        # (peft/integration.py, driven by every /generate request) uses:
+        # (oft/integration.py, driven by every /generate request) uses:
         # _prepare_mem_pool_batch -> memory_pool.prepare_oft_batch(...).
         manager._prepare_mem_pool_batch({"adapter-a"})
 
@@ -597,22 +597,22 @@ class TestPrepareOftBatchLazilyAdmitsAStagedAdapter(unittest.TestCase):
 
 class TestOFTManagerClassSelection(unittest.TestCase):
     """Mirrors test_lora_staging_control.py's TestStagingFlagAndSelection for
-    OFT's oft_impl choice: _get_oft_manager_class (peft/integration.py)
-    is the construction-site helper model_runner.py's maybe_init_peft_manager
+    OFT's oft_impl choice: _get_oft_manager_class (oft/integration.py)
+    is the construction-site helper model_runner.py's maybe_init_oft_manager
     ultimately calls through, and must resolve both oft_impl choices to
     the right manager class."""
 
     def test_selects_staged_manager_when_oft_impl_is_staged(self):
+        from sglang.srt.oft.integration import _get_oft_manager_class
         from sglang.srt.oft.staged_manager import StagedOFTManager
-        from sglang.srt.peft.integration import _get_oft_manager_class
 
         server_args = SimpleNamespace(oft_impl="staged")
 
         self.assertIs(_get_oft_manager_class(server_args), StagedOFTManager)
 
     def test_keeps_sibling_manager_when_oft_impl_is_sibling(self):
+        from sglang.srt.oft.integration import _get_oft_manager_class
         from sglang.srt.oft.oft_manager import OFTManager
-        from sglang.srt.peft.integration import _get_oft_manager_class
 
         server_args = SimpleNamespace(oft_impl="sibling")
 
@@ -621,20 +621,20 @@ class TestOFTManagerClassSelection(unittest.TestCase):
 
 class TestWeightUpdaterStagedRouting(unittest.TestCase):
     """Mirrors test_lora_staging_control.py's TestWeightUpdaterRouting for the
-    new oft_impl == "staged" branch: WeightUpdater.stage_adapter /
-    activate_adapter_version must dispatch directly to model_runner.oft_manager
-    (StagedOFTManager) and propagate its OFTUpdateOutput.success/error_message,
-    the same shape the native-LoRA branch already uses a few lines above.
+    oft_impl == "staged" branch and the oft_impl == "sibling" branch beside
+    it: WeightUpdater.stage_adapter / activate_adapter_version must dispatch
+    directly to model_runner.oft_manager (StagedOFTManager or plain
+    OFTManager, respectively) and propagate its OFTUpdateOutput.success/
+    error_message, the same shape the native-LoRA branch already uses a few
+    lines above -- all three branches now call their manager's
+    stage_adapter/activate_adapter directly, with no separate façade
+    function in between.
 
     Regression this guards: StagedOFTManager.stage_adapter/activate_adapter
     return an OFTUpdateOutput(success=False, ...) WITHOUT raising, unlike the
     plain OFTManager it replaces (which raises on failure and relied on the
-    caller's try/except). Before this branch existed, a staged failure fell
-    through to peft.stage_adapter/peft.activate_adapter, which return that
-    same unwrapped result -- and the generic fallback path here only checks
-    `result is peft.NOT_HANDLED`, never `.success` -- so a real staging/
-    activation failure would have been reported as
-    (True, "Succeeded to ..."). These tests fail on that regression.
+    caller's try/except) -- so a real staging/activation failure must
+    propagate as (False, error_message), never (True, "Succeeded to ...").
     """
 
     def _updater(self, runner):
@@ -664,9 +664,6 @@ class TestWeightUpdaterStagedRouting(unittest.TestCase):
         return values
 
     def test_staged_stage_forwards_args_and_returns_manager_failure(self):
-        from sglang.srt.model_executor.model_runner_components import (
-            weight_updater as weight_updater_module,
-        )
         from sglang.srt.model_executor.model_runner_components.weight_updater import (
             WeightUpdater,
         )
@@ -679,10 +676,7 @@ class TestWeightUpdaterStagedRouting(unittest.TestCase):
         )
         updater = self._updater(runner)
 
-        with (
-            patch.object(torch.distributed, "broadcast", return_value=MagicMock()),
-            patch.object(weight_updater_module.peft, "stage_adapter") as fallback,
-        ):
+        with patch.object(torch.distributed, "broadcast", return_value=MagicMock()):
             result = WeightUpdater.stage_adapter(updater, **self._stage_kwargs())
 
         self.assertEqual(result, (False, "staged stage rejected"))
@@ -692,14 +686,43 @@ class TestWeightUpdaterStagedRouting(unittest.TestCase):
             call.args[1:], (self._stage_kwargs()["adapter_config"], "policy", 8)
         )
         self.assertEqual(call.kwargs, {"adapter_id": "id-a"})
-        fallback.assert_not_called()
 
-    def test_non_staged_stage_keeps_peft_fallback(self):
-        from unittest.mock import sentinel
-
-        from sglang.srt.model_executor.model_runner_components import (
-            weight_updater as weight_updater_module,
+    def test_non_staged_stage_calls_oft_manager_directly(self):
+        """Regression: oft_impl="sibling" used to route through a separate
+        stage_adapter façade function instead of calling
+        model_runner.oft_manager.stage_adapter directly the way the native-
+        LoRA-staging and OFT-staged branches above it already do -- the only
+        structural asymmetry with LoRA's own call shape. Now all three
+        branches call their manager's stage_adapter the same way."""
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            WeightUpdater,
         )
+
+        runner = MagicMock()
+        runner.server_args.enable_lora_staging = False
+        runner.server_args.oft_impl = "sibling"
+        runner.oft_manager.stage_adapter.return_value = SimpleNamespace(
+            success=True, error_message=None
+        )
+        updater = self._updater(runner)
+
+        with patch.object(torch.distributed, "broadcast", return_value=MagicMock()):
+            result = WeightUpdater.stage_adapter(updater, **self._stage_kwargs())
+
+        self.assertEqual(result, (True, "Succeeded to stage adapter online."))
+        call = runner.oft_manager.stage_adapter.call_args
+        self.assertEqual([name for name, _ in call.args[0]], ["__flattened__"])
+        self.assertEqual(
+            call.args[1:], (self._stage_kwargs()["adapter_config"], "policy", 8)
+        )
+        self.assertEqual(call.kwargs, {"adapter_id": "id-a"})
+
+    def test_non_staged_stage_rejects_non_double_buffer(self):
+        """Regression guard for the memory-safety check
+        oft_integration.stage_adapter used to own: the sibling pool's plain
+        (non-double-buffer) slot layout would let activate() clobber the
+        base-identity slot, so double_buffer=False must still raise even
+        after the check moved inline into WeightUpdater.stage_adapter."""
         from sglang.srt.model_executor.model_runner_components.weight_updater import (
             WeightUpdater,
         )
@@ -709,24 +732,17 @@ class TestWeightUpdaterStagedRouting(unittest.TestCase):
         runner.server_args.oft_impl = "sibling"
         updater = self._updater(runner)
 
-        with (
-            patch.object(torch.distributed, "broadcast", return_value=MagicMock()),
-            patch.object(
-                weight_updater_module.peft,
-                "stage_adapter",
-                return_value=sentinel.peft_result,
-            ) as fallback,
-        ):
-            result = WeightUpdater.stage_adapter(updater, **self._stage_kwargs())
+        with patch.object(torch.distributed, "broadcast", return_value=MagicMock()):
+            result = WeightUpdater.stage_adapter(
+                updater, **self._stage_kwargs(double_buffer=False)
+            )
 
-        self.assertEqual(result, (True, "Succeeded to stage adapter online."))
-        fallback.assert_called_once()
+        success, message = result
+        self.assertFalse(success)
+        self.assertIn("double-buffer", message)
         runner.oft_manager.stage_adapter.assert_not_called()
 
     def test_staged_activation_forwards_id_and_returns_manager_failure(self):
-        from sglang.srt.model_executor.model_runner_components import (
-            weight_updater as weight_updater_module,
-        )
         from sglang.srt.model_executor.model_runner_components.weight_updater import (
             WeightUpdater,
         )
@@ -739,26 +755,24 @@ class TestWeightUpdaterStagedRouting(unittest.TestCase):
         )
         updater = self._updater(runner)
 
-        with patch.object(weight_updater_module.peft, "activate_adapter") as fallback:
-            result = WeightUpdater.activate_adapter_version(
-                updater,
-                adapter_name="policy",
-                adapter_id="id-a",
-                adapter_version="8",
-            )
+        result = WeightUpdater.activate_adapter_version(
+            updater,
+            adapter_name="policy",
+            adapter_id="id-a",
+            adapter_version="8",
+        )
 
         self.assertEqual(result, (False, "staged activation rejected"))
         runner.oft_manager.activate_adapter.assert_called_once_with(
             "policy", 8, adapter_id="id-a"
         )
-        fallback.assert_not_called()
 
-    def test_non_staged_activation_keeps_peft_fallback(self):
-        from unittest.mock import sentinel
-
-        from sglang.srt.model_executor.model_runner_components import (
-            weight_updater as weight_updater_module,
-        )
+    def test_non_staged_activation_calls_oft_manager_directly(self):
+        """Regression: oft_impl="sibling" used to route through a separate
+        activate_adapter façade function; now it calls
+        model_runner.oft_manager.activate_adapter directly, matching the
+        staged branch above (minus the staged-only adapter_id kwarg, which
+        the sibling manager's activate_adapter signature doesn't take)."""
         from sglang.srt.model_executor.model_runner_components.weight_updater import (
             WeightUpdater,
         )
@@ -766,29 +780,26 @@ class TestWeightUpdaterStagedRouting(unittest.TestCase):
         runner = MagicMock()
         runner.server_args.enable_lora_staging = False
         runner.server_args.oft_impl = "sibling"
+        runner.oft_manager.activate_adapter.return_value = SimpleNamespace(
+            success=True, error_message=None
+        )
         updater = self._updater(runner)
 
-        with patch.object(
-            weight_updater_module.peft,
-            "activate_adapter",
-            return_value=sentinel.peft_result,
-        ) as fallback:
-            result = WeightUpdater.activate_adapter_version(
-                updater,
-                adapter_name="policy",
-                adapter_id="id-a",
-                adapter_version="8",
-            )
+        result = WeightUpdater.activate_adapter_version(
+            updater,
+            adapter_name="policy",
+            adapter_id="id-a",
+            adapter_version="8",
+        )
 
         self.assertEqual(result, (True, "Succeeded to activate adapter version."))
-        fallback.assert_called_once_with(runner, "policy", 8)
-        runner.oft_manager.activate_adapter.assert_not_called()
+        runner.oft_manager.activate_adapter.assert_called_once_with("policy", 8)
 
 
 class TestOFTStagingBackendPrepareActivation(unittest.TestCase):
     """Regression for round-1 review: a real client's obj.adapter_id defaults
     to None, so prepare_activation must resolve it from tm.oft_ref_cache
-    (the same lookup register_peft_ref itself uses) -- otherwise
+    (the same lookup register_oft_ref itself uses) -- otherwise
     StagedOFTManager.activate_adapter's uid falls back to obj.adapter_name
     and never matches the UUID stage_adapter recorded."""
 

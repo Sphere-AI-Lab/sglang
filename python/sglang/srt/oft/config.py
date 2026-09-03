@@ -357,7 +357,7 @@ def validate_oft_args(server_args) -> None:
         # every prepare_oft_batch call, which has no pointer stability across
         # CUDA-graph capture and replay (prepare_oft_batch runs outside the
         # capture region -- see decode_cuda_graph_runner.py's
-        # maybe_prepare_peft_batch/maybe_prepare_replay_batch calls): a
+        # prepare_oft_batch/_prepare_oft_replay_batch calls): a
         # captured decode graph replays against the stale capture-time
         # tensor, silently applying an unrelated adapter's rotation (or
         # identity) instead of erroring. Same class of failure as the OFT

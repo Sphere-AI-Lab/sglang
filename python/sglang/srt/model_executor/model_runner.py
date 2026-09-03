@@ -172,7 +172,7 @@ from sglang.srt.model_loader.loader import (
     postprocess_weight,
     restore_weight,
 )
-from sglang.srt.peft import integration as peft
+from sglang.srt.oft import integration as oft_integration
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -670,7 +670,7 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
-        self.maybe_init_peft_manager()
+        self.maybe_init_oft_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
 
@@ -768,9 +768,9 @@ class ModelRunner:
         if get_lora().enable_lora:
             self.init_lora_manager()
 
-    def maybe_init_peft_manager(self):
+    def maybe_init_oft_manager(self):
         # Init the OFT adapter manager. No-op when enable_oft is not set.
-        peft.maybe_init_peft_manager(self, self.server_args)
+        oft_integration.maybe_init_oft_manager(self, self.server_args)
 
     def maybe_enable_batch_invariant_mode(self):
         if get_exec().deterministic.enable_deterministic_inference:

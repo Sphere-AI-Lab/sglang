@@ -305,7 +305,6 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.peft import integration as peft
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import get_context, publish
@@ -455,7 +454,7 @@ class Scheduler(
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
         # OFT adapters are admitted on the same schedule-time contract as LoRA
-        # above; the check itself lives behind the peft facade.
+        # above; the check itself lives in _can_schedule_oft_req below.
         self.enable_oft = server_args.enable_oft
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
@@ -3393,9 +3392,7 @@ class Scheduler(
                 if not can_schedule_lora:
                     continue
 
-            if self.enable_oft and not peft.maybe_admit_request(
-                self, req, running_ofts
-            ):
+            if self.enable_oft and not self._can_schedule_oft_req(req, running_ofts):
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3583,6 +3580,17 @@ class Scheduler(
             return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
                 new_lora_set
             )
+
+    def _can_schedule_oft_req(
+        self, req: Req, running_ofts: set[Optional[str]]
+    ) -> bool:
+        """Check if an OFT request can be scheduled: the adapter can be
+        loaded (either already resident or a resident buffer slot can admit
+        it), validated against the manager's buffer capacity."""
+        new_oft_set = {req.adapter_id} | running_ofts
+        return self.tp_worker.model_runner.oft_manager.validate_oft_batch(
+            new_oft_set
+        )
 
     def _resolve_active_lora_fast(
         self, running_batch: ScheduleBatch, can_run_list: List[Req]

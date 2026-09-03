@@ -1494,7 +1494,7 @@ async def update_weights_from_distributed(
 async def update_adapter_from_distributed(
     obj: Annotated[UpdateAdapterFromDistributedReqInput, Body()], request: Request
 ):
-    """Double-buffer PEFT (OFT/LoRA) STAGE over NCCL. double_buffer=True stages
+    """Double-buffer OFT/LoRA STAGE over NCCL. double_buffer=True stages
     only; double_buffer=False stages then activates-in-place (caller idle)."""
     (
         success,
@@ -1523,7 +1523,7 @@ async def update_adapter_from_distributed(
 async def activate_adapter_version(
     obj: Annotated[ActivateAdapterVersionReqInput, Body()], request: Request
 ):
-    """Double-buffer PEFT ACTIVATE (drained atomic swap). Drains in-flight
+    """Double-buffer OFT/LoRA ACTIVATE (drained atomic swap). Drains in-flight
     generation (tokenizer-side writer_lock) then flips staging->active."""
     success, message = await _global_state.tokenizer_manager.activate_adapter_version(
         obj, request

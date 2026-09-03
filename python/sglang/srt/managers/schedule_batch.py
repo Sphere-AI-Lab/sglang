@@ -814,6 +814,23 @@ def _extend_lora_extra_key(
     return (extra_key or "") + f"|lora:{lora_id}:v{version}"
 
 
+def _extend_oft_extra_key(
+    extra_key: Optional[str], adapter_id: Optional[str], adapter_version: Optional[int]
+) -> Optional[str]:
+    """Separate radix entries by OFT adapter identity and weight VERSION.
+
+    Without the identity half, a base request prefix-matches KV computed
+    under an adapter and silently returns adapter output (measured: base
+    greedy == adapter output on 14/16 prompts until keyed). Without the
+    version half, under RL the same adapter id is re-pushed with new weights
+    every step, so id alone would let a prefix cached under version k be
+    reused under k+1."""
+    if adapter_id is None:
+        return extra_key
+    version = 0 if adapter_version is None else adapter_version
+    return (extra_key or "") + f"|oft:{adapter_id}:v{version}"
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -938,22 +955,7 @@ class Req(ReqDllmMixin):
 
         # Extra key for caller-defined request classification.
         extra_key = _extend_lora_extra_key(extra_key, lora_id, lora_version)
-        if adapter_id is not None:
-            # Radix keys MUST separate OFT-adapter requests from base requests:
-            # without this, a base request prefix-matches KV computed under the
-            # adapter and silently returns adapter output (measured: base greedy
-            # == adapter output on 14/16 prompts until keyed).
-            #
-            # The key also carries the adapter WEIGHT VERSION: under RL the same
-            # adapter id is re-pushed with new weights every step, so id alone
-            # would let a prefix cached under version k be reused under k+1.
-            # Lazy import: integration's module-level deps must not load from
-            # this module.
-            from sglang.srt.peft.integration import maybe_extend_extra_key
-
-            extra_key = maybe_extend_extra_key(
-                extra_key, adapter_id, adapter_version
-            )
+        extra_key = _extend_oft_extra_key(extra_key, adapter_id, adapter_version)
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None

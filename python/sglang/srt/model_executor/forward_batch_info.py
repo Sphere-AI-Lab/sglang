@@ -51,7 +51,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.peft import integration as peft
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
@@ -944,7 +943,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init OFT (single-active) batch info. Distinct namespace/guard from
         # the upstream enable_lora block above.
         if model_runner.server_args.enable_oft:
-            peft.maybe_apply_forward(model_runner, ret)
+            model_runner.oft_manager.fetch_new_ofts(set(ret.adapter_ids))
+            model_runner.oft_manager.prepare_oft_batch(ret)
 
         if (
             model_runner.ps.attn_dcp_size > 1

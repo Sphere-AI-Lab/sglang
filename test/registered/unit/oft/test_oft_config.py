@@ -69,7 +69,7 @@ def _args(
     return ns
 
 
-def test_native_lora_and_single_active_peft_are_mutually_exclusive():
+def test_native_lora_and_single_active_oft_are_mutually_exclusive():
     """Catch the PEFT method initializing alongside native LoRA."""
     from sglang.srt.oft.config import validate_oft_args
 
@@ -84,7 +84,7 @@ def test_native_lora_and_single_active_peft_are_mutually_exclusive():
     ("enable_lora", "enable_oft"),
     [(True, False), (False, True)],
 )
-def test_native_lora_and_single_active_peft_validate_independently(
+def test_native_lora_and_single_active_oft_validate_independently(
     enable_lora, enable_oft
 ):
     """Catch an over-broad guard that rejects either system on its own."""
