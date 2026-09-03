@@ -12,8 +12,8 @@ OFT.
 Single-active invariant: the engine boots with ``enable_lora`` XOR
 ``enable_oft``, so there is exactly one active OFT registry / ref
 cache. These hooks never branch on ``load_format`` or adapter type -- the
-ref class is fixed at init via ``_mint_ref``. The AdapterRegistry base
-(oft/base/registry.py) provides the register/acquire/LRU behaviour.
+ref class is fixed at init via ``_mint_ref``. ``OFTRegistry``
+(oft/oft_registry.py) provides the register/acquire/LRU behaviour.
 
 Import-light by design (registry classes imported lazily): the tokenizer-manager
 boot chain is deep. See commit c42b88a1c for the cycle this avoids.
@@ -85,7 +85,7 @@ class OFTTokenizerMixin:
     """Mixin class for TokenizerManager to handle OFT adapter registry/lease."""
 
     def _mint_ref(self: TokenizerManager, name):
-        """Build the OFT AdapterRef for ``name`` (path == name for streamed
+        """Build the OFTRef for ``name`` (path == name for streamed
         adapters). Matches the registry class built in init_tokenizer_oft.
 
         reloadable=False: a streamed adapter has no on-disk artifact to reload
@@ -208,7 +208,7 @@ class OFTTokenizerMixin:
             )
 
         # Reload adapters that were dynamically evicted (OFT eviction; no-op single-active).
-        unregistered = await self.oft_registry.get_unregistered_adapters(unique_paths)
+        unregistered = await self.oft_registry.get_unregistered_ofts(unique_paths)
         for oft_path in unregistered:
             if oft_path is None:
                 continue
@@ -358,7 +358,7 @@ class OFTTokenizerMixin:
                             raise ValueError(
                                 "Didn't find any OFT adapters when trying to "
                                 "evict LRU OFT adapter. OFT registry is: "
-                                f"{self.oft_registry.get_all_adapters()}"
+                                f"{self.oft_registry.get_all_ofts()}"
                             )
                         logger.info(
                             f"Unloading least recently used OFT adapter '{lru_name}' "
@@ -435,7 +435,7 @@ class OFTTokenizerMixin:
                             raise ValueError(
                                 "Didn't find any OFT adapters when trying to "
                                 "evict LRU OFT adapter. OFT registry is: "
-                                f"{self.oft_registry.get_all_adapters()}"
+                                f"{self.oft_registry.get_all_ofts()}"
                             )
                         logger.info(
                             f"Unloading least recently used OFT adapter '{lru_name}' "
@@ -516,7 +516,7 @@ class OFTTokenizerMixin:
                             raise ValueError(
                                 "Didn't find any OFT adapters when trying to "
                                 "evict LRU OFT adapter. OFT registry is: "
-                                f"{self.oft_registry.get_all_adapters()}"
+                                f"{self.oft_registry.get_all_ofts()}"
                             )
                         logger.info(
                             f"Unloading least recently used OFT adapter '{lru_name}' "

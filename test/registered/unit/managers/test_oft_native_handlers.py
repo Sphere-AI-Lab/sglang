@@ -120,9 +120,9 @@ class TestFreshLoadRegisters(CustomTestCase):
         self.assertIsNotNone(obj.oft_id)
         self.assertEqual(tm.oft_registry.num_registered_ofts, 1)
         self.assertEqual(
-            tm.oft_registry.get_all_adapters()["a"].oft_id, obj.oft_id
+            tm.oft_registry.get_all_ofts()["a"].oft_id, obj.oft_id
         )
-        self.assertIs(tm.oft_ref_cache["a"], tm.oft_registry.get_all_adapters()["a"])
+        self.assertIs(tm.oft_ref_cache["a"], tm.oft_registry.get_all_ofts()["a"])
 
     def test_from_distributed_fresh_load_registers(self):
         tm = _make_tokenizer_manager()
@@ -189,7 +189,7 @@ class TestUpsertReusesId(CustomTestCase):
         )
 
         self.assertTrue(result.success)
-        updated = tm.oft_registry.get_all_adapters()["a"]
+        updated = tm.oft_registry.get_all_ofts()["a"]
         self.assertEqual(updated.version, existing.version + 1)
         self.assertEqual(tm.oft_ref_cache["a"].version, updated.version)
 
@@ -208,7 +208,7 @@ class TestUpsertReusesId(CustomTestCase):
         )
 
         self.assertTrue(result.success)
-        updated = tm.oft_registry.get_all_adapters()["a"]
+        updated = tm.oft_registry.get_all_ofts()["a"]
         self.assertEqual(updated.version, existing.version + 1)
 
     def test_non_upsert_duplicate_fails(self):
@@ -243,7 +243,7 @@ class TestLRUEviction(CustomTestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(tm.oft_registry.num_registered_ofts, 1)
-        registered = tm.oft_registry.get_all_adapters()
+        registered = tm.oft_registry.get_all_ofts()
         self.assertNotIn("old", registered)
         self.assertIn("new", registered)
         # The eviction loop must scrub the evicted name from the reported
@@ -271,7 +271,7 @@ class TestLRUEviction(CustomTestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(tm.oft_registry.num_registered_ofts, 2)
-        self.assertIn("old", tm.oft_registry.get_all_adapters())
+        self.assertIn("old", tm.oft_registry.get_all_ofts())
 
 
 class TestUnloadDeleteVsEvictSemantics(CustomTestCase):
@@ -592,7 +592,7 @@ class TestMintRefIsNotReloadable(CustomTestCase):
     """Regression guard: _mint_ref (the ref constructor for the streamed/
     staged adapter path, used by register_oft_ref) used to construct its
     OFTRef without an explicit reloadable=, silently defaulting to
-    reloadable=True (AdapterRef's dataclass default) -- as if a streamed
+    reloadable=True (OFTRef's dataclass default) -- as if a streamed
     adapter were disk-backed. A streamed adapter has no on-disk artifact
     either, so this must be reloadable=False, mirroring
     staged_manager.py's LoRARef construction for its own streamed adapters.
