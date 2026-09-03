@@ -201,6 +201,8 @@ def get_normalized_target_modules(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
+        "in_proj_b": "in_proj_ba",
+        "in_proj_a": "in_proj_ba",
         "q_a_proj": "fused_qkv_a_proj_with_mqa",
         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
         "embed_tokens": "embed_tokens",

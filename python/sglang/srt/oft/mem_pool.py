@@ -33,6 +33,9 @@ MERGED_OFT_PROJ_GROUPS = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj"),
     "gate_up_proj": ("gate_proj", "up_proj"),
     "fused_qkv_a_proj_with_mqa": ("q_a_proj", "kv_a_proj_with_mqa"),
+    # GDN (GatedDeltaNet) packed input projections, e.g. Qwen3.5.
+    "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+    "in_proj_ba": ("in_proj_b", "in_proj_a"),
 }
 
 
