@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.lora.lora_moe_runners import LoRAHooks
+    from sglang.srt.oft.oft_moe_runners import OFTInfo
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +151,11 @@ class MoeRunner:
             self.fused_func = None
 
     def run(
-        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
+        self,
+        dispatch_output: DispatchOutput,
+        quant_info: MoeQuantInfo,
+        lora_info=None,
+        oft_info: OFTInfo | None = None,
     ) -> CombineInput:
         if (
             self.fused_func is not None
@@ -222,7 +227,7 @@ class MoeRunner:
             from sglang.srt.oft.oft_moe_runners import make_oft_invoke
 
             run_kwargs["invoke"] = make_oft_invoke(
-                self._peft_layer, invoke_fused_moe_kernel
+                self._peft_layer, invoke_fused_moe_kernel, oft_info
             )
 
         runner_output = self.runner_core.run(

@@ -4,11 +4,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from sglang.srt.layers.moe import MoeRunnerBackend
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.oft.backend.base_backend import _compute_moe_oft_info
 from sglang.srt.oft.backend.torch_backend import TorchNativeOFTBackend
 from sglang.srt.oft.backend.triton_backend import TritonOFTBackend
+from sglang.srt.oft.layers import FusedMoEWithOFT
 from sglang.srt.oft.mem_pool import EMPTY_SLOT, OFTMemoryPool
 from sglang.srt.oft.oft_manager import OFTManager
+from sglang.srt.oft.streamed_weight_loader import (
+    _commit_streamed_oft_tensor_groups,
+)
 
 
 def _expert_pool(groups):
@@ -23,6 +29,74 @@ def _expert_pool(groups):
 
 def _block_identity_like(slot):
     return torch.eye(slot.shape[-1], dtype=slot.dtype).expand_as(slot)
+
+
+def _make_oft_wrapper():
+    config = MoeRunnerConfig(
+        num_experts=3,
+        num_local_experts=3,
+        hidden_size=4,
+        intermediate_size_per_partition=4,
+        layer_id=0,
+        top_k=2,
+        num_fused_shared_experts=0,
+        params_dtype=torch.float32,
+        activation="silu",
+        inplace=False,
+    )
+    quant_method = MagicMock()
+    quant_method.runner = None
+    quant_method.get_triton_quant_info.return_value = SimpleNamespace()
+    dispatcher = MagicMock()
+    dispatch_output = object()
+    combine_input = object()
+    dispatcher.dispatch.return_value = dispatch_output
+    dispatcher.combine.return_value = combine_input
+
+    base_layer = torch.nn.Module()
+    for name, value in {
+        "quant_method": quant_method,
+        "moe_runner_config": config,
+        "dispatcher": dispatcher,
+        "num_experts": 3,
+        "num_local_experts": 3,
+        "top_k": 2,
+        "hidden_size": 4,
+        "should_fuse_routed_scaling_factor_in_topk": False,
+        "moe_tp_size": 1,
+        "moe_tp_rank": 0,
+        "intermediate_size_per_partition": 4,
+    }.items():
+        setattr(base_layer, name, value)
+    base_layer.forward = MagicMock()
+
+    backend = TorchNativeOFTBackend(
+        max_ofts_per_batch=3, device=torch.device("cpu")
+    )
+    moe_batch_info = _compute_moe_oft_info(
+        num_tokens=3,
+        seg_indptr=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        weight_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_ofts=3,
+    )
+    backend.batch_info = SimpleNamespace(
+        moe_oft_info=moe_batch_info,
+        has_active_oft=True,
+    )
+    with patch(
+        "sglang.srt.layers.moe.utils.get_moe_runner_backend",
+        return_value=MoeRunnerBackend.TRITON,
+    ):
+        wrapper = FusedMoEWithOFT(base_layer, backend)
+    rotations = torch.eye(4).view(1, 1, 1, 4, 4).expand(3, 3, 1, 4, 4)
+    wrapper.set_oft_info(
+        w13_oft_r=rotations,
+        w1_oft_r=None,
+        w3_oft_r=None,
+        w2_oft_r=rotations,
+    )
+    wrapper._oft_runner.run = MagicMock(return_value=combine_input)
+    return wrapper, dispatch_output, combine_input
 
 
 def test_expert_group_exposes_all_adapter_slots():
@@ -69,6 +143,54 @@ def test_disk_expert_load_writes_only_selected_slot():
 
     torch.testing.assert_close(pool.slot("w1_oft_r", 0, 1), before)
     assert not torch.equal(pool.slot("w1_oft_r", 0, 2), before)
+
+
+def test_streamed_expert_commit_writes_allocated_request_slot():
+    pool = _expert_pool(
+        {
+            name: {0: torch.zeros(3, 2, 1, 4, 4)}
+            for name in ("w1_oft_r", "w3_oft_r")
+        }
+    )
+    pool.active_idx = 1
+    manager = object.__new__(OFTManager)
+    manager.memory_pool = pool
+    manager.adapter_modules = []
+    moe = SimpleNamespace(
+        num_local_experts=2,
+        moe_tp_rank=0,
+        moe_tp_size=1,
+        w13_weight=torch.empty(0),
+        _map_global_expert_id_to_local_expert_id=lambda expert_id: expert_id,
+    )
+    manager._find_fused_moe_modules = lambda: {0: moe}
+    expert_chunk = {
+        0: {
+            0: {
+                "gate_proj.oft_R": torch.zeros(1, 6),
+                "up_proj.oft_R": torch.zeros(1, 6),
+            }
+        }
+    }
+
+    with patch(
+        "sglang.srt.oft.torch_ops.oft_ops.precompute_oft_r",
+        return_value=torch.eye(4).view(1, 4, 4),
+    ):
+        success, error = _commit_streamed_oft_tensor_groups(
+            manager,
+            named_tensors=[],
+            plan=(expert_chunk, {}, {}, []),
+            buffer_id=2,
+            block_size=4,
+            adapter_name="adapter-2",
+            adapter_id="adapter-2",
+        )
+
+    assert success is True
+    assert error == "Success"
+    torch.testing.assert_close(pool.slot("w1_oft_r", 0, 1), torch.zeros(2, 1, 4, 4))
+    assert not torch.equal(pool.slot("w1_oft_r", 0, 2), torch.zeros(2, 1, 4, 4))
 
 
 def test_expert_load_failure_does_not_publish_slot():
@@ -137,6 +259,34 @@ def test_base_only_batch_has_no_active_oft():
 
     assert info.adapter_enabled.tolist() == [0, 0, 0]
     assert info.token_oft_mapping.tolist() == [0, 0, 0]
+
+
+def test_wrapper_passes_current_oft_info_to_runner():
+    wrapper, dispatch_output, combine_input = _make_oft_wrapper()
+    hidden_states = torch.randn(3, 4)
+    topk_output = object()
+
+    actual = wrapper.forward(hidden_states, topk_output)
+
+    call = wrapper._oft_runner.run.call_args
+    assert call.args == (dispatch_output, wrapper._quant_info)
+    oft_info = call.kwargs["oft_info"]
+    assert oft_info.batch_info.req_to_oft.tolist() == [0, 1, 2]
+    assert oft_info.w13_oft_r is wrapper.w13_oft_r
+    assert oft_info.w2_oft_r is wrapper.w2_oft_r
+    assert actual is combine_input
+
+
+def test_wrapper_uses_base_path_when_batch_info_is_absent():
+    wrapper, _, _ = _make_oft_wrapper()
+    wrapper.oft_backend.batch_info = None
+    hidden_states = torch.randn(3, 4)
+    topk_output = object()
+
+    wrapper.forward(hidden_states, topk_output)
+
+    wrapper.base_layer.forward.assert_called_once_with(hidden_states, topk_output)
+    wrapper._oft_runner.run.assert_not_called()
 
 
 @pytest.mark.parametrize("backend_cls", [TritonOFTBackend, TorchNativeOFTBackend])

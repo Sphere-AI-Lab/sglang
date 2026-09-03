@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
+from sglang.srt.oft.backend.triton_backend import TritonOFTBackend
 from sglang.srt.oft.oft_moe_runners import (
     OFTInfo,
     _compute_oft_alignment,
@@ -29,6 +32,109 @@ EXPERTS = 2
 TOP_K = 1
 BLOCK_M = 8
 TOL = 2e-3
+
+
+def make_forward_batch(req_to_oft, num_tokens):
+    extend_seq_lens_cpu = [num_tokens // len(req_to_oft)] * len(req_to_oft)
+    return SimpleNamespace(
+        batch_size=len(req_to_oft),
+        extend_seq_lens=torch.tensor(extend_seq_lens_cpu, dtype=torch.int32),
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        forward_mode=SimpleNamespace(
+            is_decode_or_idle=lambda: False,
+            is_target_verify=lambda: False,
+            is_extend=lambda: True,
+        ),
+        req_to_oft=req_to_oft,
+    )
+
+
+class _GraphOFTRunner:
+    def __init__(self, backend, max_tokens, num_experts, top_k, block_size):
+        self.backend = backend
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.input = torch.arange(
+            max_tokens * block_size, device="cuda", dtype=torch.bfloat16
+        ).view(max_tokens, block_size)
+        self.topk_ids = torch.tensor(
+            [[0, 1], [1, 2], [2, 0], [0, 2]],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        self.output = torch.empty(
+            max_tokens * top_k, block_size, device="cuda", dtype=torch.bfloat16
+        )
+
+    def _run(self, rotations):
+        batch_info = self.backend.batch_info.moe_oft_info
+        oft_info = OFTInfo(
+            w13_oft_r=rotations,
+            w1_oft_r=None,
+            w3_oft_r=None,
+            w2_oft_r=rotations,
+            batch_info=batch_info,
+            num_experts=self.num_experts,
+            max_ofts=self.backend.max_ofts_per_batch,
+            has_active_oft=True,
+            cg_buffers=self.backend.moe_cg_buffers,
+        )
+        sorted_ids, expert_ids, padded, oft_ids = _compute_oft_alignment(
+            self.topk_ids, oft_info
+        )
+        rotated = apply_oft_rotation_triton(
+            self.input,
+            rotations,
+            self.topk_ids,
+            sorted_ids,
+            expert_ids,
+            padded,
+            oft_ids,
+            batch_info.adapter_enabled,
+            top_k=self.top_k,
+            block_m=64,
+        )
+        self.output.copy_(rotated)
+
+    def capture(self, rotations):
+        self._run(rotations)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._run(rotations)
+        return graph
+
+
+def make_graph_oft_fixture(max_tokens, max_ofts, num_experts, top_k):
+    backend = TritonOFTBackend(max_ofts, torch.device("cuda"))
+    backend.is_moe_oft = True
+    backend._moe_num_experts = num_experts
+    backend._moe_top_k = top_k
+    backend.init_cuda_graph_batch_info(max_tokens, 1)
+    block_size = 4
+    eye = torch.eye(block_size, device="cuda", dtype=torch.bfloat16)
+    rotations = eye.view(1, 1, 1, block_size, block_size).expand(
+        max_ofts, num_experts, 1, block_size, block_size
+    ).clone()
+    rotations[1, :, 0] = torch.diag(
+        torch.tensor([-1, 1, -1, 1], device="cuda", dtype=torch.bfloat16)
+    )
+    graph_runner = _GraphOFTRunner(
+        backend, max_tokens, num_experts, top_k, block_size
+    )
+    return backend, graph_runner, rotations
+
+
+def eager_oft_moe_reference(forward_batch, rotations, graph_runner):
+    rows = []
+    slots = forward_batch.req_to_oft
+    tokens_per_request = graph_runner.input.shape[0] // len(slots)
+    for token in range(graph_runner.input.shape[0]):
+        slot = slots[token // tokens_per_request]
+        for route in range(graph_runner.top_k):
+            expert = int(graph_runner.topk_ids[token, route])
+            rows.append(graph_runner.input[token] @ rotations[slot, expert, 0])
+    return torch.stack(rows)
 
 
 def _fixture(block_size: int):
@@ -440,3 +546,66 @@ def test_nonlocal_route_rows_remain_zero_with_padding(block_size):
     )
     torch.cuda.synchronize()
     assert torch.count_nonzero(out.reshape(M * TOP_K, -1)[valid_routes]).item() == 0
+
+
+def test_cuda_graph_replay_reuses_oft_buffers_and_observes_new_slot(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.srt.oft.oft_moe_runners.get_is_capture_mode", lambda: True
+    )
+    backend, graph_runner, rotations = make_graph_oft_fixture(
+        max_tokens=4,
+        max_ofts=3,
+        num_experts=3,
+        top_k=2,
+    )
+    tracked_names = {
+        "sorted_token_ids_oft",
+        "expert_ids_oft",
+        "num_tokens_post_padded_oft",
+        "oft_ids",
+        "adapter_enabled",
+        "token_oft_mapping",
+        "cumsum_buffer",
+        "token_mask",
+    }
+    assert tracked_names <= backend.moe_cg_buffers.keys()
+    tracked = {
+        name: backend.moe_cg_buffers[name].data_ptr() for name in tracked_names
+    }
+    rotations_ptr = rotations.data_ptr()
+
+    adapter_1 = make_forward_batch(req_to_oft=[1], num_tokens=4)
+    backend.prepare_oft_batch(
+        adapter_1,
+        weight_indices=adapter_1.req_to_oft,
+        oft_block_sizes=[0, 4, 4],
+        use_cuda_graph=True,
+    )
+    graph = graph_runner.capture(rotations=rotations)
+
+    adapter_2 = make_forward_batch(req_to_oft=[2], num_tokens=4)
+    backend.prepare_oft_batch(
+        adapter_2,
+        weight_indices=adapter_2.req_to_oft,
+        oft_block_sizes=[0, 4, 4],
+        use_cuda_graph=True,
+    )
+    changed_slot = torch.tensor(
+        [[0, 0, 0, 1], [0, 0, 1, 0], [0, 1, 0, 0], [1, 0, 0, 0]],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    rotations[2, :, 0].copy_(changed_slot)
+    assert rotations.data_ptr() == rotations_ptr
+    for name, ptr in tracked.items():
+        assert backend.moe_cg_buffers[name].data_ptr() == ptr
+
+    expected = eager_oft_moe_reference(adapter_2, rotations, graph_runner)
+    torch.cuda.synchronize()
+    allocations_before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    graph.replay()
+    torch.cuda.synchronize()
+    allocations_after = torch.cuda.memory_stats()["allocation.all.allocated"]
+    assert allocations_after == allocations_before
+    actual = graph_runner.output.detach().clone()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

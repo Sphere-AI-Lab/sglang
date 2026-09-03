@@ -508,7 +508,9 @@ def _commit_streamed_oft_tensor_groups(
         )
 
     if fused_expert_chunk:
-        oft_manager.apply_streamed_expert_oft(fused_expert_chunk, block_size)
+        oft_manager.apply_streamed_expert_oft(
+            fused_expert_chunk, block_size, slot_idx=buffer_id
+        )
 
     batch_chunk_limit_bytes = _resolve_oft_batch_chunk_limit_bytes()
     # Row-parallel groups go through the SAME chunked flush as everything else.

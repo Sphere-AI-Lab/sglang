@@ -24,10 +24,9 @@ previous design had to preserve by hand via renamed variables.
 in-kernel originals, so numerics stay bit-identical. The OFT MoE golden tests
 guard this contract across three configurations with zero permitted drift.
 
-The wrapper closes over the LAYER and re-reads ``layer.w*_oft_r`` on EVERY call,
-so a streamed in-place weight sync stays visible under CUDA-graph replay, and an
-identity boot (buffers injected after the wrapper is built) is picked up. It is
-self-gating: with no OFT buffer present it delegates straight to the real kernel.
+The wrapper closes over immutable per-forward ``OFTInfo``. Its tensors are full
+pool groups, so in-place slot updates stay visible under CUDA-graph replay
+without publishing adapter state on the MoE module.
 """
 
 from dataclasses import dataclass
@@ -49,7 +48,7 @@ _QUANT_KWARGS = (
 OFT_ALIGNMENT_BLOCK_SIZE = 64
 
 
-@dataclass
+@dataclass(frozen=True)
 class OFTInfo:
     w13_oft_r: torch.Tensor | None
     w1_oft_r: torch.Tensor | None
@@ -253,16 +252,16 @@ def _run_gate_up_split(
 
     Verbatim body (was ``moe_hooks.py::_oft_run_gate_up_split``, itself the
     ``if split_w13_oft:`` block from ``_fused_moe_kernel_sequence``). Rotates
-    gate/up inputs independently (``layer.w1_oft_r`` / ``layer.w3_oft_r``, read
-    live) and writes the two ``N // 2`` halves of ``C`` (= intermediate_cache1).
+    gate/up inputs independently and writes the two ``N // 2`` halves of ``C``
+    (= intermediate_cache1).
     Each half GEMM writes a contiguous scratch buffer (the kernel needs a
     contiguous C), then copies into the non-contiguous half-column view.
 
     ``N``/``total_tokens`` are derived from ``C`` -- upstream allocates it as
     ``torch.empty((total_tokens, N))`` -- instead of being threaded down.
     """
-    w1_oft_r = layer.w1_oft_r
-    w3_oft_r = layer.w3_oft_r
+    w1_oft_r = oft_info.w1_oft_r
+    w3_oft_r = oft_info.w3_oft_r
     if w1_oft_r is None or w3_oft_r is None:
         raise RuntimeError(
             "Split expert gate/up OFT requires both w1_oft_r and w3_oft_r"
@@ -341,17 +340,19 @@ def make_oft_invoke(
 ) -> Callable:
     """Build the OFT-rotating replacement for ``invoke_fused_moe_kernel``.
 
-    Dispatches on the WEIGHT TENSOR IDENTITY: ``triton.py`` passes
+    Dispatches on the BASE WEIGHT TENSOR IDENTITY: ``triton.py`` passes
     ``w1=quant_info.w13_weight`` / ``w2=quant_info.w2_weight``, and both
     ``unquant.py`` and ``fp8.py`` build those as ``layer.w13_weight`` /
     ``layer.w2_weight`` -- the very objects this closure holds. The split path's
     inner half-GEMMs call ``real_invoke`` directly (with a freshly sliced weight),
     so there is no recursion.
 
-    Self-gating: a GEMM whose OFT buffer is ``None`` falls through to
+    Self-gating: a GEMM whose per-forward OFT buffer is ``None`` falls through to
     ``real_invoke`` unchanged, so there is no separate "is any hook set?" gate to
     get wrong (the WS-A Finding-#1 bug class becomes unrepresentable).
     """
+
+    base_layer = getattr(layer, "base_layer", layer)
 
     def invoke(
         A,
@@ -371,8 +372,8 @@ def make_oft_invoke(
         config,
         **kw,
     ):
-        is_gate_up = B is layer.w13_weight
-        is_down = B is layer.w2_weight
+        is_gate_up = B is base_layer.w13_weight
+        is_down = B is base_layer.w2_weight
         if not (is_gate_up or is_down):
             # Not one of this layer's two expert GEMMs (e.g. the split path's own
             # sliced half-weights, or a future extra GEMM): no rotation to apply.
@@ -383,8 +384,8 @@ def make_oft_invoke(
             )
 
         if is_gate_up:
-            w13 = getattr(layer, "w13_oft_r", None)
-            w1 = getattr(layer, "w1_oft_r", None)
+            w13 = oft_info.w13_oft_r if oft_info is not None else None
+            w1 = oft_info.w1_oft_r if oft_info is not None else None
             if w13 is not None and w1 is not None:
                 # Invariant (enforced by the OFT manager via oft_type): a layer
                 # carries EITHER the legacy fused w13 rotation OR the split w1/w3
@@ -418,7 +419,7 @@ def make_oft_invoke(
                 )
             oft_r = w13
         else:
-            oft_r = getattr(layer, "w2_oft_r", None)
+            oft_r = oft_info.w2_oft_r if oft_info is not None else None
 
         if oft_r is None:
             return real_invoke(

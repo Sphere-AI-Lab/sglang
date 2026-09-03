@@ -960,20 +960,21 @@ class ReplicatedLinearWithOFT(BaseLayerWithOFT):
 
 
 class FusedMoEWithOFT(nn.Module):
-    """Wrapper around FusedMoE that routes the MoE forward through a dedicated
-    runner so OFT rides a dedicated fused_func=None runner (like LoRA's
-    FusedMoEWithLoRA), letting the base runner drop the _has_expert_adapters gate.
-
-    OFT buffers stay on ``self.base_layer`` (w13_oft_r / w1_oft_r / w3_oft_r /
-    w2_oft_r); the runner reads them live via ``_peft_layer`` and applies the
-    rotation through the OFT MoE invoker. This is a thin
-    shell: it does NOT move buffers into a pool, so the streamed-sync /
-    double-buffer / cuda-graph machinery keeps working unchanged on base_layer.
-    """
+    """Wrapper around FusedMoE with request-routed, pool-backed OFT."""
 
     def __init__(self, base_layer, oft_backend: BaseOFTBackend):
         super().__init__()
         self.base_layer = base_layer
+        self.oft_backend = oft_backend
+        self.oft_backend.is_moe_oft = True
+        self.oft_backend._moe_num_experts = max(
+            getattr(self.oft_backend, "_moe_num_experts", 0) or 0,
+            base_layer.num_experts,
+        )
+        self.oft_backend._moe_top_k = max(
+            getattr(self.oft_backend, "_moe_top_k", 0) or 0,
+            base_layer.top_k,
+        )
         # Copy the config the runner path reads (mirror FusedMoEWithLoRA).
         self.quant_method = base_layer.quant_method
         self.moe_runner_config = base_layer.moe_runner_config
@@ -1038,8 +1039,7 @@ class FusedMoEWithOFT(nn.Module):
             base_layer.moe_runner_config,
             peft_enabled=True,
         )
-        # The runner builds make_oft_invoke(self._peft_layer, ...) from the live buffers.
-        self._oft_runner._peft_layer = base_layer
+        self._oft_runner._peft_layer = self
 
         self.w13_oft_r = None
         self.w1_oft_r = None
@@ -1060,18 +1060,37 @@ class FusedMoEWithOFT(nn.Module):
         self.w3_oft_r = w3_oft_r
         self.w2_oft_r = w2_oft_r
 
+    def _get_oft_info(self):
+        """Build immutable expert OFT inputs for the current forward."""
+        from sglang.srt.oft.oft_moe_runners import OFTInfo
+
+        batch_info = self.oft_backend.batch_info
+        moe_oft_info = batch_info.moe_oft_info
+        assert moe_oft_info is not None
+        return OFTInfo(
+            w13_oft_r=self.w13_oft_r,
+            w1_oft_r=self.w1_oft_r,
+            w3_oft_r=self.w3_oft_r,
+            w2_oft_r=self.w2_oft_r,
+            batch_info=moe_oft_info,
+            num_experts=self.base_layer.num_experts,
+            max_ofts=self.oft_backend.max_ofts_per_batch,
+            has_active_oft=bool(getattr(batch_info, "has_active_oft", False)),
+            cg_buffers=getattr(self.oft_backend, "moe_cg_buffers", None),
+        )
+
     def forward(self, hidden_states, topk_output, **kwargs):
-        # KNOWN LIMITATION: this reads one shared set of expert-OFT weights
-        # (base_layer.w13_oft_r/w2_oft_r etc.) for the whole batch -- no
-        # per-token adapter routing like LoRA's MoE path (token_lora_mapping)
-        # or the dense OFT path (prepare_oft_batch's weight_indices). Two
-        # concurrently-resident adapters that both carry expert OFT weights
-        # will silently share/clobber this state.
+        if self.oft_backend.batch_info is None:
+            return self.base_layer.forward(hidden_states, topk_output, **kwargs)
+
+        oft_info = self._get_oft_info()
         base_layer = self.base_layer
         dispatch_output = base_layer.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
-        combine_input = self._oft_runner.run(dispatch_output, self._quant_info)
+        combine_input = self._oft_runner.run(
+            dispatch_output, self._quant_info, oft_info=oft_info
+        )
         return base_layer.dispatcher.combine(combine_input=combine_input)
 
 

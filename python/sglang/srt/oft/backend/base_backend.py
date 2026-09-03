@@ -29,6 +29,8 @@ class BaseOFTBackend:
         self.device = device
         self._cuda_graph_grouped_batch_infos = {}
         self._is_moe_oft = False
+        self._moe_num_experts: Optional[int] = None
+        self._moe_top_k: Optional[int] = None
         self.moe_cg_buffers: Optional[dict[str, torch.Tensor]] = None
 
     @property
@@ -48,6 +50,55 @@ class BaseOFTBackend:
                 max_num_tokens, dtype=torch.int32, device=self.device
             ),
         }
+        if not self.is_moe_oft:
+            return
+
+        num_experts = self._moe_num_experts
+        top_k = self._moe_top_k
+        if num_experts is None or top_k is None:
+            raise RuntimeError(
+                "MoE OFT CUDA graph buffers require num_experts and top_k"
+            )
+
+        block_size_m = 64
+        max_num_tokens_padded = max_num_tokens * top_k + num_experts * (
+            block_size_m - 1
+        )
+        max_num_tokens_padded = (
+            (max_num_tokens_padded + block_size_m - 1) // block_size_m
+        ) * block_size_m
+        max_num_m_blocks = max_num_tokens_padded // block_size_m
+        max_ofts = self.max_ofts_per_batch
+        self.moe_cg_buffers.update(
+            {
+                "sorted_token_ids_oft": torch.empty(
+                    max_ofts * max_num_tokens_padded,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "expert_ids_oft": torch.empty(
+                    max_ofts * max_num_m_blocks,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "num_tokens_post_padded_oft": torch.empty(
+                    max_ofts, dtype=torch.int32, device=self.device
+                ),
+                "oft_ids": torch.arange(
+                    max_ofts, dtype=torch.int32, device=self.device
+                ),
+                "cumsum_buffer": torch.zeros(
+                    max_ofts * (num_experts + 1),
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "token_mask": torch.empty(
+                    max_ofts * max_num_tokens * top_k,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            }
+        )
 
     def _add_moe_oft_info(
         self, forward_batch: ForwardBatch, batch_info: OFTBatchInfo

@@ -311,11 +311,9 @@ class OFTManager(AdapterManager):
         self.load_oft_weights(ref)
 
     def _clear_expert_on_unload(self, adapter):
-        if adapter is not None and any(
-            hasattr(layer, "expert_weights") and layer.expert_weights
-            for layer in adapter.layers
-        ):
-            self._clear_expert_oft()
+        # Expert rotations live in adapter slots. The memory-pool unload path
+        # resets the selected slot to identity before it can be reused.
+        return None
 
     def _unload_streamed_adapter(self, ref):
         return self.unload_streamed_adapter(ref)
@@ -420,10 +418,6 @@ class OFTManager(AdapterManager):
                 # available for reuse. A zero OFT matrix is not identity and
                 # would silently corrupt a base request routed through it.
                 self.memory_pool.reset_buffer_slot_to_identity(buffer_id)
-                # The non-staged streamed MoE path binds expert rotations
-                # directly on each FusedMoE module rather than in this slot.
-                # Clear those global bindings before base traffic resumes.
-                self._clear_expert_oft()
             if oft_ref.adapter_id in self.configs:
                 del self.configs[oft_ref.adapter_id]
             if oft_ref.adapter_id in self.refs:
@@ -511,18 +505,7 @@ class OFTManager(AdapterManager):
         undefined -- a silently wrong-serving-results failure mode, worse
         than the disclosed evicted-adapter one. `unload_streamed_adapter(ref)`
         undoes that registration on commit failure so the phantom ref is
-        never left resident.
-
-        KNOWN LIMITATION: multi-tenant serving is only correct for
-        dense-target-module adapters. If two concurrently-resident adapters
-        both carry MoE/expert OFT weights, they silently share state
-        (`apply_streamed_expert_oft` writes onto module-level
-        `moe.w13_oft_r`/`w1_oft_r`/`w3_oft_r`/`w2_oft_r`, not a per-adapter
-        slot) because `FusedMoEWithOFT.forward` has no per-token
-        adapter-routing mechanism, unlike the dense path (`prepare_oft_batch`'s
-        `weight_indices`) or LoRA's MoE path (`token_lora_mapping`). See
-        `apply_streamed_expert_oft`'s docstring for why `slot_idx` alone
-        doesn't fix this."""
+        never left resident."""
         from sglang.srt.oft.streamed_weight_loader import (
             _commit_streamed_oft_tensor_groups,
             _resolve_streamed_oft_tensor_groups,
@@ -805,9 +788,8 @@ class OFTManager(AdapterManager):
         # the MoE modules, and invalidates the finder cache so later callers see
         # through the wrapper to base_layer.
         n_expert_wrapped = self._install_moe_oft_wrappers()
-        # Expert OFT buffers are global to each FusedMoE layer rather than
-        # selected per request. Until expert kernels route by adapter slot,
-        # even one expert adapter would affect base and mixed-adapter traffic.
+        # Keep expert-target admission disabled while the request-routing
+        # plumbing lands. Backend-specific admission is enabled separately.
         if n_expert_wrapped:
             raise ValueError(
                 "OFT on MoE expert targets is unsupported until expert "
@@ -1030,8 +1012,8 @@ class OFTManager(AdapterManager):
 
     def _install_moe_oft_wrappers(self):
         """Replace each expert-OFT-target FusedMoE with a FusedMoEWithOFT wrapper
-        (own peft_enabled runner). Buffers are injected later onto the wrapper's
-        base_layer, unchanged. Invalidates the _find_fused_moe_modules cache so
+        (own peft_enabled runner). Full slot groups are bound to the wrapper
+        after pool creation. Invalidates the _find_fused_moe_modules cache so
         every later caller re-scans and sees through the wrapper to base_layer."""
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.oft.layers import FusedMoEWithOFT
@@ -1185,27 +1167,12 @@ class OFTManager(AdapterManager):
     # ------------------------------------------------------------------ #
 
     def _init_identity_expert_oft_for_cuda_graph(self):
-        """Install identity expert OFT buffers before CUDA graph capture.
-
-        Streamed training syncs expert OFT tensors after the server has
-        already initialized. CUDA graph replay is only correct if the graph
-        captured the expert-OFT kernels and the same R-buffer tensor objects
-        are updated in place later.
-        """
+        """Initialize every pool-backed expert OFT slot to identity."""
         target_modules = getattr(self, "target_modules", set())
         init_w13 = bool({"gate_up_proj", "gate_proj", "up_proj"} & target_modules)
         init_w2 = "down_proj" in target_modules
         if not (init_w13 or init_w2):
             return
-
-        # oft_type (OFTArgs.oft_type, threaded through server_args into
-        # self.oft_type) is the single global split-vs-fused signal -- see
-        # plan Task 6. This layout HINT only applies to a module with nothing
-        # loaded (CUDA-graph pre-alloc). The reliable signal for a module that
-        # already has weights is the per-module buffer the loader wrote
-        # (_apply_expert_oft_to_module): a loaded legacy w13_oft_r must survive
-        # untouched regardless of oft_type -- short-circuited below.
-        w13_is_split = self.oft_type == "canonical_oft"
 
         block_size = self.max_oft_block_size
         if block_size <= 0:
@@ -1219,66 +1186,28 @@ class OFTManager(AdapterManager):
                         f"MoE w13 OFT input dim {moe.hidden_size} is not "
                         f"divisible by block_size {block_size}"
                     )
-                if getattr(moe, "w13_oft_r", None) is not None:
-                    # Loaded legacy fused w13 — leave entirely untouched (do NOT
-                    # split it, do NOT null it). This short-circuit is the fix:
-                    # a loaded legacy adapter must survive regardless of
-                    # oft_type.
-                    pass
-                elif w13_is_split:
-                    # Pool-backed (mem_pool.py ``_declare_expert_groups``):
-                    # each buffer is the memory pool's "w1_oft_r"/"w3_oft_r"
-                    # group slot 0 (ACTIVE), not a private module-owned
-                    # tensor, so a later streamed sync (which reads back and
-                    # mutates ``moe.w1_oft_r``/``moe.w3_oft_r`` in place)
-                    # writes the SAME pool slot.
-                    for attr in ("w1_oft_r", "w3_oft_r"):
-                        if getattr(moe, attr, None) is None:
-                            _fill_expert_oft_identity(
-                                self.memory_pool.slot(
-                                    attr, layer_id, self.memory_pool.active_idx
-                                )
-                            )
-                            setattr(
-                                moe,
-                                attr,
-                                self.memory_pool.active_view(attr, layer_id),
-                            )
-                            initialized = True
-                    # Split buffers supersede the legacy fused buffer.
-                    moe.w13_oft_r = None
-                else:
-                    # Legacy, nothing loaded on this module: pre-allocate an
-                    # identity fused buffer so CUDA graph replay captures an
-                    # in-place-updatable tensor. Pool-backed (mem_pool.py
-                    # ``_declare_expert_groups``): the buffer is the memory
-                    # pool's "w13_oft_r" group slot 0 (ACTIVE), not a private
-                    # module-owned tensor, so a later streamed sync (which
-                    # reads back and mutates ``moe.w13_oft_r`` in place) writes
-                    # the SAME pool slot.
-                    _fill_expert_oft_identity(
-                        self.memory_pool.slot(
-                            "w13_oft_r", layer_id, self.memory_pool.active_idx
-                        )
-                    )
-                    moe.w13_oft_r = self.memory_pool.active_view(
-                        "w13_oft_r", layer_id
-                    )
-                    initialized = True
+                group_names = (
+                    ("w1_oft_r", "w3_oft_r")
+                    if self.oft_type == "canonical_oft"
+                    else ("w13_oft_r",)
+                )
+                for group_name in group_names:
+                    group = self.memory_pool.get_expert_tensor(group_name, layer_id)
+                    if group is not None:
+                        _fill_expert_oft_identity(group)
+                        initialized = True
 
-            if init_w2 and getattr(moe, "w2_oft_r", None) is None:
+            if init_w2:
                 w2_input_dim = moe.intermediate_size_per_partition
                 if w2_input_dim % block_size != 0:
                     raise ValueError(
                         f"MoE w2 OFT input dim {w2_input_dim} is not "
                         f"divisible by block_size {block_size}"
                     )
-                # Pool-backed, same rationale as the w13 branch above.
-                _fill_expert_oft_identity(
-                    self.memory_pool.slot("w2_oft_r", layer_id, self.memory_pool.active_idx)
-                )
-                moe.w2_oft_r = self.memory_pool.active_view("w2_oft_r", layer_id)
-                initialized = True
+                group = self.memory_pool.get_expert_tensor("w2_oft_r", layer_id)
+                if group is not None:
+                    _fill_expert_oft_identity(group)
+                    initialized = True
 
         if initialized:
             logger.info(
@@ -1293,7 +1222,7 @@ class OFTManager(AdapterManager):
         ew_dict: {global_expert_id: {"gate_proj.oft_R": tensor,
                                      "down_proj.oft_R": tensor}}.
         Block-diagonal R is kept as external PEFT — only writes the pool slot,
-        never base w13_weight / w2_weight or the legacy module-global reader.
+        never base w13_weight / w2_weight.
 
         w13 R rotates hidden_size (input to gate/up); hidden_size is NOT
         TP-sharded, so no TP slicing. w2 R rotates intermediate_size
@@ -1443,27 +1372,10 @@ class OFTManager(AdapterManager):
 
         expert_tensors: {layer_id: {global_expert_id: {"gate_proj.oft_R": t,
                                                        "down_proj.oft_R": t}}}.
-        Keeps OFT external — only writes moe.w13_oft_r / moe.w2_oft_r,
-        never merges into base weights.
-
-        ``slot_idx=None`` (default) preserves today's exact in-place-on-
-        ``moe.w*_oft_r`` behavior byte-for-byte -- every existing caller
-        keeps working unchanged. Passing an explicit ``slot_idx`` (e.g. the
-        pool's ``staging_idx`` for double-buffer ``stage()``) bypasses the
-        module attribute -- which is only ever bound to the ACTIVE slot --
-        and scatters straight into ``self.memory_pool.slot(group, layer,
-        slot_idx)`` instead, leaving ``moe.w*_oft_r`` untouched so forward
-        keeps reading ACTIVE until ``activate()`` flips it.
-
-        NOTE: an explicit ``slot_idx`` only isolates the WRITE; it does not
-        give multi-tenant correctness by itself, since nothing on the read
-        side selects a per-request ``slot_idx`` -- ``FusedMoEWithOFT.forward``
-        always reads the plain ``moe.w*_oft_r`` attribute this writes when
-        ``slot_idx=None``. Using a per-adapter ``slot_idx`` here without a
-        matching per-token routing mechanism in forward would make that
-        adapter's rotation silently never apply, not fix concurrent
-        residency (`StagedOFTManager`'s ``staging_idx`` usage is safe only
-        because exactly one thing is ever active at a time).
+        Keeps OFT external and writes only the selected pool slot, never module
+        attributes or base weights. ``slot_idx=None`` retains the streamed
+        single-active convention by selecting ``memory_pool.active_idx``;
+        staged updates pass ``staging_idx`` explicitly.
 
         Per-layer batched Cayley (one ``precompute_oft_r`` call per
         (layer, proj) covering all experts present in this chunk; no
@@ -1473,8 +1385,8 @@ class OFTManager(AdapterManager):
         bucket), and the same layer's experts can be split across those
         chunks. Reallocating per chunk would wipe earlier chunks' experts
         and leave most slots at zero (zero R ≠ identity → silent OFT-rotation
-        loss → slow rollout/training logprob drift). Lazily allocate the
-        per-FusedMoE buffer must already match the streamed tensor layout.
+        loss → slow rollout/training logprob drift). The per-FusedMoE pool
+        buffer must already match the streamed tensor layout.
         If it does not, raise with diagnostics instead of silently replacing
         the graph-captured tensor and disabling CUDA Graph.
         """
@@ -1483,6 +1395,8 @@ class OFTManager(AdapterManager):
         moe_modules = self._find_fused_moe_modules()
         if not moe_modules:
             return
+        if slot_idx is None:
+            slot_idx = self.memory_pool.active_idx
 
         for layer_id, ew_dict in expert_tensors.items():
             moe = moe_modules.get(layer_id)
@@ -1540,25 +1454,23 @@ class OFTManager(AdapterManager):
                 return buf
 
             def _resolve_expert_buffer(group_name):
-                # slot_idx is None -> byte-identical to today: read the
-                # already-bound module attribute (a pool ACTIVE-slot view on
-                # the identity-boot path, or a disk-loaded private tensor on
-                # the legacy short-circuit path -- either way, the exact
-                # tensor forward reads). Any other slot_idx resolves straight
-                # from the pool's group registry instead.
-                if slot_idx is None:
-                    return getattr(moe, group_name, None)
                 groups = self.memory_pool._groups
                 if group_name not in groups or layer_id not in groups[group_name]:
                     return None
                 return self.memory_pool.slot(group_name, layer_id, slot_idx)
 
             if is_split:
-                w1_oft_r = _validate_w13_buffer(_resolve_expert_buffer("w1_oft_r"), "w1")
-                w3_oft_r = _validate_w13_buffer(_resolve_expert_buffer("w3_oft_r"), "w3")
+                w1_oft_r = _validate_w13_buffer(
+                    _resolve_expert_buffer("w1_oft_r"), "w1"
+                )
+                w3_oft_r = _validate_w13_buffer(
+                    _resolve_expert_buffer("w3_oft_r"), "w3"
+                )
                 w13_oft_r = None
             elif is_legacy:
-                w13_oft_r = _validate_w13_buffer(_resolve_expert_buffer("w13_oft_r"), "w13")
+                w13_oft_r = _validate_w13_buffer(
+                    _resolve_expert_buffer("w13_oft_r"), "w13"
+                )
                 w1_oft_r = None
                 w3_oft_r = None
             else:
@@ -1645,25 +1557,14 @@ class OFTManager(AdapterManager):
             _scatter(w13_oft_r, gate_compacts, num_blocks_w13)
             _scatter(w2_oft_r, down_compacts, blocks_per_tp)
 
-            if slot_idx is None:
-                # Byte-identical to today: re-pin the (unchanged) module
-                # attrs. Skipped for an explicit slot_idx (e.g. STAGING) --
-                # the module attr stays bound to ACTIVE until activate().
-                if is_split:
-                    moe.w1_oft_r = w1_oft_r
-                    moe.w3_oft_r = w3_oft_r
-                    moe.w13_oft_r = None
-                elif is_legacy:
-                    moe.w13_oft_r = w13_oft_r
-                    moe.w1_oft_r = None
-                    moe.w3_oft_r = None
-                if w2_oft_r is not None:
-                    moe.w2_oft_r = w2_oft_r
-
             if _orbit_log_weight_sync_enabled():
                 written_ids = sorted(set(local_ids))
-                gate_written = sum(1 for compact in gate_compacts if compact is not None)
-                down_written = sum(1 for compact in down_compacts if compact is not None)
+                gate_written = sum(
+                    1 for compact in gate_compacts if compact is not None
+                )
+                down_written = sum(
+                    1 for compact in down_compacts if compact is not None
+                )
                 global_ids = sorted(ew_dict.keys())
                 w13_changed, w13_max_delta = _expert_oft_delta_summary(
                     w13_oft_r, block_size
@@ -1866,11 +1767,3 @@ class OFTManager(AdapterManager):
                 f"{result.error_message}"
             )
         return oft_ref
-
-    def _clear_expert_oft(self):
-        """Clear expert OFT tensors from all FusedMoE layers."""
-        for moe in self._find_fused_moe_modules().values():
-            moe.w1_oft_r = None
-            moe.w3_oft_r = None
-            moe.w13_oft_r = None
-            moe.w2_oft_r = None
