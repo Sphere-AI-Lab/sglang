@@ -6,7 +6,11 @@ import torch
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
-from sglang.srt.oft.oft_moe_runners import OFTInfo, _compute_oft_alignment
+from sglang.srt.oft.oft_moe_runners import (
+    OFTInfo,
+    _compute_oft_alignment,
+    _oft_prerotate,
+)
 from sglang.srt.oft.triton_ops.block_rotate import (
     apply_oft_rotation_triton,
 )
@@ -339,6 +343,77 @@ def test_rotation_routes_base_and_two_adapters_through_both_moe_stages(
         ]
     )
     torch.testing.assert_close(actual_down, expected_down, rtol=0, atol=0)
+
+
+def test_oft_prerotate_uses_alignment_block_size_for_nondefault_moe_config():
+    num_tokens, top_k, num_experts = 4, 2, 3
+    oft_block_size, runtime_block_m = 4, 16
+    eye = torch.eye(oft_block_size, device="cuda", dtype=torch.bfloat16)
+    rotations = eye.view(1, 1, 1, oft_block_size, oft_block_size).expand(
+        3, num_experts, 1, oft_block_size, oft_block_size
+    ).clone()
+    rotations[1, :, 0] = torch.diag(
+        torch.tensor([-1, 1, -1, 1], device="cuda", dtype=torch.bfloat16)
+    )
+    rotations[2, :, 0] = torch.flip(eye, dims=[1])
+    topk_ids = torch.tensor(
+        [[0, 1], [1, 2], [2, 0], [0, 2]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    request_slots = torch.tensor([0, 1, 2, 1], device="cuda")
+    batch = MoEOFTBatchInfo(
+        seg_indptr=torch.tensor([0, 1, 2, 3, 4], device="cuda", dtype=torch.int32),
+        req_to_oft=request_slots.to(torch.int32),
+        adapter_enabled=torch.tensor([0, 1, 1], device="cuda", dtype=torch.int32),
+        token_oft_mapping=request_slots.to(torch.int32),
+        num_tokens=num_tokens,
+    )
+    oft_info = OFTInfo(
+        w13_oft_r=rotations,
+        w1_oft_r=None,
+        w3_oft_r=None,
+        w2_oft_r=rotations,
+        batch_info=batch,
+        num_experts=num_experts,
+        max_ofts=3,
+        has_active_oft=True,
+    )
+    hidden_states = torch.arange(
+        num_tokens * oft_block_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).view(num_tokens, oft_block_size)
+    routing = moe_align_block_size(topk_ids, runtime_block_m, num_experts)
+
+    actual, *_ = _oft_prerotate(
+        hidden_states,
+        rotations,
+        oft_info,
+        torch.empty(
+            num_tokens * top_k, 1, device="cuda", dtype=torch.bfloat16
+        ),
+        torch.ones(num_tokens, top_k, device="cuda"),
+        topk_ids,
+        *routing,
+        top_k,
+        num_experts,
+        runtime_block_m,
+    )
+    expected = torch.stack(
+        [
+            hidden_states[token]
+            if int(request_slots[token]) == 0
+            else hidden_states[token]
+            @ rotations[
+                int(request_slots[token]), int(topk_ids[token, route]), 0
+            ]
+            for token in range(num_tokens)
+            for route in range(top_k)
+        ]
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("block_size", [4, 8, 16])

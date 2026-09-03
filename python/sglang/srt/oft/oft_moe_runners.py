@@ -46,6 +46,8 @@ _QUANT_KWARGS = (
     "per_channel_quant",
 )
 
+OFT_ALIGNMENT_BLOCK_SIZE = 64
+
 
 @dataclass
 class OFTInfo:
@@ -71,7 +73,7 @@ def _compute_oft_alignment(
     if row_group_factor < 1:
         raise ValueError(f"row_group_factor must be positive, got {row_group_factor}")
 
-    block_size_m = 64
+    block_size_m = OFT_ALIGNMENT_BLOCK_SIZE
     max_ofts = oft_info.max_ofts
     max_num_tokens_padded = topk_ids.numel() + oft_info.num_experts * (
         block_size_m - 1
@@ -195,7 +197,7 @@ def _oft_prerotate(
         oft_ids,
         oft_info.batch_info.adapter_enabled,
         top_k=top_k,
-        block_m=block_size_m,
+        block_m=OFT_ALIGNMENT_BLOCK_SIZE,
     )
     C = C.reshape(-1, 1, C.shape[-1])
     topk_weights = topk_weights.reshape(-1, 1)
