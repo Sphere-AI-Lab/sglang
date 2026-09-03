@@ -51,7 +51,7 @@ class AdapterManager:
         """Construct the method-specific AdapterRef for an adapter first
         introduced via ``stage_adapter`` (double-buffer / streamed identity
         boot). Called by ``stage_adapter`` only when ``name`` is not already
-        registered in ``self.refs``.
+        registered in ``self.oft_refs``.
 
         Multi-slot methods (OFT) additionally register per-request serving
         routing here (``memory_pool.uid_to_buffer_id[oft_id]=active_idx``,
@@ -66,14 +66,14 @@ class AdapterManager:
             success=success,
             error_message=error_message,
             loaded_adapters={
-                ref.oft_name: ref.oft_path for ref in self.refs.values()
+                ref.oft_name: ref.oft_path for ref in self.oft_refs.values()
             },
         )
 
     def init_adapters(self):
         self.configs = {}
         self.adapters = {}
-        self.refs = {}
+        self.oft_refs = {}
         self.num_pinned = 0
         # Overlap-loading (see oft_overlap_loader.py): maps an adapter id
         # currently being materialized on the load stream to the CUDA event
@@ -83,7 +83,7 @@ class AdapterManager:
 
     def unload_adapter(self, ref):
         adapter = self.configs.get(ref.oft_id)
-        stored_ref = self.refs.get(ref.oft_id)
+        stored_ref = self.oft_refs.get(ref.oft_id)
         if adapter is None or stored_ref is None:
             # Should have been verified before the request was sent to the
             # backend (e.g. a registry/GPU-pool divergence, such as the GPU
@@ -112,7 +112,7 @@ class AdapterManager:
             self._clear_expert_on_unload(self.adapters.get(ref.oft_id))
             del self.configs[ref.oft_id]
             del self.adapters[ref.oft_id]
-            del self.refs[ref.oft_id]
+            del self.oft_refs[ref.oft_id]
             self.num_pinned -= int(stored_ref.pinned)
         except Exception as e:
             return self._make_update_result(success=False, error_message=str(e))
@@ -127,13 +127,13 @@ class AdapterManager:
         # activate_adapter's _bump_ref_version can find and bump it, and (for
         # multi-slot OFT) so per-request /generate routing resolves. No-op once
         # registered (subsequent syncs of the same adapter reuse the ref).
-        if not any(ref.oft_name == name for ref in self.refs.values()):
+        if not any(ref.oft_name == name for ref in self.oft_refs.values()):
             ref = self._make_streamed_ref(name, version, oft_id, config)
             # setdefault, not assignment: OFT's _make_streamed_ref already stored
             # the ref via register_streamed_adapter (which also sets the routing);
             # LoRA's did not, so this registers the fresh-uuid ref for it. Avoids
             # double-registering the OFT ref.
-            self.refs.setdefault(ref.oft_id, ref)
+            self.oft_refs.setdefault(ref.oft_id, ref)
 
     def activate_adapter(self, name, version):
         self.memory_pool.activate(version)
@@ -199,7 +199,7 @@ class AdapterManager:
         # counting the number of pinned OFT adapters in the batch.
         pinned_ofts_in_batch = 0
         for oft_id in real_adapter_ids:
-            oft_ref = self.refs.get(oft_id)
+            oft_ref = self.oft_refs.get(oft_id)
             assert (
                 oft_ref is not None
             ), f"adapter ID {oft_id} not found in refs."

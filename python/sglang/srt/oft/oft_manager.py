@@ -424,7 +424,7 @@ class OFTManager(AdapterManager):
 
             self.load_oft_weights(oft_ref)
 
-            self.refs[oft_ref.oft_id] = oft_ref
+            self.oft_refs[oft_ref.oft_id] = oft_ref
             self.num_pinned += int(oft_ref.pinned)
         except Exception as e:
             return self.create_oft_update_result(success=False, error_message=str(e))
@@ -459,7 +459,7 @@ class OFTManager(AdapterManager):
             )
 
         # Check if this OFT adapter is already loaded
-        for existing_oft_ref in self.refs.values():
+        for existing_oft_ref in self.oft_refs.values():
             if oft_ref.oft_name == existing_oft_ref.oft_name:
                 raise ValueError(
                     f"Failed to load OFT adapter {oft_ref.oft_name} because it is already loaded"
@@ -521,10 +521,10 @@ class OFTManager(AdapterManager):
             # Guards against double-counting if this is ever called twice for
             # the same ref -- mirrors unload_streamed_adapter's symmetric
             # was_registered guard.
-            was_already_registered = oft_ref.oft_id in self.refs
+            was_already_registered = oft_ref.oft_id in self.oft_refs
             config = OFTConfig.from_dict(config_dict)
             self.configs[oft_ref.oft_id] = config
-            self.refs[oft_ref.oft_id] = oft_ref
+            self.oft_refs[oft_ref.oft_id] = oft_ref
             # Register buffer slot mapping so inference can find this adapter
             self.memory_pool.uid_to_buffer_id[oft_ref.oft_id] = buffer_id
             self.memory_pool.buffer_id_to_uid[buffer_id] = oft_ref.oft_id
@@ -554,13 +554,13 @@ class OFTManager(AdapterManager):
             # Snapshot before deleting: was_registered gates the num_pinned
             # decrement below so a second (idempotent) unload call for the
             # same ref -- this method already tolerates being called more
-            # than once, via the `in self.configs`/`in self.refs` checks --
+            # than once, via the `in self.configs`/`in self.oft_refs` checks --
             # can't double-decrement and drive num_pinned negative.
-            was_registered = oft_ref.oft_id in self.refs
+            was_registered = oft_ref.oft_id in self.oft_refs
             if oft_ref.oft_id in self.configs:
                 del self.configs[oft_ref.oft_id]
-            if oft_ref.oft_id in self.refs:
-                del self.refs[oft_ref.oft_id]
+            if oft_ref.oft_id in self.oft_refs:
+                del self.oft_refs[oft_ref.oft_id]
             if was_registered:
                 self.num_pinned -= int(oft_ref.pinned)
             # Clean up buffer slot mapping
@@ -588,7 +588,7 @@ class OFTManager(AdapterManager):
         has a CPU-side ``OFTAdapter`` entry in ``self.adapters`` -- i.e. it
         was loaded from disk via ``--peft-paths``, not over the wire.
 
-        ``self.refs``/``self.configs`` are shared by both disk-backed and
+        ``self.oft_refs``/``self.configs`` are shared by both disk-backed and
         wire-loaded (streamed) adapters, but only wire-loaded ones lack a
         ``self.adapters`` entry. Calling ``unload_streamed_adapter`` on a
         disk-backed adapter would delete its ``configs``/``refs`` entries
@@ -641,7 +641,7 @@ class OFTManager(AdapterManager):
         error message rather than left silent -- and without the cleanup
         call in the commit-failure branch below, the NEW adapter's own
         `ref` would also have been left looking valid and resident (its
-        buffer/config registration already committed to self.refs/
+        buffer/config registration already committed to self.oft_refs/
         self.configs/memory_pool.uid_to_buffer_id before the write is
         attempted) despite its buffer's contents being partially written or
         undefined -- a silently wrong-serving-results failure mode, worse
@@ -717,7 +717,7 @@ class OFTManager(AdapterManager):
                 )
 
             existing_id = None
-            for ref_id, existing_ref in list(self.refs.items()):
+            for ref_id, existing_ref in list(self.oft_refs.items()):
                 if existing_ref.oft_name == ref.oft_name:
                     existing_id = ref_id
                     break
@@ -732,7 +732,7 @@ class OFTManager(AdapterManager):
                     )
                 if existing_id in self.adapters:
                     # existing_id is disk-backed (--peft-paths): register_streamed_adapter
-                    # below would overwrite self.refs[existing_id]/self.configs[existing_id]
+                    # below would overwrite self.oft_refs[existing_id]/self.configs[existing_id]
                     # with the new wire-loaded ref while leaving self.adapters[existing_id]
                     # (the old CPU-side OFTAdapter) behind, stale -- silently corrupting
                     # num_pinned accounting and later disk-vs-streamed unload dispatch.
@@ -748,18 +748,18 @@ class OFTManager(AdapterManager):
                         ),
                     )
                 self._unload_streamed_adapter_if_not_disk_backed(
-                    self.refs[existing_id], context="upsert"
+                    self.oft_refs[existing_id], context="upsert"
                 )
 
             buffer_id, evicted_uid = self.memory_pool.allocate_buffer_slot_with_eviction(
-                self.refs
+                self.oft_refs
             )
             evicted_name = (
-                self.refs[evicted_uid].oft_name if evicted_uid is not None else None
+                self.oft_refs[evicted_uid].oft_name if evicted_uid is not None else None
             )
             if evicted_uid is not None:
                 evict_result = self._unload_streamed_adapter_if_not_disk_backed(
-                    self.refs[evicted_uid], context="eviction"
+                    self.oft_refs[evicted_uid], context="eviction"
                 )
                 if not evict_result.success:
                     return evict_result
@@ -855,7 +855,7 @@ class OFTManager(AdapterManager):
             cur_uids=cur_uids,
             oft_adapters=self.adapters,
             oft_modules=self.adapter_modules,
-            oft_refs=self.refs.copy(),
+            oft_refs=self.oft_refs.copy(),
             oft_embed_tokens_module=self.embed_tokens_module,
             oft_lm_head_module=self.lm_head_module,
         )
@@ -1201,10 +1201,10 @@ class OFTManager(AdapterManager):
         # Expert OFT has no adapter slot dimension (kernels index by expert
         # only), so more than one resident adapter is unrepresentable on the
         # expert path. Dense targets are unaffected.
-        if n_expert_wrapped and len(self.refs) > 1:
+        if n_expert_wrapped and len(self.oft_refs) > 1:
             raise ValueError(
                 f"Multi-adapter OFT serving is unsupported on MoE expert "
-                f"targets: {len(self.refs)} adapters are loaded but expert OFT "
+                f"targets: {len(self.oft_refs)} adapters are loaded but expert OFT "
                 "buffers are single-adapter. Serve one adapter, or remove "
                 "expert projections from --oft-target-modules."
             )
@@ -1224,7 +1224,7 @@ class OFTManager(AdapterManager):
             1 for layer_modules in self.adapter_modules if layer_modules
         )
         loaded_adapter_names = sorted(
-            str(oft_ref.oft_name) for oft_ref in self.refs.values()
+            str(oft_ref.oft_name) for oft_ref in self.oft_refs.values()
         )
         logger.info(
             "event=oft_manager_initialized target_modules=%s "
@@ -1273,7 +1273,7 @@ class OFTManager(AdapterManager):
                         # per-adapter inference for this adapter.
                         continue
                     else:
-                        oft_name = self.refs[oft_id].oft_name
+                        oft_name = self.oft_refs[oft_id].oft_name
                         raise ValueError(
                             f"OFT adapter '{oft_name}' uses "
                             f"target_modules='{config.target_modules}' which cannot "
@@ -1300,7 +1300,7 @@ class OFTManager(AdapterManager):
             adapter_target_modules = get_normalized_target_modules(
                 config.target_modules
             )
-            oft_name = self.refs[oft_id].oft_name
+            oft_name = self.oft_refs[oft_id].oft_name
             validate_model_oft_target_modules(
                 self.base_model,
                 adapter_target_modules,
@@ -1782,6 +1782,18 @@ class OFTManager(AdapterManager):
         if w2_oft_r is not None:
             _batched_cayley_assign(w2_oft_r, down_compacts, blocks_per_tp)
 
+        # Cayley ran in the compact weights' own dtype (bit-identical to
+        # Bridge's _cayley_batch), but the STORED buffers must match the
+        # rotation kernel's activation dtype: apply_oft_rotation_triton feeds
+        # A (model dtype) and R into one tl.dot, which rejects mixed dtypes --
+        # an fp32 disk adapter otherwise crashes every expert forward. The
+        # dense path already gets this cast for free by copying into the
+        # oft_r_dtype memory pool; mirror it here.
+        if self.oft_r_dtype is not None and dtype != self.oft_r_dtype:
+            w1_oft_r = w1_oft_r.to(self.oft_r_dtype) if w1_oft_r is not None else None
+            w3_oft_r = w3_oft_r.to(self.oft_r_dtype) if w3_oft_r is not None else None
+            w2_oft_r = w2_oft_r.to(self.oft_r_dtype) if w2_oft_r is not None else None
+
         if is_split:
             moe.w1_oft_r = w1_oft_r
             moe.w3_oft_r = w3_oft_r
@@ -2084,7 +2096,7 @@ class OFTManager(AdapterManager):
                 f"sizes are unsupported."
             )
         other_adapters = sorted(
-            r.oft_name for r in self.refs.values() if r.oft_name != name
+            r.oft_name for r in self.oft_refs.values() if r.oft_name != name
         )
         if other_adapters:
             raise ValueError(
@@ -2181,9 +2193,9 @@ class OFTManager(AdapterManager):
             )
 
     def _bump_ref_version(self, name, version):
-        for oft_id, ref in self.refs.items():
+        for oft_id, ref in self.oft_refs.items():
             if ref.oft_name == name:
-                self.refs[oft_id] = replace(ref, version=version)
+                self.oft_refs[oft_id] = replace(ref, version=version)
                 return
         raise ValueError(
             f"OFT adapter {name!r} not found in refs; cannot bump version"

@@ -192,7 +192,7 @@ def _manager_for_pool_construction(max_ofts_per_batch=4):
     manager.memory_saver_cpu_backup = False
     manager.oft_double_buffer = False
     manager.adapters = {}
-    manager.refs = {}
+    manager.oft_refs = {}
     manager.configs = {}
     manager.embed_tokens_module = None
     manager.lm_head_module = None
@@ -217,7 +217,7 @@ def _manager(max_ofts_per_batch=4):
     manager.lm_head_module = None
     manager.configs = {}
     manager.adapters = {}
-    manager.refs = {}
+    manager.oft_refs = {}
     manager._pending_oft_stage = None
     return manager
 

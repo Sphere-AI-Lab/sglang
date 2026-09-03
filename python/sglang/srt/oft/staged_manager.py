@@ -10,6 +10,7 @@ from sglang.srt.oft.mem_pool import OFTMemoryPool
 from sglang.srt.oft.oft import OFTAdapter
 from sglang.srt.oft.oft_config import OFTConfig
 from sglang.srt.oft.oft_manager import OFTManager
+from sglang.srt.oft.oft_registry import OFTRef
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import OFTUpdateOutput
@@ -133,14 +134,15 @@ class PendingOFTStage:
     left to do after the pool-level copy has already succeeded.
     """
 
-    __slots__ = ("uid", "version", "config", "adapter", "name")
+    __slots__ = ("uid", "version", "config", "adapter", "name", "ref")
 
-    def __init__(self, uid, version, config, adapter, name):
+    def __init__(self, uid, version, config, adapter, name, ref):
         self.uid = uid
         self.version = version
         self.config = config
         self.adapter = adapter
         self.name = name
+        self.ref = ref
 
 
 class StagedOFTManager(OFTManager):
@@ -321,6 +323,24 @@ class StagedOFTManager(OFTManager):
             # from_dict -> validate -> _create_lora_adapter_from_tensors, all
             # strictly before memory_pool.stage(...).
             oft_config = OFTConfig.from_dict(config)
+            old_ref = self.oft_refs.get(uid)
+            if old_ref is not None and version <= old_ref.version:
+                raise ValueError(
+                    f"OFT adapter version {version} must be newer than active "
+                    f"version {old_ref.version}."
+                )
+            # Weights arrive over the wire here (no on-disk artifact) --
+            # reloadable=False, mirroring StagedLoRAManager.stage_adapter's
+            # new_ref exactly. pinned carries forward from the adapter's
+            # prior ref so an in-place update never un-pins it.
+            new_ref = OFTRef(
+                oft_id=uid,
+                oft_name=name,
+                oft_path="__distributed__",
+                pinned=old_ref.pinned if old_ref is not None else False,
+                reloadable=False,
+                version=version,
+            )
             oft_adapter = OFTAdapter(
                 uid, oft_config, self.base_hf_config, self.load_config, self.oft_backend
             )
@@ -369,6 +389,7 @@ class StagedOFTManager(OFTManager):
                 config=oft_config,
                 adapter=oft_adapter,
                 name=name,
+                ref=new_ref,
             )
         except Exception as error:
             return self.create_oft_update_result(
@@ -439,6 +460,14 @@ class StagedOFTManager(OFTManager):
         # `self.configs[uid] = pending.config; self.loras[uid] = pending.adapter`.
         self.configs[uid] = pending.config
         self.adapters[uid] = pending.adapter
+        # Also REQUIRED: OFTMemoryPool's eviction-candidate filter reads
+        # oft_refs.get(victim_uid) to skip pinned/non-reloadable adapters
+        # (mem_pool.py's prepare_oft_batch). Without this, a staged/
+        # distributed-loaded adapter is invisible to that filter and can be
+        # silently LRU-evicted with no on-disk artifact to reload from --
+        # mirrors StagedLoRAManager.activate_adapter's
+        # `self.lora_refs[uid] = pending.ref` exactly.
+        self.oft_refs[uid] = pending.ref
 
         # No SECOND discard_stage() call here, unlike StagedLoRAManager:
         # unlike StagedLoRAMemoryPool.activate (which leaves _staged_uid/
