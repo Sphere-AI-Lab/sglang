@@ -161,6 +161,8 @@ from sglang.srt.managers.io_struct import (
     LoadOFTAdapterFromDistributedReqOutput,
     LoadOFTAdapterFromTensorsReqInput,
     LoadOFTAdapterFromTensorsReqOutput,
+    LoadOFTAdapterReqInput,
+    LoadOFTAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -302,8 +304,9 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.oft.oft_drainer import OFTDrainer
+from sglang.srt.oft.oft_overlap_loader import OFTOverlapLoader
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.peft import integration as peft
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import get_context, publish
@@ -453,8 +456,10 @@ class Scheduler(
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
         # OFT adapters are admitted on the same schedule-time contract as LoRA
-        # above; the check itself lives behind the peft facade.
-        self.enable_oft = server_args.peft_method == "oft"
+        # above; the check itself lives in _can_schedule_oft_req below.
+        self.enable_oft = server_args.enable_oft
+        self.enable_oft_overlap_loading = server_args.enable_oft_overlap_loading
+        self.max_ofts_per_batch = server_args.max_ofts_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
@@ -658,6 +663,12 @@ class Scheduler(
 
         # Init LoRA overlap loader
         self.init_lora_overlap_loader()
+
+        # Init OFT drainer for fair scheduling
+        self.init_oft_drainer()
+
+        # Init OFT overlap loader
+        self.init_oft_overlap_loader()
 
         # Init the grammar backend for constrained generation
         self.init_grammar_manager()
@@ -1662,6 +1673,7 @@ class Scheduler(
                     self.load_lora_adapter_from_distributed,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (LoadOFTAdapterReqInput, self.load_oft_adapter),
                 (
                     LoadOFTAdapterFromTensorsReqInput,
                     self.load_oft_adapter_from_tensors,
@@ -2025,6 +2037,21 @@ class Scheduler(
         if self.enable_lora_overlap_loading:
             self.lora_overlap_loader = LoRAOverlapLoader(
                 self.tp_worker.model_runner.lora_manager
+            )
+
+    def init_oft_drainer(self) -> None:
+        if get_lora().oft_drain_wait_threshold > 0.0:
+            self.oft_drainer = OFTDrainer(
+                self.max_ofts_per_batch,
+                get_lora().oft_drain_wait_threshold,
+            )
+        else:
+            self.oft_drainer = None
+
+    def init_oft_overlap_loader(self) -> None:
+        if self.enable_oft_overlap_loading:
+            self.oft_overlap_loader = OFTOverlapLoader(
+                self.tp_worker.model_runner.oft_manager
             )
 
     def init_grammar_manager(self) -> None:
@@ -2468,8 +2495,8 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 lora_version=recv_req.lora_version,
-                adapter_id=recv_req.adapter_id,
-                adapter_version=recv_req.adapter_version,
+                oft_id=recv_req.oft_id,
+                oft_version=recv_req.oft_version,
                 session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
@@ -3349,10 +3376,16 @@ class Scheduler(
 
         if self.enable_oft:
             running_ofts = {
-                req.adapter_id for req in running_batch.reqs if not req.finished()
+                req.oft_id for req in running_batch.reqs if not req.finished()
             }
             # Account for adapters already loaded in the adder, such as chunked requests
-            running_ofts.update(req.adapter_id for req in adder.can_run_list)
+            running_ofts.update(req.oft_id for req in adder.can_run_list)
+
+            if self.oft_drainer:
+                self.oft_drainer.update_draining_state(
+                    self.waiting_queue,
+                    running_batch.reqs,
+                )
 
         if self.enable_lora:
             if self.max_loras_per_batch == 1:
@@ -3390,9 +3423,7 @@ class Scheduler(
                 if not can_schedule_lora:
                     continue
 
-            if self.enable_oft and not peft.maybe_admit_request(
-                self, req, running_ofts
-            ):
+            if self.enable_oft and not self._can_schedule_oft_req(req, running_ofts):
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3435,7 +3466,7 @@ class Scheduler(
                     running_loras.add(req.lora_id)
 
             if self.enable_oft:
-                running_ofts.add(req.adapter_id)
+                running_ofts.add(req.oft_id)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -3579,6 +3610,33 @@ class Scheduler(
             new_lora_set = {req.lora_id} | running_loras
             return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
                 new_lora_set
+            )
+
+    def _can_schedule_oft_req(
+        self, req: Req, running_ofts: set[Optional[str]]
+    ) -> bool:
+        """Check if an OFT request can be scheduled.
+
+        This method checks two conditions:
+        1. The drainer allows scheduling (based on draining state)
+        2. The OFT adapter can be loaded (either already running or can be added)
+        """
+        if self.oft_drainer and not self.oft_drainer.can_schedule(req):
+            return False
+
+        if req.oft_id in running_ofts:
+            return True
+
+        if self.enable_oft_overlap_loading:
+            # For overlapping loading of OFT weights with computation, we will load each
+            # adapter one at a time, as opposed to loading them in one batch
+            return self.oft_overlap_loader.try_overlap_load_oft(
+                req.oft_id, running_ofts
+            )
+        else:
+            new_oft_set = {req.oft_id} | running_ofts
+            return self.tp_worker.model_runner.oft_manager.validate_oft_batch(
+                new_oft_set
             )
 
     def _resolve_active_lora_fast(
@@ -4997,6 +5055,14 @@ class Scheduler(
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
+        return result
+
+    def load_oft_adapter(
+        self, recv_req: LoadOFTAdapterReqInput
+    ) -> LoadOFTAdapterReqOutput:
+        """In-place loading a new OFT adapter from disk or huggingface."""
+
+        result = self.tp_worker.load_oft_adapter(recv_req)
         return result
 
     def load_oft_adapter_from_tensors(

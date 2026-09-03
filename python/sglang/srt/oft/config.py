@@ -1,11 +1,11 @@
-"""PEFT (OFT) server-args config seam.
+"""OFT server-args config seam.
 
 Owns the OFT CLI flags, their defaults, the argparse Action, and validation, so
-``server_args.py`` shrinks to two call-outs — ``register_peft_args(parser)`` and
-``validate_peft_args(self)`` — and ``ServerArgs`` mixes in :class:`PEFTArgs` for the
+``server_args.py`` shrinks to two call-outs — ``register_oft_args(parser)`` and
+``validate_oft_args(self)`` — and ``ServerArgs`` mixes in :class:`OFTArgs` for the
 field declarations.
 
-``PEFTArgs`` is ``kw_only`` so it can be a base of ``ServerArgs`` (which has the
+``OFTArgs`` is ``kw_only`` so it can be a base of ``ServerArgs`` (which has the
 required positional ``model_path``) without the "non-default follows default"
 dataclass error; ``ServerArgs`` is built by keyword (``from_cli_args``), so the
 keyword-only OFT fields construct fine.
@@ -26,17 +26,17 @@ OFT_IMPL_CHOICES = ["sibling", "staged"]
 
 
 @dataclass(kw_only=True)
-class PEFTArgs:
+class OFTArgs:
     """OFT (Orthogonal Finetuning) server-arg fields, mixed into ServerArgs."""
 
-    # Single-active PEFT method: None (off) | "oft". This one field replaces
-    # the former enable_oft / enable_peft_lora boolean pair -- two bools could
-    # encode illegal states (both set) that the single-active invariant
-    # forbids. (Also used to be "lora", served by srt/peft/lora; that legacy
-    # path was deleted once srt/lora + StagedLoRAManager superseded it.)
-    peft_method: A[Optional[str], NS("lora")] = None
+    # Enable single-active OFT serving, mirroring --enable-lora exactly.
+    # (Used to be the string field peft_method: None | "oft" -- "oft" was its
+    # only valid value, so the string added nothing a plain bool doesn't;
+    # before that it also accepted "lora", served by the since-deleted
+    # srt/peft/lora, superseded by srt/lora + StagedLoRAManager.)
+    enable_oft: A[bool, NS("lora")] = False
 
-    # Shared single-active PEFT inputs (the active method is `peft_method`):
+    # Shared single-active OFT inputs (the active method is enable_oft):
     #   oft_target_modules  module allow-list; method-specific normalization
     #                       ("all"/embed/lm_head handling is OFT-only) in validate.
     oft_target_modules: A[Optional[Union[set[str], List[str]]], NS("lora")] = None
@@ -50,18 +50,13 @@ class PEFTArgs:
     # fast-path kernels (`TritonOFTBackend.single_adapter_mode`); orbit's RL
     # launcher pins the value explicitly (2..4) and ignores this default.
     max_ofts_per_batch: A[int, NS("lora")] = 8
-    max_loaded_ofts: A[
-        Optional[int],
-        "If specified, limits the maximum number of OFT adapters loaded in "
-        "the tokenizer-side registry at a time (CPU-side bookkeeping — "
-        "independent of --max-ofts-per-batch's GPU-resident batch capacity). "
-        "Must be >= --max-ofts-per-batch - 1 (buffer slot 0 is always "
-        "reserved for the base/identity placeholder, so real per-batch "
-        "adapter capacity is --max-ofts-per-batch - 1).",
-        NS("lora"),
-    ] = None
+    # Help text lives on the manual parser.add_argument in register_oft_args
+    # below (like every other OFTArgs field) -- a bare-string Arg annotation
+    # here would make add_cli_args_from_dataclass auto-register this field
+    # too, conflicting with that manual registration.
+    max_loaded_ofts: A[Optional[int], NS("lora")] = None
     oft_backend: A[str, NS("lora")] = "triton"
-    # Which OFT implementation serves when peft_method == "oft". CUTOVER
+    # Which OFT implementation serves when enable_oft is set. CUTOVER
     # 2026-08-29: default is "sibling" = srt/oft (the srt/lora-shaped mirror),
     # after the equivalence gate passed bitwise on the full parity matrix.
     # "staged" = srt/oft's StagedOFTManager, an explicit stage/activate
@@ -89,27 +84,28 @@ class PEFTArgs:
     # single-active sync (IPC/colocate), byte-identical to today.
     oft_double_buffer: A[bool, NS("lora")] = False
 
-    @property
-    def enable_peft(self) -> bool:
-        """True if the single-active peft method (OFT) is enabled."""
-        return self.peft_method is not None
+    # Starvation-prevention scheduling (mirrors --lora-drain-wait-threshold).
+    # Help text lives on the manual parser.add_argument in register_oft_args
+    # below, like every other OFTArgs field.
+    oft_drain_wait_threshold: A[float, NS("lora")] = 0.0
+
+    # Overlap the GPU-side cost of materializing a not-yet-resident adapter's
+    # weights with ongoing compute (mirrors --enable-lora-overlap-loading).
+    enable_oft_overlap_loading: A[bool, NS("lora")] = False
 
 
-def register_peft_args(parser: argparse.ArgumentParser) -> None:
+def register_oft_args(parser: argparse.ArgumentParser) -> None:
     """Register all OFT CLI flags on ``parser`` (was the OFT block of add_cli_args)."""
-    # Single-active PEFT method selector (replaces the former --enable-oft /
-    # --enable-peft-lora store_true pair).
     parser.add_argument(
-        "--peft-method",
-        type=str,
-        default=PEFTArgs.peft_method,
-        choices=["oft"],
-        help="Single-active PEFT method: 'oft' (Orthogonal Finetuning). "
-        "Distinct from upstream --enable-lora (multi-tenant).",
+        "--enable-oft",
+        action="store_true",
+        default=OFTArgs.enable_oft,
+        help="Enable single-active OFT (Orthogonal Finetuning) serving. "
+        "Distinct from --enable-lora (multi-tenant).",
     )
     parser.add_argument(
         "--max-oft-block-size",
-        default=PEFTArgs.max_oft_block_size,
+        default=OFTArgs.max_oft_block_size,
         type=int,
         help="The maximum block size of OFT adapters. Required (together with "
         "--oft-target-modules) for OFT initialization.",
@@ -121,39 +117,39 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="The set of target modules where the active PEFT method is applied. "
         "'all' selects all supported modules (validated per-method in "
-        "validate_peft_args).",
+        "validate_oft_args).",
     )
     parser.add_argument(
         "--max-ofts-per-batch",
         type=int,
-        default=PEFTArgs.max_ofts_per_batch,
+        default=OFTArgs.max_ofts_per_batch,
         help="Maximum number of OFT adapters for a running batch, include base-only request.",
     )
     parser.add_argument(
         "--max-loaded-ofts",
         type=int,
-        default=PEFTArgs.max_loaded_ofts,
+        default=OFTArgs.max_loaded_ofts,
         help="If specified, limits the maximum number of OFT adapters loaded in the tokenizer-side registry at a time. The value must be greater than or equal to `--max-ofts-per-batch - 1` (buffer slot 0 is always reserved for the base/identity placeholder, so real per-batch adapter capacity is `--max-ofts-per-batch - 1`).",
     )
     parser.add_argument(
         "--oft-backend",
         type=str,
         choices=OFT_BACKEND_CHOICES,
-        default=PEFTArgs.oft_backend,
+        default=OFTArgs.oft_backend,
         help="Choose the kernel backend for multi-OFT serving.",
     )
     parser.add_argument(
         "--oft-dtype",
         type=str,
         choices=["auto", "model", "float32", "fp32", "bfloat16", "bf16", "float16", "fp16"],
-        default=PEFTArgs.oft_dtype,
+        default=OFTArgs.oft_dtype,
         help="Dtype for precomputed OFT rotation buffers. Defaults to the model dtype.",
     )
     parser.add_argument(
         "--oft-type",
         type=str,
         choices=OFT_TYPE_CHOICES,
-        default=PEFTArgs.oft_type,
+        default=OFTArgs.oft_type,
         help="OFT variant: 'canonical_oft' (default) uses independent per-"
         "sub-projection SPLIT rotations (orbit's only trained variant); "
         "'oft' uses the legacy shared-R FUSED rotation. Single global "
@@ -163,7 +159,7 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-oft-chunk-size",
         type=int,
-        default=PEFTArgs.max_oft_chunk_size,
+        default=OFTArgs.max_oft_chunk_size,
         choices=[16, 32, 64, 128],
         help="Maximum chunk size for the OFT backend. Choosing a larger value might improve performance.",
     )
@@ -171,7 +167,7 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--oft-double-buffer",
         action="store_true",
-        default=PEFTArgs.oft_double_buffer,
+        default=OFTArgs.oft_double_buffer,
         help="Reserve a staging slot and enable the double-buffer stage/activate "
              "adapter endpoints (async-RL NCCL weight-sync).",
     )
@@ -180,10 +176,29 @@ def register_peft_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default="sibling",
         choices=OFT_IMPL_CHOICES,
-        help="Which OFT implementation serves for peft_method='oft'. "
+        help="Which OFT implementation serves when --enable-oft is set. "
         "'sibling' = srt/oft (default since the 2026-08-29 cutover); "
         "'staged' = srt/oft's StagedOFTManager (explicit stage/activate "
         "transaction for async-RL weight sync).",
+    )
+    parser.add_argument(
+        "--oft-drain-wait-threshold",
+        type=float,
+        default=OFTArgs.oft_drain_wait_threshold,
+        help="When any OFT adapter request waits longer than this threshold "
+        "(in seconds), the scheduler will selectively drain one running "
+        "adapter to make room. This mitigates extreme tail latency under "
+        "high or skewed workloads by preventing a small set of adapters "
+        "from monopolizing batch slots. Set to 0 to disable draining "
+        "(default).",
+    )
+    parser.add_argument(
+        "--enable-oft-overlap-loading",
+        action="store_true",
+        default=OFTArgs.enable_oft_overlap_loading,
+        help="Overlap the GPU-side cost of materializing a not-yet-resident "
+        "OFT adapter's weights with ongoing compute, instead of stalling "
+        "the forward pass that first names it.",
     )
 
 
@@ -234,28 +249,24 @@ def _model_has_moe_layers(server_args) -> bool:
     )
 
 
-def validate_peft_args(server_args) -> None:
+def validate_oft_args(server_args) -> None:
     """Validate + normalize OFT server args in place (was check_oft_server_args)."""
-    if server_args.peft_method not in (None, "oft"):
-        raise ValueError(
-            f"--peft-method {server_args.peft_method!r} is no longer supported: "
-            "srt/peft/lora was deleted (superseded by srt/lora + "
-            "StagedLoRAManager; see --enable-lora for native multi-tenant "
-            "LoRA). Only None and 'oft' are valid for --peft-method."
-        )
-    if getattr(server_args, "oft_impl", "sibling") not in OFT_IMPL_CHOICES:
+    if server_args.oft_impl not in OFT_IMPL_CHOICES:
         raise ValueError(
             f"Invalid --oft-impl {server_args.oft_impl!r}; choose from {OFT_IMPL_CHOICES}."
         )
-    if server_args.enable_lora and server_args.peft_method is not None:
+    if server_args.enable_lora and server_args.enable_oft:
         raise ValueError(
-            "--enable-lora and --peft-method are mutually exclusive: native "
-            "multi-tenant LoRA and single-active PEFT cannot be initialized together."
+            "--enable-lora and --enable-oft are mutually exclusive: native "
+            "multi-tenant LoRA and single-active OFT cannot be initialized together."
         )
 
     from sglang.srt.utils.common import SUPPORTED_OFT_TARGET_MODULES
 
     assert server_args.max_ofts_per_batch > 0, "max_ofts_per_batch must be positive"
+    assert (
+        server_args.oft_drain_wait_threshold >= 0.0
+    ), "--oft-drain-wait-threshold must be non-negative."
 
     if server_args.max_loaded_ofts is not None:
         # Buffer slot 0 is always reserved for the base/identity placeholder
@@ -276,7 +287,7 @@ def validate_peft_args(server_args) -> None:
             f"max_ofts_per_batch={server_args.max_ofts_per_batch}"
         )
 
-    if server_args.peft_method == "oft":
+    if server_args.enable_oft:
         assert server_args.oft_type in OFT_TYPE_CHOICES, (
             f"--oft-type must be one of {OFT_TYPE_CHOICES}, got "
             f"{server_args.oft_type!r}."
@@ -318,7 +329,7 @@ def validate_peft_args(server_args) -> None:
 
             if server_args.cuda_graph_config.prefill.backend != Backend.DISABLED:
                 logger.warning(
-                    "peft_method=oft is incompatible with prefill CUDA graphs "
+                    "enable_oft is incompatible with prefill CUDA graphs "
                     "(captured OFT batch metadata goes stale before replay -> "
                     "illegal memory access); disabling the prefill CUDA graph "
                     "(was backend=%s). Decode CUDA graphs stay enabled.",
@@ -377,7 +388,7 @@ def validate_peft_args(server_args) -> None:
         # every prepare_oft_batch call, which has no pointer stability across
         # CUDA-graph capture and replay (prepare_oft_batch runs outside the
         # capture region -- see decode_cuda_graph_runner.py's
-        # maybe_prepare_peft_batch/maybe_prepare_replay_batch calls): a
+        # prepare_oft_batch/_prepare_oft_replay_batch calls): a
         # captured decode graph replays against the stale capture-time
         # tensor, silently applying an unrelated adapter's rotation (or
         # identity) instead of erroring. Same class of failure as the OFT
@@ -440,7 +451,7 @@ def validate_peft_args(server_args) -> None:
                 and _model_has_moe_layers(server_args)
             ):
                 logger.warning(
-                    "peft_method=oft with oft_impl=sibling targeting MoE expert "
+                    "enable_oft with oft_impl=sibling targeting MoE expert "
                     "modules %s is incompatible with decode CUDA graphs "
                     "(effective per-batch adapter capacity %s%s, so the "
                     "dual-capture mechanism in docs/superpowers/plans/"
@@ -474,6 +485,6 @@ def validate_peft_args(server_args) -> None:
             ), "--max-oft-chunk-size must be a power of 2 between 16 and 128."
 
         server_args._late_resolution(
-            "validate_peft_args",
+            "validate_oft_args",
             oft_target_modules=oft_target_modules,
         )

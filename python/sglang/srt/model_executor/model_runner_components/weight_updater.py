@@ -11,7 +11,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.peft import integration as peft
+from sglang.srt.oft import integration as oft_integration
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -387,14 +387,24 @@ class WeightUpdater:
     ):
         """NCCL-receive a staged adapter payload and route it to its manager.
 
-        Native LoRA staging uses ``model_runner.lora_manager`` only when the
-        explicit staging flag and ``lora_adapter`` format are both active. All
-        other configurations retain the existing ``peft.stage_adapter`` path.
-        The version arrives as a string and is converted to int at this boundary.
+        Three mutually-exclusive routes, matching the server's active adapter
+        config exactly (native LoRA staging / OFT staged / OFT sibling native-
+        RPC); an unmatched ``load_format`` (e.g. plain non-staged LoRA, which
+        loads adapters through load_lora_adapter_from_distributed instead)
+        falls through to the final "not handled" return. The version arrives
+        as a string and is converted to int at this boundary.
 
-        On the PEFT fallback, ``double_buffer`` is forwarded unchanged and rejects
-        it for OFT (see that function's docstring) -- the in-place-distributed
-        (``double_buffer=False``) OFT path is not implemented."""
+        The OFT sibling route rejects ``double_buffer=False``: with DB-off
+        sizing the pool inherits ``OFTMemoryPool``'s base defaults
+        (active_idx=0, staging_idx=1) -- the base-identity placeholder boots
+        into slot 0 (==active_idx), and ``stage()`` correctly fills slot 1
+        (==staging_idx, the adapter's own gather slot), but ``activate()``
+        unconditionally copies every group's staging_idx->active_idx
+        (slot1->slot0) -- CLOBBERING the base-identity slot with adapter data
+        instead of updating the adapter in place (the runtime already reads
+        the adapter's weights straight from slot 1; there is no correct use
+        for copying into slot 0). The in-place-distributed
+        (``double_buffer=False``) OFT sibling path is not implemented."""
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
@@ -425,7 +435,7 @@ class WeightUpdater:
                 and load_format == "lora_adapter"
             ):
                 if payload_metadata is not None:
-                    tensors = peft.reconstruct_oft_staging(tensors, payload_metadata)
+                    tensors = oft_integration.reconstruct_oft_staging(tensors, payload_metadata)
                 result = model_runner.lora_manager.stage_adapter(
                     tensors,
                     adapter_config,
@@ -442,38 +452,43 @@ class WeightUpdater:
                 and load_format == "oft_adapter"
             ):
                 if payload_metadata is not None:
-                    tensors = peft.reconstruct_oft_staging(tensors, payload_metadata)
+                    tensors = oft_integration.reconstruct_oft_staging(tensors, payload_metadata)
                 result = model_runner.oft_manager.stage_adapter(
                     tensors,
                     adapter_config,
                     adapter_name,
                     int(adapter_version),
-                    adapter_id=adapter_id,
+                    oft_id=adapter_id,
                 )
                 if not result.success:
                     return False, result.error_message
                 return True, "Succeeded to stage adapter online."
 
-            result = peft.stage_adapter(
-                model_runner,
-                load_format,
-                tensors,
-                adapter_config,
-                adapter_name,
-                # Single-active convention: the tokenizer-registered adapter_id
-                # (== adapter_name == "orbit_oft"); fall back to adapter_name when
-                # the tokenizer supplied none.
-                adapter_id=adapter_id if adapter_id is not None else adapter_name,
-                version=int(adapter_version),
-                payload_metadata=payload_metadata,
-                double_buffer=double_buffer,
-            )
-            if result is peft.NOT_HANDLED:
-                return (
-                    False,
-                    f"peft stage_adapter not handled for load_format={load_format}.",
+            if model_runner.server_args.oft_impl == "sibling" and load_format == "oft_adapter":
+                if not double_buffer:
+                    raise ValueError(
+                        "distributed non-double-buffer OFT adapter sync via "
+                        "stage/activate is not supported; enable "
+                        "--adapter-double-buffer (double-buffer) or use the "
+                        "IPC/colocate weight-sync."
+                    )
+                if payload_metadata is not None:
+                    tensors = oft_integration.reconstruct_oft_staging(tensors, payload_metadata)
+                result = model_runner.oft_manager.stage_adapter(
+                    tensors,
+                    adapter_config,
+                    adapter_name,
+                    int(adapter_version),
+                    # Single-active convention: the tokenizer-registered adapter_id
+                    # (== adapter_name == "orbit_oft"); fall back to adapter_name when
+                    # the tokenizer supplied none.
+                    oft_id=adapter_id if adapter_id is not None else adapter_name,
                 )
-            return True, "Succeeded to stage adapter online."
+                if not result.success:
+                    return False, result.error_message
+                return True, "Succeeded to stage adapter online."
+
+            return False, f"stage_adapter not handled for load_format={load_format}."
         except Exception as e:
             error_msg = f"Failed to stage adapter online: {e}."
             logger.error(error_msg)
@@ -482,7 +497,8 @@ class WeightUpdater:
     def activate_adapter_version(
         self: WeightUpdater, *, adapter_name, adapter_id, adapter_version
     ):
-        """Activate a staged adapter through native LoRA or the PEFT fallback.
+        """Activate a staged adapter through native LoRA staging, OFT staged,
+        or OFT sibling native-RPC -- matching ``stage_adapter``'s three routes.
 
         The caller's tokenizer writer lock guarantees the running batch is
         drained. Manager results are normalized to the scheduler's ``(bool, str)``
@@ -504,22 +520,25 @@ class WeightUpdater:
                 result = model_runner.oft_manager.activate_adapter(
                     adapter_name,
                     int(adapter_version),
-                    adapter_id=adapter_id,
+                    oft_id=adapter_id,
                 )
                 if not result.success:
                     return False, result.error_message
                 return True, "Succeeded to activate adapter version."
 
-            result = peft.activate_adapter(
-                model_runner, adapter_name, int(adapter_version)
-            )
-            if result is peft.NOT_HANDLED:
-                return (
-                    False,
-                    f"peft activate_adapter not handled (peft_method="
-                    f"{model_runner.server_args.peft_method}).",
+            if model_runner.server_args.enable_oft:
+                result = model_runner.oft_manager.activate_adapter(
+                    adapter_name, int(adapter_version)
                 )
-            return True, "Succeeded to activate adapter version."
+                if not result.success:
+                    return False, result.error_message
+                return True, "Succeeded to activate adapter version."
+
+            return (
+                False,
+                f"activate_adapter not handled (enable_oft="
+                f"{model_runner.server_args.enable_oft}).",
+            )
         except Exception as e:
             error_msg = f"Failed to activate adapter version: {e}."
             logger.error(error_msg)

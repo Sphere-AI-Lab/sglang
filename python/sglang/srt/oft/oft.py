@@ -191,3 +191,4 @@ class OFTAdapter(nn.Module):
 
         for name, weight in self.added_tokens_embeddings.items():
             self.added_tokens_embeddings[name] = weight.pin_memory()
+

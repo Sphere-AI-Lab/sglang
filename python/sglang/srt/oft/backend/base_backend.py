@@ -25,29 +25,6 @@ class BaseOFTBackend:
         self.device = device
         self._cuda_graph_grouped_batch_infos = {}
 
-    def run_extra_token_embedding(
-        self,
-        input_ids: torch.Tensor,
-        output: torch.Tensor,
-        extra_embeddings: torch.Tensor,
-        vocab_size: int,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Apply extra token embeddings to output in-place.
-
-        Args:
-            input_ids: (s,) token IDs
-            output: (s, embed_dim) output tensor to be modified
-            extra_embeddings: (num_ofts, num_extra_tokens, embed_dim) extra embeddings
-            vocab_size: base vocabulary size
-
-        Returns:
-            output: modified output tensor
-        """
-        raise NotImplementedError
-
     def run_oft_r_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
     ) -> torch.Tensor:
@@ -68,72 +45,6 @@ class BaseOFTBackend:
              result with shape (s, dim)
         """
         pass
-
-    def run_grouped_oft_r_sgemm(
-        self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        *args,
-        n_groups: int,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Run OFT rotation on grouped rows using the backend's normal kernel.
-
-        Some model paths flatten each logical token into multiple adjacent
-        group rows before applying the same adapter. The standard OFT metadata
-        is token-segmented, so each segment boundary must be scaled by
-        ``n_groups`` before invoking the regular segmented backend.
-        """
-        if n_groups <= 0:
-            raise ValueError(f"n_groups must be positive, got {n_groups}")
-        if n_groups == 1:
-            return self.run_oft_r_sgemm(x, weights, *args, **kwargs)
-
-        batch_info = self.batch_info
-        if batch_info.use_cuda_graph:
-            old_batch_info = self.batch_info
-            self.batch_info = self._get_cuda_graph_grouped_batch_info(
-                batch_info, n_groups
-            )
-            try:
-                return self.run_oft_r_sgemm(x, weights, *args, **kwargs)
-            finally:
-                self.batch_info = old_batch_info
-
-        updates = {
-            "seg_indptr": batch_info.seg_indptr * n_groups,
-            "max_len": (
-                int(batch_info.max_len) * n_groups
-                if batch_info.max_len is not None
-                else None
-            ),
-        }
-        if batch_info.seg_lens is not None:
-            updates["seg_lens"] = batch_info.seg_lens * n_groups
-
-        grouped_batch_info = replace(batch_info, **updates)
-        old_batch_info = self.batch_info
-        self.batch_info = grouped_batch_info
-        try:
-            return self.run_oft_r_sgemm(x, weights, *args, **kwargs)
-        finally:
-            self.batch_info = old_batch_info
-
-    def _get_cuda_graph_grouped_batch_info(self, batch_info, n_groups: int):
-        grouped = self._cuda_graph_grouped_batch_infos.get(n_groups)
-        if grouped is None:
-            grouped = replace(
-                batch_info,
-                seg_indptr=torch.empty_like(batch_info.seg_indptr),
-                seg_lens=(
-                    torch.empty_like(batch_info.seg_lens)
-                    if batch_info.seg_lens is not None
-                    else None
-                ),
-            )
-            self._cuda_graph_grouped_batch_infos[n_groups] = grouped
-        self._refresh_cuda_graph_grouped_batch_info(n_groups, batch_info, grouped)
-        return grouped
 
     def _refresh_cuda_graph_grouped_batch_info(
         self, n_groups: int, batch_info, grouped

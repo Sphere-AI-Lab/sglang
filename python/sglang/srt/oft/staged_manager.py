@@ -10,6 +10,7 @@ from sglang.srt.oft.mem_pool import OFTMemoryPool
 from sglang.srt.oft.oft import OFTAdapter
 from sglang.srt.oft.oft_config import OFTConfig
 from sglang.srt.oft.oft_manager import OFTManager
+from sglang.srt.oft.oft_registry import OFTRef
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import OFTUpdateOutput
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class StagedOFTMemoryPool(OFTMemoryPool):
     """OFT pool with one physical slot hidden from serving, and per-uid
-    stage/activate (unlike the inherited AdapterMemPool.stage/activate,
+    stage/activate (unlike the inherited OFTMemoryPool.stage/activate,
     which are pool-wide single-slot and used only by the non-multi-tenant
     double-buffer path)."""
 
@@ -40,7 +41,7 @@ class StagedOFTMemoryPool(OFTMemoryPool):
         ``OFTMemoryPool``'s buffer families are sized off two independent
         fields:
 
-        - ``AdapterMemPool.register_buffer_group`` (called from
+        - ``register_buffer_group`` (called from
           ``_declare_groups``/``_declare_expert_groups``) allocates the dense
           ``R:{target}`` groups and the expert ``w1/w3/w13/w2`` groups using
           ``self.max_adapters_per_batch`` as the leading (slot) dimension.
@@ -133,14 +134,15 @@ class PendingOFTStage:
     left to do after the pool-level copy has already succeeded.
     """
 
-    __slots__ = ("uid", "version", "config", "adapter", "name")
+    __slots__ = ("uid", "version", "config", "adapter", "name", "ref")
 
-    def __init__(self, uid, version, config, adapter, name):
+    def __init__(self, uid, version, config, adapter, name, ref):
         self.uid = uid
         self.version = version
         self.config = config
         self.adapter = adapter
         self.name = name
+        self.ref = ref
 
 
 class StagedOFTManager(OFTManager):
@@ -158,7 +160,7 @@ class StagedOFTManager(OFTManager):
     ``precompute_oft_r``, and the inherited ``apply_streamed_expert_oft`` --
     only the orchestration loop is duplicated here (see
     ``_partition_and_precompute``), because ``_stage_fill`` itself ends by
-    calling the OLD pool-wide, single-slot ``AdapterMemPool.stage(version,
+    calling the OLD pool-wide, single-slot ``OFTMemoryPool.stage(version,
     named_tensors)`` (2 args), which is incompatible with
     ``StagedOFTMemoryPool.stage(uid, version, named_tensors)`` (3 args,
     per-uid). ``_stage_fill`` is untouched and still serves the original
@@ -186,7 +188,7 @@ class StagedOFTManager(OFTManager):
             target_modules=self.target_modules,
             base_model=self.base_model,
             oft_type=self.oft_type,
-            oft_modules=self.adapter_modules,
+            oft_modules=self.oft_modules,
             external_target_modules=external_target_modules,
             eviction_policy=self.eviction_policy,
             oft_added_tokens_size=self.oft_added_tokens_size,
@@ -207,7 +209,7 @@ class StagedOFTManager(OFTManager):
         """Raw checkpoint-name tensors -> (staged_dense, fused_expert_chunk,
         block_size), the per-uid analogue of ``OFTManager._stage_fill``
         (oft_manager.py:1412-1538, unedited -- still the hook for the
-        original single-slot ``AdapterManager.stage_adapter``). Reuses every
+        original single-slot ``OFTManager.stage_adapter``). Reuses every
         transformation primitive that method uses; only the final pool call
         differs (per-uid ``memory_pool.stage(uid, version, staged_dense)``
         here vs. the pool-wide ``memory_pool.stage(version, staged_dense)``
@@ -259,7 +261,7 @@ class StagedOFTManager(OFTManager):
                 )
 
         staged_dense = {}
-        oft_modules = self.adapter_modules
+        oft_modules = self.oft_modules
         for tensor_name, tensor in dense_named_tensors:
             layer_id = get_layer_id(tensor_name)
             if layer_id is None:
@@ -295,9 +297,9 @@ class StagedOFTManager(OFTManager):
         return staged_dense, fused_expert_chunk, block_size
 
     def stage_adapter(
-        self, named_tensors, config, name, version, adapter_id=None
+        self, named_tensors, config, name, version, oft_id=None
     ) -> "OFTUpdateOutput":
-        uid = adapter_id if adapter_id is not None else name
+        uid = oft_id if oft_id is not None else name
         try:
             version = int(version)
             pending = self._pending_oft_stage
@@ -321,6 +323,24 @@ class StagedOFTManager(OFTManager):
             # from_dict -> validate -> _create_lora_adapter_from_tensors, all
             # strictly before memory_pool.stage(...).
             oft_config = OFTConfig.from_dict(config)
+            old_ref = self.oft_refs.get(uid)
+            if old_ref is not None and version <= old_ref.version:
+                raise ValueError(
+                    f"OFT adapter version {version} must be newer than active "
+                    f"version {old_ref.version}."
+                )
+            # Weights arrive over the wire here (no on-disk artifact) --
+            # reloadable=False, mirroring StagedLoRAManager.stage_adapter's
+            # new_ref exactly. pinned carries forward from the adapter's
+            # prior ref so an in-place update never un-pins it.
+            new_ref = OFTRef(
+                oft_id=uid,
+                oft_name=name,
+                oft_path="__distributed__",
+                pinned=old_ref.pinned if old_ref is not None else False,
+                reloadable=False,
+                version=version,
+            )
             oft_adapter = OFTAdapter(
                 uid, oft_config, self.base_hf_config, self.load_config, self.oft_backend
             )
@@ -369,6 +389,7 @@ class StagedOFTManager(OFTManager):
                 config=oft_config,
                 adapter=oft_adapter,
                 name=name,
+                ref=new_ref,
             )
         except Exception as error:
             return self.create_oft_update_result(
@@ -377,9 +398,9 @@ class StagedOFTManager(OFTManager):
         return self.create_oft_update_result(success=True)
 
     def activate_adapter(
-        self, name, version, adapter_id=None
+        self, name, version, oft_id=None
     ) -> "OFTUpdateOutput":
-        uid = adapter_id if adapter_id is not None else name
+        uid = oft_id if oft_id is not None else name
         try:
             version = int(version)
         except Exception as error:
@@ -439,6 +460,14 @@ class StagedOFTManager(OFTManager):
         # `self.configs[uid] = pending.config; self.loras[uid] = pending.adapter`.
         self.configs[uid] = pending.config
         self.adapters[uid] = pending.adapter
+        # Also REQUIRED: OFTMemoryPool's eviction-candidate filter reads
+        # oft_refs.get(victim_uid) to skip pinned/non-reloadable adapters
+        # (mem_pool.py's prepare_oft_batch). Without this, a staged/
+        # distributed-loaded adapter is invisible to that filter and can be
+        # silently LRU-evicted with no on-disk artifact to reload from --
+        # mirrors StagedLoRAManager.activate_adapter's
+        # `self.lora_refs[uid] = pending.ref` exactly.
+        self.oft_refs[uid] = pending.ref
 
         # No SECOND discard_stage() call here, unlike StagedLoRAManager:
         # unlike StagedLoRAMemoryPool.activate (which leaves _staged_uid/
@@ -452,11 +481,8 @@ class StagedOFTManager(OFTManager):
         return self.create_oft_update_result(success=True)
 
 
-from sglang.srt.adapter_sync.tokenizer_backend import AdapterStagingBackend
-
-
-class OFTStagingBackend(AdapterStagingBackend):
-    """Tokenizer-layer staging for OFT, wrapping the existing peft_tokenizer_hooks
+class OFTStagingBackend:
+    """Tokenizer-layer staging for OFT, wrapping the existing OFTTokenizerMixin
     registry logic rather than reimplementing it -- OFT's tokenizer-side
     registration/version-bump behavior does not change with this refactor,
     only how it's selected."""
@@ -465,30 +491,27 @@ class OFTStagingBackend(AdapterStagingBackend):
         self._tm = tm
 
     async def reserve_stage(self, obj) -> None:
-        from sglang.srt.peft import tokenizer_hooks as peft_tokenizer_hooks
-
-        await peft_tokenizer_hooks.register_peft_ref(self._tm, obj)
+        await self._tm.register_oft_ref(obj)
 
     def prepare_activation(self, obj) -> None:
         # A real client's obj.adapter_id defaults to None -- it has no way to
         # know the server-minted id -- so this must resolve it here the same
-        # way register_peft_ref does (peft/tokenizer_hooks.py:109), or
-        # StagedOFTManager.activate_adapter's `uid = adapter_id if adapter_id
+        # way register_oft_ref does (oft/tokenizer_mixin.py), or
+        # StagedOFTManager.activate_adapter's `uid = oft_id if oft_id
         # is not None else name` falls back to obj.adapter_name, which never
         # matches the UUID stage_adapter recorded for this adapter. No
         # separate pre-activation validation exists beyond this identity
-        # resolution in the current peft_tokenizer_hooks flow.
-        if obj.adapter_name not in self._tm.peft_ref_cache:
+        # resolution in the current OFTTokenizerMixin flow.
+        if obj.adapter_name not in self._tm.oft_ref_cache:
             raise ValueError(
                 f"Cannot activate name={obj.adapter_name}; no OFT adapter "
                 "with that name is registered"
             )
-        obj.adapter_id = self._tm.peft_ref_cache[obj.adapter_name].adapter_id
+        obj.adapter_id = self._tm.oft_ref_cache[obj.adapter_name].oft_id
 
     async def finish_activation(self, obj, results):
         from sglang.srt.managers.communicator import FanOutCommunicator
-        from sglang.srt.peft import tokenizer_hooks as peft_tokenizer_hooks
 
         success, message = FanOutCommunicator.merge_results(results)
-        message += await peft_tokenizer_hooks.bump_peft_version(self._tm, obj, success)
+        message += await self._tm.bump_oft_version(obj, success)
         return success, message

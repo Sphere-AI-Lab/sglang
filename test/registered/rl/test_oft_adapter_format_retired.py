@@ -159,7 +159,7 @@ class TestOFTAdapterFormatRetired(CustomTestCase):
 
         self.assertFalse(success, f"Expected success=False, got message={message!r}")
         self.assertIn("oft_adapter", message)
-        self.assertIn("no longer supported", message)
+        self.assertIn("permanently retired", message)
         self.assertGreater(
             num_output_ids,
             0,

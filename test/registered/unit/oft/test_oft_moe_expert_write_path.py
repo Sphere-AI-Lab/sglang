@@ -187,7 +187,7 @@ class TestExpertOFTWritePath(CustomTestCase):
         # reimplementing their logic.
         tm = SimpleNamespace(
             memory_pool=pool,
-            adapter_modules=None,
+            oft_modules=None,
             oft_type="canonical_oft",
             target_modules={"gate_proj", "up_proj", "down_proj"},
             max_oft_block_size=BLOCK_SIZE,

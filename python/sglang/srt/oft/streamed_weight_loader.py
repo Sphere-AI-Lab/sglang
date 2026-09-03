@@ -7,11 +7,7 @@ from typing import Dict, List, Literal, Sequence, Tuple
 
 import torch
 
-from sglang.srt.utils import MultiprocessingSerializer
-from sglang.srt.weight_sync.tensor_bucket import (
-    FlattenedTensorBucket,
-    FlattenedTensorMetadata,
-)
+from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -42,86 +38,6 @@ type FlattenedOFTTensorPayload = tuple[
     List[FlattenedTensorMetadata],
     List[Tuple[str, int]],
 ]
-
-
-def get_tensor_alias_key(tensor: torch.Tensor) -> tuple:
-    storage = tensor.untyped_storage()
-    return (
-        tensor.device.type,
-        tensor.device.index,
-        str(tensor.dtype),
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
-        tensor.storage_offset(),
-        storage.data_ptr(),
-    )
-
-
-def dedupe_named_tensors_by_storage(
-    named_tensors: Sequence[Tuple[str, torch.Tensor]],
-) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, int]]]:
-    unique_named_tensors: list[tuple[str, torch.Tensor]] = []
-    entries: list[tuple[str, int]] = []
-    key_to_index: dict[tuple, int] = {}
-
-    for name, tensor in named_tensors:
-        alias_key = get_tensor_alias_key(tensor)
-        unique_index = key_to_index.get(alias_key)
-        if unique_index is None:
-            unique_index = len(unique_named_tensors)
-            key_to_index[alias_key] = unique_index
-            unique_named_tensors.append((name, tensor))
-        entries.append((name, unique_index))
-
-    return unique_named_tensors, entries
-
-
-def serialize_flattened_oft_payload(
-    named_tensors: Sequence[Tuple[str, torch.Tensor]],
-) -> bytes:
-    unique_named_tensors, entries = dedupe_named_tensors_by_storage(named_tensors)
-    flattened_bucket = FlattenedTensorBucket(named_tensors=list(unique_named_tensors))
-    payload: FlattenedOFTTensorPayload = (
-        "flattened_oft_payload",
-        MultiprocessingSerializer.serialize(
-            flattened_bucket.get_flattened_tensor().detach()
-        ),
-        flattened_bucket.get_metadata(),
-        entries,
-    )
-    return MultiprocessingSerializer.serialize(payload)
-
-
-def normalize_oft_weight_payload(
-    payload: FlattenedOFTTensorPayload,
-    *,
-    device,
-) -> list[tuple[str, torch.Tensor]]:
-    """Deserialize a flattened OFT payload to a list of (name, tensor).
-
-    OFT sync (orbit, verl) always sends the flattened bucket form built by
-    `serialize_flattened_oft_payload`. The legacy non-flattened path was
-    never exercised in production and has been removed.
-    """
-    assert (
-        isinstance(payload, tuple)
-        and len(payload) == 4
-        and payload[0] == "flattened_oft_payload"
-    ), "OFT update_weights_from_tensor expects a FlattenedOFTTensorPayload"
-    _, serialized_flattened_tensor, metadata, entries = payload
-    flattened_tensor = MultiprocessingSerializer.deserialize(
-        serialized_flattened_tensor
-    ).to(device)
-    bucket = FlattenedTensorBucket(
-        flattened_tensor=flattened_tensor,
-        metadata=metadata,
-    )
-    unique_named_tensors = bucket.reconstruct_tensors()
-    unique_tensors = [tensor for _, tensor in unique_named_tensors]
-    return [
-        (name, unique_tensors[unique_index])
-        for name, unique_index in entries
-    ]
 
 
 def _partition_expert_oft_tensors(
@@ -325,7 +241,7 @@ def _resolve_streamed_oft_tensor_groups(
     from sglang.srt.layers.utils import get_layer_id
 
     memory_pool = oft_manager.memory_pool
-    oft_modules = oft_manager.adapter_modules
+    oft_modules = oft_manager.oft_modules
 
     # MoE expert OFT R cannot share the dense per-layer R_buffer slots
     # (those have no expert dimension and would silently overwrite each
@@ -460,8 +376,8 @@ def _commit_streamed_oft_tensor_groups(
     plan,
     buffer_id: int,
     block_size: int,
-    adapter_name: str,
-    adapter_id: str | None,
+    oft_name: str,
+    oft_id: str | None,
 ) -> tuple[bool, str]:
     """Write an already-resolved plan (see _resolve_streamed_oft_tensor_groups)
     into buffer_id's R_buffer slots. named_tensors is the ORIGINAL raw
@@ -470,7 +386,7 @@ def _commit_streamed_oft_tensor_groups(
     """
     fused_expert_chunk, non_row_groups, row_parallel_groups, direct_writes = plan
     memory_pool = oft_manager.memory_pool
-    oft_modules = oft_manager.adapter_modules
+    oft_modules = oft_manager.oft_modules
 
     if os.getenv("ORBIT_LOG_WEIGHT_SYNC", "").strip().lower() not in {"", "0", "false", "no"}:
         samples = []
@@ -491,10 +407,10 @@ def _commit_streamed_oft_tensor_groups(
                     f"max={cur_max:.3e} mean={cur_mean:.3e} nonzero={cur_nonzero}"
                 )
         logger.info(
-            "OFT streamed payload adapter=%s adapter_id=%s buffer_id=%s "
+            "OFT streamed payload adapter=%s oft_id=%s buffer_id=%s "
             "tensor_count=%s max_abs=%.6e total_nonzero=%s samples=%s",
-            adapter_name,
-            adapter_id,
+            oft_name,
+            oft_id,
             buffer_id,
             len(named_tensors),
             max_abs,

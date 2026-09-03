@@ -67,30 +67,9 @@ def cayley_neumann(
     return R
 
 
-def cayley_exact(
-    Q_skew: torch.Tensor,
-) -> torch.Tensor:
-    """Compute exact Cayley transform: R = (I - Q) @ (I + Q)^{-1}.
-
-    Args:
-        Q_skew: (num_blocks, block_size, block_size) skew-symmetric matrices
-
-    Returns:
-        (num_blocks, block_size, block_size) orthogonal matrices
-    """
-    b, block_size, _ = Q_skew.shape
-    I = (
-        torch.eye(block_size, device=Q_skew.device, dtype=Q_skew.dtype)
-        .unsqueeze(0)
-        .expand(b, block_size, block_size)
-    )
-    return torch.linalg.solve(I + Q_skew, I - Q_skew, left=False)
-
-
 def precompute_oft_r(
     compact_weights: torch.Tensor,
     block_size: int,
-    use_neumann: bool = True,
     num_neumann_terms: int = 5,
 ) -> torch.Tensor:
     """Precompute orthogonal rotation matrices from compact OFT weights.
@@ -98,24 +77,20 @@ def precompute_oft_r(
     Called at weight loading time (not during forward pass) since inference
     weights are frozen.
 
-    Pipeline: compact upper-tri -> skew-symmetric -> Cayley transform -> R
+    Pipeline: compact upper-tri -> skew-symmetric -> Cayley-Neumann transform -> R
 
     Args:
         compact_weights: (num_blocks, n_elements) compact upper-triangular weights
         block_size: size of each orthogonal block
-        use_neumann: use Neumann approximation vs exact solve
         num_neumann_terms: terms in Neumann series
 
     Returns:
         (num_blocks, block_size, block_size) orthogonal rotation matrices
     """
     skew = expand_to_skew_symmetric(compact_weights, block_size)
-    if use_neumann:
-        if HAS_TRITON and skew.is_cuda and num_neumann_terms == 5 and block_size >= 16:
-            return _triton_cayley_fwd(skew, num_neumann_terms)
-        return cayley_neumann(skew, num_neumann_terms)
-    else:
-        return cayley_exact(skew)
+    if HAS_TRITON and skew.is_cuda and num_neumann_terms == 5 and block_size >= 16:
+        return _triton_cayley_fwd(skew, num_neumann_terms)
+    return cayley_neumann(skew, num_neumann_terms)
 
 
 def apply_block_diag_orth(

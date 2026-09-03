@@ -135,6 +135,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadOFTAdapterFromDistributedReqInput,
     LoadOFTAdapterFromTensorsReqInput,
+    LoadOFTAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
@@ -1493,7 +1494,7 @@ async def update_weights_from_distributed(
 async def update_adapter_from_distributed(
     obj: Annotated[UpdateAdapterFromDistributedReqInput, Body()], request: Request
 ):
-    """Double-buffer PEFT (OFT/LoRA) STAGE over NCCL. double_buffer=True stages
+    """Double-buffer OFT/LoRA STAGE over NCCL. double_buffer=True stages
     only; double_buffer=False stages then activates-in-place (caller idle)."""
     (
         success,
@@ -1522,7 +1523,7 @@ async def update_adapter_from_distributed(
 async def activate_adapter_version(
     obj: Annotated[ActivateAdapterVersionReqInput, Body()], request: Request
 ):
-    """Double-buffer PEFT ACTIVATE (drained atomic swap). Drains in-flight
+    """Double-buffer OFT/LoRA ACTIVATE (drained atomic swap). Drains in-flight
     generation (tokenizer-side writer_lock) then flips staging->active."""
     success, message = await _global_state.tokenizer_manager.activate_adapter_version(
         obj, request
@@ -1705,6 +1706,17 @@ async def unload_lora_adapter(
 ):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/load_oft_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def load_oft_adapter(
+    obj: Annotated[LoadOFTAdapterReqInput, Body()], request: Request
+):
+    """Load a new OFT adapter without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_oft_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 

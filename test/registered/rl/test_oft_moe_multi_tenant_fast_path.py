@@ -80,7 +80,7 @@ ENGINE_KWARGS = dict(
     model_path=MODEL_PATH,
     load_format="dummy",
     json_model_override_args=json.dumps(MODEL_OVERRIDE),
-    peft_method="oft",
+    enable_oft=True,
     oft_impl="sibling",
     max_oft_block_size=BLOCK_SIZE,
     oft_target_modules=[DENSE_TARGET_MODULE] + MOE_TARGET_MODULES,
@@ -174,7 +174,7 @@ class TestMoeMultiTenantFastPathRegression(CustomTestCase):
     def tearDownClass(cls):
         cls.engine.shutdown()
 
-    def _generate(self, adapter_name=None):
+    def _generate(self, oft_name=None):
         """Returns (text, per-token output logprobs). With --load-format
         dummy (random, untrained weights), greedy-decoded TEXT alone is too
         coarse a signal -- a random model can land in a degenerate repeated-
@@ -186,7 +186,7 @@ class TestMoeMultiTenantFastPathRegression(CustomTestCase):
         output = self.engine.generate(
             prompt=[TEST_PROMPT],
             sampling_params={"max_new_tokens": MAX_NEW_TOKENS, "temperature": 0.0},
-            adapter_path=[adapter_name] if adapter_name is not None else None,
+            oft_path=[oft_name] if oft_name is not None else None,
             return_logprob=True,
         )
         text = output[0]["text"]
@@ -207,7 +207,7 @@ class TestMoeMultiTenantFastPathRegression(CustomTestCase):
         # (Task 4b's Fix 2) -- it never touches the expert groups at all.
         dense_name = "dense_only_adapter"
         dense_result = self.engine.load_oft_adapter_from_tensors(
-            adapter_name=dense_name,
+            oft_name=dense_name,
             tensors=_dense_named_tensors(seed=1),
             config_dict=_dense_config_dict(),
         )
@@ -223,7 +223,7 @@ class TestMoeMultiTenantFastPathRegression(CustomTestCase):
         # adapter's slot can be active_idx (0).
         moe_name = "moe_target_adapter"
         moe_result = self.engine.load_oft_adapter_from_tensors(
-            adapter_name=moe_name,
+            oft_name=moe_name,
             tensors=_expert_named_tensors(seed=2),
             config_dict=_moe_config_dict(),
         )
@@ -236,7 +236,7 @@ class TestMoeMultiTenantFastPathRegression(CustomTestCase):
         # one distinct real slot in the whole batch (the dense adapter is
         # resident but not referenced by any request here) -- but that slot
         # is NOT active_idx, so the fast path must NOT be taken.
-        moe_text, moe_logprobs = self._generate(adapter_name=moe_name)
+        moe_text, moe_logprobs = self._generate(oft_name=moe_name)
         print(f"[Without OFT] {base_text} logprobs={base_logprobs}")
         print(
             f"[With sole resident MoE-target adapter] {moe_text} logprobs={moe_logprobs}"

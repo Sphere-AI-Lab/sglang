@@ -422,7 +422,7 @@ def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
         # Capture-time forcing (get_capture_oft_variant() == "oft_multi")
         # makes sure the graph that gets captured is the one that actually
         # reads slot_ids, even though the capture-time dummy batch itself
-        # carries zero real adapters. peft/config.py's validate_peft_args
+        # carries zero real adapters. oft/config.py's validate_oft_args
         # only disables decode CUDA graphs for the residual configurations
         # dual-capture does NOT cover (DP-attention, insufficient effective
         # adapter capacity -- see _resolve_record_oft_variant_graph's

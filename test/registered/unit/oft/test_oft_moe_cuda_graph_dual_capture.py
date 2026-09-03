@@ -65,7 +65,7 @@ class TestResolveOftVariant(unittest.TestCase):
 
     def test_returns_none_when_dual_capture_not_enabled(self):
         runner = self._make_runner(record_oft_variant_graph=False)
-        forward_batch = SimpleNamespace(adapter_ids=["a", "b", None])
+        forward_batch = SimpleNamespace(oft_ids=["a", "b", None])
         self.assertIsNone(runner._resolve_oft_variant(forward_batch))
 
     def test_exactly_one_real_adapter_resolves_to_oft_multi_not_oft_single(self):
@@ -82,22 +82,22 @@ class TestResolveOftVariant(unittest.TestCase):
         the wrong routing. Verified this fails against the pre-fix (`> 1`)
         threshold and passes against the fixed (`>= 1`) one."""
         runner = self._make_runner(record_oft_variant_graph=True)
-        forward_batch = SimpleNamespace(adapter_ids=["a", "a", None])
+        forward_batch = SimpleNamespace(oft_ids=["a", "a", None])
         self.assertEqual(runner._resolve_oft_variant(forward_batch), "oft_multi")
 
     def test_returns_oft_single_when_no_adapters_at_all(self):
         runner = self._make_runner(record_oft_variant_graph=True)
-        forward_batch = SimpleNamespace(adapter_ids=[None, None])
+        forward_batch = SimpleNamespace(oft_ids=[None, None])
         self.assertEqual(runner._resolve_oft_variant(forward_batch), "oft_single")
 
     def test_returns_oft_multi_for_two_or_more_distinct_adapters(self):
         runner = self._make_runner(record_oft_variant_graph=True)
-        forward_batch = SimpleNamespace(adapter_ids=["a", "b", None])
+        forward_batch = SimpleNamespace(oft_ids=["a", "b", None])
         self.assertEqual(runner._resolve_oft_variant(forward_batch), "oft_multi")
 
     def test_returns_none_when_adapter_ids_is_none(self):
         runner = self._make_runner(record_oft_variant_graph=True)
-        forward_batch = SimpleNamespace(adapter_ids=None)
+        forward_batch = SimpleNamespace(oft_ids=None)
         self.assertIsNone(runner._resolve_oft_variant(forward_batch))
 
 
@@ -132,7 +132,7 @@ class TestResolveRecordOftVariantGraph(unittest.TestCase):
 
     def _server_args(self, **overrides):
         defaults = dict(
-            peft_method="oft",
+            enable_oft=True,
             oft_target_modules={"gate_up_proj", "down_proj"},
             max_ofts_per_batch=8,
             enable_dp_attention=False,
@@ -165,7 +165,7 @@ class TestResolveRecordOftVariantGraph(unittest.TestCase):
         )
 
     def test_false_when_oft_not_enabled(self):
-        server_args = self._server_args(peft_method=None)
+        server_args = self._server_args(enable_oft=False)
         model_config = self._model_config(has_moe_layers=True)
         self.assertFalse(
             DecodeCudaGraphRunner._resolve_record_oft_variant_graph(

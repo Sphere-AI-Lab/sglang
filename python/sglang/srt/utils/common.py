@@ -4386,8 +4386,6 @@ SUPPORTED_OFT_TARGET_MODULES = [
     "w3",
 ]
 
-OFT_TARGET_ALL_MODULES = "all"
-
 
 class ConcurrentCounter:
     """

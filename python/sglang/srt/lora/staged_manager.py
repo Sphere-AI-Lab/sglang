@@ -312,10 +312,7 @@ class StagedLoRAManager(LoRAManager):
         return self.create_lora_update_result(success=True)
 
 
-from sglang.srt.adapter_sync.tokenizer_backend import AdapterStagingBackend
-
-
-class LoRAStagingBackend(AdapterStagingBackend):
+class LoRAStagingBackend:
     """Tokenizer-layer staging for native LoRA. Wraps TokenizerManager's
     lora_registry/lora_ref_cache/failed_lora_activations/pending_lora_stage
     state — same objects tokenizer_control_mixin.py used directly before

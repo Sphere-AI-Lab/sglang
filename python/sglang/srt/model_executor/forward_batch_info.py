@@ -51,7 +51,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.peft import integration as peft
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
@@ -477,7 +476,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For LoRA
     lora_ids: Optional[List[str]] = None
     # For OFT
-    adapter_ids: Optional[List[str]] = None
+    oft_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
@@ -802,7 +801,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
-            adapter_ids=[req.adapter_id for req in batch.reqs],
+            oft_ids=[req.oft_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
@@ -943,8 +942,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Init OFT (single-active) batch info. Distinct namespace/guard from
         # the upstream enable_lora block above.
-        if model_runner.server_args.peft_method == "oft":
-            peft.maybe_apply_forward(model_runner, ret)
+        if model_runner.server_args.enable_oft:
+            model_runner.oft_manager.fetch_new_ofts(set(ret.oft_ids))
+            model_runner.oft_manager.prepare_oft_batch(ret)
 
         if (
             model_runner.ps.attn_dcp_size > 1

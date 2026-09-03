@@ -7,10 +7,10 @@ bugs found by Task 8's GPU integration suite and fixed afterward:
    production shape from `TpModelWorker._deserialize_own_rank`) straight
    through to code that iterates `named_tensors` as `List[Tuple[str, Tensor]]`
    -- crashed every native-RPC load with "too many values to unpack".
-2. `allocate_buffer_slot()` (used by the legacy single-active streamed path)
-   has no eviction fallback and hard-fails when the pool is full; the new
-   multi-tenant admission path needs real LRU eviction instead, without
-   changing `allocate_buffer_slot()`'s own behavior.
+2. The legacy single-active streamed path's admission had no eviction
+   fallback and hard-failed when the pool was full; the new multi-tenant
+   admission path (`allocate_buffer_slot_with_eviction`) needs real LRU
+   eviction instead.
 3. `LRUEvictionPolicy.select_victim` (`srt/lora/eviction_policy.py`, shared
    with LoRA) asserts if none of the eviction candidates were ever
    `mark_used(...)`'d and `None` isn't offered -- exactly the scenario of an
@@ -32,9 +32,7 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.lora.eviction_policy import get_eviction_policy
-from sglang.srt.oft.base.manager import AdapterManager
-from sglang.srt.oft.base.mem_pool import EMPTY_SLOT
-from sglang.srt.oft.mem_pool import OFTMemoryPool
+from sglang.srt.oft.mem_pool import EMPTY_SLOT, OFTMemoryPool
 from sglang.srt.oft.oft_manager import OFTManager
 from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.oft.streamed_weight_loader import (
@@ -56,7 +54,7 @@ CONFIG_DICT = {
 
 def _make_pool(max_ofts_per_batch, max_block_size=BLOCK_SIZE):
     """A lightweight stand-in carrying exactly the attributes
-    OFTMemoryPool.allocate_buffer_slot[_with_eviction] touch (bookkeeping
+    OFTMemoryPool.allocate_buffer_slot_with_eviction touches (bookkeeping
     dicts/lists + the shared eviction_policy) -- no R_buffer/torch tensors,
     since none of this logic reads or writes them. The REAL (unbound)
     OFTMemoryPool methods are bound onto it via MethodType, so what's under
@@ -72,7 +70,6 @@ def _make_pool(max_ofts_per_batch, max_block_size=BLOCK_SIZE):
     pool.allocate_buffer_slot_with_eviction = MethodType(
         OFTMemoryPool.allocate_buffer_slot_with_eviction, pool
     )
-    pool.allocate_buffer_slot = MethodType(OFTMemoryPool.allocate_buffer_slot, pool)
     pool.prepare_oft_batch = MethodType(OFTMemoryPool.prepare_oft_batch, pool)
     pool.load_oft_weight_to_buffer = MethodType(
         OFTMemoryPool.load_oft_weight_to_buffer, pool
@@ -83,9 +80,9 @@ def _make_pool(max_ofts_per_batch, max_block_size=BLOCK_SIZE):
 def _make_manager(max_ofts_per_batch=4, max_block_size=BLOCK_SIZE):
     """OFTManager.__new__ bypasses __init__ (which requires a real wired-up
     base_model/backend/memory pool) -- the methods under test only touch
-    self.refs/self.configs/self.adapters/self.memory_pool, all set here."""
+    self.oft_refs/self.configs/self.adapters/self.memory_pool, all set here."""
     mgr = OFTManager.__new__(OFTManager)
-    mgr.refs = {}
+    mgr.oft_refs = {}
     mgr.configs = {}
     mgr.adapters = {}
     mgr.num_pinned = 0
@@ -93,11 +90,11 @@ def _make_manager(max_ofts_per_batch=4, max_block_size=BLOCK_SIZE):
     return mgr
 
 
-def _make_ref(name, adapter_id=None, pinned=False, reloadable=True):
+def _make_ref(name, oft_id=None, pinned=False, reloadable=True):
     return OFTRef(
-        adapter_id=adapter_id or name,
-        adapter_name=name,
-        adapter_path=name,
+        oft_id=oft_id or name,
+        oft_name=name,
+        oft_path=name,
         pinned=pinned,
         reloadable=reloadable,
     )
@@ -149,9 +146,9 @@ class TestLoadAdapterFromTensorsDictInput(unittest.TestCase):
 
 
 class TestAllocateBufferSlotWithEviction(unittest.TestCase):
-    """Bug 3: allocate_buffer_slot_with_eviction (new) evicts an unpinned
-    resident real adapter when full; allocate_buffer_slot() (legacy
-    primitive, unchanged) still hard-fails with no eviction."""
+    """Bug 3: allocate_buffer_slot_with_eviction evicts an unpinned
+    resident real adapter when full, instead of the legacy admission's
+    unconditional hard-fail."""
 
     def test_empty_slot_used_first_no_eviction(self):
         pool = _make_pool(max_ofts_per_batch=2)
@@ -244,13 +241,6 @@ class TestAllocateBufferSlotWithEviction(unittest.TestCase):
         pool.buffer_id_to_uid = ["pinned_one", "wire_loaded"]
         with self.assertRaises(ValueError):
             pool.allocate_buffer_slot_with_eviction(refs)
-
-    def test_allocate_buffer_slot_itself_still_hard_fails_unchanged(self):
-        pool = _make_pool(max_ofts_per_batch=1)
-        pool.uid_to_buffer_id = {"x": 0}
-        pool.buffer_id_to_uid = ["x"]
-        with self.assertRaises(ValueError):
-            pool.allocate_buffer_slot()
 
 
 def _prepare_oft_batch(pool, cur_uids, oft_adapters=None):
@@ -372,8 +362,8 @@ class TestSelectVictimNeverUsedEdgeCase(unittest.TestCase):
         ):
             result_b = mgr.load_adapter_from_tensors(ref_b, [], CONFIG_DICT)
         self.assertTrue(result_b.success, result_b.error_message)
-        self.assertNotIn("adapter_a", mgr.refs)  # evicted
-        self.assertIn("adapter_b", mgr.refs)
+        self.assertNotIn("adapter_a", mgr.oft_refs)  # evicted
+        self.assertIn("adapter_b", mgr.oft_refs)
         self.assertEqual(mgr.memory_pool.uid_to_buffer_id[None], 0)  # identity untouched
 
 
@@ -384,10 +374,10 @@ class TestValidateBeforeEvict(unittest.TestCase):
     def test_resolve_failure_never_triggers_eviction(self):
         mgr = _make_manager(max_ofts_per_batch=1)
         resident = _make_ref("resident")
-        mgr.refs[resident.adapter_id] = resident
-        mgr.configs[resident.adapter_id] = "cfg"
-        mgr.memory_pool.uid_to_buffer_id[resident.adapter_id] = 0
-        mgr.memory_pool.buffer_id_to_uid[0] = resident.adapter_id
+        mgr.oft_refs[resident.oft_id] = resident
+        mgr.configs[resident.oft_id] = "cfg"
+        mgr.memory_pool.uid_to_buffer_id[resident.oft_id] = 0
+        mgr.memory_pool.buffer_id_to_uid[0] = resident.oft_id
 
         new_ref = _make_ref("new_adapter")
         with patch(
@@ -404,7 +394,7 @@ class TestValidateBeforeEvict(unittest.TestCase):
         mock_commit.assert_not_called()
         # The resident adapter must be completely untouched: never evicted
         # for a payload that was invalid anyway.
-        self.assertIn("resident", mgr.refs)
+        self.assertIn("resident", mgr.oft_refs)
         self.assertEqual(mgr.memory_pool.uid_to_buffer_id["resident"], 0)
         self.assertEqual(mgr.memory_pool.buffer_id_to_uid[0], "resident")
 
@@ -414,10 +404,10 @@ class TestValidateBeforeEvict(unittest.TestCase):
         called out explicitly in the error."""
         mgr = _make_manager(max_ofts_per_batch=1)
         resident = _make_ref("resident")
-        mgr.refs[resident.adapter_id] = resident
-        mgr.configs[resident.adapter_id] = "cfg"
-        mgr.memory_pool.uid_to_buffer_id[resident.adapter_id] = 0
-        mgr.memory_pool.buffer_id_to_uid[0] = resident.adapter_id
+        mgr.oft_refs[resident.oft_id] = resident
+        mgr.configs[resident.oft_id] = "cfg"
+        mgr.memory_pool.uid_to_buffer_id[resident.oft_id] = 0
+        mgr.memory_pool.buffer_id_to_uid[0] = resident.oft_id
         mgr.memory_pool.eviction_policy.mark_used("resident")
 
         new_ref = _make_ref("new_adapter")
@@ -435,18 +425,18 @@ class TestValidateBeforeEvict(unittest.TestCase):
         self.assertIn("evicted", result.error_message)
         self.assertIn("OOM during Cayley precompute", result.error_message)
         # The eviction genuinely happened (validation had already passed).
-        self.assertNotIn("resident", mgr.refs)
+        self.assertNotIn("resident", mgr.oft_refs)
         # And the NEW adapter must not be left as a phantom resident ref
         # either: register_streamed_adapter + mark_used already ran before
         # commit failed, so without cleanup it would look valid/resident
         # while its buffer's contents are undefined.
-        self.assertNotIn(new_ref.adapter_id, mgr.refs)
-        self.assertNotIn(new_ref.adapter_id, mgr.configs)
-        self.assertNotIn(new_ref.adapter_id, mgr.memory_pool.uid_to_buffer_id)
+        self.assertNotIn(new_ref.oft_id, mgr.oft_refs)
+        self.assertNotIn(new_ref.oft_id, mgr.configs)
+        self.assertNotIn(new_ref.oft_id, mgr.memory_pool.uid_to_buffer_id)
         # LRU tracking must be cleaned up too, not just the residency maps --
         # otherwise it's a slow leak across repeated failed loads.
         self.assertNotIn(
-            new_ref.adapter_id, mgr.memory_pool.eviction_policy.access_order
+            new_ref.oft_id, mgr.memory_pool.eviction_policy.access_order
         )
 
     def test_commit_failure_does_not_leave_phantom_resident_ref(self):
@@ -467,13 +457,13 @@ class TestValidateBeforeEvict(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("OOM during Cayley precompute", result.error_message)
         self.assertNotIn("evicted", result.error_message)  # no eviction happened
-        self.assertNotIn(new_ref.adapter_id, mgr.refs)
-        self.assertNotIn(new_ref.adapter_id, mgr.configs)
-        self.assertNotIn(new_ref.adapter_id, mgr.memory_pool.uid_to_buffer_id)
+        self.assertNotIn(new_ref.oft_id, mgr.oft_refs)
+        self.assertNotIn(new_ref.oft_id, mgr.configs)
+        self.assertNotIn(new_ref.oft_id, mgr.memory_pool.uid_to_buffer_id)
         # The slot it briefly occupied is back to empty, not phantom-owned.
         self.assertEqual(mgr.memory_pool.buffer_id_to_uid[0], EMPTY_SLOT)
         self.assertNotIn(
-            new_ref.adapter_id, mgr.memory_pool.eviction_policy.access_order
+            new_ref.oft_id, mgr.memory_pool.eviction_policy.access_order
         )
 
 
@@ -481,7 +471,7 @@ class TestEvictionPreservesDiskBackedAdapter(unittest.TestCase):
     """C1 fix #2: once fix #1 excludes wire-loaded (non-reloadable)
     residents from eviction candidacy, the only adapters
     allocate_buffer_slot_with_eviction can ever select as a victim are
-    disk-backed (--peft-paths) ones -- self.refs/self.configs are shared by
+    disk-backed (--peft-paths) ones -- self.oft_refs/self.configs are shared by
     both kinds, but only disk-backed adapters also have a self.adapters
     entry. Calling unload_streamed_adapter on such a victim would delete
     its configs/refs while leaving self.adapters behind and num_pinned
@@ -497,12 +487,12 @@ class TestEvictionPreservesDiskBackedAdapter(unittest.TestCase):
         # fall back to first).
         mgr = _make_manager(max_ofts_per_batch=1)
         disk_ref = _make_ref("disk_backed", reloadable=True)
-        mgr.refs[disk_ref.adapter_id] = disk_ref
-        mgr.configs[disk_ref.adapter_id] = "disk_cfg"
-        mgr.adapters[disk_ref.adapter_id] = "disk_adapter_object"
-        mgr.memory_pool.uid_to_buffer_id[disk_ref.adapter_id] = 0
-        mgr.memory_pool.buffer_id_to_uid[0] = disk_ref.adapter_id
-        mgr.memory_pool.eviction_policy.mark_used(disk_ref.adapter_id)
+        mgr.oft_refs[disk_ref.oft_id] = disk_ref
+        mgr.configs[disk_ref.oft_id] = "disk_cfg"
+        mgr.adapters[disk_ref.oft_id] = "disk_adapter_object"
+        mgr.memory_pool.uid_to_buffer_id[disk_ref.oft_id] = 0
+        mgr.memory_pool.buffer_id_to_uid[0] = disk_ref.oft_id
+        mgr.memory_pool.eviction_policy.mark_used(disk_ref.oft_id)
 
         new_ref = _make_ref("wire_new", reloadable=False)
         with patch(
@@ -516,32 +506,32 @@ class TestEvictionPreservesDiskBackedAdapter(unittest.TestCase):
 
         self.assertTrue(result.success, result.error_message)
         # Lost its GPU buffer slot to the new wire-loaded adapter...
-        self.assertNotIn(disk_ref.adapter_id, mgr.memory_pool.uid_to_buffer_id)
+        self.assertNotIn(disk_ref.oft_id, mgr.memory_pool.uid_to_buffer_id)
         # ...but keeps its CPU-side bookkeeping fully intact -- unlike a
         # wire-loaded victim, which would be fully unloaded (configs/refs
         # deleted too, since it has nothing else to fall back on).
-        self.assertIn(disk_ref.adapter_id, mgr.refs)
-        self.assertIn(disk_ref.adapter_id, mgr.configs)
-        self.assertIn(disk_ref.adapter_id, mgr.adapters)
+        self.assertIn(disk_ref.oft_id, mgr.oft_refs)
+        self.assertIn(disk_ref.oft_id, mgr.configs)
+        self.assertIn(disk_ref.oft_id, mgr.adapters)
 
     def test_upsert_of_disk_backed_name_is_rejected_even_with_mismatched_new_id(self):
         """Same bug shape at the OTHER call site that can unload a resident
         ref by name: an upsert naming an already-loaded disk-backed adapter
         is rejected outright (see TestUpsertRejectsDiskBackedToWireLoadedTransition),
-        regardless of what adapter_id the incoming (mismatched-id) ref
-        carries -- existing_id is found by NAME match against self.refs, so
+        regardless of what oft_id the incoming (mismatched-id) ref
+        carries -- existing_id is found by NAME match against self.oft_refs, so
         the rejection check does not depend on the new ref's own id. Keeps
         the disk-backed entry completely untouched, same as the realistic
         same-id case."""
         mgr = _make_manager(max_ofts_per_batch=2)
         disk_ref = _make_ref("shared_name", reloadable=True)
-        mgr.refs[disk_ref.adapter_id] = disk_ref
-        mgr.configs[disk_ref.adapter_id] = "disk_cfg"
-        mgr.adapters[disk_ref.adapter_id] = "disk_adapter_object"
-        mgr.memory_pool.uid_to_buffer_id[disk_ref.adapter_id] = 0
-        mgr.memory_pool.buffer_id_to_uid[0] = disk_ref.adapter_id
+        mgr.oft_refs[disk_ref.oft_id] = disk_ref
+        mgr.configs[disk_ref.oft_id] = "disk_cfg"
+        mgr.adapters[disk_ref.oft_id] = "disk_adapter_object"
+        mgr.memory_pool.uid_to_buffer_id[disk_ref.oft_id] = 0
+        mgr.memory_pool.buffer_id_to_uid[0] = disk_ref.oft_id
 
-        new_ref = _make_ref("shared_name", adapter_id="new_wire_id", reloadable=False)
+        new_ref = _make_ref("shared_name", oft_id="new_wire_id", reloadable=False)
         with patch(
             "sglang.srt.oft.streamed_weight_loader._resolve_streamed_oft_tensor_groups",
             return_value=(("fused", {}, {}, []), ""),
@@ -554,23 +544,23 @@ class TestEvictionPreservesDiskBackedAdapter(unittest.TestCase):
             )
 
         self.assertFalse(result.success)
-        self.assertIn(disk_ref.adapter_name, result.error_message)
+        self.assertIn(disk_ref.oft_name, result.error_message)
         mock_commit.assert_not_called()
-        self.assertIn(disk_ref.adapter_id, mgr.refs)
-        self.assertIn(disk_ref.adapter_id, mgr.configs)
-        self.assertIn(disk_ref.adapter_id, mgr.adapters)
-        self.assertNotIn("new_wire_id", mgr.refs)
+        self.assertIn(disk_ref.oft_id, mgr.oft_refs)
+        self.assertIn(disk_ref.oft_id, mgr.configs)
+        self.assertIn(disk_ref.oft_id, mgr.adapters)
+        self.assertNotIn("new_wire_id", mgr.oft_refs)
 
 
 class TestUpsertRejectsDiskBackedToWireLoadedTransition(unittest.TestCase):
     """Second-round fix: upserting a NEW wire-loaded adapter over an
     EXISTING disk-backed (--peft-paths) adapter's name -- reusing the SAME
-    adapter_id, the realistic case (resolve_or_reuse reuses ids for a
-    matching adapter_name upstream) -- must be rejected outright, not
+    oft_id, the realistic case (resolve_or_reuse reuses ids for a
+    matching oft_name upstream) -- must be rejected outright, not
     silently corrupt self.adapters/num_pinned state.
     _unload_streamed_adapter_if_not_disk_backed no-ops for a disk-backed
     existing entry, but register_streamed_adapter would still overwrite
-    self.refs/self.configs for the SAME id afterward, leaving
+    self.oft_refs/self.configs for the SAME id afterward, leaving
     self.adapters[existing_id] (the old CPU-side OFTAdapter) stale --
     silently corrupting later num_pinned accounting and disk-vs-streamed
     unload dispatch. Migrating the identity in place was considered and
@@ -579,17 +569,17 @@ class TestUpsertRejectsDiskBackedToWireLoadedTransition(unittest.TestCase):
     def test_upsert_with_colliding_id_over_disk_backed_name_is_rejected(self):
         mgr = _make_manager(max_ofts_per_batch=2)
         disk_ref = _make_ref("shared_name", reloadable=True, pinned=True)
-        mgr.refs[disk_ref.adapter_id] = disk_ref
-        mgr.configs[disk_ref.adapter_id] = "disk_cfg"
-        mgr.adapters[disk_ref.adapter_id] = "disk_adapter_object"
-        mgr.memory_pool.uid_to_buffer_id[disk_ref.adapter_id] = 0
-        mgr.memory_pool.buffer_id_to_uid[0] = disk_ref.adapter_id
+        mgr.oft_refs[disk_ref.oft_id] = disk_ref
+        mgr.configs[disk_ref.oft_id] = "disk_cfg"
+        mgr.adapters[disk_ref.oft_id] = "disk_adapter_object"
+        mgr.memory_pool.uid_to_buffer_id[disk_ref.oft_id] = 0
+        mgr.memory_pool.buffer_id_to_uid[0] = disk_ref.oft_id
         mgr.num_pinned = 1  # disk_ref was loaded pinned, per load_adapter's accounting
 
-        # Reuses the SAME adapter_id as the existing disk-backed entry (the
+        # Reuses the SAME oft_id as the existing disk-backed entry (the
         # realistic same-id case), not a mismatched one.
         new_ref = _make_ref("shared_name", reloadable=False)
-        self.assertEqual(new_ref.adapter_id, disk_ref.adapter_id)
+        self.assertEqual(new_ref.oft_id, disk_ref.oft_id)
 
         with patch(
             "sglang.srt.oft.streamed_weight_loader._resolve_streamed_oft_tensor_groups",
@@ -603,14 +593,14 @@ class TestUpsertRejectsDiskBackedToWireLoadedTransition(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertIn("disk", result.error_message.lower())
-        self.assertIn(disk_ref.adapter_name, result.error_message)
+        self.assertIn(disk_ref.oft_name, result.error_message)
         # Rejected before any mutation: the original disk-backed entry, and
         # num_pinned, are completely untouched.
-        self.assertIs(mgr.refs[disk_ref.adapter_id], disk_ref)
-        self.assertEqual(mgr.configs[disk_ref.adapter_id], "disk_cfg")
-        self.assertEqual(mgr.adapters[disk_ref.adapter_id], "disk_adapter_object")
+        self.assertIs(mgr.oft_refs[disk_ref.oft_id], disk_ref)
+        self.assertEqual(mgr.configs[disk_ref.oft_id], "disk_cfg")
+        self.assertEqual(mgr.adapters[disk_ref.oft_id], "disk_adapter_object")
         self.assertEqual(mgr.num_pinned, 1)
-        self.assertEqual(mgr.memory_pool.uid_to_buffer_id[disk_ref.adapter_id], 0)
+        self.assertEqual(mgr.memory_pool.uid_to_buffer_id[disk_ref.oft_id], 0)
         # The commit path was never reached -- rejected before both
         # _unload_streamed_adapter_if_not_disk_backed and
         # register_streamed_adapter.
@@ -623,10 +613,10 @@ class TestUpsertRejectsDiskBackedToWireLoadedTransition(unittest.TestCase):
         must still succeed."""
         mgr = _make_manager(max_ofts_per_batch=2)
         old_wire_ref = _make_ref("shared_name", reloadable=False, pinned=False)
-        mgr.refs[old_wire_ref.adapter_id] = old_wire_ref
-        mgr.configs[old_wire_ref.adapter_id] = "old_wire_cfg"
-        mgr.memory_pool.uid_to_buffer_id[old_wire_ref.adapter_id] = 0
-        mgr.memory_pool.buffer_id_to_uid[0] = old_wire_ref.adapter_id
+        mgr.oft_refs[old_wire_ref.oft_id] = old_wire_ref
+        mgr.configs[old_wire_ref.oft_id] = "old_wire_cfg"
+        mgr.memory_pool.uid_to_buffer_id[old_wire_ref.oft_id] = 0
+        mgr.memory_pool.buffer_id_to_uid[0] = old_wire_ref.oft_id
 
         new_ref = _make_ref("shared_name", reloadable=False)
         with patch(
@@ -647,7 +637,7 @@ class TestNumPinnedBookkeeping(unittest.TestCase):
     num_pinned in sync for pinned wire-loaded adapters -- previously
     register_streamed_adapter never touched it, silently under-counting
     num_pinned and making validate_new_adapter's anti-starvation guard and
-    validate_batch's mem_pool_vacancy arithmetic (base/manager.py) wrong once
+    validate_oft_batch's mem_pool_vacancy arithmetic (oft_manager.py) wrong once
     pinned OFT adapters became reachable over the wire."""
 
     def test_register_increments_num_pinned_for_pinned_ref(self):
@@ -707,7 +697,7 @@ class TestGracefulFailureInsteadOfAssert(unittest.TestCase):
         ref = _make_ref("half_present")
         # configs present but refs missing -- an inconsistent state that
         # must still fail gracefully, not assert.
-        mgr.configs[ref.adapter_id] = "cfg"
+        mgr.configs[ref.oft_id] = "cfg"
         result = mgr.unload_adapter(ref)
         self.assertFalse(result.success)
         self.assertIn("not loaded", result.error_message)
@@ -734,7 +724,7 @@ class TestResolveCommitSplit(unittest.TestCase):
             )
         oft_manager = MagicMock()
         oft_manager.memory_pool = memory_pool
-        oft_manager.adapter_modules = []
+        oft_manager.oft_modules = []
         return oft_manager
 
     def test_unresolved_name_fails_without_mutation(self):
@@ -773,8 +763,8 @@ class TestResolveCommitSplit(unittest.TestCase):
 
 
 def _make_admission_manager(max_adapters_per_batch):
-    """Stand-in wiring AdapterManager.validate_batch (oft/base/manager.py) to
-    a REAL AdapterMemPool-shaped memory pool -- so the admission-layer
+    """Stand-in wiring OFTManager.validate_oft_batch (oft/oft_manager.py) to
+    a REAL OFTMemoryPool-shaped memory pool -- so the admission-layer
     capacity check can be exercised against realistic pool bookkeeping.
     Boot-registers uid=None at buffer slot 0, mirroring
     OFTManager.init_memory_pool's real `fetch_new_ofts({None})` call."""
@@ -788,21 +778,21 @@ def _make_admission_manager(max_adapters_per_batch):
     mgr = SimpleNamespace(
         max_adapters_per_batch=max_adapters_per_batch,
         num_pinned=0,
-        refs={},
+        oft_refs={},
         memory_pool=pool,
     )
-    mgr.validate_batch = MethodType(AdapterManager.validate_batch, mgr)
+    mgr.validate_oft_batch = MethodType(OFTManager.validate_oft_batch, mgr)
     return mgr
 
 
 class TestValidateBatchEnforcesRealAdapterCapacity(unittest.TestCase):
-    """Important finding (Task 4b re-review): AdapterManager.validate_batch
-    (oft/base/manager.py) validated batch size against the FULL
+    """Important finding (Task 4b re-review): OFTManager.validate_oft_batch
+    (oft/oft_manager.py) validated batch size against the FULL
     max_adapters_per_batch, not max_adapters_per_batch - 1 -- even though
     buffer slot 0 is now (Task 4b's Critical eviction fix) permanently
     reserved for the base/identity placeholder and genuinely unavailable to
     real adapters. A batch referencing max_adapters_per_batch distinct real
-    (non-None) adapters passed validate_batch (which thought there was
+    (non-None) adapters passed validate_oft_batch (which thought there was
     room) but then had no real slot to seat the last one into (no on-disk
     preload path exists anymore to lazily page it in from either) --
     reaching OFTMemoryPool.prepare_oft_batch's loud ValueError with no
@@ -816,19 +806,19 @@ class TestValidateBatchEnforcesRealAdapterCapacity(unittest.TestCase):
         # batch referencing 2 distinct real, unpinned adapters with no
         # base/None request mixed in. Must now be rejected at admission.
         mgr = _make_admission_manager(max_adapters_per_batch=2)
-        self.assertFalse(mgr.validate_batch({"A1", "A2"}))
+        self.assertFalse(mgr.validate_oft_batch({"A1", "A2"}))
 
     def test_single_real_adapter_at_capacity_two_is_admitted(self):
         # Sanity: the fix must not be over-broad -- a batch within the real
         # (max_adapters_per_batch - 1) bound is still admitted.
         mgr = _make_admission_manager(max_adapters_per_batch=2)
-        self.assertTrue(mgr.validate_batch({"A1"}))
+        self.assertTrue(mgr.validate_oft_batch({"A1"}))
 
     def test_none_in_batch_does_not_count_toward_real_capacity(self):
         # A base/no-adapter request mixed into the batch must not itself
         # consume a "real adapter" slot in the capacity arithmetic.
         mgr = _make_admission_manager(max_adapters_per_batch=2)
-        self.assertTrue(mgr.validate_batch({None, "A1"}))
+        self.assertTrue(mgr.validate_oft_batch({None, "A1"}))
 
     def test_capacity_one_rejects_any_real_adapter(self):
         # max_adapters_per_batch=1 has zero real slots (slot 0 is the only
@@ -836,8 +826,8 @@ class TestValidateBatchEnforcesRealAdapterCapacity(unittest.TestCase):
         # batch referencing a real adapter must be rejected, while an
         # all-base batch is still fine.
         mgr = _make_admission_manager(max_adapters_per_batch=1)
-        self.assertFalse(mgr.validate_batch({"A1"}))
-        self.assertTrue(mgr.validate_batch({None}))
+        self.assertFalse(mgr.validate_oft_batch({"A1"}))
+        self.assertTrue(mgr.validate_oft_batch({None}))
 
     def test_globally_pinned_adapter_outside_this_batch_still_consumes_real_capacity(
         self,
@@ -850,19 +840,19 @@ class TestValidateBatchEnforcesRealAdapterCapacity(unittest.TestCase):
         # free for the batch's 2 unpinned adapters.
         mgr = _make_admission_manager(max_adapters_per_batch=4)
         mgr.num_pinned = 2
-        mgr.refs = {
+        mgr.oft_refs = {
             "pinned_A": _make_ref("pinned_A", pinned=True),
             "unpinned_1": _make_ref("unpinned_1", pinned=False),
             "unpinned_2": _make_ref("unpinned_2", pinned=False),
         }
         self.assertFalse(
-            mgr.validate_batch({"pinned_A", "unpinned_1", "unpinned_2"})
+            mgr.validate_oft_batch({"pinned_A", "unpinned_1", "unpinned_2"})
         )
 
 
 class TestFetchNewAdaptersAssertsRealAdapterCapacity(unittest.TestCase):
-    """fetch_new_adapters's assertion (oft/base/manager.py) had the same
-    off-by-one-real-slot gap as validate_batch above -- it must reject
+    """fetch_new_ofts's assertion (oft/oft_manager.py) had the same
+    off-by-one-real-slot gap as validate_oft_batch above -- it must reject
     before ever calling _prepare_mem_pool_batch, not merely raise later."""
 
     def _make_manager(self, max_adapters_per_batch):
@@ -870,23 +860,23 @@ class TestFetchNewAdaptersAssertsRealAdapterCapacity(unittest.TestCase):
             max_adapters_per_batch=max_adapters_per_batch,
             _prepare_mem_pool_batch=MagicMock(),
         )
-        mgr.fetch_new_adapters = MethodType(AdapterManager.fetch_new_adapters, mgr)
+        mgr.fetch_new_ofts = MethodType(OFTManager.fetch_new_ofts, mgr)
         return mgr
 
     def test_assertion_rejects_batch_exceeding_real_capacity(self):
         mgr = self._make_manager(max_adapters_per_batch=2)
         with self.assertRaises(AssertionError):
-            mgr.fetch_new_adapters({"A1", "A2"})
+            mgr.fetch_new_ofts({"A1", "A2"})
         mgr._prepare_mem_pool_batch.assert_not_called()
 
     def test_assertion_allows_batch_within_real_capacity(self):
         mgr = self._make_manager(max_adapters_per_batch=2)
-        mgr.fetch_new_adapters({"A1"})  # must not raise
+        mgr.fetch_new_ofts({"A1"})  # must not raise
         mgr._prepare_mem_pool_batch.assert_called_once_with({"A1"})
 
     def test_none_does_not_count_toward_the_assertion(self):
         mgr = self._make_manager(max_adapters_per_batch=2)
-        mgr.fetch_new_adapters({None, "A1"})  # must not raise
+        mgr.fetch_new_ofts({None, "A1"})  # must not raise
 
 
 class TestValidateNewAdapterPinnedBoundReservesRealSlotForUnpinned(unittest.TestCase):
@@ -906,7 +896,7 @@ class TestValidateNewAdapterPinnedBoundReservesRealSlotForUnpinned(unittest.Test
         # `getattr(self, "memory_pool", None)` then short-circuits its
         # block_size-compatibility branch, so this stays a narrow unit test
         # of the pinned-bound line rather than needing a full pool double.
-        mgr = SimpleNamespace(refs={}, num_pinned=num_pinned, max_ofts_per_batch=max_ofts_per_batch)
+        mgr = SimpleNamespace(oft_refs={}, num_pinned=num_pinned, max_ofts_per_batch=max_ofts_per_batch)
         mgr.validate_new_adapter = MethodType(OFTManager.validate_new_adapter, mgr)
         return mgr
 
