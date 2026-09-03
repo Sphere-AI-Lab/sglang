@@ -266,6 +266,8 @@ def _manager(max_ofts_per_batch=4):
     manager.configs = {}
     manager.adapters = {}
     manager.refs = {}
+    manager.embed_tokens_module = None
+    manager.lm_head_module = None
     manager.num_pinned = 0
     manager._pending_oft_stage = None
     manager.memory_pool.uid_to_buffer_id[None] = 0
@@ -486,18 +488,33 @@ class TestStagedOFTManagerActivation(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("no OFT stage is pending", result.error_message)
 
-    def test_first_stage_reserves_a_serving_slot_for_the_minted_id(self):
+    def test_stage_does_not_reserve_a_serving_slot(self):
         manager = _manager()
+        uid_to_buffer_id_before = dict(manager.memory_pool.uid_to_buffer_id)
+        buffer_id_to_uid_before = list(manager.memory_pool.buffer_id_to_uid)
+
         self._staged(manager)
 
-        destination = manager.memory_pool.uid_to_buffer_id["adapter-a"]
+        self.assertEqual(
+            manager.memory_pool.uid_to_buffer_id, uid_to_buffer_id_before
+        )
+        self.assertEqual(
+            manager.memory_pool.buffer_id_to_uid, buffer_id_to_uid_before
+        )
+
+    def test_activate_accepts_a_new_uid_without_a_reserved_slot(self):
+        manager = _manager()
+        self._staged(manager)
+        self.assertNotIn("adapter-a", manager.memory_pool.uid_to_buffer_id)
+
         result = manager.activate_adapter("adapter-a", 1, "adapter-a")
 
         self.assertTrue(result.success, result.error_message)
-        self.assertNotEqual(destination, manager.memory_pool.staging_idx)
-        self.assertEqual(
-            manager.memory_pool.buffer_id_to_uid[destination], "adapter-a"
-        )
+        self.assertIn("adapter-a", manager.configs)
+        self.assertIn("adapter-a", manager.adapters)
+        self.assertIn("adapter-a", manager.refs)
+        self.assertNotIn("adapter-a", manager.memory_pool.uid_to_buffer_id)
+        self.assertIsNone(manager.memory_pool.staged_identity())
 
     def test_stage_then_activate_from_raw_tensors_lands_the_transformed_value(self):
         """End-to-end through the real transformation (mirrors Task 2's
@@ -514,7 +531,9 @@ class TestStagedOFTManagerActivation(unittest.TestCase):
         slot_0_before = manager.memory_pool.slot(f"R:{TARGET_MODULE}", 0, 0).clone()
 
         self._staged(manager, fill_value=9.0)
-        destination = manager.memory_pool.uid_to_buffer_id["adapter-a"]
+        destination = 2
+        manager.memory_pool.uid_to_buffer_id["adapter-a"] = destination
+        manager.memory_pool.buffer_id_to_uid[destination] = "adapter-a"
         result = manager.activate_adapter("adapter-a", 1, "adapter-a")
 
         self.assertTrue(result.success, result.error_message)
@@ -531,6 +550,38 @@ class TestStagedOFTManagerActivation(unittest.TestCase):
         )
         self.assertIsNone(manager._pending_oft_stage)
         self.assertIsNone(manager.memory_pool.staged_identity())
+
+
+class TestPrepareOFTBatchLazyAdmission(unittest.TestCase):
+    def test_first_request_admits_a_staged_adapter_with_real_weights(self):
+        from sglang.srt.oft.torch_ops.oft_ops import precompute_oft_r
+
+        manager = _manager(max_ofts_per_batch=2)
+        compact = _raw_named_tensors_for_layer_0(fill_value=9.0)[0][1]
+
+        result = manager.stage_adapter(
+            _raw_named_tensors_for_layer_0(fill_value=9.0),
+            CONFIG_DICT,
+            "adapter-a",
+            1,
+            "adapter-a",
+        )
+        self.assertTrue(result.success, result.error_message)
+        self.assertNotIn("adapter-a", manager.memory_pool.uid_to_buffer_id)
+
+        result = manager.activate_adapter("adapter-a", 1, "adapter-a")
+        self.assertTrue(result.success, result.error_message)
+        self.assertNotIn("adapter-a", manager.memory_pool.uid_to_buffer_id)
+
+        manager._prepare_mem_pool_batch({"adapter-a"})
+
+        buffer_id = manager.memory_pool.uid_to_buffer_id["adapter-a"]
+        self.assertEqual(
+            manager.memory_pool.buffer_id_to_uid[buffer_id], "adapter-a"
+        )
+        expected_r = precompute_oft_r(compact, BLOCK_SIZE)[0]
+        actual = manager.memory_pool.slot(f"R:{TARGET_MODULE}", 0, buffer_id)
+        self.assertTrue(torch.allclose(actual, expected_r.expand_as(actual)))
 
 
 class TestActivateUpdatesManagerBookkeeping(unittest.TestCase):

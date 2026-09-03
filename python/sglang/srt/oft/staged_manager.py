@@ -7,7 +7,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.oft.base.mem_pool import EMPTY_SLOT
 from sglang.srt.oft.mem_pool import OFTMemoryPool
 from sglang.srt.oft.oft import OFTAdapter
 from sglang.srt.oft.oft_config import OFTConfig
@@ -346,16 +345,6 @@ class StagedOFTManager(OFTManager):
             staged_dense, fused_expert_chunk, block_size = (
                 self._partition_and_precompute(named_tensors, config)
             )
-            destination = self.memory_pool.uid_to_buffer_id.get(uid)
-            reserved_new_slot = destination is None
-            evicted_uid = None
-            if reserved_new_slot:
-                destination, evicted_uid = (
-                    self.memory_pool.allocate_buffer_slot_with_eviction(self.refs)
-                )
-                self.memory_pool.uid_to_buffer_id[uid] = destination
-                self.memory_pool.buffer_id_to_uid[destination] = uid
-
             pending_ref = OFTRef(
                 adapter_id=uid,
                 adapter_name=name,
@@ -396,14 +385,6 @@ class StagedOFTManager(OFTManager):
                     # discard and this would raise "the staging slot is
                     # empty" -- the original mutation_error is what matters.
                     pass
-                if reserved_new_slot:
-                    self.memory_pool.uid_to_buffer_id.pop(uid, None)
-                    if evicted_uid is None:
-                        self.memory_pool.buffer_id_to_uid[destination] = EMPTY_SLOT
-                    else:
-                        self.memory_pool.uid_to_buffer_id[evicted_uid] = destination
-                        self.memory_pool.buffer_id_to_uid[destination] = evicted_uid
-                        self.memory_pool.eviction_policy.mark_used(evicted_uid)
                 raise mutation_error
 
             self._pending_oft_stage = PendingOFTStage(
@@ -445,40 +426,29 @@ class StagedOFTManager(OFTManager):
                 ),
             )
 
+        # Existing adapters already have a serving slot, so commit the hidden
+        # staging slot into it immediately. A newly introduced adapter has no
+        # serving slot yet; publish its CPU-side state now and let the first
+        # request admit it through OFTMemoryPool.prepare_oft_batch.
         destination = self.memory_pool.uid_to_buffer_id.get(uid)
-        if destination is None:
-            return self.create_oft_update_result(
-                success=False,
-                error_message=f"No serving slot is reserved for adapter uid={uid}.",
-            )
-        try:
-            self.memory_pool.activate(uid, version, destination)
-        except Exception as activation_error:
-            return self.create_oft_update_result(
-                success=False, error_message=str(activation_error)
-            )
+        if destination is not None:
+            try:
+                self.memory_pool.activate(uid, version, destination)
+            except Exception as activation_error:
+                return self.create_oft_update_result(
+                    success=False, error_message=str(activation_error)
+                )
+        else:
+            self.memory_pool.discard_stage(uid, version)
 
-        # REQUIRED, not optional: OFTManager.prepare_oft_batch reads
-        # self.adapters[uid].block_size / self.configs[uid].block_size for
-        # every resident uid on every batch. Activating a new uid without
-        # populating these leaves it physically live in the GPU slot but
-        # invisible to the manager's own bookkeeping. pending.config/
-        # pending.adapter were already fully constructed and validated in
-        # stage_adapter, so this is a trivial commit, mirroring
-        # StagedLoRAManager.activate_adapter's
-        # `self.configs[uid] = pending.config; self.loras[uid] = pending.adapter`.
+        # Lazy admission needs the materialized adapter and its configuration;
+        # eviction filtering also needs the corresponding reference.
         self.configs[uid] = pending.config
         self.adapters[uid] = pending.adapter
         self.refs[uid] = pending.ref
-        self.memory_pool.eviction_policy.mark_used(uid)
 
-        # No discard_stage() call here, unlike StagedLoRAManager: unlike
-        # StagedLoRAMemoryPool.activate (which leaves _staged_uid/_staged_
-        # version set so the manager must clear them separately),
-        # StagedOFTMemoryPool.activate (Task 2) already clears them itself
-        # as its last step. Calling discard_stage() again here would re-run
-        # _require_staged_identity against an already-empty staging slot and
-        # raise unconditionally.
+        # Both activate() and the new-adapter discard branch clear the hidden
+        # staging identity before the transaction is published.
         self._pending_oft_stage = None
         return self.create_oft_update_result(success=True)
 
