@@ -298,6 +298,9 @@ def maybe_admit_request(scheduler: "Scheduler", req: "Req", running_ofts) -> boo
 
     Returns True to admit the request, False if the caller should ``continue``.
     """
+    if scheduler.oft_drainer and not scheduler.oft_drainer.can_schedule(req):
+        return False
+
     new_oft_set = {req.adapter_id} | running_ofts
     return scheduler.tp_worker.model_runner.oft_manager.validate_oft_batch(
         new_oft_set

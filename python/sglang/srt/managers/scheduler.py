@@ -111,6 +111,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.oft.oft_drainer import OFTDrainer
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -501,6 +502,7 @@ class Scheduler(
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_oft = server_args.peft_method == "oft"
+        self.max_ofts_per_batch = server_args.max_ofts_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
@@ -701,6 +703,9 @@ class Scheduler(
 
         # Init LoRA drainer for fair scheduling
         self.init_lora_drainer()
+
+        # Init OFT drainer for fair scheduling
+        self.init_oft_drainer()
 
         # Init LoRA overlap loader
         self.init_lora_overlap_loader()
@@ -2082,6 +2087,15 @@ class Scheduler(
             )
         else:
             self.lora_drainer = None
+
+    def init_oft_drainer(self) -> None:
+        if get_lora().oft_drain_wait_threshold > 0.0:
+            self.oft_drainer = OFTDrainer(
+                self.max_ofts_per_batch,
+                get_lora().oft_drain_wait_threshold,
+            )
+        else:
+            self.oft_drainer = None
 
     def init_lora_overlap_loader(self) -> None:
         if self.enable_lora_overlap_loading:
@@ -3474,6 +3488,12 @@ class Scheduler(
                 req.adapter_id for req in running_batch.reqs if not req.finished()
             }
             running_ofts.update(req.adapter_id for req in adder.can_run_list)
+
+            if self.oft_drainer:
+                self.oft_drainer.update_draining_state(
+                    self.waiting_queue,
+                    running_batch.reqs,
+                )
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:

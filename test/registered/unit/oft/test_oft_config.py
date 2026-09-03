@@ -16,6 +16,7 @@ def _args(
     max_loaded_ofts=None,
     max_ofts_per_batch=2,
     peft_paths=None,
+    oft_drain_wait_threshold=0.0,
 ):
     ns = SimpleNamespace(
         enable_lora=enable_lora,
@@ -33,6 +34,7 @@ def _args(
         oft_dtype=None,
         oft_type="canonical_oft",
         max_oft_chunk_size=16,
+        oft_drain_wait_threshold=oft_drain_wait_threshold,
         speculative_algorithm=None,
         cuda_graph_config=None,
     )
@@ -93,6 +95,32 @@ def test_register_oft_args_exposes_max_loaded_ofts():
     register_oft_args(parser)
 
     assert parser.parse_args(["--max-loaded-ofts", "3"]).max_loaded_ofts == 3
+
+
+def test_register_oft_args_exposes_drain_wait_threshold():
+    from sglang.srt.oft.config import register_oft_args
+
+    parser = argparse.ArgumentParser()
+    register_oft_args(parser)
+
+    assert (
+        parser.parse_args(["--oft-drain-wait-threshold", "2.5"])
+        .oft_drain_wait_threshold
+        == 2.5
+    )
+
+
+def test_oft_drain_wait_threshold_must_be_non_negative():
+    from sglang.srt.oft.config import validate_oft_args
+
+    with pytest.raises(AssertionError, match="must be non-negative"):
+        validate_oft_args(
+            _args(
+                "oft",
+                enable_lora=False,
+                oft_drain_wait_threshold=-0.1,
+            )
+        )
 
 
 def test_max_loaded_ofts_must_cover_real_per_batch_capacity():

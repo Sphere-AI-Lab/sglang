@@ -64,6 +64,7 @@ class OFTArgs:
     oft_dtype: A[Optional[str], NS("lora")] = None
     oft_type: A[str, NS("lora")] = "canonical_oft"
     max_oft_chunk_size: A[Optional[int], NS("lora")] = 16
+    oft_drain_wait_threshold: A[float, NS("lora")] = 0.0
 
     @property
     def enable_oft(self) -> bool:
@@ -171,6 +172,15 @@ def register_oft_args(parser: argparse.ArgumentParser) -> None:
         choices=[16, 32, 64, 128],
         help="Maximum OFT kernel chunk size.",
     )
+    parser.add_argument(
+        "--oft-drain-wait-threshold",
+        type=float,
+        default=OFTArgs.oft_drain_wait_threshold,
+        help=(
+            "Maximum seconds an OFT request may wait before a running adapter "
+            "is drained to make room for it. Disabled when set to 0."
+        ),
+    )
 
 
 def _normalize_oft_refs(raw_paths):
@@ -221,6 +231,9 @@ def _normalize_oft_refs(raw_paths):
 
 def validate_oft_args(server_args) -> None:
     """Validate and normalize the OFT-owned ``ServerArgs`` fields in place."""
+    assert server_args.oft_drain_wait_threshold >= 0.0, (
+        "--oft-drain-wait-threshold must be non-negative."
+    )
     method = server_args.peft_method
     if method not in (None, "oft"):
         raise ValueError(f"Unsupported --peft-method {method!r}; only 'oft' is valid.")
