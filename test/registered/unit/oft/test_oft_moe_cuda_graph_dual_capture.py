@@ -132,7 +132,7 @@ class TestResolveRecordOftVariantGraph(unittest.TestCase):
 
     def _server_args(self, **overrides):
         defaults = dict(
-            peft_method="oft",
+            enable_oft=True,
             oft_target_modules={"gate_up_proj", "down_proj"},
             max_ofts_per_batch=8,
             enable_dp_attention=False,
@@ -165,7 +165,7 @@ class TestResolveRecordOftVariantGraph(unittest.TestCase):
         )
 
     def test_false_when_oft_not_enabled(self):
-        server_args = self._server_args(peft_method=None)
+        server_args = self._server_args(enable_oft=False)
         model_config = self._model_config(has_moe_layers=True)
         self.assertFalse(
             DecodeCudaGraphRunner._resolve_record_oft_variant_graph(

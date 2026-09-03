@@ -943,7 +943,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Init OFT (single-active) batch info. Distinct namespace/guard from
         # the upstream enable_lora block above.
-        if model_runner.server_args.peft_method == "oft":
+        if model_runner.server_args.enable_oft:
             peft.maybe_apply_forward(model_runner, ret)
 
         if (

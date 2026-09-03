@@ -4678,7 +4678,7 @@ class ServerArgs(OFTArgs):
                 # prepare step, not the torch.compile dummy forward -- so the
                 # compile pass raises "AttributeError: 'TritonOFTBackend' object has
                 # no attribute 'batch_info'".
-                lambda: self.peft_method == "oft",
+                lambda: self.enable_oft,
             ),
             (
                 "multimodal model",

@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadOFTAdapterFromDistributedReqInput,
     LoadOFTAdapterFromTensorsReqInput,
+    LoadOFTAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadOFTAdapterReqInput,
@@ -311,6 +312,10 @@ class BaseTpWorker(ABC):
             recv_req.added_tokens_config,
             upsert=recv_req.upsert,
         )
+        return result
+
+    def load_oft_adapter(self, recv_req: LoadOFTAdapterReqInput):
+        result = self.model_runner.load_oft_adapter(recv_req.to_ref())
         return result
 
     def unload_oft_adapter(self, recv_req: UnloadOFTAdapterReqInput):

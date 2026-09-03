@@ -121,7 +121,7 @@ from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
-from sglang.srt.peft import tokenizer_hooks as peft_tokenizer_hooks
+from sglang.srt.oft.tokenizer_mixin import OFTTokenizerMixin
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -240,9 +240,9 @@ class ReqState:
     # negative, which hangs it just the same (it waits for exactly zero).
     lora_lease_released: bool = False
 
-    # Same idempotency guard as lora_lease_released, for the single-active
-    # peft (OFT) adapter lease released via peft_tokenizer_hooks.finalize_peft_lease.
-    peft_lease_released: bool = False
+    # Same idempotency guard as lora_lease_released, for the OFT adapter
+    # lease released via OFTTokenizerMixin.finalize_oft_lease.
+    oft_lease_released: bool = False
 
     # For streaming output
     last_output_offset: int = 0
@@ -402,7 +402,7 @@ class InputFormat(Enum):
 _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
 
-class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
     @property
@@ -435,6 +435,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.enable_metrics = server_args.enable_metrics
         self.incremental_streaming_output = server_args.incremental_streaming_output
         self.enable_lora = get_lora().enable_lora
+        self.enable_oft = get_lora().enable_oft
         self.enable_trace = server_args.enable_trace
         self.allow_auto_truncate = server_args.allow_auto_truncate
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -683,7 +684,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_peft(self):
         # Single-active PEFT registry bootstrap (LoRA or OFT). Body lives in the
         # peft.tokenizer_hooks façade to keep this file peft-free.
-        peft_tokenizer_hooks.init_tokenizer_peft(self)
+        self.init_tokenizer_oft()
 
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
@@ -834,14 +835,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
             async with self.model_update_lock.reader_lock:
-                # Single-active peft (enable_peft_lora XOR enable_oft) resolves the
-                # named adapter through the unified peft path; its request never goes
+                # Single-active OFT (enable_lora XOR enable_oft) resolves the
+                # named adapter through the OFT path; its request never goes
                 # through upstream _validate_and_resolve_lora (which requires
                 # enable_lora). Upstream multi-tenant LoRA keeps the old path.
-                if self.server_args.enable_peft:
-                    # peft adapter path only on GenerateReqInput (no embedding support).
+                if self.enable_oft:
+                    # OFT adapter path only on GenerateReqInput (no embedding support).
                     if isinstance(obj, GenerateReqInput):
-                        await peft_tokenizer_hooks.maybe_resolve_peft_path(self, obj)
+                        await self.maybe_resolve_oft_path(obj)
                 else:
                     await self._validate_and_resolve_lora(obj)
 
@@ -1818,7 +1819,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # already released the lease and deleted the state — the finalizer's
             # idempotency is what prevents the counter from going negative here.
             self._finalize_lora_lease(state)
-            peft_tokenizer_hooks.finalize_peft_lease(self, state)
+            self.finalize_oft_lease(state)
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -2605,7 +2606,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Mark ongoing LoRA request as finished.
                 self._finalize_lora_lease(state)
-                peft_tokenizer_hooks.finalize_peft_lease(self, state)
+                self.finalize_oft_lease(state)
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -3347,9 +3348,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # tokenizer-held, and disagg-retracted requests — none of them reach
         # _handle_batch_output, so this is their only lease-release point.
         self._finalize_lora_lease(self.rid_to_state.get(recv_obj.rid))
-        peft_tokenizer_hooks.finalize_peft_lease(
-            self, self.rid_to_state.get(recv_obj.rid)
-        )
+        self.finalize_oft_lease(self.rid_to_state.get(recv_obj.rid))
         del self.rid_to_state[recv_obj.rid]
 
         state.out_list.append(out)
@@ -3584,7 +3583,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # this rid, and once the state is dropped a late terminal has no release
             # point either — so release the LoRA lease here.
             self._finalize_lora_lease(self.rid_to_state.get(rid))
-            peft_tokenizer_hooks.finalize_peft_lease(self, self.rid_to_state.get(rid))
+            self.finalize_oft_lease(self.rid_to_state.get(rid))
             self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(

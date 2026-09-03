@@ -76,6 +76,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadOFTAdapterFromDistributedReqInput,
     LoadOFTAdapterFromTensorsReqInput,
+    LoadOFTAdapterReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
     ProfileReq,
@@ -1639,6 +1640,36 @@ class Engine(EngineScoreMixin, EngineBase):
         obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
 
         return await self.tokenizer_manager.unload_lora_adapter(obj, None)
+
+    def load_oft_adapter(self, adapter_name: str, adapter_path: str, pinned: bool = False):
+        """Load a new OFT adapter without re-launching the engine."""
+
+        obj = LoadOFTAdapterReqInput(
+            adapter_name=adapter_name,
+            adapter_path=adapter_path,
+            pinned=pinned,
+        )
+
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_oft_adapter(obj, None)
+        )
+
+    async def async_load_oft_adapter(
+        self, adapter_name: str, adapter_path: str, pinned: bool = False
+    ):
+        """
+        Asynchronous version of load_oft_adapter.
+
+        See load_oft_adapter() for detailed documentation.
+        """
+
+        obj = LoadOFTAdapterReqInput(
+            adapter_name=adapter_name,
+            adapter_path=adapter_path,
+            pinned=pinned,
+        )
+
+        return await self.tokenizer_manager.load_oft_adapter(obj, None)
 
     def load_oft_adapter_from_tensors(
         self,

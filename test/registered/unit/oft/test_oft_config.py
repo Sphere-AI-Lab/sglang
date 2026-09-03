@@ -9,7 +9,7 @@ _UNSET = object()
 
 
 def _args(
-    peft_method,
+    enable_oft,
     *,
     enable_lora=True,
     max_loaded_ofts=None,
@@ -25,7 +25,7 @@ def _args(
     ns = SimpleNamespace(
         enable_lora=enable_lora,
         enable_dp_attention=enable_dp_attention,
-        peft_method=peft_method,
+        enable_oft=enable_oft,
         # OFT initialization always requires both max_oft_block_size and
         # oft_target_modules explicitly -- default both to a valid value
         # whenever OFT is enabled and the caller didn't override them, so
@@ -34,12 +34,12 @@ def _args(
         oft_target_modules=(
             oft_target_modules
             if oft_target_modules is not _UNSET
-            else (["o_proj"] if peft_method is not None else None)
+            else (["o_proj"] if enable_oft else None)
         ),
         max_oft_block_size=(
             max_oft_block_size
             if max_oft_block_size is not None
-            else (32 if peft_method is not None else None)
+            else (32 if enable_oft else None)
         ),
         max_ofts_per_batch=max_ofts_per_batch,
         max_loaded_ofts=max_loaded_ofts,
@@ -69,41 +69,28 @@ def _args(
     return ns
 
 
-def test_removed_lora_method_is_rejected_even_when_set_programmatically():
-    """Regression: argparse's ``choices=["oft"]`` rejects ``--peft-method lora``
-    on the CLI, but a caller that builds ``ServerArgs`` directly (e.g. an RL
-    launcher passing ``peft_method="lora"`` as a kwarg) bypasses argparse
-    entirely and used to sail through ``validate_oft_args`` uncaught after
-    srt/peft/lora was deleted -- silently no-op'ing to base-model-only serving
-    instead of failing loudly."""
-    from sglang.srt.oft.config import validate_oft_args
-
-    with pytest.raises(ValueError, match=r"--peft-method 'lora' is no longer supported"):
-        validate_oft_args(_args("lora", enable_lora=False))
-
-
 def test_native_lora_and_single_active_peft_are_mutually_exclusive():
     """Catch the PEFT method initializing alongside native LoRA."""
     from sglang.srt.oft.config import validate_oft_args
 
     with pytest.raises(
         ValueError,
-        match=r"--enable-lora.*--peft-method.*mutually exclusive",
+        match=r"--enable-lora.*--enable-oft.*mutually exclusive",
     ):
-        validate_oft_args(_args("oft"))
+        validate_oft_args(_args(True))
 
 
 @pytest.mark.parametrize(
-    ("enable_lora", "peft_method"),
-    [(True, None), (False, "oft")],
+    ("enable_lora", "enable_oft"),
+    [(True, False), (False, True)],
 )
 def test_native_lora_and_single_active_peft_validate_independently(
-    enable_lora, peft_method
+    enable_lora, enable_oft
 ):
     """Catch an over-broad guard that rejects either system on its own."""
     from sglang.srt.oft.config import validate_oft_args
 
-    validate_oft_args(_args(peft_method, enable_lora=enable_lora))
+    validate_oft_args(_args(enable_oft, enable_lora=enable_lora))
 
 
 def test_max_loaded_ofts_must_be_at_least_max_ofts_per_batch_minus_one():
@@ -119,7 +106,7 @@ def test_max_loaded_ofts_must_be_at_least_max_ofts_per_batch_minus_one():
 
     # max_loaded_ofts=2 is below max_ofts_per_batch - 1 == 3: must still fail.
     with pytest.raises(AssertionError, match=r"max_loaded_ofts should be greater than or equal"):
-        validate_oft_args(_args("oft", enable_lora=False, max_loaded_ofts=2, max_ofts_per_batch=4))
+        validate_oft_args(_args(True, enable_lora=False, max_loaded_ofts=2, max_ofts_per_batch=4))
 
 
 def test_max_loaded_ofts_equal_to_max_ofts_per_batch_minus_one_is_legal():
@@ -130,7 +117,7 @@ def test_max_loaded_ofts_equal_to_max_ofts_per_batch_minus_one_is_legal():
 
     validate_oft_args(
         _args(
-            "oft",
+            True,
             enable_lora=False,
             max_loaded_ofts=3,
             max_ofts_per_batch=4,
@@ -144,7 +131,7 @@ def test_oft_target_modules_alone_works_as_canonical_flag():
     from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
-        "oft",
+        True,
         enable_lora=False,
         oft_target_modules=["o_proj", "down_proj"],
     )
@@ -158,7 +145,7 @@ def test_oft_double_buffer_alone_works_as_canonical_flag():
     from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
-        "oft",
+        True,
         enable_lora=False,
         max_ofts_per_batch=3,
         oft_double_buffer=True,
@@ -197,7 +184,7 @@ def test_moe_target_oft_sibling_with_zero_capacity_disables_decode_cuda_graph():
     from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
-        "oft",
+        True,
         enable_lora=False,
         oft_target_modules=["gate_proj", "up_proj", "down_proj"],
         oft_impl="sibling",
@@ -226,7 +213,7 @@ def test_moe_target_oft_sibling_with_real_capacity_keeps_decode_cuda_graph_enabl
     from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
-        "oft",
+        True,
         enable_lora=False,
         oft_target_modules=["gate_proj", "up_proj", "down_proj"],
         oft_impl="sibling",
@@ -252,7 +239,7 @@ def test_dense_target_oft_leaves_decode_cuda_graph_enabled():
     from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
-        "oft",
+        True,
         enable_lora=False,
         oft_target_modules=["o_proj"],
         oft_impl="sibling",
@@ -285,7 +272,7 @@ def test_dense_model_targeting_mlp_module_names_keeps_decode_cuda_graph(
     from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
-        "oft",
+        True,
         enable_lora=False,
         oft_target_modules=oft_target_modules,
         oft_impl="sibling",
@@ -309,7 +296,7 @@ def test_moe_target_oft_staged_impl_leaves_decode_cuda_graph_enabled():
     from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
-        "oft",
+        True,
         enable_lora=False,
         oft_target_modules=["gate_proj", "up_proj", "down_proj"],
         oft_impl="staged",
@@ -340,7 +327,7 @@ def test_moe_target_oft_sibling_with_dp_attention_disables_decode_cuda_graph_eve
     from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
-        "oft",
+        True,
         enable_lora=False,
         oft_target_modules=["gate_proj", "up_proj", "down_proj"],
         oft_impl="sibling",
@@ -362,7 +349,7 @@ def test_moe_target_oft_sibling_without_dp_attention_and_with_capacity_keeps_dec
     from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
-        "oft",
+        True,
         enable_lora=False,
         oft_target_modules=["gate_proj", "up_proj", "down_proj"],
         oft_impl="sibling",
@@ -376,13 +363,13 @@ def test_moe_target_oft_sibling_without_dp_attention_and_with_capacity_keeps_dec
 
 
 def test_non_oft_server_leaves_decode_cuda_graph_enabled():
-    """Negative case: peft_method=None (OFT disabled entirely) must never
+    """Negative case: enable_oft=False (OFT disabled entirely) must never
     trip the MoE decode-graph guard."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.oft.config import validate_oft_args
 
     args = _args(
-        None,
+        False,
         cuda_graph_config=_cuda_graph_config(decode_backend=Backend.FULL),
     )
     validate_oft_args(args)

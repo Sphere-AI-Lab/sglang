@@ -2520,6 +2520,25 @@ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
 ) = LoadLoRAAdapterFromDistributedReqOutput = LoRAUpdateOutput
 
 
+class LoadOFTAdapterReqInput(BaseReq, kw_only=True):
+    # The name of the OFT adapter to newly loaded.
+    adapter_name: str
+    # The path of loading.
+    adapter_path: str
+    # Whether to pin the OFT adapter in memory.
+    pinned: bool = False
+    # The unique identifier for the OFT adapter, automatically generated in the `TokenizerManager`.
+    adapter_id: Optional[str] = None
+
+    def to_ref(self) -> OFTRef:
+        return OFTRef(
+            adapter_id=self.adapter_id,
+            adapter_name=self.adapter_name,
+            adapter_path=self.adapter_path,
+            pinned=self.pinned,
+        )
+
+
 class UnloadOFTAdapterReqInput(BaseReq, kw_only=True):
     adapter_name: str
     adapter_id: Optional[str] = None
@@ -2579,7 +2598,7 @@ class OFTUpdateOutput(BaseReq, kw_only=True):
     loaded_adapters: Optional[Dict[str, Union[str, OFTRef]]] = None
 
 
-UnloadOFTAdapterReqOutput = (
+LoadOFTAdapterReqOutput = UnloadOFTAdapterReqOutput = (
     LoadOFTAdapterFromTensorsReqOutput
 ) = LoadOFTAdapterFromDistributedReqOutput = OFTUpdateOutput
 

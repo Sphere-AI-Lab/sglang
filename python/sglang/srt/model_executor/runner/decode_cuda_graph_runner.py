@@ -296,7 +296,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.record_oft_variant_graph = self._resolve_record_oft_variant_graph(
             model_runner.server_args,
             model_runner.model_config,
-            # OFTManager is only ever constructed when peft_method=="oft"
+            # OFTManager is only ever constructed when enable_oft is set
             # (peft/integration.py's maybe_init_peft_manager), and by
             # construction order (ModelRunner.initialize() runs
             # maybe_init_peft_manager() before Scheduler ever calls
@@ -643,7 +643,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         Real-config checks, mirroring dsa_dual_graph's own real-config-check
         model in __init__:
-          1. OFT is actually enabled (--peft-method oft).
+          1. OFT is actually enabled (--enable-oft).
           2. --enable-dp-attention is NOT set. _compute_moe_multi_tenant_
              slot_ids (oft_manager.py) all-gathers MoE tokens across DP
              ranks, which this per-rank persistent buffer's sizing does not
@@ -691,7 +691,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
              fast-path-safe" carve-out unreachable. See that function's
              docstring for the full history.
         """
-        if server_args.peft_method != "oft":
+        if not server_args.enable_oft:
             return False
         if server_args.enable_dp_attention:
             return False

@@ -161,6 +161,8 @@ from sglang.srt.managers.io_struct import (
     LoadOFTAdapterFromDistributedReqOutput,
     LoadOFTAdapterFromTensorsReqInput,
     LoadOFTAdapterFromTensorsReqOutput,
+    LoadOFTAdapterReqInput,
+    LoadOFTAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -454,7 +456,7 @@ class Scheduler(
         self.max_loras_per_batch = server_args.max_loras_per_batch
         # OFT adapters are admitted on the same schedule-time contract as LoRA
         # above; the check itself lives behind the peft facade.
-        self.enable_oft = server_args.peft_method == "oft"
+        self.enable_oft = server_args.enable_oft
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
@@ -1662,6 +1664,7 @@ class Scheduler(
                     self.load_lora_adapter_from_distributed,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                (LoadOFTAdapterReqInput, self.load_oft_adapter),
                 (
                     LoadOFTAdapterFromTensorsReqInput,
                     self.load_oft_adapter_from_tensors,
@@ -4997,6 +5000,14 @@ class Scheduler(
         """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
+        return result
+
+    def load_oft_adapter(
+        self, recv_req: LoadOFTAdapterReqInput
+    ) -> LoadOFTAdapterReqOutput:
+        """In-place loading a new OFT adapter from disk or huggingface."""
+
+        result = self.tp_worker.load_oft_adapter(recv_req)
         return result
 
     def load_oft_adapter_from_tensors(

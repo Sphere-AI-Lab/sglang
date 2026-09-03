@@ -135,6 +135,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadOFTAdapterFromDistributedReqInput,
     LoadOFTAdapterFromTensorsReqInput,
+    LoadOFTAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
@@ -1705,6 +1706,17 @@ async def unload_lora_adapter(
 ):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/load_oft_adapter", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def load_oft_adapter(
+    obj: Annotated[LoadOFTAdapterReqInput, Body()], request: Request
+):
+    """Load a new OFT adapter without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_oft_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 

@@ -29,6 +29,7 @@ from sglang.srt.oft.base.manager import AdapterManager
 from sglang.srt.oft.backend.base_backend import BaseOFTBackend
 from sglang.srt.oft.backend.oft_registry import get_backend_from_name
 from sglang.srt.oft.layers import BaseLayerWithOFT, get_oft_layer
+from sglang.srt.oft.oft import OFTAdapter
 from sglang.srt.oft.oft_config import OFTConfig
 from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.oft.mem_pool import (
@@ -44,6 +45,7 @@ from sglang.srt.oft.utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_available_gpu_memory
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 if TYPE_CHECKING:
@@ -389,6 +391,63 @@ class OFTManager(AdapterManager):
 
     def _unload_streamed_adapter(self, ref):
         return self.unload_streamed_adapter(ref)
+
+    def load_oft_adapter(self, oft_ref: OFTRef) -> "OFTUpdateOutput":
+        """Load a new OFT adapter from disk or huggingface. Mirrors
+        LoRAManager.load_lora_adapter exactly."""
+        logger.info(
+            f"OFT adapter loading starts: {oft_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
+        )
+        result = self._load_oft_adapter(oft_ref)
+        logger.info(
+            f"OFT adapter loading completes: {oft_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
+        )
+        return result
+
+    def _load_oft_adapter(self, oft_ref: OFTRef) -> "OFTUpdateOutput":
+        """Load a single OFT adapter from the specified path. Mirrors
+        LoRAManager._load_lora_adapter exactly."""
+        assert (
+            oft_ref.adapter_name is not None and oft_ref.adapter_path is not None
+        ), "OFTRef must have both adapter_name and adapter_path set for loading."
+        assert oft_ref.adapter_id not in self.adapters, (
+            f"OFT adapter with ID {oft_ref.adapter_id} is already loaded. This "
+            "should have been verified before request is sent to the backend."
+        )
+
+        try:
+            new_config = self._build_config(oft_ref.adapter_path)
+            self.validate_new_adapter(new_config, oft_ref)
+            self.configs[oft_ref.adapter_id] = new_config
+
+            self.load_oft_weights(oft_ref)
+
+            self.refs[oft_ref.adapter_id] = oft_ref
+            self.num_pinned += int(oft_ref.pinned)
+        except Exception as e:
+            return self.create_oft_update_result(success=False, error_message=str(e))
+
+        return self.create_oft_update_result(success=True)
+
+    def load_oft_weights(self, oft_ref: OFTRef):
+        """Load the weights of an OFT adapter to CPU memory. Mirrors
+        LoRAManager.load_lora_weights exactly -- the adapter is only
+        materialized here (self.adapters); prepare_oft_batch's existing
+        lazy-admission path installs it into a GPU buffer slot the next
+        time a request actually names this adapter, the same way it already
+        does for tensor/distributed-streamed adapters."""
+        oft_adapter = OFTAdapter(
+            oft_ref.adapter_id,
+            self.configs[oft_ref.adapter_id],
+            self.base_hf_config,
+            self.load_config,
+            self.oft_backend,
+        )
+        oft_adapter.initialize_weights()
+
+        self.adapters[oft_ref.adapter_id] = oft_adapter
 
     def validate_new_adapter(self, oft_config: OFTConfig, oft_ref: OFTRef):
         """

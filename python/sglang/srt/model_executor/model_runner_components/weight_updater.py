@@ -516,8 +516,8 @@ class WeightUpdater:
             if result is peft.NOT_HANDLED:
                 return (
                     False,
-                    f"peft activate_adapter not handled (peft_method="
-                    f"{model_runner.server_args.peft_method}).",
+                    f"peft activate_adapter not handled (enable_oft="
+                    f"{model_runner.server_args.enable_oft}).",
                 )
             return True, "Succeeded to activate adapter version."
         except Exception as e:

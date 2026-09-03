@@ -22,12 +22,12 @@ concurrently resident (Task 6's removal of the single-active restriction).
 
 HISTORY: this file's docstring used to document three known bugs against the
 native RPC path (a dict/list mismatch in OFTManager.load_adapter_from_tensors,
-a missing release counterpart for peft_registry.acquire_with_version that made
+a missing release counterpart for oft_registry.acquire_with_version that made
 unload_oft_adapter hang forever after any generate() call, and
 OFTMemoryPool's eviction-free hard-fail once its buffer pool filled). All
 three were fixed and reviewed earlier in this branch's history: the dict/list
 normalization landed in OFTManager.load_adapter_from_tensors,
-peft_tokenizer_hooks.finalize_peft_lease now releases every request's
+OFTTokenizerMixin.finalize_oft_lease now releases every request's
 adapter lease on every terminal path, and allocate_buffer_slot_with_eviction
 added LRU eviction to the native admission path. Per that last fix, tests
 below now call engine.unload_oft_adapter() after generate() (see
@@ -60,7 +60,7 @@ MAX_NEW_TOKENS = 16
 # exercise their limits without booting an oversized pool.
 ENGINE_KWARGS = dict(
     model_path=MODEL_PATH,
-    peft_method="oft",
+    enable_oft=True,
     oft_impl="sibling",
     max_oft_block_size=BLOCK_SIZE,
     oft_target_modules=[TARGET_MODULE],
@@ -151,10 +151,10 @@ class TestOFTLoadFromTensor(CustomTestCase):
             "(random-but-nonzero OFT rotation weights should perturb decoding)",
         )
 
-        # Regression guard: this used to hang forever (peft_registry.
+        # Regression guard: this used to hang forever (oft_registry.
         # wait_for_unload never returned) after any generate() call named
         # this adapter, because nothing released the request's adapter
-        # lease. peft_tokenizer_hooks.finalize_peft_lease now releases it on
+        # lease. OFTTokenizerMixin.finalize_oft_lease now releases it on
         # every terminal request path, so this must now complete promptly.
         unload_result = self.engine.unload_oft_adapter(name)
         self.assertTrue(
@@ -243,7 +243,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
                 f"failed: {result.error_message}",
             )
 
-            all_adapters = engine.tokenizer_manager.peft_registry.get_all_adapters()
+            all_adapters = engine.tokenizer_manager.oft_registry.get_all_adapters()
             self.assertEqual(
                 list(all_adapters.keys()),
                 [name],
@@ -414,7 +414,7 @@ class TestOFTLoadFromTensor(CustomTestCase):
         )
         print(f"[Test]Overflow load correctly rejected: {overflow_result.error_message}")
 
-        all_adapters = engine.tokenizer_manager.peft_registry.get_all_adapters()
+        all_adapters = engine.tokenizer_manager.oft_registry.get_all_adapters()
         self.assertNotIn(
             overflow_name,
             all_adapters,

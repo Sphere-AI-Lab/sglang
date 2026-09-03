@@ -453,7 +453,7 @@ class StagedOFTManager(OFTManager):
 
 
 class OFTStagingBackend:
-    """Tokenizer-layer staging for OFT, wrapping the existing peft_tokenizer_hooks
+    """Tokenizer-layer staging for OFT, wrapping the existing OFTTokenizerMixin
     registry logic rather than reimplementing it -- OFT's tokenizer-side
     registration/version-bump behavior does not change with this refactor,
     only how it's selected."""
@@ -462,30 +462,27 @@ class OFTStagingBackend:
         self._tm = tm
 
     async def reserve_stage(self, obj) -> None:
-        from sglang.srt.peft import tokenizer_hooks as peft_tokenizer_hooks
-
-        await peft_tokenizer_hooks.register_peft_ref(self._tm, obj)
+        await self._tm.register_oft_ref(obj)
 
     def prepare_activation(self, obj) -> None:
         # A real client's obj.adapter_id defaults to None -- it has no way to
         # know the server-minted id -- so this must resolve it here the same
-        # way register_peft_ref does (peft/tokenizer_hooks.py:109), or
+        # way register_oft_ref does (oft/tokenizer_mixin.py), or
         # StagedOFTManager.activate_adapter's `uid = adapter_id if adapter_id
         # is not None else name` falls back to obj.adapter_name, which never
         # matches the UUID stage_adapter recorded for this adapter. No
         # separate pre-activation validation exists beyond this identity
-        # resolution in the current peft_tokenizer_hooks flow.
-        if obj.adapter_name not in self._tm.peft_ref_cache:
+        # resolution in the current OFTTokenizerMixin flow.
+        if obj.adapter_name not in self._tm.oft_ref_cache:
             raise ValueError(
                 f"Cannot activate name={obj.adapter_name}; no OFT adapter "
                 "with that name is registered"
             )
-        obj.adapter_id = self._tm.peft_ref_cache[obj.adapter_name].adapter_id
+        obj.adapter_id = self._tm.oft_ref_cache[obj.adapter_name].adapter_id
 
     async def finish_activation(self, obj, results):
         from sglang.srt.managers.communicator import FanOutCommunicator
-        from sglang.srt.peft import tokenizer_hooks as peft_tokenizer_hooks
 
         success, message = FanOutCommunicator.merge_results(results)
-        message += await peft_tokenizer_hooks.bump_peft_version(self._tm, obj, success)
+        message += await self._tm.bump_oft_version(obj, success)
         return success, message

@@ -183,8 +183,7 @@ class StagedOFTTestHarness:
             str(base_gpu_id),
             "--tp-size",
             str(tp_size),
-            "--peft-method",
-            "oft",
+            "--enable-oft",
             "--oft-impl",
             "staged",
             # No --oft-dtype: defaults to the base model's dtype (bf16),
@@ -283,7 +282,7 @@ class StagedOFTTestHarness:
             # peft/tokenizer_hooks.py's _request_peft_path and
             # GenerateReqInput's adapter_path field; the value passed is the
             # adapter's NAME (the same name passed to stage()/activate()),
-            # not an on-disk path, since tm.peft_ref_cache is keyed by name).
+            # not an on-disk path, since tm.oft_ref_cache is keyed by name).
             payload["adapter_path"] = adapter
         body = self._post("/generate", payload).json()
         return body["output_ids"]

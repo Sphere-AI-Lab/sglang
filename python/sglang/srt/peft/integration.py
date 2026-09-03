@@ -54,11 +54,10 @@ def maybe_init_peft_manager(
     model_runner: "ModelRunner", server_args: "ServerArgs"
 ) -> None:
     """Single peft init seam ``model_runner.py`` calls: build the adapter
-    manager for the configured ``server_args.peft_method``. ``"oft"`` builds an
-    OFTManager on ``model_runner.oft_manager``. No-op when ``peft_method`` is
-    None.
+    manager when ``server_args.enable_oft`` is set, building an OFTManager on
+    ``model_runner.oft_manager``. No-op otherwise.
     """
-    if server_args.peft_method == "oft":
+    if server_args.enable_oft:
         _init_oft_manager(model_runner, server_args)
 
 
@@ -212,11 +211,10 @@ def activate_adapter(model_runner: "ModelRunner", adapter_name: str, version):
     """Double-buffer ACTIVATE flip: drain-then-copy staging->active on the
     resolved manager's memory pool. Unlike ``stage_adapter``, there is no
     ``load_format`` to dispatch on here, so this dispatches on
-    ``server_args.peft_method`` directly. Returns ``NOT_HANDLED`` when the
-    method isn't active.
+    ``server_args.enable_oft`` directly. Returns ``NOT_HANDLED`` when OFT
+    isn't active.
     """
-    peft_method = model_runner.server_args.peft_method
-    if peft_method == "oft":
+    if model_runner.server_args.enable_oft:
         return model_runner.oft_manager.activate_adapter(adapter_name, version)
 
     return NOT_HANDLED
@@ -224,7 +222,7 @@ def activate_adapter(model_runner: "ModelRunner", adapter_name: str, version):
 
 def maybe_dummy_ids(server_args: "ServerArgs", batch_size: int):
     """Returns ``[None] * batch_size`` if OFT is enabled, else ``None``."""
-    if server_args.peft_method == "oft":
+    if server_args.enable_oft:
         return [None] * batch_size
     return None
 
@@ -233,12 +231,10 @@ def maybe_prepare_peft_batch(
     model_runner: "ModelRunner", forward_batch: "ForwardBatch"
 ) -> None:
     """Unified peft batch-prep seam for the cuda-graph runners (decode capture +
-    the prefill compile pass). Dispatches on peft_method: OFT preps its
-    batch_info when the batch carries adapter_ids. No-op when peft_method is
-    None.
+    the prefill compile pass). Preps OFT's batch_info when the batch carries
+    adapter_ids. No-op when ``enable_oft`` is not set.
     """
-    method = model_runner.server_args.peft_method
-    if method == "oft":
+    if model_runner.server_args.enable_oft:
         if forward_batch.adapter_ids is not None:
             model_runner.oft_manager.prepare_oft_batch(forward_batch)
 
@@ -265,7 +261,7 @@ def maybe_init_cuda_graph_batch_info(
     model_runner: "ModelRunner", max_bs: int, num_tokens_per_bs: int
 ) -> None:
     """Body of the former inline OFT cuda-graph batch-info init in ``CudaGraphRunner``."""
-    if model_runner.server_args.peft_method == "oft":
+    if model_runner.server_args.enable_oft:
         model_runner.oft_manager.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs, num_tokens_per_bs=num_tokens_per_bs
         )
@@ -275,7 +271,7 @@ def maybe_prepare_replay_batch(
     model_runner: "ModelRunner", forward_batch: "ForwardBatch", bs: int, raw_bs: int
 ) -> None:
     """Body of the former inline OFT replay-batch prep in ``CudaGraphRunner``."""
-    if model_runner.server_args.peft_method == "oft" and forward_batch.adapter_ids is not None:
+    if model_runner.server_args.enable_oft and forward_batch.adapter_ids is not None:
         original_batch_size = forward_batch.batch_size
         original_oft_ids = forward_batch.adapter_ids
         forward_batch.batch_size = bs
@@ -287,6 +283,6 @@ def maybe_prepare_replay_batch(
 
 def maybe_apply_forward(model_runner: "ModelRunner", forward_batch: "ForwardBatch") -> None:
     """Body of the former inline OFT apply in ``ForwardBatch.init_new``."""
-    if model_runner.server_args.peft_method == "oft":
+    if model_runner.server_args.enable_oft:
         model_runner.oft_manager.fetch_new_ofts(set(forward_batch.adapter_ids))
         model_runner.oft_manager.prepare_oft_batch(forward_batch)

@@ -702,7 +702,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         attn_backend.init_forward_metadata(fb)
         # peft (OFT or single-active LoRA): set the adapter batch_info before the
         # compile/capture forward, mirroring decode_cuda_graph_runner and the
-        # normal forward (forward_batch_info.py). Self-guards on peft_method;
+        # normal forward (forward_batch_info.py). Self-guards on enable_oft;
         # without it FusedMoEWithLoRA._get_lora_info / the OFT triton backend read
         # an unset batch_info during the tc-piecewise compile pass. fb carries
         # dummy adapter_ids (base) from capture_prepare; load_batch re-preps OFT
@@ -1263,7 +1263,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # OFT: dummy adapter_ids so prepare_oft_batch binds the OFT batch_info
         # during the compile/capture pass (mirrors decode_cuda_graph_runner's
-        # maybe_dummy_ids). [None]*bs when peft_method=="oft" (-> base slot at
+        # maybe_dummy_ids). [None]*bs when enable_oft is set (-> base slot at
         # capture), else None. load_batch threads the real adapter_ids back in at
         # replay, flipping the single-active idx base->active.
         from sglang.srt.peft import integration as peft

@@ -91,6 +91,32 @@ class OFTAdapter(nn.Module):
         self.embedding_layers: Dict[str, torch.Tensor] = {}
         self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
 
+    def initialize_weights(self):
+        model_path = self.config.path
+        # An adapter's own weights always exist on disk, so they must never be
+        # loaded as "dummy". When the base model was booted with
+        # load_format="dummy" (e.g. perf/parity fixtures), that format leaks in
+        # via the shared load_config and DefaultModelLoader._prepare_weights
+        # hard-raises on DUMMY -- override it to AUTO for the adapter's real
+        # safetensors. No-op for real bases (already AUTO/safetensors). The same
+        # fix applies to any other adapter loader that shares load_config with a
+        # dummy-loaded base.
+        load_config = self.load_config
+        if load_config.load_format == LoadFormat.DUMMY:
+            load_config = dataclasses.replace(load_config, load_format=LoadFormat.AUTO)
+        loader = DefaultModelLoader(load_config)
+        revision = getattr(self.config.hf_config, "revision", None)
+
+        # Get normalized target modules for filtering
+        for name, loaded_weight in loader._get_weights_iterator(
+            DefaultModelLoader.Source(
+                model_path, revision=revision, fall_back_to_pt=True
+            )
+        ):
+            self._process_weight(name, loaded_weight)
+
+        self._normalize_weights()
+
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
         for name, tensor in tensors.items():
             self._process_weight(name, tensor)
@@ -150,4 +176,19 @@ class OFTAdapter(nn.Module):
         # Topology-aware normalization is done at load time inside OFTMemoryPool
         # / streamed_weight_loader, where the runtime R_buffer keys are known.
         return
+
+    def pin_weights_in_cpu(self):
+        for layer in self.layers:
+            for name, weight in layer.weights.items():
+                layer.weights[name] = weight.pin_memory()
+
+            for expert_id, expert_dict in layer.expert_weights.items():
+                for name, weight in expert_dict.items():
+                    expert_dict[name] = weight.pin_memory()
+
+        for name, weight in self.embedding_layers.items():
+            self.embedding_layers[name] = weight.pin_memory()
+
+        for name, weight in self.added_tokens_embeddings.items():
+            self.added_tokens_embeddings[name] = weight.pin_memory()
 

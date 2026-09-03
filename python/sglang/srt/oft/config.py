@@ -29,14 +29,14 @@ OFT_IMPL_CHOICES = ["sibling", "staged"]
 class OFTArgs:
     """OFT (Orthogonal Finetuning) server-arg fields, mixed into ServerArgs."""
 
-    # Single-active PEFT method: None (off) | "oft". This one field replaces
-    # the former enable_oft / enable_peft_lora boolean pair -- two bools could
-    # encode illegal states (both set) that the single-active invariant
-    # forbids. (Also used to be "lora", served by srt/peft/lora; that legacy
-    # path was deleted once srt/lora + StagedLoRAManager superseded it.)
-    peft_method: A[Optional[str], NS("lora")] = None
+    # Enable single-active OFT serving, mirroring --enable-lora exactly.
+    # (Used to be the string field peft_method: None | "oft" -- "oft" was its
+    # only valid value, so the string added nothing a plain bool doesn't;
+    # before that it also accepted "lora", served by the since-deleted
+    # srt/peft/lora, superseded by srt/lora + StagedLoRAManager.)
+    enable_oft: A[bool, NS("lora")] = False
 
-    # Shared single-active PEFT inputs (the active method is `peft_method`):
+    # Shared single-active OFT inputs (the active method is enable_oft):
     #   oft_target_modules  module allow-list; method-specific normalization
     #                       ("all"/embed/lm_head handling is OFT-only) in validate.
     oft_target_modules: A[Optional[Union[set[str], List[str]]], NS("lora")] = None
@@ -50,18 +50,13 @@ class OFTArgs:
     # fast-path kernels (`TritonOFTBackend.single_adapter_mode`); orbit's RL
     # launcher pins the value explicitly (2..4) and ignores this default.
     max_ofts_per_batch: A[int, NS("lora")] = 8
-    max_loaded_ofts: A[
-        Optional[int],
-        "If specified, limits the maximum number of OFT adapters loaded in "
-        "the tokenizer-side registry at a time (CPU-side bookkeeping — "
-        "independent of --max-ofts-per-batch's GPU-resident batch capacity). "
-        "Must be >= --max-ofts-per-batch - 1 (buffer slot 0 is always "
-        "reserved for the base/identity placeholder, so real per-batch "
-        "adapter capacity is --max-ofts-per-batch - 1).",
-        NS("lora"),
-    ] = None
+    # Help text lives on the manual parser.add_argument in register_oft_args
+    # below (like every other OFTArgs field) -- a bare-string Arg annotation
+    # here would make add_cli_args_from_dataclass auto-register this field
+    # too, conflicting with that manual registration.
+    max_loaded_ofts: A[Optional[int], NS("lora")] = None
     oft_backend: A[str, NS("lora")] = "triton"
-    # Which OFT implementation serves when peft_method == "oft". CUTOVER
+    # Which OFT implementation serves when enable_oft is set. CUTOVER
     # 2026-08-29: default is "sibling" = srt/oft (the srt/lora-shaped mirror),
     # after the equivalence gate passed bitwise on the full parity matrix.
     # "staged" = srt/oft's StagedOFTManager, an explicit stage/activate
@@ -89,23 +84,15 @@ class OFTArgs:
     # single-active sync (IPC/colocate), byte-identical to today.
     oft_double_buffer: A[bool, NS("lora")] = False
 
-    @property
-    def enable_peft(self) -> bool:
-        """True if the single-active peft method (OFT) is enabled."""
-        return self.peft_method is not None
-
 
 def register_oft_args(parser: argparse.ArgumentParser) -> None:
     """Register all OFT CLI flags on ``parser`` (was the OFT block of add_cli_args)."""
-    # Single-active PEFT method selector (replaces the former --enable-oft /
-    # --enable-peft-lora store_true pair).
     parser.add_argument(
-        "--peft-method",
-        type=str,
-        default=OFTArgs.peft_method,
-        choices=["oft"],
-        help="Single-active PEFT method: 'oft' (Orthogonal Finetuning). "
-        "Distinct from upstream --enable-lora (multi-tenant).",
+        "--enable-oft",
+        action="store_true",
+        default=OFTArgs.enable_oft,
+        help="Enable single-active OFT (Orthogonal Finetuning) serving. "
+        "Distinct from --enable-lora (multi-tenant).",
     )
     parser.add_argument(
         "--max-oft-block-size",
@@ -180,7 +167,7 @@ def register_oft_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default="sibling",
         choices=OFT_IMPL_CHOICES,
-        help="Which OFT implementation serves for peft_method='oft'. "
+        help="Which OFT implementation serves when --enable-oft is set. "
         "'sibling' = srt/oft (default since the 2026-08-29 cutover); "
         "'staged' = srt/oft's StagedOFTManager (explicit stage/activate "
         "transaction for async-RL weight sync).",
@@ -236,21 +223,14 @@ def _model_has_moe_layers(server_args) -> bool:
 
 def validate_oft_args(server_args) -> None:
     """Validate + normalize OFT server args in place (was check_oft_server_args)."""
-    if server_args.peft_method not in (None, "oft"):
-        raise ValueError(
-            f"--peft-method {server_args.peft_method!r} is no longer supported: "
-            "srt/peft/lora was deleted (superseded by srt/lora + "
-            "StagedLoRAManager; see --enable-lora for native multi-tenant "
-            "LoRA). Only None and 'oft' are valid for --peft-method."
-        )
     if getattr(server_args, "oft_impl", "sibling") not in OFT_IMPL_CHOICES:
         raise ValueError(
             f"Invalid --oft-impl {server_args.oft_impl!r}; choose from {OFT_IMPL_CHOICES}."
         )
-    if server_args.enable_lora and server_args.peft_method is not None:
+    if server_args.enable_lora and server_args.enable_oft:
         raise ValueError(
-            "--enable-lora and --peft-method are mutually exclusive: native "
-            "multi-tenant LoRA and single-active PEFT cannot be initialized together."
+            "--enable-lora and --enable-oft are mutually exclusive: native "
+            "multi-tenant LoRA and single-active OFT cannot be initialized together."
         )
 
     from sglang.srt.utils.common import SUPPORTED_OFT_TARGET_MODULES
@@ -276,7 +256,7 @@ def validate_oft_args(server_args) -> None:
             f"max_ofts_per_batch={server_args.max_ofts_per_batch}"
         )
 
-    if server_args.peft_method == "oft":
+    if server_args.enable_oft:
         assert server_args.oft_type in OFT_TYPE_CHOICES, (
             f"--oft-type must be one of {OFT_TYPE_CHOICES}, got "
             f"{server_args.oft_type!r}."
@@ -318,7 +298,7 @@ def validate_oft_args(server_args) -> None:
 
             if server_args.cuda_graph_config.prefill.backend != Backend.DISABLED:
                 logger.warning(
-                    "peft_method=oft is incompatible with prefill CUDA graphs "
+                    "enable_oft is incompatible with prefill CUDA graphs "
                     "(captured OFT batch metadata goes stale before replay -> "
                     "illegal memory access); disabling the prefill CUDA graph "
                     "(was backend=%s). Decode CUDA graphs stay enabled.",
@@ -440,7 +420,7 @@ def validate_oft_args(server_args) -> None:
                 and _model_has_moe_layers(server_args)
             ):
                 logger.warning(
-                    "peft_method=oft with oft_impl=sibling targeting MoE expert "
+                    "enable_oft with oft_impl=sibling targeting MoE expert "
                     "modules %s is incompatible with decode CUDA graphs "
                     "(effective per-batch adapter capacity %s%s, so the "
                     "dual-capture mechanism in docs/superpowers/plans/"

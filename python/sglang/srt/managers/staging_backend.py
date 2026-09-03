@@ -23,7 +23,7 @@ import importlib
 #
 # Keyed by the server_args enable-flag, not obj.load_format: native LoRA and
 # OFT are already mutually-exclusive server configurations (enable_lora vs.
-# peft_method=="oft"), so at most one flag below is ever true for a given
+# enable_oft), so at most one flag below is ever true for a given
 # server process -- checking obj.load_format on top of that would be
 # re-deriving information the server's own config already determines. Each
 # backend's reserve_stage still validates obj.load_format internally as a
