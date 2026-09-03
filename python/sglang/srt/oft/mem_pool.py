@@ -556,9 +556,9 @@ class OFTMemoryPool(AdapterMemPool):
     def _find_fused_moe_layers(self) -> Dict[int, torch.nn.Module]:
         """Layer-id-indexed FusedMoE modules found in the base model.
 
-        Mirrors ``AdapterManager._find_fused_moe_modules`` (base/manager.py);
+        Mirrors ``OFTManager._find_fused_moe_modules`` (oft_manager.py);
         duplicated here (not imported) because the pool only has
-        ``self.base_model`` to scan, not an ``AdapterManager`` instance.
+        ``self.base_model`` to scan, not an ``OFTManager`` instance.
         """
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 

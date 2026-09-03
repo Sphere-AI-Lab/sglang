@@ -209,7 +209,7 @@ class StagedOFTManager(OFTManager):
         """Raw checkpoint-name tensors -> (staged_dense, fused_expert_chunk,
         block_size), the per-uid analogue of ``OFTManager._stage_fill``
         (oft_manager.py:1412-1538, unedited -- still the hook for the
-        original single-slot ``AdapterManager.stage_adapter``). Reuses every
+        original single-slot ``OFTManager.stage_adapter``). Reuses every
         transformation primitive that method uses; only the final pool call
         differs (per-uid ``memory_pool.stage(uid, version, staged_dense)``
         here vs. the pool-wide ``memory_pool.stage(version, staged_dense)``

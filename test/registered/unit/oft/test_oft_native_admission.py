@@ -32,7 +32,6 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.lora.eviction_policy import get_eviction_policy
-from sglang.srt.oft.base.manager import AdapterManager
 from sglang.srt.oft.base.mem_pool import EMPTY_SLOT
 from sglang.srt.oft.mem_pool import OFTMemoryPool
 from sglang.srt.oft.oft_manager import OFTManager
@@ -639,7 +638,7 @@ class TestNumPinnedBookkeeping(unittest.TestCase):
     num_pinned in sync for pinned wire-loaded adapters -- previously
     register_streamed_adapter never touched it, silently under-counting
     num_pinned and making validate_new_adapter's anti-starvation guard and
-    validate_batch's mem_pool_vacancy arithmetic (base/manager.py) wrong once
+    validate_oft_batch's mem_pool_vacancy arithmetic (oft_manager.py) wrong once
     pinned OFT adapters became reachable over the wire."""
 
     def test_register_increments_num_pinned_for_pinned_ref(self):
@@ -765,7 +764,7 @@ class TestResolveCommitSplit(unittest.TestCase):
 
 
 def _make_admission_manager(max_adapters_per_batch):
-    """Stand-in wiring AdapterManager.validate_batch (oft/base/manager.py) to
+    """Stand-in wiring OFTManager.validate_oft_batch (oft/oft_manager.py) to
     a REAL AdapterMemPool-shaped memory pool -- so the admission-layer
     capacity check can be exercised against realistic pool bookkeeping.
     Boot-registers uid=None at buffer slot 0, mirroring
@@ -783,18 +782,18 @@ def _make_admission_manager(max_adapters_per_batch):
         oft_refs={},
         memory_pool=pool,
     )
-    mgr.validate_batch = MethodType(AdapterManager.validate_batch, mgr)
+    mgr.validate_oft_batch = MethodType(OFTManager.validate_oft_batch, mgr)
     return mgr
 
 
 class TestValidateBatchEnforcesRealAdapterCapacity(unittest.TestCase):
-    """Important finding (Task 4b re-review): AdapterManager.validate_batch
-    (oft/base/manager.py) validated batch size against the FULL
+    """Important finding (Task 4b re-review): OFTManager.validate_oft_batch
+    (oft/oft_manager.py) validated batch size against the FULL
     max_adapters_per_batch, not max_adapters_per_batch - 1 -- even though
     buffer slot 0 is now (Task 4b's Critical eviction fix) permanently
     reserved for the base/identity placeholder and genuinely unavailable to
     real adapters. A batch referencing max_adapters_per_batch distinct real
-    (non-None) adapters passed validate_batch (which thought there was
+    (non-None) adapters passed validate_oft_batch (which thought there was
     room) but then had no real slot to seat the last one into (no on-disk
     preload path exists anymore to lazily page it in from either) --
     reaching OFTMemoryPool.prepare_oft_batch's loud ValueError with no
@@ -808,19 +807,19 @@ class TestValidateBatchEnforcesRealAdapterCapacity(unittest.TestCase):
         # batch referencing 2 distinct real, unpinned adapters with no
         # base/None request mixed in. Must now be rejected at admission.
         mgr = _make_admission_manager(max_adapters_per_batch=2)
-        self.assertFalse(mgr.validate_batch({"A1", "A2"}))
+        self.assertFalse(mgr.validate_oft_batch({"A1", "A2"}))
 
     def test_single_real_adapter_at_capacity_two_is_admitted(self):
         # Sanity: the fix must not be over-broad -- a batch within the real
         # (max_adapters_per_batch - 1) bound is still admitted.
         mgr = _make_admission_manager(max_adapters_per_batch=2)
-        self.assertTrue(mgr.validate_batch({"A1"}))
+        self.assertTrue(mgr.validate_oft_batch({"A1"}))
 
     def test_none_in_batch_does_not_count_toward_real_capacity(self):
         # A base/no-adapter request mixed into the batch must not itself
         # consume a "real adapter" slot in the capacity arithmetic.
         mgr = _make_admission_manager(max_adapters_per_batch=2)
-        self.assertTrue(mgr.validate_batch({None, "A1"}))
+        self.assertTrue(mgr.validate_oft_batch({None, "A1"}))
 
     def test_capacity_one_rejects_any_real_adapter(self):
         # max_adapters_per_batch=1 has zero real slots (slot 0 is the only
@@ -828,8 +827,8 @@ class TestValidateBatchEnforcesRealAdapterCapacity(unittest.TestCase):
         # batch referencing a real adapter must be rejected, while an
         # all-base batch is still fine.
         mgr = _make_admission_manager(max_adapters_per_batch=1)
-        self.assertFalse(mgr.validate_batch({"A1"}))
-        self.assertTrue(mgr.validate_batch({None}))
+        self.assertFalse(mgr.validate_oft_batch({"A1"}))
+        self.assertTrue(mgr.validate_oft_batch({None}))
 
     def test_globally_pinned_adapter_outside_this_batch_still_consumes_real_capacity(
         self,
@@ -848,13 +847,13 @@ class TestValidateBatchEnforcesRealAdapterCapacity(unittest.TestCase):
             "unpinned_2": _make_ref("unpinned_2", pinned=False),
         }
         self.assertFalse(
-            mgr.validate_batch({"pinned_A", "unpinned_1", "unpinned_2"})
+            mgr.validate_oft_batch({"pinned_A", "unpinned_1", "unpinned_2"})
         )
 
 
 class TestFetchNewAdaptersAssertsRealAdapterCapacity(unittest.TestCase):
-    """fetch_new_adapters's assertion (oft/base/manager.py) had the same
-    off-by-one-real-slot gap as validate_batch above -- it must reject
+    """fetch_new_ofts's assertion (oft/oft_manager.py) had the same
+    off-by-one-real-slot gap as validate_oft_batch above -- it must reject
     before ever calling _prepare_mem_pool_batch, not merely raise later."""
 
     def _make_manager(self, max_adapters_per_batch):
@@ -862,23 +861,23 @@ class TestFetchNewAdaptersAssertsRealAdapterCapacity(unittest.TestCase):
             max_adapters_per_batch=max_adapters_per_batch,
             _prepare_mem_pool_batch=MagicMock(),
         )
-        mgr.fetch_new_adapters = MethodType(AdapterManager.fetch_new_adapters, mgr)
+        mgr.fetch_new_ofts = MethodType(OFTManager.fetch_new_ofts, mgr)
         return mgr
 
     def test_assertion_rejects_batch_exceeding_real_capacity(self):
         mgr = self._make_manager(max_adapters_per_batch=2)
         with self.assertRaises(AssertionError):
-            mgr.fetch_new_adapters({"A1", "A2"})
+            mgr.fetch_new_ofts({"A1", "A2"})
         mgr._prepare_mem_pool_batch.assert_not_called()
 
     def test_assertion_allows_batch_within_real_capacity(self):
         mgr = self._make_manager(max_adapters_per_batch=2)
-        mgr.fetch_new_adapters({"A1"})  # must not raise
+        mgr.fetch_new_ofts({"A1"})  # must not raise
         mgr._prepare_mem_pool_batch.assert_called_once_with({"A1"})
 
     def test_none_does_not_count_toward_the_assertion(self):
         mgr = self._make_manager(max_adapters_per_batch=2)
-        mgr.fetch_new_adapters({None, "A1"})  # must not raise
+        mgr.fetch_new_ofts({None, "A1"})  # must not raise
 
 
 class TestValidateNewAdapterPinnedBoundReservesRealSlotForUnpinned(unittest.TestCase):

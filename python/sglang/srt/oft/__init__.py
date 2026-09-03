@@ -34,8 +34,8 @@ these without a design decision:
     backend/{chunked,ascend}_backend.py,      upstream-specific backends/experiments with no
     marlin_lora_temp/, trtllm_lora_temp/      OFT counterpart planned.
 
-Transitional notes: base/ (AdapterManager and friends) has no upstream
-analogue and folds into this package later. OFT server flags live in
+Transitional notes: base/ (AdapterMemPool) has no upstream analogue and
+folds into this package later. OFT server flags live in
 ``sglang.srt.oft.config.OFTArgs``.
 
 Every caller imports submodules directly (``from sglang.srt.oft.oft_manager
