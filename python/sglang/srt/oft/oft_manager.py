@@ -613,15 +613,19 @@ class OFTManager(AdapterManager):
             # never-served adapters and find nothing tracked to select.
             self.memory_pool.eviction_policy.mark_used(ref.adapter_id)
 
-            success, error_message = _commit_streamed_oft_tensor_groups(
-                self,
-                named_tensors,
-                plan,
-                buffer_id,
-                block_size,
-                ref.adapter_name,
-                ref.adapter_id,
-            )
+            try:
+                success, error_message = _commit_streamed_oft_tensor_groups(
+                    self,
+                    named_tensors,
+                    plan,
+                    buffer_id,
+                    block_size,
+                    ref.adapter_name,
+                    ref.adapter_id,
+                )
+            except Exception as error:
+                success = False
+                error_message = str(error)
             if not success:
                 # Undo the registration/mark_used above: without this, refs/
                 # configs/uid_to_buffer_id would still list `ref` as valid

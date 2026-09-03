@@ -43,6 +43,7 @@ def _handler(*, max_loaded_ofts=None, preloaded=None, responses=None):
     handler.peft_update_lock = asyncio.Lock()
     handler.peft_registry = OFTRegistry()
     handler.peft_ref_cache = {}
+    handler.failed_oft_activations = {}
     preloaded = dict(preloaded or {})
     observed_payloads = []
 
@@ -103,8 +104,91 @@ def test_tensor_upsert_reuses_id_and_bumps_version():
     assert result.success
     updated = handler.peft_registry.get_all_adapters()["adapter"]
     assert request.adapter_id == existing.adapter_id
+    assert request.adapter_version == 5
     assert updated.adapter_id == existing.adapter_id
     assert updated.adapter_version == 5
+
+
+def test_tensor_upsert_stops_admission_and_waits_for_existing_lease():
+    async def scenario():
+        handler = _handler()
+        existing = OFTRef(
+            adapter_name="adapter",
+            adapter_path="__tensor__",
+            reloadable=False,
+            adapter_version=4,
+        )
+        await handler.peft_registry.register(existing)
+        handler.peft_ref_cache["adapter"] = existing
+        leased_id, leased_version = await handler.peft_registry.acquire_with_version(
+            "adapter"
+        )
+        communicator_started = asyncio.Event()
+
+        async def communicate(obj):
+            communicator_started.set()
+            return [OFTUpdateOutput(success=True)]
+
+        handler.update_oft_adapter_communicator = communicate
+        update = asyncio.create_task(
+            handler.load_oft_adapter_from_tensors(_tensor_request(upsert=True))
+        )
+
+        await asyncio.sleep(0)
+        assert not communicator_started.is_set()
+        try:
+            await handler.peft_registry.acquire_with_version("adapter")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("new requests were admitted during OFT upsert")
+
+        await handler.peft_registry.release(leased_id)
+        result = await update
+
+        assert result.success
+        assert communicator_started.is_set()
+        assert leased_version == 4
+        updated = handler.peft_registry.get_all_adapters()["adapter"]
+        assert updated.adapter_id == existing.adapter_id
+        assert updated.adapter_version == 5
+
+    asyncio.run(scenario())
+
+
+def test_distributed_partial_upsert_failure_quarantines_adapter():
+    async def scenario():
+        handler = _handler(
+            responses=[
+                OFTUpdateOutput(success=True),
+                OFTUpdateOutput(success=False, error_message="rank 1 failed"),
+            ]
+        )
+        existing = OFTRef(
+            adapter_name="adapter",
+            adapter_path="__distributed__",
+            reloadable=False,
+            adapter_version=4,
+        )
+        await handler.peft_registry.register(existing)
+        handler.peft_ref_cache["adapter"] = existing
+
+        result = await handler.load_oft_adapter_from_distributed(
+            _distributed_request(upsert=True)
+        )
+
+        assert not result.success
+        assert "rank 1 failed" in result.error_message
+        assert "adapter" not in handler.peft_registry.get_all_adapters()
+        assert "adapter" not in handler.peft_ref_cache
+
+        retry = await handler.load_oft_adapter_from_distributed(
+            _distributed_request(upsert=True)
+        )
+        assert not retry.success
+        assert "quarantined" in retry.error_message
+
+    asyncio.run(scenario())
 
 
 def test_tensor_load_reports_any_rank_failure_without_registering():
@@ -120,7 +204,8 @@ def test_tensor_load_reports_any_rank_failure_without_registering():
     )
 
     assert not result.success
-    assert result.error_message == "rank 1 failed"
+    assert "rank 1 failed" in result.error_message
+    assert "quarantined" in result.error_message
     assert handler.peft_registry.num_registered_ofts == 0
 
 

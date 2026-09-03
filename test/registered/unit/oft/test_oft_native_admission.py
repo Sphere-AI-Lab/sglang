@@ -154,6 +154,26 @@ class TestNativeAdmission(unittest.TestCase):
         self.assertNotIn(ref.adapter_id, manager.memory_pool.uid_to_buffer_id)
         self.assertNotIn(ref.adapter_id, manager.memory_pool.eviction_policy.access_order)
 
+    def test_commit_exception_removes_phantom_registration(self):
+        manager = _manager()
+        ref = _ref("new")
+
+        with patch(
+            "sglang.srt.oft.streamed_weight_loader._resolve_streamed_oft_tensor_groups",
+            return_value=(({}, {}, {}, []), ""),
+        ), patch(
+            "sglang.srt.oft.streamed_weight_loader._commit_streamed_oft_tensor_groups",
+            side_effect=RuntimeError("write exploded"),
+        ):
+            result = manager.load_adapter_from_tensors(ref, [], CONFIG)
+
+        self.assertFalse(result.success)
+        self.assertIn("write exploded", result.error_message)
+        self.assertNotIn(ref.adapter_id, manager.refs)
+        self.assertNotIn(ref.adapter_id, manager.configs)
+        self.assertNotIn(ref.adapter_id, manager.memory_pool.uid_to_buffer_id)
+        self.assertNotIn(ref.adapter_id, manager.memory_pool.eviction_policy.access_order)
+
     def test_wire_upsert_cannot_replace_disk_backed_adapter(self):
         manager = _manager()
         disk_ref = _ref("same", adapter_id="disk-id", reloadable=True)

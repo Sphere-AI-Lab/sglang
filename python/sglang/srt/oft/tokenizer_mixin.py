@@ -53,6 +53,67 @@ def _merge_oft_update_results(results: List[OFTUpdateOutput]) -> OFTUpdateOutput
 class OFTTokenizerMixin:
     """Mixin class for TokenizerManager to handle OFT adapter loading/unloading."""
 
+    def _ensure_oft_load_is_not_quarantined(
+        self: TokenizerManager, adapter_name: str
+    ) -> None:
+        failure = self.failed_oft_activations.get(adapter_name)
+        if failure is not None:
+            raise ValueError(
+                f"OFT adapter '{adapter_name}' is quarantined after an "
+                f"inconsistent update; restart required: {failure}"
+            )
+
+    async def _prepare_oft_wire_load(
+        self: TokenizerManager,
+        obj,
+        candidate: OFTRef,
+    ):
+        """Resolve identity and drain an existing adapter before an upsert."""
+        self._ensure_oft_load_is_not_quarantined(obj.adapter_name)
+        new_ref, reused = await self.peft_registry.resolve_or_reuse(
+            candidate,
+            upsert=obj.upsert,
+        )
+        if reused:
+            adapter_id = await self.peft_registry.unregister(obj.adapter_name)
+            self.peft_ref_cache.pop(obj.adapter_name, None)
+            await self.peft_registry.wait_for_unload(adapter_id)
+
+        obj.adapter_id = new_ref.adapter_id
+        obj.adapter_version = new_ref.adapter_version
+        return new_ref, reused
+
+    async def _finish_oft_wire_load(
+        self: TokenizerManager,
+        obj,
+        new_ref: OFTRef,
+        reused: bool,
+        results: List[OFTUpdateOutput],
+    ) -> OFTUpdateOutput:
+        """Publish unanimous success or quarantine a divergent/failed upsert."""
+        result = _merge_oft_update_results(results)
+        if result.success:
+            await self.peft_registry.register(new_ref)
+            self.peft_ref_cache[obj.adapter_name] = new_ref
+            return result
+
+        partial_failure = any(item.success for item in results) and any(
+            not item.success for item in results
+        )
+        if reused or partial_failure:
+            failure = (
+                f"OFT adapter '{obj.adapter_name}' is quarantined because its "
+                "update did not succeed consistently on every worker; restart required"
+            )
+            self.failed_oft_activations[obj.adapter_name] = failure
+            self.peft_ref_cache.pop(obj.adapter_name, None)
+            return OFTUpdateOutput(
+                success=False,
+                error_message=f"{result.error_message} | {failure}",
+                loaded_adapters=result.loaded_adapters,
+            )
+        return result
+
     async def _enforce_oft_registry_limit(
         self: TokenizerManager,
         result: OFTUpdateOutput,
@@ -158,26 +219,23 @@ class OFTTokenizerMixin:
             )
 
             async with self.peft_update_lock:
-                new_ref, reused = await self.peft_registry.resolve_or_reuse(
+                new_ref, reused = await self._prepare_oft_wire_load(
+                    obj,
                     OFTRef(
                         adapter_name=obj.adapter_name,
                         adapter_path="__tensor__",
                         pinned=obj.pinned,
                         reloadable=False,
                     ),
-                    upsert=obj.upsert,
                 )
-                obj.adapter_id = new_ref.adapter_id
-                result = _merge_oft_update_results(
-                    await self.update_oft_adapter_communicator(obj)
+                result = await self._finish_oft_wire_load(
+                    obj,
+                    new_ref,
+                    reused,
+                    await self.update_oft_adapter_communicator(obj),
                 )
 
                 if result.success:
-                    if reused:
-                        await self.peft_registry.refresh(new_ref)
-                    else:
-                        await self.peft_registry.register(new_ref)
-                    self.peft_ref_cache[obj.adapter_name] = new_ref
                     await self._enforce_oft_registry_limit(result)
 
                 return result
@@ -206,26 +264,23 @@ class OFTTokenizerMixin:
             )
 
             async with self.peft_update_lock:
-                new_ref, reused = await self.peft_registry.resolve_or_reuse(
+                new_ref, reused = await self._prepare_oft_wire_load(
+                    obj,
                     OFTRef(
                         adapter_name=obj.adapter_name,
                         adapter_path="__distributed__",
                         pinned=obj.pinned,
                         reloadable=False,
                     ),
-                    upsert=obj.upsert,
                 )
-                obj.adapter_id = new_ref.adapter_id
-                result = _merge_oft_update_results(
-                    await self.update_oft_adapter_communicator(obj)
+                result = await self._finish_oft_wire_load(
+                    obj,
+                    new_ref,
+                    reused,
+                    await self.update_oft_adapter_communicator(obj),
                 )
 
                 if result.success:
-                    if reused:
-                        await self.peft_registry.refresh(new_ref)
-                    else:
-                        await self.peft_registry.register(new_ref)
-                    self.peft_ref_cache[obj.adapter_name] = new_ref
                     await self._enforce_oft_registry_limit(result)
 
                 return result

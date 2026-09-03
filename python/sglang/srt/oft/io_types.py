@@ -67,6 +67,7 @@ class LoadOFTAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
     pinned: bool = False
     adapter_id: Optional[str] = None
+    adapter_version: int = 1
     load_format: Optional[str] = None
     # If already loaded, refresh weights in place instead of failing.
     upsert: bool = False
@@ -77,6 +78,7 @@ class LoadOFTAdapterFromTensorsReqInput(BaseReq, kw_only=True):
             adapter_name=self.adapter_name,
             adapter_path="__tensor__",
             pinned=self.pinned,
+            adapter_version=self.adapter_version,
             reloadable=False,
         )
 
@@ -90,6 +92,7 @@ class LoadOFTAdapterFromDistributedReqInput(BaseReq, kw_only=True):
     group_name: str = "weight_update_group"
     pinned: bool = False
     adapter_id: Optional[str] = None
+    adapter_version: int = 1
     # If already loaded, refresh weights in place instead of failing.
     upsert: bool = False
 
@@ -99,6 +102,7 @@ class LoadOFTAdapterFromDistributedReqInput(BaseReq, kw_only=True):
             adapter_name=self.adapter_name,
             adapter_path="__distributed__",
             pinned=self.pinned,
+            adapter_version=self.adapter_version,
             reloadable=False,
         )
 
