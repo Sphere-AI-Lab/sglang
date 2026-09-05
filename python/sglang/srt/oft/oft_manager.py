@@ -875,15 +875,24 @@ class OFTManager:
             # never-served adapters and find nothing tracked to select.
             self.memory_pool.eviction_policy.mark_used(ref.oft_id)
 
-            success, error_message = _commit_streamed_oft_tensor_groups(
-                self,
-                named_tensors,
-                plan,
-                buffer_id,
-                block_size,
-                ref.oft_name,
-                ref.oft_id,
-            )
+            try:
+                success, error_message = _commit_streamed_oft_tensor_groups(
+                    self,
+                    named_tensors,
+                    plan,
+                    buffer_id,
+                    block_size,
+                    ref.oft_name,
+                    ref.oft_id,
+                )
+            except Exception as commit_exc:
+                # An exception here must be treated exactly like a (False, msg)
+                # return -- otherwise it skips the cleanup below entirely,
+                # leaving oft_refs/configs/uid_to_buffer_id pointing at `ref`
+                # as valid and resident with a buffer whose contents are now
+                # partially written or undefined.
+                success = False
+                error_message = str(commit_exc)
             if not success:
                 # Undo the registration/mark_used above: without this, refs/
                 # configs/uid_to_buffer_id would still list `ref` as valid

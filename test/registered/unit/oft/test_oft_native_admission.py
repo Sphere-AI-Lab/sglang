@@ -466,6 +466,34 @@ class TestValidateBeforeEvict(unittest.TestCase):
             new_ref.oft_id, mgr.memory_pool.eviction_policy.access_order
         )
 
+    def test_commit_exception_does_not_leave_phantom_resident_ref(self):
+        """A commit that RAISES (vs. returning (False, msg)) must be treated
+        identically to a returned failure. Before this fix, an exception
+        propagated straight past the `if not success` cleanup block to the
+        outer except-clause, which never called unload_streamed_adapter --
+        leaving oft_refs/configs/uid_to_buffer_id pointing at a "resident"
+        adapter whose buffer contents are undefined."""
+        mgr = _make_manager(max_ofts_per_batch=2)
+        new_ref = _make_ref("new_adapter")
+        with patch(
+            "sglang.srt.oft.streamed_weight_loader._resolve_streamed_oft_tensor_groups",
+            return_value=(("fused", {}, {}, []), ""),
+        ), patch(
+            "sglang.srt.oft.streamed_weight_loader._commit_streamed_oft_tensor_groups",
+            side_effect=RuntimeError("OOM during Cayley precompute"),
+        ):
+            result = mgr.load_adapter_from_tensors(new_ref, [], CONFIG_DICT)
+
+        self.assertFalse(result.success)
+        self.assertIn("OOM during Cayley precompute", result.error_message)
+        self.assertNotIn(new_ref.oft_id, mgr.oft_refs)
+        self.assertNotIn(new_ref.oft_id, mgr.configs)
+        self.assertNotIn(new_ref.oft_id, mgr.memory_pool.uid_to_buffer_id)
+        self.assertEqual(mgr.memory_pool.buffer_id_to_uid[0], EMPTY_SLOT)
+        self.assertNotIn(
+            new_ref.oft_id, mgr.memory_pool.eviction_policy.access_order
+        )
+
 
 class TestEvictionPreservesDiskBackedAdapter(unittest.TestCase):
     """C1 fix #2: once fix #1 excludes wire-loaded (non-reloadable)
