@@ -1060,8 +1060,10 @@ class OFTMemoryPool:
         """
 
         # Prefer exact fused runtime leaves first, so ``gate_up_proj`` does not
-        # get interpreted as the split ``up_proj`` leaf.
-        for target in self.R_buffer:
+        # get interpreted as the split ``up_proj`` leaf. Longer (more
+        # qualified) names are checked first so "indexer.wq_b" wins over a
+        # shorter bare name like "wq_b" that also substring-matches it.
+        for target in sorted(self.R_buffer, key=len, reverse=True):
             if _contains_leaf(name, target):
                 return target, None, 1
 
@@ -1072,7 +1074,7 @@ class OFTMemoryPool:
                 if _contains_leaf(name, split_leaf):
                     return fused_target, index, len(split_leaves)
 
-        for target in self.target_modules:
+        for target in sorted(self.target_modules, key=len, reverse=True):
             if _contains_leaf(name, target):
                 return target, None, 1
 

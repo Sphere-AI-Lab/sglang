@@ -90,6 +90,14 @@ def _intermediate_for_layer(config: AutoConfig, layer_idx: int) -> int:
     return config.intermediate_size
 
 
+# DSA indexer projections are qualified with their parent module name because
+# the bare leaf names collide with unrelated modules in other models (e.g.
+# DeepSeek-V4 attention's own "wq_b").
+DSA_INDEXER_OFT_NAMES = frozenset(
+    {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
+)
+
+
 def get_hidden_dim(
     module_name: str,
     config: AutoConfig,
@@ -147,6 +155,21 @@ def get_hidden_dim(
                 return config.hidden_size, q_lora_rank + kv_lora_rank + qk_rope
             # o_proj differs from non-MLA: input dim is num_heads * v_head_dim.
             return num_heads * v_head, config.hidden_size
+        if module_name in DSA_INDEXER_OFT_NAMES:
+            from sglang.srt.configs.model_config import (
+                get_dsa_index_head_dim,
+                get_dsa_index_n_heads,
+            )
+
+            if module_name == "indexer.wq_b":
+                return (
+                    config.q_lora_rank,
+                    get_dsa_index_n_heads(config) * get_dsa_index_head_dim(config),
+                )
+            elif module_name == "indexer.wk":
+                return config.hidden_size, get_dsa_index_head_dim(config)
+            else:  # indexer.weights_proj
+                return config.hidden_size, get_dsa_index_n_heads(config)
         if module_name == "qkv_proj":
             return config.hidden_size, head_dim * (
                 config.num_attention_heads + config.num_key_value_heads * 2
@@ -212,10 +235,22 @@ def get_normalized_target_modules(
         "lm_head": "lm_head",
         "output": "lm_head",
         "unembed_tokens": "lm_head",
+        # DSA indexer wk / weights_proj don't collide with any other OFT
+        # target, so the bare leaf name can map straight to the qualified
+        # form. wq_b is deliberately NOT mapped here: unlike LoRA, OFT
+        # already uses bare "wq_b" for DeepSeek V4 attention's own query
+        # projection, so the indexer's query projection must be requested
+        # via the fully qualified "indexer.wq_b" (passed through as-is
+        # below, never stripped to its bare leaf name).
+        "wk": "indexer.wk",
+        "weights_proj": "indexer.weights_proj",
     }
 
     result = set()
     for name in target_modules:
+        if name in DSA_INDEXER_OFT_NAMES:
+            result.add(name)
+            continue
         base_name = name.split(".")[-1]
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
@@ -228,8 +263,12 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
     If there is a target module name in target_modules that can match full_module_name, return this name.
     Else raise ValueError.
+
+    Longer (more qualified) candidates are checked first so a qualified name
+    like "indexer.wq_b" wins over a shorter bare name like "wq_b" that also
+    happens to substring-match the same full_module_name.
     """
-    for target_module in target_modules:
+    for target_module in sorted(target_modules, key=len, reverse=True):
         if target_module in full_module_name:
             return target_module
     raise ValueError(

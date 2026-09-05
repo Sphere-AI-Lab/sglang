@@ -39,6 +39,7 @@ from sglang.srt.oft.mem_pool import (
     _fill_expert_oft_identity,
 )
 from sglang.srt.oft.utils import (
+    DSA_INDEXER_OFT_NAMES,
     generate_sequence_lengths,
     get_hf_config_attr,
     get_normalized_target_modules,
@@ -1484,6 +1485,26 @@ class OFTManager:
                 # Otherwise, infer target_modules from adapter configs.
                 self.target_modules.update(adapter_target_modules)
 
+        # dsa_indexer.Indexer (DeepSeek V2/V3) supports a fused Q/K mode that
+        # folds wk + weights_proj into wk_weights_proj, so the modules OFT
+        # wraps are absent and an indexer-targeted adapter is silently
+        # dropped. dsv4's C4Indexer (DeepSeek V4) has no such mode, so this
+        # only fires when a real fused-capable Indexer is present.
+        indexer_targets = self.target_modules & DSA_INDEXER_OFT_NAMES
+        if indexer_targets:
+            from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+
+            fused_indexer = next(
+                (m for m in self.base_model.modules() if isinstance(m, Indexer)),
+                None,
+            )
+            if fused_indexer is not None and fused_indexer.use_dsa_indexer_fusion:
+                raise ValueError(
+                    f"OFT targets the DSA indexer ({sorted(indexer_targets)}), which is "
+                    "incompatible with DSA indexer Q/K fusion. Set "
+                    "SGLANG_DISABLE_DSA_INDEXER_FUSION=1 to disable fusion and use indexer OFT."
+                )
+
         if max_oft_block_size is not None:
             self.max_oft_block_size = validate_oft_block_size(max_oft_block_size)
         else:
@@ -1650,11 +1671,20 @@ class OFTManager:
         skipped_by_policy = []
         skipped_without_layer_id = []
         for module_name, module in self.base_model.named_modules():
-            module_suffix = module_name.split(".")[-1]
+            module_name_parts = module_name.split(".")
+            module_suffix = module_name_parts[-1]
+            # DSA indexer targets (e.g. "indexer.wq_b") are qualified with
+            # their parent name to disambiguate from unrelated bare-name
+            # modules elsewhere (e.g. DeepSeek V4 attention's own "wq_b").
+            module_qualified_suffix = ".".join(module_name_parts[-2:])
+            is_targeted = (
+                module_suffix in self.target_modules
+                or module_qualified_suffix in self.target_modules
+            )
             if getattr(
                 self.base_model, "should_apply_oft", None
             ) and not self.base_model.should_apply_oft(module_name):
-                if module_suffix in self.target_modules:
+                if is_targeted:
                     skipped_by_policy.append(module_name)
                 continue
 
@@ -1679,7 +1709,7 @@ class OFTManager:
                     continue
 
             # The module should be converted if it is included in target_names
-            if module_suffix in self.target_modules:
+            if is_targeted:
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     skipped_without_layer_id.append(module_name)
