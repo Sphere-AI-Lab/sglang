@@ -98,8 +98,9 @@ class OFTAdapter(nn.Module):
         # load_format="dummy" (e.g. perf/parity fixtures), that format leaks in
         # via the shared load_config and DefaultModelLoader._prepare_weights
         # hard-raises on DUMMY -- override it to AUTO for the adapter's real
-        # safetensors. No-op for real bases (already AUTO/safetensors). Mirrors
-        # the equivalent fix in the native LoRA loader.
+        # safetensors. No-op for real bases (already AUTO/safetensors). The same
+        # fix applies to any other adapter loader that shares load_config with a
+        # dummy-loaded base.
         load_config = self.load_config
         if load_config.load_format == LoadFormat.DUMMY:
             load_config = dataclasses.replace(load_config, load_format=LoadFormat.AUTO)
@@ -190,3 +191,4 @@ class OFTAdapter(nn.Module):
 
         for name, weight in self.added_tokens_embeddings.items():
             self.added_tokens_embeddings[name] = weight.pin_memory()
+

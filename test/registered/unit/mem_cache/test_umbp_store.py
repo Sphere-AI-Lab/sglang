@@ -11,16 +11,11 @@ from types import ModuleType, SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
+import mori.umbp  # noqa: F401
+
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=30, suite="stage-a-test-1-gpu-small-amd")
-
-try:
-    import mori.umbp  # noqa: F401
-
-    HAS_MORI = True
-except ImportError:
-    HAS_MORI = False
 
 
 @dataclass
@@ -123,7 +118,6 @@ def make_indices(indices):
     return indices
 
 
-@unittest.skipUnless(HAS_MORI, "mori.umbp not available (AMD/ROCm only)")
 class TestUMBPStore(unittest.TestCase):
     def test_basic_set_get(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
@@ -318,7 +312,6 @@ class TestUMBPStore(unittest.TestCase):
             store.clear()
 
 
-@unittest.skipUnless(HAS_MORI, "mori.umbp not available (AMD/ROCm only)")
 class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
     @staticmethod
     def _make_v2_store():

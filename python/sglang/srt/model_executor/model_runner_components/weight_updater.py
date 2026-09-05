@@ -7,12 +7,11 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.adapter_sync.utils import reconstruct_adapter_staging
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.oft import integration as oft
+from sglang.srt.oft import integration as oft_integration
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -386,27 +385,30 @@ class WeightUpdater:
         payload_metadata: Optional[dict] = None,
         double_buffer: bool = True,
     ):
-        """Receive and stage a native LoRA or canonical OFT payload."""
-        model_runner = self.get_model_runner()
-        use_native_lora = (
-            model_runner.server_args.enable_lora_staging
-            and load_format == "lora_adapter"
-        )
-        use_oft = (
-            getattr(model_runner.server_args, "peft_method", None) == "oft"
-            and load_format == "oft_adapter"
-        )
-        if not (use_native_lora or use_oft):
-            return False, (
-                "adapter staging requires native LoRA staging with "
-                "load_format=lora_adapter or canonical OFT with "
-                "load_format=oft_adapter"
-            )
+        """NCCL-receive a staged adapter payload and route it to its manager.
+
+        Three mutually-exclusive routes, matching the server's active adapter
+        config exactly (native LoRA staging / OFT staged / OFT sibling native-
+        RPC); an unmatched ``load_format`` (e.g. plain non-staged LoRA, which
+        loads adapters through load_lora_adapter_from_distributed instead)
+        falls through to the final "not handled" return. The version arrives
+        as a string and is converted to int at this boundary.
+
+        The OFT sibling route rejects ``double_buffer=False``: with DB-off
+        sizing the pool inherits ``OFTMemoryPool``'s base defaults
+        (active_idx=0, staging_idx=1) -- the base-identity placeholder boots
+        into slot 0 (==active_idx), and ``stage()`` correctly fills slot 1
+        (==staging_idx, the adapter's own gather slot), but ``activate()``
+        unconditionally copies every group's staging_idx->active_idx
+        (slot1->slot0) -- CLOBBERING the base-identity slot with adapter data
+        instead of updating the adapter in place (the runtime already reads
+        the adapter's weights straight from slot 1; there is no correct use
+        for copying into slot 0). The in-place-distributed
+        (``double_buffer=False``) OFT sibling path is not implemented."""
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
         )
-
         try:
             tensors = []
             handles = []
@@ -427,9 +429,13 @@ class WeightUpdater:
             for handle in handles:
                 handle.wait()
 
-            if use_native_lora:
+            model_runner = self.get_model_runner()
+            if (
+                getattr(model_runner.server_args, "enable_lora_staging", False)
+                and load_format == "lora_adapter"
+            ):
                 if payload_metadata is not None:
-                    tensors = reconstruct_adapter_staging(tensors, payload_metadata)
+                    tensors = oft_integration.reconstruct_oft_staging(tensors, payload_metadata)
                 result = model_runner.lora_manager.stage_adapter(
                     tensors,
                     adapter_config,
@@ -441,61 +447,102 @@ class WeightUpdater:
                     return False, result.error_message
                 return True, "Succeeded to stage adapter online."
 
-            result = oft.stage_adapter(
-                model_runner,
-                load_format,
-                tensors,
-                adapter_config,
-                adapter_name,
-                adapter_id=adapter_id if adapter_id is not None else adapter_name,
-                version=int(adapter_version),
-                payload_metadata=payload_metadata,
-                double_buffer=double_buffer,
-            )
-            if result is oft.NOT_HANDLED:
-                return False, f"adapter stage not handled for {load_format=}"
-            if not result.success:
-                return False, result.error_message
-            return True, "Succeeded to stage adapter online."
-        except Exception as error:
-            error_message = f"Failed to stage adapter online: {error}."
-            logger.error(error_message)
-            return False, error_message
+            if (
+                model_runner.server_args.oft_impl == "staged"
+                and load_format == "oft_adapter"
+            ):
+                if payload_metadata is not None:
+                    tensors = oft_integration.reconstruct_oft_staging(tensors, payload_metadata)
+                result = model_runner.oft_manager.stage_adapter(
+                    tensors,
+                    adapter_config,
+                    adapter_name,
+                    int(adapter_version),
+                    oft_id=adapter_id,
+                )
+                if not result.success:
+                    return False, result.error_message
+                return True, "Succeeded to stage adapter online."
+
+            if model_runner.server_args.oft_impl == "sibling" and load_format == "oft_adapter":
+                if not double_buffer:
+                    raise ValueError(
+                        "distributed non-double-buffer OFT adapter sync via "
+                        "stage/activate is not supported; enable "
+                        "--adapter-double-buffer (double-buffer) or use the "
+                        "IPC/colocate weight-sync."
+                    )
+                if payload_metadata is not None:
+                    tensors = oft_integration.reconstruct_oft_staging(tensors, payload_metadata)
+                result = model_runner.oft_manager.stage_adapter(
+                    tensors,
+                    adapter_config,
+                    adapter_name,
+                    int(adapter_version),
+                    # Single-active convention: the tokenizer-registered adapter_id
+                    # (== adapter_name == "orbit_oft"); fall back to adapter_name when
+                    # the tokenizer supplied none.
+                    oft_id=adapter_id if adapter_id is not None else adapter_name,
+                )
+                if not result.success:
+                    return False, result.error_message
+                return True, "Succeeded to stage adapter online."
+
+            return False, f"stage_adapter not handled for load_format={load_format}."
+        except Exception as e:
+            error_msg = f"Failed to stage adapter online: {e}."
+            logger.error(error_msg)
+            return False, error_msg
 
     def activate_adapter_version(
         self: WeightUpdater, *, adapter_name, adapter_id, adapter_version
     ):
-        """Activate the exact native LoRA or canonical OFT version."""
-        model_runner = self.get_model_runner()
-        use_native_lora = model_runner.server_args.enable_lora_staging
-        use_oft = getattr(model_runner.server_args, "peft_method", None) == "oft"
-        if not (use_native_lora or use_oft):
-            return False, (
-                "adapter activation requires native LoRA staging or canonical OFT"
-            )
+        """Activate a staged adapter through native LoRA staging, OFT staged,
+        or OFT sibling native-RPC -- matching ``stage_adapter``'s three routes.
+
+        The caller's tokenizer writer lock guarantees the running batch is
+        drained. Manager results are normalized to the scheduler's ``(bool, str)``
+        boundary.
+        """
         try:
-            if use_native_lora:
+            model_runner = self.get_model_runner()
+            if getattr(model_runner.server_args, "enable_lora_staging", False):
                 result = model_runner.lora_manager.activate_adapter(
                     adapter_name,
                     int(adapter_version),
                     adapter_id=adapter_id,
                 )
-            else:
-                result = oft.activate_adapter(
-                    model_runner,
+                if not result.success:
+                    return False, result.error_message
+                return True, "Succeeded to activate adapter version."
+
+            if model_runner.server_args.oft_impl == "staged":
+                result = model_runner.oft_manager.activate_adapter(
                     adapter_name,
                     int(adapter_version),
-                    adapter_id=adapter_id,
+                    oft_id=adapter_id,
                 )
-                if result is oft.NOT_HANDLED:
-                    return False, "canonical OFT activation is not enabled"
-            if not result.success:
-                return False, result.error_message
-            return True, "Succeeded to activate adapter version."
-        except Exception as error:
-            error_message = f"Failed to activate adapter version: {error}."
-            logger.error(error_message)
-            return False, error_message
+                if not result.success:
+                    return False, result.error_message
+                return True, "Succeeded to activate adapter version."
+
+            if model_runner.server_args.enable_oft:
+                result = model_runner.oft_manager.activate_adapter(
+                    adapter_name, int(adapter_version)
+                )
+                if not result.success:
+                    return False, result.error_message
+                return True, "Succeeded to activate adapter version."
+
+            return (
+                False,
+                f"activate_adapter not handled (enable_oft="
+                f"{model_runner.server_args.enable_oft}).",
+            )
+        except Exception as e:
+            error_msg = f"Failed to activate adapter version: {e}."
+            logger.error(error_msg)
+            return False, error_msg
 
     def update_weights_from_tensor(
         self: WeightUpdater,
@@ -518,10 +565,24 @@ class WeightUpdater:
             )
 
         if load_format == "oft_adapter":
+            # The old srt/peft streamed-loader mechanism (maybe_load_adapter_
+            # format -> load_streamed_oft_adapter) that used to handle this
+            # load_format here has been retired in favor of the native OFT
+            # adapter RPC. Reject explicitly and gracefully -- there is no
+            # try/except anywhere in the scheduler's request-dispatch path
+            # (unlike update_weights_from_distributed's equivalent call),
+            # so letting this fall through to the generic
+            # `else: raise NotImplementedError(...)` below would propagate
+            # uncaught, hit run_scheduler_process's outer `except Exception`,
+            # and SIGQUIT-kill the entire engine process -- the same failure
+            # mode this plan already found and fixed once for
+            # _ensure_streaming_oft_adapter_slot's ValueError.
             return (
                 False,
-                "load_format='oft_adapter' is no longer supported; use the native "
-                "OFT adapter RPC instead.",
+                "load_format='oft_adapter' is a permanently retired legacy "
+                "format, not a transient error -- please migrate the caller "
+                "to the native OFT adapter RPC (load_oft_adapter_from_tensors/"
+                "_from_distributed) instead.",
             )
 
         # We need to get device after patch otherwise the device would be wrong

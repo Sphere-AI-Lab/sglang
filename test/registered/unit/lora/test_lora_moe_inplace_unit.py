@@ -35,7 +35,7 @@ import torch
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
 
-def _make_base_layer(quant_method=None) -> torch.nn.Module:
+def _make_base_layer(quant_method=None) -> types.SimpleNamespace:
     """The attribute surface FusedMoEWithLoRA.__init__ reads off its base FusedMoE."""
     config = MoeRunnerConfig(
         num_experts=8,
@@ -56,8 +56,7 @@ def _make_base_layer(quant_method=None) -> torch.nn.Module:
         # getters auto-mock.
         quant_method = mock.MagicMock()
         quant_method.runner = None
-    base_layer = torch.nn.Module()
-    for name, value in dict(
+    return types.SimpleNamespace(
         quant_method=quant_method,
         moe_runner_config=config,
         dispatcher=None,
@@ -66,9 +65,7 @@ def _make_base_layer(quant_method=None) -> torch.nn.Module:
         moe_tp_size=1,
         moe_tp_rank=0,
         intermediate_size_per_partition=32,
-    ).items():
-        setattr(base_layer, name, value)
-    return base_layer
+    )
 
 
 class FusedMoEWithLoRAInplaceTest(unittest.TestCase):

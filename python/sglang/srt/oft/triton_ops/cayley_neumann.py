@@ -6,7 +6,7 @@ Single-program-per-block approach: each triton program handles one
 (block_size x block_size) block entirely in registers, fusing all
 matrix multiplications and accumulations.
 
-For small blocks (fp16: <= 128, fp32: <= 32), uses triton kernels (3-4x fwd, 14-25x bwd).
+For small blocks (fp16: <= 128, fp32: <= 32), uses a triton kernel (3-4x faster).
 For larger blocks, falls back to torch (register pressure makes triton slower).
 
 Hardcoded for NUM_TERMS=5 (the standard OFT configuration).
@@ -19,23 +19,6 @@ import triton.language as tl
 from sglang.srt.oft.torch_ops.oft_ops import cayley_neumann as _torch_cayley_neumann
 
 NUM_TERMS = 5  # R = I + 2Q + 2Q² + 2Q³ + Q⁴
-# fp32 needs 2x registers per element, so lower threshold
-_TRITON_MAX_BLOCK_SIZE_FP32 = 32
-_TRITON_MAX_BLOCK_SIZE_FP16 = 128
-
-
-def _torch_cayley_neumann_bwd(
-    grad_R: torch.Tensor, Q_skew: torch.Tensor
-) -> torch.Tensor:
-    """Differentiate the five-term Neumann polynomial with Torch matmuls."""
-    q_t = Q_skew.transpose(-1, -2)
-    g_prev = grad_R
-    acc = grad_R
-    for _ in range(3):
-        g_k = (2.0 * grad_R + g_prev @ q_t).to(grad_R.dtype)
-        g_prev = g_k
-        acc = (g_k + q_t @ acc).to(grad_R.dtype)
-    return acc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,71 +62,8 @@ def _cayley_fwd_kernel(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Backward kernel
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# R = I + 2P₁ + 2P₂ + 2P₃ + P₄   where Pₖ = Pₖ₋₁ @ Q, P₀ = I
-#
-# Adjoint recurrence (backward through the polynomial):
-#   G₄ = grad_R                          (coeff of P₄ is 1)
-#   Gₖ = cₖ·grad_R + Gₖ₊₁ @ Qᵀ         for k = 3,2,1  (cₖ = 2)
-#
-# Gradient via Horner's method:
-#   grad_Q = G₁ + Qᵀ(G₂ + Qᵀ(G₃ + Qᵀ·G₄))
-#
-# Single backward sweep, O(n) matmuls:
-#   acc = G₄;  G_prev = G₄
-#   for k = n-1 down to 1:
-#     Gₖ = 2·grad_R + G_prev @ Qᵀ
-#     acc = Gₖ + Qᵀ @ acc
-#     G_prev = Gₖ
-#   grad_Q = acc
-
-@triton.jit
-def _cayley_bwd_kernel(
-    grad_R_ptr, Q_ptr, grad_Q_ptr,
-    stride_b, stride_r, stride_c,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Compute grad_Q for one block. Grid: (num_blocks,)"""
-    bid = tl.program_id(0)
-    rows = tl.arange(0, BLOCK_SIZE)
-    cols = tl.arange(0, BLOCK_SIZE)
-
-    Q_base = Q_ptr + bid * stride_b
-    Q = tl.load(Q_base + rows[:, None] * stride_r + cols[None, :] * stride_c)
-    gR_base = grad_R_ptr + bid * stride_b
-    gR = tl.load(gR_base + rows[:, None] * stride_r + cols[None, :] * stride_c)
-
-    Q_T = tl.trans(Q)
-    # G_prev = G₄ = grad_R;  acc = G₄ (Horner innermost)
-    G_prev = gR
-    acc = gR
-
-    # Sweep k = 3, 2, 1 (3 iterations for NUM_TERMS=5)
-    for _ in range(3):
-        # Gₖ = 2·grad_R + G_prev @ Qᵀ  (cast to input dtype for next dot)
-        G_k = (2.0 * gR + tl.dot(G_prev, Q_T, input_precision="ieee")).to(gR.dtype)
-        G_prev = G_k
-
-        # Horner: acc = Gₖ + Qᵀ @ acc
-        acc = (G_k + tl.dot(Q_T, acc, input_precision="ieee")).to(gR.dtype)
-
-    # Store grad_Q
-    gQ_base = grad_Q_ptr + bid * stride_b
-    tl.store(
-        gQ_base + rows[:, None] * stride_r + cols[None, :] * stride_c,
-        acc.to(gR.dtype),
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Python launchers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def cayley_neumann_fwd(Q_skew: torch.Tensor, num_terms: int = 5) -> torch.Tensor:
-    """Triton Cayley-Neumann forward (block_size must be <= _TRITON_MAX_BLOCK_SIZE)."""
+    """Triton Cayley-Neumann forward (block_size must be <= 128 for fp16, <= 32 for fp32)."""
     assert num_terms == NUM_TERMS, f"Only num_terms={NUM_TERMS} supported, got {num_terms}"
     num_blocks, block_size, _ = Q_skew.shape
     if block_size < 16:
@@ -155,59 +75,3 @@ def cayley_neumann_fwd(Q_skew: torch.Tensor, num_terms: int = 5) -> torch.Tensor
         BLOCK_SIZE=block_size,
     )
     return R
-
-
-def cayley_neumann_bwd(
-    grad_R: torch.Tensor,
-    Q_skew: torch.Tensor,
-    num_terms: int = 5,
-) -> torch.Tensor:
-    """Triton Cayley-Neumann backward (block_size must be <= _TRITON_MAX_BLOCK_SIZE)."""
-    assert num_terms == NUM_TERMS, f"Only num_terms={NUM_TERMS} supported, got {num_terms}"
-    num_blocks, block_size, _ = Q_skew.shape
-    if block_size < 16:
-        return _torch_cayley_neumann_bwd(grad_R, Q_skew)
-    grad_Q = torch.empty_like(Q_skew)
-    _cayley_bwd_kernel[(num_blocks,)](
-        grad_R, Q_skew, grad_Q,
-        Q_skew.stride(0), Q_skew.stride(1), Q_skew.stride(2),
-        BLOCK_SIZE=block_size,
-        num_warps=4 if block_size <= 32 else 8,
-        num_stages=1,
-    )
-    return grad_Q
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Autograd Function
-# ─────────────────────────────────────────────────────────────────────────────
-
-class CayleyNeumannFunction(torch.autograd.Function):
-    """Autograd wrapper for triton Cayley-Neumann transform."""
-
-    @staticmethod
-    def forward(ctx, Q_skew, num_terms):
-        ctx.save_for_backward(Q_skew)
-        ctx.num_terms = num_terms
-        return cayley_neumann_fwd(Q_skew, num_terms)
-
-    @staticmethod
-    def backward(ctx, grad_R):
-        Q_skew, = ctx.saved_tensors
-        grad_Q = cayley_neumann_bwd(grad_R.contiguous(), Q_skew, ctx.num_terms)
-        return grad_Q, None
-
-
-def cayley_neumann(Q_skew: torch.Tensor, num_terms: int = 5) -> torch.Tensor:
-    """Functional API: triton Cayley-Neumann with autograd support.
-
-    Uses triton for small blocks (fp16: <= 64, fp32: <= 32).
-    Falls back to torch for larger blocks (register pressure makes triton slower).
-    """
-    block_size = Q_skew.shape[-1]
-    if block_size < 16:
-        return _torch_cayley_neumann(Q_skew, num_terms)
-    max_bs = _TRITON_MAX_BLOCK_SIZE_FP32 if Q_skew.dtype == torch.float32 else _TRITON_MAX_BLOCK_SIZE_FP16
-    if block_size > max_bs:
-        return _torch_cayley_neumann(Q_skew, num_terms)
-    return CayleyNeumannFunction.apply(Q_skew, num_terms)

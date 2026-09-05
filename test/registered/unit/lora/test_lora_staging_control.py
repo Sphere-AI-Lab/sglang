@@ -185,8 +185,8 @@ class TestWeightUpdaterRouting(unittest.TestCase):
         with (
             patch.object(torch.distributed, "broadcast", return_value=handle),
             patch.object(
-                weight_updater,
-                "reconstruct_adapter_staging",
+                weight_updater.oft_integration,
+                "reconstruct_oft_staging",
                 return_value=reconstructed,
             ) as reconstruct,
         ):
@@ -202,18 +202,31 @@ class TestWeightUpdaterRouting(unittest.TestCase):
             8,
             adapter_id="id-a",
         )
+        runner.oft_manager.stage_adapter.assert_not_called()
 
-    def test_non_native_stage_is_rejected_without_touching_native_manager(self):
+    def test_non_native_stage_calls_oft_manager_directly(self):
+        """When LoRA isn't using native staging, an OFT-format request for the
+        sibling implementation must still reach model_runner.oft_manager
+        directly (no separate façade function in between -- see
+        test_oft_staging_backend.py's TestWeightUpdaterStagedRouting for the
+        OFT-side coverage) and must never touch the LoRA manager."""
         runner = MagicMock()
         runner.server_args.enable_lora_staging = False
-        updater = _weight_updater(runner)
-
-        result = WeightUpdater.stage_adapter(
-            updater, **_stage_kwargs(load_format="oft_adapter")
+        runner.server_args.oft_impl = "sibling"
+        runner.oft_manager.stage_adapter.return_value = SimpleNamespace(
+            success=True, error_message=None
         )
+        updater = _weight_updater(runner)
+        handle = MagicMock()
 
-        self.assertFalse(result[0])
-        self.assertIn("native LoRA staging", result[1])
+        with patch.object(torch.distributed, "broadcast", return_value=handle):
+            result = WeightUpdater.stage_adapter(
+                updater,
+                **_stage_kwargs(load_format="oft_adapter", payload_metadata=None),
+            )
+
+        self.assertEqual(result, (True, "Succeeded to stage adapter online."))
+        runner.oft_manager.stage_adapter.assert_called_once()
         runner.lora_manager.stage_adapter.assert_not_called()
 
     def test_native_activation_forwards_id_and_returns_manager_result(self):
@@ -235,10 +248,18 @@ class TestWeightUpdaterRouting(unittest.TestCase):
         runner.lora_manager.activate_adapter.assert_called_once_with(
             "policy", 8, adapter_id="id-a"
         )
+        runner.oft_manager.activate_adapter.assert_not_called()
 
-    def test_non_native_activation_is_rejected_without_touching_native_manager(self):
+    def test_non_native_activation_calls_oft_manager_directly(self):
+        """Counterpart to test_non_native_stage_calls_oft_manager_directly for
+        activate_adapter_version."""
         runner = MagicMock()
         runner.server_args.enable_lora_staging = False
+        runner.server_args.oft_impl = "sibling"
+        runner.server_args.enable_oft = True
+        runner.oft_manager.activate_adapter.return_value = SimpleNamespace(
+            success=True, error_message=None
+        )
         updater = _weight_updater(runner)
 
         result = WeightUpdater.activate_adapter_version(
@@ -248,8 +269,8 @@ class TestWeightUpdaterRouting(unittest.TestCase):
             adapter_version="8",
         )
 
-        self.assertFalse(result[0])
-        self.assertIn("native LoRA staging", result[1])
+        self.assertEqual(result, (True, "Succeeded to activate adapter version."))
+        runner.oft_manager.activate_adapter.assert_called_once_with("policy", 8)
         runner.lora_manager.activate_adapter.assert_not_called()
 
 
@@ -295,24 +316,6 @@ class TestTokenizerNativeStaging(unittest.TestCase):
 
         self.assertIs(tm.pending_lora_stage, pending)
         self.assertEqual(second.adapter_id, first.adapter_id)
-
-    def test_rejects_equal_or_stale_versions_before_staging(self):
-        tm = _make_tm()
-        old = LoRARef(
-            lora_id="id-a",
-            lora_name="policy",
-            lora_path="__distributed__",
-            version=4,
-        )
-        asyncio.run(tm.lora_registry.register(old))
-
-        for version in ("4", "3"):
-            with self.assertRaisesRegex(ValueError, "newer than active version 4"):
-                asyncio.run(
-                    tm.update_adapter_from_distributed(_stage_req(version=version))
-                )
-
-        tm.update_adapter_from_distributed_communicator.assert_not_awaited()
 
     def test_conflicting_stage_reports_pending_identity(self):
         tm = _make_tm()

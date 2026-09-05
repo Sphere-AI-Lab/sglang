@@ -86,58 +86,6 @@ def _fused_rotate_project_qkv_kernel(
 
 
 @triton.jit
-def _fused_rotate_project_gate_up_kernel(
-    x_ptr,
-    R_ptr,
-    W_ptr,
-    bias_ptr,
-    out_ptr,
-    slot_idx_ptr,
-    bsv_ptr,
-    M, K, sum_out,
-    blocks_per_slice,
-    S0: tl.constexpr, S1: tl.constexpr,
-    BS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    GROUP_N: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    TILE_K: tl.constexpr,
-):
-    """N=2 variant (gate/up)."""
-    pid_m = tl.program_id(0)
-    pid_slice = tl.program_id(1)
-    pid_n = tl.program_id(2)
-
-    O0: tl.constexpr = 0
-    O1: tl.constexpr = S0
-
-    if pid_slice == 0:
-        slice_offset = O0
-        slice_width = S0
-    else:
-        slice_offset = O1
-        slice_width = S1
-
-    n_group_start = pid_n * BLOCK_N * GROUP_N
-    if n_group_start >= slice_width:
-        return
-
-    NUM_SLICES: tl.constexpr = 2
-    slot = tl.load(slot_idx_ptr)
-    bsv = tl.load(bsv_ptr)
-    slot_R_offset = slot * NUM_SLICES * blocks_per_slice * BS * BS
-
-    _fused_rotate_project_inner(
-        x_ptr, R_ptr, W_ptr, bias_ptr, out_ptr,
-        pid_m, pid_slice, n_group_start, slice_offset, slice_width,
-        slot_R_offset, bsv,
-        M, K, sum_out, blocks_per_slice,
-        BS, BLOCK_M, BLOCK_N, GROUP_N, HAS_BIAS, TILE_K,
-    )
-
-
-@triton.jit
 def _fused_rotate_gate_up_inputs_kernel(
     x_ptr,                   # (M, K) bf16 input, row-major
     R_ptr,                   # (max_slots, 2 * blocks_per_slice, BS, BS) bf16
@@ -1032,63 +980,6 @@ def fused_rotate_project_qkv(
     return out
 
 
-def fused_rotate_project_gate_up(
-    x: torch.Tensor,
-    R: torch.Tensor,
-    W: torch.Tensor,
-    output_sizes: List[int],
-    bias: Optional[torch.Tensor] = None,
-    *,
-    slot_idx_t: Optional[torch.Tensor] = None,
-    bsv_t: Optional[torch.Tensor] = None,
-    force_tiled: bool = False,  # accepted and ignored: there is one path now
-    tile_k: Optional[int] = None,
-) -> torch.Tensor:
-    """Fused rotate-and-project for fused gate/up (N=2, equal output dims)."""
-    M, K, BS, blocks_per_slice = _validate_inputs(x, R, W, output_sizes, 2)
-    R, slot_idx_t, bsv_t = _ensure_4d_R_and_runtime_tensors(
-        R, slot_idx_t, bsv_t, BS, x.device
-    )
-    assert output_sizes[0] == output_sizes[1], (
-        f"gate/up must have equal output sizes; got {output_sizes}"
-    )
-    sum_out = int(sum(output_sizes))
-    S0, S1 = int(output_sizes[0]), int(output_sizes[1])
-
-    # When bias is None we pass x as a dummy pointer; HAS_BIAS=False makes the
-    # kernel never read from it. This avoids a torch.empty(0) alloc per call,
-    # which is harmless in eager but adds bookkeeping in CUDA graph capture.
-    bias_arg = bias if bias is not None else x
-    has_bias = bias is not None
-
-    out = torch.empty(M, sum_out, dtype=torch.bfloat16, device=x.device)
-
-    max_slice_width = max(S0, S1)
-    BLOCK_M, BLOCK_N, GROUP_N = _pick_tiles(M, max_slice_width)
-
-    tile_k_sel = _pick_tile_k(BS, BLOCK_M, BLOCK_N, GROUP_N,
-                              preferred=tile_k or OFT_TILE_K)
-
-    grid = (
-        triton.cdiv(M, BLOCK_M),
-        2,
-        triton.cdiv(max_slice_width, BLOCK_N * GROUP_N),
-    )
-
-    _fused_rotate_project_gate_up_kernel[grid](
-        x, R, W, bias_arg, out,
-        slot_idx_t, bsv_t,
-        M, K, sum_out,
-        blocks_per_slice,
-        S0, S1,
-        BS=BS,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, GROUP_N=GROUP_N,
-        HAS_BIAS=has_bias,
-        TILE_K=tile_k_sel,
-    )
-    return out
-
-
 if __name__ == "__main__":
     """Standalone benchmark vs realistic baselines.
 
@@ -1203,8 +1094,6 @@ if __name__ == "__main__":
     WRAPPERS = [
         ("QKV", {"K": 3584, "output_sizes": [448, 64, 64], "block_size": 32},
          fused_rotate_project_qkv),
-        ("FC1", {"K": 3584, "output_sizes": [2368, 2368], "block_size": 32},
-         fused_rotate_project_gate_up),
     ]
     BSV_REGIMES = [
         ("identity", 0),   # bsv=0 → skip rotation; captures the capture-time / KL forward case
@@ -1275,7 +1164,7 @@ if __name__ == "__main__":
     print("FC1 two-output rotate-input experiment")
     header2 = (
         f"{'M':>5} | {'mode':<8} | "
-        f"{'input2 us':>9} {'legacy us':>9} {'fullfused us':>12} "
+        f"{'input2 us':>9} {'legacy us':>9} "
         f"{'merged us':>9} | {'input2/legacy':>13} | parity"
     )
     print(header2)
@@ -1313,17 +1202,13 @@ if __name__ == "__main__":
                 x, R_4d, W, output_sizes, bias=None,
                 slot_t=slot_t, bsv_t=bsv_t,
             ))
-            full_fused_us = _time_us(lambda: fused_rotate_project_gate_up(
-                x, R_4d, W, output_sizes, bias=None,
-                slot_idx_t=slot_t, bsv_t=bsv_t,
-            ))
             merged_us = _time_us(lambda: _merged_weight_path(x, W, bias=None))
 
             verdict = "PASS" if parity_ok else f"FAIL({max_abs:.1e})"
             print(
                 f"{M:>5} | {bsv_label:<8} | "
                 f"{input2_us:>9.1f} {legacy_us:>9.1f} "
-                f"{full_fused_us:>12.1f} {merged_us:>9.1f} | "
+                f"{merged_us:>9.1f} | "
                 f"{legacy_us / input2_us:>12.2f}x | {verdict}"
             )
         print()

@@ -70,7 +70,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.oft import integration as oft
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -93,6 +92,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_dsa_variant,
     _set_capture_lora_variant,
+    _set_capture_oft_variant,
     model_capture_mode,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
@@ -283,6 +283,38 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.dsa_index_topk,
             )
 
+        # --- OFT MoE-expert dual-graph capture -------------------------
+        # OFT MoE-expert dual-graph capture: no-real-adapter (today's fast
+        # path) and any-real-adapter (per-token routing) variants, selected
+        # at replay by whether the batch has ANY real resident adapter (not
+        # "how many" -- see _resolve_record_oft_variant_graph's docstring
+        # for the threshold's real-config checks and why the boundary is
+        # zero-vs-any rather than one-vs-many). Opt-in: a server without
+        # OFT, or with no possible resident MoE-target adapter at all,
+        # captures only the fast-path variant it already did before this
+        # feature existed -- zero extra cost.
+        self.record_oft_variant_graph = self._resolve_record_oft_variant_graph(
+            model_runner.server_args,
+            model_runner.model_config,
+            # OFTManager is only ever constructed when enable_oft is set
+            # (oft/integration.py's maybe_init_oft_manager), and by
+            # construction order (ModelRunner.initialize() runs
+            # maybe_init_oft_manager() before Scheduler ever calls
+            # init_cuda_graphs()) it already exists and is fully
+            # initialized here whenever that is true -- so plain attribute
+            # access would work in production. getattr is used anyway
+            # because this attribute is genuinely, conditionally absent
+            # (not merely possibly-None) for every non-OFT server, and this
+            # runner has no other reason to import/require OFT internals.
+            oft_manager=getattr(model_runner, "oft_manager", None),
+        )
+        if self.record_oft_variant_graph:
+            logger.info(
+                "[dense-decode] OFT MoE-expert dual-graph enabled: capturing "
+                "no-real-adapter + any-real-adapter decode graphs; dispatch "
+                "on whether the batch has any real resident adapter."
+            )
+
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         # True if a DSACPLayerCommunicator-style prefill-CP flavor is active
@@ -394,9 +426,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 num_tokens_per_req=self.captured_req_width,
             )
 
-        oft.maybe_init_cuda_graph_batch_info(
-            self.model_runner, self.max_bs, self.captured_req_width
-        )
+        # OFT: init the cuda-graph batch_info (analog of the LoRA init above).
+        # No-op unless enable_oft. Gives OFT's prepare_oft_batch a
+        # cuda_graph_batch_info to bind during capture/replay.
+        if self.model_runner.server_args.enable_oft:
+            self.model_runner.oft_manager.init_cuda_graph_batch_info(
+                max_bs_in_cuda_graph=self.max_bs,
+                num_tokens_per_bs=self.captured_req_width,
+            )
 
         enable_mamba_track = (
             self.model_runner.server_args.enable_mamba_extra_buffer()
@@ -545,13 +582,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(
-        self, size, stream_idx=None, variant_label=None, dsa_variant=None
+        self,
+        size,
+        stream_idx=None,
+        variant_label=None,
+        dsa_variant=None,
+        oft_variant=None,
     ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
             dsa_variant=dsa_variant,
+            oft_variant=oft_variant,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -585,6 +628,122 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return "lora"
         return "nolora"
+
+    @staticmethod
+    def _resolve_record_oft_variant_graph(
+        server_args, model_config, oft_manager=None
+    ) -> bool:
+        """Whether this server needs OFT MoE-expert dual-graph capture: OFT
+        actually enabled, not under --enable-dp-attention, targeting MoE
+        expert modules with fully-bound multi-tenant buffers, and with
+        effective per-batch adapter capacity for at least one real resident
+        adapter.
+
+        Real-config checks, mirroring dsa_dual_graph's own real-config-check
+        model in __init__:
+          1. OFT is actually enabled (--enable-oft).
+          2. --enable-dp-attention is NOT set. _compute_moe_multi_tenant_
+             slot_ids (oft_manager.py) all-gathers MoE tokens across DP
+             ranks, which this per-rank persistent buffer's sizing does not
+             account for -- it raises RuntimeError under DP-attention
+             unconditionally, and capture-time forcing (see 3 below) would
+             trip that raise AT BOOT (capture), not runtime, the moment
+             dual-capture engaged (final whole-branch review's C1).
+             oft/config.py's validate_oft_args disables decode CUDA
+             graphs outright for this combination for the identical reason
+             -- dual-capture never engages here, and the single fast-path
+             graph alone is not safe for it either (unlike the
+             insufficient-capacity case below, a real adapter is not
+             guaranteed to stay off memory_pool.active_idx under DP
+             gathering).
+          3. It targets MoE expert modules AND has every multi-tenant
+             buffer view actually bound post-model-load -- preferred source
+             of truth: ``oft_manager.moe_expert_oft_multi_tenant_ready()``
+             (oft_manager.py), which is ground truth for both "does this
+             server actually have MoE-expert OFT buffers at all" (subsuming
+             oft/config.py's pre-model-load target-module-set +
+             HF-config-probe approximation, including the --peft-paths
+             -inferred target-modules case that approximation cannot see)
+             and "did a boot-loaded adapter leave any buffer's per-slot view
+             unbound" (final whole-branch review's I1: a boot-loaded
+             legacy-fused adapter, or -- independent of oft_type -- ANY
+             boot-loaded adapter targeting down_proj, leaves a gap that
+             oft_moe_runners.py's dispatch raises on the moment capture-time
+             forcing makes slot_ids non-None, i.e. at boot). Falls back to
+             re-deriving from server_args (reusing oft/config.py's own
+             shared constants, not a second hand-copied literal) only when
+             oft_manager is not available -- this cannot see the I1 gap
+             (no model is loaded yet at that point) or --peft-paths
+             -inferred target modules, but is otherwise this method's
+             pre-plan behavior.
+          4. Effective per-batch adapter capacity (max_ofts_per_batch - 1;
+             buffer slot 0 is always reserved for the base/identity
+             placeholder, see OFTMemoryPool) allows at least ONE real
+             resident adapter -- not ">1". _compute_moe_multi_tenant_
+             slot_ids (oft_manager.py) already takes the general per-token
+             path for EVERY batch with >=1 real adapter today, not just 2+:
+             in the plain native-RPC ("sibling") pool, slot 0 (memory_pool.
+             active_idx) is permanently reserved for the boot-time
+             base/identity registration, so a real adapter can never land
+             there, making the old "single real adapter at active_idx is
+             fast-path-safe" carve-out unreachable. See that function's
+             docstring for the full history.
+        """
+        if not server_args.enable_oft:
+            return False
+        if server_args.enable_dp_attention:
+            return False
+
+        if oft_manager is not None:
+            if not oft_manager.moe_expert_oft_multi_tenant_ready():
+                return False
+        else:
+            from sglang.srt.oft.config import (
+                _MOE_EXPERT_COUNT_CONFIG_ATTRS,
+                MOE_EXPERT_TARGET_MODULES,
+            )
+
+            oft_target_modules = set(server_args.oft_target_modules or ())
+            targets_moe_experts = bool(
+                MOE_EXPERT_TARGET_MODULES & oft_target_modules
+            )
+            model_has_moe_layers = any(
+                hasattr(model_config.hf_text_config, attr)
+                for attr in _MOE_EXPERT_COUNT_CONFIG_ATTRS
+            )
+            if not (targets_moe_experts and model_has_moe_layers):
+                return False
+
+        from sglang.srt.oft.config import effective_oft_capacity
+
+        return effective_oft_capacity(server_args) >= 1
+
+    def _resolve_oft_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
+        """Host dispatch: pick which pre-captured OFT MoE-expert decode graph
+        to replay, from the batch's real per-request adapter identity.
+
+        Mirrors _resolve_lora_variant's shape deliberately: reads
+        forward_batch.oft_ids directly rather than reaching into
+        OFTManager, matching how _resolve_lora_variant reads
+        forward_batch.lora_ids directly rather than reaching into
+        LoRAManager. Returns None when OFT dual-graph capture is not enabled
+        for this server (the common case: zero extra cost).
+
+        The "oft_multi"/"oft_single" boundary is ANY real adapter vs. ZERO
+        real adapters, not "many" vs. "one" (the labels are historical, kept
+        as literal values other code depends on -- see Task 1). This mirrors
+        _compute_moe_multi_tenant_slot_ids's actual current fast-path
+        condition (oft_manager.py): in the plain native-RPC ("sibling")
+        pool, buffer slot 0 (memory_pool.active_idx) is permanently reserved
+        for the boot-time base/identity registration, so a real adapter can
+        never land there -- meaning that function already takes the general
+        per-token path for ANY batch with a real adapter, not just 2+."""
+        if not getattr(self, "record_oft_variant_graph", False):
+            return None
+        if forward_batch.oft_ids is None:
+            return None
+        distinct_real = {uid for uid in forward_batch.oft_ids if uid is not None}
+        return "oft_multi" if len(distinct_real) >= 1 else "oft_single"
 
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
@@ -688,6 +847,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
+            oft_variant=self._resolve_oft_variant(forward_batch),
         )
 
         is_bs_supported = (
@@ -942,7 +1102,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             lora_ids = None
 
-        adapter_ids = oft.maybe_dummy_ids(self.model_runner.server_args, bs)
+        # OFT: dummy oft_ids so prepare_oft_batch runs during capture (mirrors the
+        # empty-lora_ids capture above); ForwardBatch carries oft_ids so the
+        # capture block below can prep the OFT batch_info.
+        if self.model_runner.server_args.enable_oft:
+            oft_ids = [None] * bs
+        else:
+            oft_ids = None
 
         # mamba state tracking (registry-owned when enabled)
         mamba_track_indices = (
@@ -989,7 +1155,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
-            adapter_ids=adapter_ids,
+            oft_ids=oft_ids,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
@@ -1105,6 +1271,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variants = (
             ["dense", "sparse"] if getattr(self, "dsa_dual_graph", False) else [None]
         )
+        # OFT MoE-expert dual-graph: capture a multi-slot (per-token routing)
+        # and a single-slot (today's fast path) variant, selected at replay by
+        # whether the batch has ANY real resident adapter (not "how many" --
+        # see _resolve_oft_variant's docstring for why the boundary is
+        # zero-vs-any rather than one-vs-many, despite the oft_single/
+        # oft_multi label names). getattr default: same reasoning as
+        # dsa_variants above -- subclasses that don't run
+        # DecodeCudaGraphRunner.__init__ never set record_oft_variant_graph.
+        oft_variants = (
+            [("oft_multi", True), ("oft_single", False)]
+            if getattr(self, "record_oft_variant_graph", False)
+            else [(None, None)]
+        )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1120,21 +1299,48 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for dsa_variant in dsa_variants:
                     _set_capture_dsa_variant(dsa_variant)
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        if dsa_variant is None:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label
+                    for oft_variant, _oft_variant_has_multi in oft_variants:
+                        _set_capture_oft_variant(oft_variant)
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.captured_req_width,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            # Subclasses like EAGLEDraftCudaGraphRunner reuse
+                            # this capture() but don't run
+                            # DecodeCudaGraphRunner.__init__ (so oft_variant
+                            # is always None for them) and override
+                            # capture_one_shape with a narrower signature
+                            # that has neither an oft_variant parameter nor
+                            # **kwargs. Only pass oft_variant when it is not
+                            # None (i.e. when record_oft_variant_graph is
+                            # actually enabled), so those overrides keep
+                            # receiving exactly the call they always did.
+                            oft_kwargs = (
+                                {"oft_variant": oft_variant}
+                                if oft_variant is not None
+                                else {}
                             )
-                        else:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label, dsa_variant
-                            )
+                            if dsa_variant is None:
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                    variant_label,
+                                    **oft_kwargs,
+                                )
+                            else:
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                    variant_label,
+                                    dsa_variant,
+                                    **oft_kwargs,
+                                )
         _set_capture_dsa_variant(None)
+        _set_capture_oft_variant(None)
 
     def capture_one_shape(
         self,
@@ -1143,6 +1349,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         dsa_variant: Optional[str] = None,
+        oft_variant: Optional[str] = None,
     ):
         num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
@@ -1166,7 +1373,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            oft.maybe_prepare_oft_batch(self.model_runner, forward_batch)
+            # Single-active OFT sets batch_info on the MoE wrappers' backends;
+            # mirror the normal-forward wiring (forward_batch_info.py) so
+            # CUDA-graph CAPTURE preps it too. Self-guards on enable_oft and,
+            # being single-active, does not depend on forward_batch.lora_ids.
+            # Without this, FusedMoEWithLoRA._get_lora_info reads an unset
+            # batch_info during capture.
+            if forward_batch.oft_ids is not None:
+                self.model_runner.oft_manager.prepare_oft_batch(forward_batch)
 
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
@@ -1234,6 +1448,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                     dsa_variant,
+                    oft_variant=oft_variant,
                 )
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
@@ -1259,6 +1474,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "The runtime hidden-state mode exceeds the fixed CUDA graph "
                 f"capture mode ({self.capture_hidden_mode.name})."
             )
+
+    def _prepare_oft_replay_batch(
+        self, forward_batch: ForwardBatch, bs: int, raw_bs: int
+    ) -> None:
+        """Re-prep the OFT batch_info for the real replay batch (padded bs,
+        the request's real oft_ids -- capture used dummy base ids).
+        No-op unless enable_oft. Mirrors v0.5.9 CudaGraphRunner.replay_prepare.
+
+        Unlike LoRA's lora_ids (restored generically by buffer_registry.
+        fill_from above), oft_ids isn't a registered buffer field, so
+        prepare_oft_batch needs the real padded batch_size/oft_ids
+        temporarily swapped in, then the originals restored.
+        """
+        if (
+            not self.model_runner.server_args.enable_oft
+            or forward_batch.oft_ids is None
+        ):
+            return
+        original_batch_size = forward_batch.batch_size
+        original_oft_ids = forward_batch.oft_ids
+        forward_batch.batch_size = bs
+        forward_batch.oft_ids = original_oft_ids + [None] * (bs - raw_bs)
+        self.model_runner.oft_manager.prepare_oft_batch(forward_batch)
+        forward_batch.batch_size = original_batch_size
+        forward_batch.oft_ids = original_oft_ids
 
     def load_batch(
         self,
@@ -1303,9 +1543,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             dsa_variant = self._resolve_dsa_variant(forward_batch)
+            oft_variant = self._resolve_oft_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label, dsa_variant
+                graph_size_key, stream_idx, variant_label, dsa_variant, oft_variant
             )
             return
 
@@ -1349,7 +1590,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        oft.maybe_prepare_replay_batch(self.model_runner, forward_batch, bs, raw_bs)
+        self._prepare_oft_replay_batch(forward_batch, bs, raw_bs)
 
         if (
             not is_ragged
@@ -1398,9 +1639,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         variant_label = self._resolve_lora_variant(forward_batch)
         dsa_variant = self._resolve_dsa_variant(forward_batch)
+        oft_variant = self._resolve_oft_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label, dsa_variant
+            graph_size_key, stream_idx, variant_label, dsa_variant, oft_variant
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:

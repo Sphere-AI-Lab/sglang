@@ -23,10 +23,23 @@ So although ``w13_oft_r`` / ``w2_oft_r`` are stored per-expert
 
 Because the rotation is a single shared ``R`` applied to the layer INPUT (outside
 the expert GEMM), it composes trivially with the native marlin kernel: rotate the
-UN-EXPANDED input by the request-segmented OFT backend, then run the native
-marlin GEMM in its proven shapes. Immutable request state selects the adapter
-slot for each request; an absent/None buffer falls through to the un-rotated
-GEMM for that stage.
+UN-EXPANDED input by ``R`` (``y = x @ R``, block-diagonal), then run the native
+marlin GEMM in its proven shapes.
+
+**Request-segmented (multi-tenant) rotation.** When the module's OFT buffers
+carry the memory pool's full multi-slot view (``peft_layer._oft_w13_oft_r_all_slots``
+/ ``_oft_w2_oft_r_all_slots``, shape ``(slot, expert, block, bs, bs)`` -- bound by
+``OFTManager`` whenever the buffer is pool-backed, i.e. the identity-boot +
+streamed-native-RPC path this fork's RL-serving use case actually exercises),
+each request's OWN adapter slot's R is applied to its own row segment via
+``oft_backend.run_grouped_oft_r_sgemm`` (the same seg_indptr-segmented mechanism
+the dense OFT layers already use) instead of one shared R for the whole batch.
+
+A disk-boot (``--peft-paths``) legacy adapter privately allocates ``w13_oft_r``/
+``w2_oft_r`` outside the pool (see ``OFTManager._apply_expert_oft_to_module``),
+so no multi-slot view exists for it -- ``_select_gate_up_oft_r``/``getattr(...,
+"w2_oft_r", None)`` fall back to today's exact single-shared-R-for-the-whole-
+batch behavior for that case, unchanged.
 """
 
 from __future__ import annotations
@@ -85,12 +98,54 @@ def _select_gate_up_oft_r(peft_layer):
     return w13
 
 
-def _shared_r_by_slot(oft_r: torch.Tensor, name: str) -> torch.Tensor:
-    """Return one shared rotation per adapter slot.
+def _select_gate_up_oft_r_all_slots(peft_layer):
+    """Multi-slot sibling of ``_select_gate_up_oft_r``: same split-rejection,
+    but returns the pool-backed ``(slot, expert, block, bs, bs)`` view (or
+    ``None`` when the buffer isn't pool-backed, e.g. a disk-boot adapter)."""
+    w1_all_slots = getattr(peft_layer, "_oft_w1_oft_r_all_slots", None)
+    w3_all_slots = getattr(peft_layer, "_oft_w3_oft_r_all_slots", None)
+    if w1_all_slots is not None or w3_all_slots is not None:
+        raise RuntimeError(
+            "canonical OFT split-expert rotations are not supported by the "
+            "Marlin MoE runner; use the triton MoE runner instead"
+        )
+    return getattr(peft_layer, "_oft_w13_oft_r_all_slots", None)
 
-    ``oft_r`` has shape ``[slot, expert, block, bs, bs]``. Legacy/shared-R
-    adapters must agree across experts independently within every slot. Retain
-    the slot dimension so request routing can still choose base, A, B, etc.
+
+def _shared_r(oft_r: torch.Tensor, name: str) -> torch.Tensor:
+    """Return the single shared rotation ``R`` (``(num_blocks, bs, bs)``) from a
+    per-expert OFT buffer ``(num_local, num_blocks, bs, bs)``.
+
+    The legacy/merged adapter fans ONE R across every expert, so all slots are
+    identical and slot 0 is representative. Verify that invariant so a genuinely
+    per-expert adapter reaching this path fails LOUD instead of silently using
+    expert 0's R for every token. The value check syncs (returns a Python bool),
+    so it is skipped under CUDA-graph capture -- it runs during eager warmup /
+    non-graph batches, which is enough to catch a mis-loaded adapter.
+    """
+    if oft_r.shape[0] > 1 and not (
+        oft_r.is_cuda and torch.cuda.is_current_stream_capturing()
+    ):
+        if not (
+            torch.equal(oft_r[0], oft_r[1]) and torch.equal(oft_r[0], oft_r[-1])
+        ):
+            raise RuntimeError(
+                f"{name} differs across experts, but the Marlin OFT path only "
+                f"supports the legacy merged SHARED-R adapter (one R fanned out "
+                f"identically across experts). A per-expert (canonical/split) "
+                f"adapter must use the triton MoE runner, not Marlin."
+            )
+    return oft_r[0]
+
+
+def _shared_r_by_slot(oft_r: torch.Tensor, name: str) -> torch.Tensor:
+    """Multi-slot sibling of ``_shared_r``: returns one shared rotation per
+    adapter slot from a ``(slot, expert, block, bs, bs)`` buffer.
+
+    Legacy/shared-R adapters must agree across experts independently WITHIN
+    every slot -- different slots (different loaded adapters) legitimately
+    hold different R, so the invariant check compares each slot only against
+    its own expert-0, not across slots.
     """
     if oft_r.shape[1] > 1 and not (
         oft_r.is_cuda and torch.cuda.is_current_stream_capturing()
@@ -107,12 +162,12 @@ def _shared_r_by_slot(oft_r: torch.Tensor, name: str) -> torch.Tensor:
 
 
 def _rotate_shared_by_request(
-    oft_backend, x: torch.Tensor, oft_r: torch.Tensor, n_groups: int = 1
+    oft_backend, x: torch.Tensor, oft_r_all_slots: torch.Tensor, n_groups: int = 1
 ) -> torch.Tensor:
-    shared_by_slot = _shared_r_by_slot(oft_r, "shared OFT rotation")
-    return oft_backend.run_grouped_oft_r_sgemm(
-        x, shared_by_slot, n_groups=n_groups
-    )
+    """Rotate each request's own row segment by its own adapter slot's shared
+    R, via the same seg_indptr-segmented sgemm the dense OFT layers use."""
+    shared_by_slot = _shared_r_by_slot(oft_r_all_slots, "shared OFT rotation")
+    return oft_backend.run_grouped_oft_r_sgemm(x, shared_by_slot, n_groups=n_groups)
 
 
 class MarlinOFTRunnerCore:
@@ -127,10 +182,10 @@ class MarlinOFTRunnerCore:
         quant_info: MarlinMoeQuantInfo,
         runner_config: MoeRunnerConfig,
         peft_layer,
-        oft_info,
     ) -> StandardCombineInput:
         from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+        from sglang.srt.oft.torch_ops.oft_ops import apply_block_diag_orth
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -231,15 +286,24 @@ class MarlinOFTRunnerCore:
         ) and (not is_mxfp4_marlin)
 
         # ---- Gate/Up (Marlin) with shared-R input rotation ----
-        # Rotate the UN-EXPANDED hidden_states by the layer's single shared gate-up
-        # R, then run the native fused_marlin_moe gate-up GEMM on the rotated input.
-        gate_up_oft_r = _select_gate_up_oft_r(oft_info)
-        if gate_up_oft_r is not None:
+        # Rotate the UN-EXPANDED hidden_states by the layer's gate-up R, then run
+        # the native fused_marlin_moe gate-up GEMM on the rotated input. Prefer
+        # the pool-backed multi-slot view (request-segmented, multi-tenant);
+        # fall back to today's single-shared-R-for-the-whole-batch behavior for
+        # a non-pool-backed (disk-boot) adapter.
+        gate_up_oft_r_all_slots = _select_gate_up_oft_r_all_slots(peft_layer)
+        if gate_up_oft_r_all_slots is not None:
             gate_up_input = _rotate_shared_by_request(
-                peft_layer.oft_backend, hidden_states, gate_up_oft_r, n_groups=1
+                peft_layer.oft_backend, hidden_states, gate_up_oft_r_all_slots, n_groups=1
             )
         else:
-            gate_up_input = hidden_states
+            gate_up_oft_r = _select_gate_up_oft_r(peft_layer)
+            if gate_up_oft_r is not None:
+                gate_up_input = apply_block_diag_orth(
+                    hidden_states, _shared_r(gate_up_oft_r, "w13_oft_r")
+                )
+            else:
+                gate_up_input = hidden_states
 
         intermediate_cache1 = moe_wna16_marlin_gemm(
             gate_up_input,
@@ -280,16 +344,23 @@ class MarlinOFTRunnerCore:
             intermediate_cache3.zero_()
 
         # ---- Down (Marlin) with shared-R input rotation ----
-        w2_oft_r = getattr(oft_info, "w2_oft_r", None)
-        if w2_oft_r is not None:
+        # intermediate_cache2 is the EXPANDED (M*topk, N) tensor -- each
+        # original token's topk expert-copies sit in topk adjacent rows -- so
+        # the multi-slot path scales segment boundaries by topk (n_groups)
+        # to keep each request's own rows grouped under its own slot.
+        w2_oft_r_all_slots = getattr(peft_layer, "_oft_w2_oft_r_all_slots", None)
+        if w2_oft_r_all_slots is not None:
             down_input = _rotate_shared_by_request(
-                peft_layer.oft_backend,
-                intermediate_cache2,
-                w2_oft_r,
-                n_groups=topk,
+                peft_layer.oft_backend, intermediate_cache2, w2_oft_r_all_slots, n_groups=topk
             )
         else:
-            down_input = intermediate_cache2
+            w2_oft_r = getattr(peft_layer, "w2_oft_r", None)
+            if w2_oft_r is not None:
+                down_input = apply_block_diag_orth(
+                    intermediate_cache2, _shared_r(w2_oft_r, "w2_oft_r")
+                )
+            else:
+                down_input = intermediate_cache2
 
         intermediate_cache3 = moe_wna16_marlin_gemm(
             down_input,

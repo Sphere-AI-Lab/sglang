@@ -157,6 +157,12 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    LoadOFTAdapterFromDistributedReqInput,
+    LoadOFTAdapterFromDistributedReqOutput,
+    LoadOFTAdapterFromTensorsReqInput,
+    LoadOFTAdapterFromTensorsReqOutput,
+    LoadOFTAdapterReqInput,
+    LoadOFTAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -180,6 +186,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UnloadOFTAdapterReqInput,
+    UnloadOFTAdapterReqOutput,
     UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -296,7 +304,6 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.oft import integration as oft
 from sglang.srt.oft.oft_drainer import OFTDrainer
 from sglang.srt.oft.oft_overlap_loader import OFTOverlapLoader
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -397,60 +404,6 @@ def _accumulate_decode_moment(
 _is_npu = is_npu()
 _is_hip = is_hip()
 
-_EXACT_SCORING_SUFFIX_STREAMING_SESSION_ERROR = (
-    "Exact scoring suffix is not supported for streaming sessions because "
-    "they do not preserve custom prompt-logprob boundaries."
-)
-
-
-def _resolve_exact_scoring_suffix_boundary(
-    req: Req, recv_req: TokenizedGenerateReqInput
-) -> Tuple[Optional[int], Optional[str]]:
-    """Validate an exact suffix against the final scheduler token sequence."""
-    suffix_len = recv_req.scoring_suffix_len
-    if suffix_len is None:
-        return None, None
-    if suffix_len <= 0:
-        return None, "scoring_suffix_len must be positive."
-    if recv_req.input_ids is None or suffix_len > len(recv_req.input_ids):
-        return None, (
-            "scoring_suffix_len exceeds the tokenizer-side input length: "
-            f"{suffix_len=} vs {len(recv_req.input_ids) if recv_req.input_ids else 0}."
-        )
-    if suffix_len >= len(req.origin_input_ids):
-        return None, (
-            "Exact scoring suffix requires a non-empty processed prefix: "
-            f"{suffix_len=} vs final input length {len(req.origin_input_ids)}."
-        )
-    if req.session is not None and req.session.streaming:
-        return None, _EXACT_SCORING_SUFFIX_STREAMING_SESSION_ERROR
-
-    expected_suffix = list(recv_req.input_ids[-suffix_len:])
-    actual_suffix = list(req.origin_input_ids[-suffix_len:])
-    if actual_suffix != expected_suffix:
-        mismatch_index = next(
-            index
-            for index, (expected, actual) in enumerate(
-                zip(expected_suffix, actual_suffix)
-            )
-            if expected != actual
-        )
-        return None, (
-            "Model-specific preprocessing did not preserve scoring_suffix_ids at "
-            f"the end of the final input: mismatch at suffix offset "
-            f"{mismatch_index}, expected token {expected_suffix[mismatch_index]}, "
-            f"got {actual_suffix[mismatch_index]} (suffix length {suffix_len})."
-        )
-
-    return len(req.origin_input_ids) - suffix_len - 1, None
-
-
-def _should_allow_auto_truncate(
-    allow_auto_truncate: bool, scoring_suffix_len: Optional[int]
-) -> bool:
-    """Never truncate a request that promises an exact suffix."""
-    return allow_auto_truncate and scoring_suffix_len is None
-
 
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
@@ -502,9 +455,11 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
-        self.enable_oft = server_args.peft_method == "oft"
-        self.max_ofts_per_batch = server_args.max_ofts_per_batch
+        # OFT adapters are admitted on the same schedule-time contract as LoRA
+        # above; the check itself lives in _can_schedule_oft_req below.
+        self.enable_oft = server_args.enable_oft
         self.enable_oft_overlap_loading = server_args.enable_oft_overlap_loading
+        self.max_ofts_per_batch = server_args.max_ofts_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
@@ -1612,21 +1567,6 @@ class Scheduler(
         )
 
     def init_request_dispatcher(self):
-        # Resolved here rather than at module scope: oft.io_types imports
-        # managers.io_struct, which is the cycle io_struct.__getattr__ avoids.
-        from sglang.srt.oft.io_types import (
-            LoadOFTAdapterReqInput as _LoadOFTAdapterReqInput,
-        )
-        from sglang.srt.oft.io_types import (
-            LoadOFTAdapterFromDistributedReqInput as _LoadOFTAdapterFromDistributedReqInput,
-        )
-        from sglang.srt.oft.io_types import (
-            LoadOFTAdapterFromTensorsReqInput as _LoadOFTAdapterFromTensorsReqInput,
-        )
-        from sglang.srt.oft.io_types import (
-            UnloadOFTAdapterReqInput as _UnloadOFTAdapterReqInput,
-        )
-
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
@@ -1733,16 +1673,16 @@ class Scheduler(
                     self.load_lora_adapter_from_distributed,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
-                (_LoadOFTAdapterReqInput, self.load_oft_adapter),
+                (LoadOFTAdapterReqInput, self.load_oft_adapter),
                 (
-                    _LoadOFTAdapterFromTensorsReqInput,
+                    LoadOFTAdapterFromTensorsReqInput,
                     self.load_oft_adapter_from_tensors,
                 ),
                 (
-                    _LoadOFTAdapterFromDistributedReqInput,
+                    LoadOFTAdapterFromDistributedReqInput,
                     self.load_oft_adapter_from_distributed,
                 ),
-                (_UnloadOFTAdapterReqInput, self.unload_oft_adapter),
+                (UnloadOFTAdapterReqInput, self.unload_oft_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
@@ -2093,6 +2033,12 @@ class Scheduler(
         else:
             self.lora_drainer = None
 
+    def init_lora_overlap_loader(self) -> None:
+        if self.enable_lora_overlap_loading:
+            self.lora_overlap_loader = LoRAOverlapLoader(
+                self.tp_worker.model_runner.lora_manager
+            )
+
     def init_oft_drainer(self) -> None:
         if get_lora().oft_drain_wait_threshold > 0.0:
             self.oft_drainer = OFTDrainer(
@@ -2106,12 +2052,6 @@ class Scheduler(
         if self.enable_oft_overlap_loading:
             self.oft_overlap_loader = OFTOverlapLoader(
                 self.tp_worker.model_runner.oft_manager
-            )
-
-    def init_lora_overlap_loader(self) -> None:
-        if self.enable_lora_overlap_loading:
-            self.lora_overlap_loader = LoRAOverlapLoader(
-                self.tp_worker.model_runner.lora_manager
             )
 
     def init_grammar_manager(self) -> None:
@@ -2555,8 +2495,8 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 lora_version=recv_req.lora_version,
-                adapter_id=recv_req.adapter_id,
-                adapter_version=recv_req.adapter_version,
+                oft_id=recv_req.oft_id,
+                oft_version=recv_req.oft_version,
                 session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
@@ -2621,22 +2561,6 @@ class Scheduler(
         ):
             # Session exists and is not closing: create request from session
             session = self.session_controller.get(session_id)
-            if recv_req.scoring_suffix_len is not None and session.streaming:
-                # Reject before Session.create_req() can mark the session inflight
-                # or share its multimodal state with the rejected request.
-                req = Req(
-                    recv_req.rid,
-                    recv_req.input_text,
-                    recv_req.input_ids,
-                    recv_req.sampling_params,
-                    vocab_size=self.model_config.vocab_size,
-                    http_worker_ipc=recv_req.http_worker_ipc,
-                )
-                req.tokenizer = self.tokenizer
-                req.set_finish_with_abort(_EXACT_SCORING_SUFFIX_STREAMING_SESSION_ERROR)
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
             req = session.create_req(
                 recv_req,
                 self.tokenizer,
@@ -2768,15 +2692,6 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        exact_logprob_start_len, error_msg = _resolve_exact_scoring_suffix_boundary(
-            req, recv_req
-        )
-        if error_msg:
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
-
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
@@ -2784,19 +2699,9 @@ class Scheduler(
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
-            _should_allow_auto_truncate(
-                get_serving().allow_auto_truncate,
-                recv_req.scoring_suffix_len,
-            ),
+            get_serving().allow_auto_truncate,
         )
         if error_msg:
-            if recv_req.scoring_suffix_len is not None:
-                error_msg = (
-                    f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                    f"the maximum allowed length ({self.max_req_input_len} tokens). "
-                    "Exact scoring suffix requests cannot be auto-truncated; use a "
-                    "shorter input."
-                )
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
@@ -2805,9 +2710,7 @@ class Scheduler(
             # When return_logprob is False, logprob_start_len should be ignored
             recv_req.logprob_start_len = -1
 
-        if exact_logprob_start_len is not None:
-            req.logprob_start_len = exact_logprob_start_len
-        elif recv_req.logprob_start_len == -1:
+        if recv_req.logprob_start_len == -1:
             if recv_req.return_logprob and recv_req.token_ids_logprob is None:
                 # If logprob is required but neither token_ids_logprob nor logprob_start_len is
                 # set, return the logprobs for output tokens by default
@@ -3052,8 +2955,6 @@ class Scheduler(
             dimensions=recv_req.dimensions,
             lora_id=recv_req.lora_id,
             lora_version=recv_req.lora_version,
-            adapter_id=recv_req.adapter_id,
-            adapter_version=recv_req.adapter_version,
             http_worker_ipc=recv_req.http_worker_ipc,
             time_stats=recv_req.time_stats,
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,
@@ -3473,6 +3374,19 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
+        if self.enable_oft:
+            running_ofts = {
+                req.oft_id for req in running_batch.reqs if not req.finished()
+            }
+            # Account for adapters already loaded in the adder, such as chunked requests
+            running_ofts.update(req.oft_id for req in adder.can_run_list)
+
+            if self.oft_drainer:
+                self.oft_drainer.update_draining_state(
+                    self.waiting_queue,
+                    running_batch.reqs,
+                )
+
         if self.enable_lora:
             if self.max_loras_per_batch == 1:
                 # At most one distinct LoRA identity can ever be admitted, so
@@ -3494,18 +3408,6 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
-        if self.enable_oft:
-            running_ofts = {
-                req.adapter_id for req in running_batch.reqs if not req.finished()
-            }
-            running_ofts.update(req.adapter_id for req in adder.can_run_list)
-
-            if self.oft_drainer:
-                self.oft_drainer.update_draining_state(
-                    self.waiting_queue,
-                    running_batch.reqs,
-                )
-
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
@@ -3521,9 +3423,7 @@ class Scheduler(
                 if not can_schedule_lora:
                     continue
 
-            if self.enable_oft and not oft.maybe_admit_request(
-                self, req, running_ofts
-            ):
+            if self.enable_oft and not self._can_schedule_oft_req(req, running_ofts):
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3566,7 +3466,7 @@ class Scheduler(
                     running_loras.add(req.lora_id)
 
             if self.enable_oft:
-                running_ofts.add(req.adapter_id)
+                running_ofts.add(req.oft_id)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -3710,6 +3610,33 @@ class Scheduler(
             new_lora_set = {req.lora_id} | running_loras
             return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
                 new_lora_set
+            )
+
+    def _can_schedule_oft_req(
+        self, req: Req, running_ofts: set[Optional[str]]
+    ) -> bool:
+        """Check if an OFT request can be scheduled.
+
+        This method checks two conditions:
+        1. The drainer allows scheduling (based on draining state)
+        2. The OFT adapter can be loaded (either already running or can be added)
+        """
+        if self.oft_drainer and not self.oft_drainer.can_schedule(req):
+            return False
+
+        if req.oft_id in running_ofts:
+            return True
+
+        if self.enable_oft_overlap_loading:
+            # For overlapping loading of OFT weights with computation, we will load each
+            # adapter one at a time, as opposed to loading them in one batch
+            return self.oft_overlap_loader.try_overlap_load_oft(
+                req.oft_id, running_ofts
+            )
+        else:
+            new_oft_set = {req.oft_id} | running_ofts
+            return self.tp_worker.model_runner.oft_manager.validate_oft_batch(
+                new_oft_set
             )
 
     def _resolve_active_lora_fast(
@@ -5130,22 +5057,34 @@ class Scheduler(
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
 
-    def load_oft_adapter(self, recv_req):
-        """In-place loading of an OFT adapter. Mirrors load_lora_adapter()."""
+    def load_oft_adapter(
+        self, recv_req: LoadOFTAdapterReqInput
+    ) -> LoadOFTAdapterReqOutput:
+        """In-place loading a new OFT adapter from disk or huggingface."""
 
         result = self.tp_worker.load_oft_adapter(recv_req)
         return result
 
-    def load_oft_adapter_from_tensors(self, recv_req):
-        """Load an OFT adapter from serialized tensors."""
-        return self.tp_worker.load_oft_adapter_from_tensors(recv_req)
+    def load_oft_adapter_from_tensors(
+        self, recv_req: LoadOFTAdapterFromTensorsReqInput
+    ) -> LoadOFTAdapterFromTensorsReqOutput:
+        """In-place loading a new OFT adapter from serialized tensors."""
 
-    def load_oft_adapter_from_distributed(self, recv_req):
-        """Load an OFT adapter broadcast over a process group."""
-        return self.tp_worker.load_oft_adapter_from_distributed(recv_req)
+        result = self.tp_worker.load_oft_adapter_from_tensors(recv_req)
+        return result
 
-    def unload_oft_adapter(self, recv_req):
-        """Unload the OFT adapter. Mirrors unload_lora_adapter()."""
+    def load_oft_adapter_from_distributed(
+        self, recv_req: LoadOFTAdapterFromDistributedReqInput
+    ) -> LoadOFTAdapterFromDistributedReqOutput:
+        """In-place loading a new OFT adapter broadcast over a process group."""
+
+        result = self.tp_worker.load_oft_adapter_from_distributed(recv_req)
+        return result
+
+    def unload_oft_adapter(
+        self, recv_req: UnloadOFTAdapterReqInput
+    ) -> UnloadOFTAdapterReqOutput:
+        """Unload the OFT adapter."""
 
         result = self.tp_worker.unload_oft_adapter(recv_req)
         return result

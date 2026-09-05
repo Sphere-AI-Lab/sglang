@@ -167,10 +167,10 @@ class TritonRunnerCore(MoeRunnerCore):
             gemm1_limit=self.config.gemm1_clamp_limit,
             filter_expert=filter_expert,
             hooks=hooks,
-            swiglu_limit=self.config.swiglu_limit,
-            fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
             # omit when unset so the sequence keeps its own default invoker
             **({} if invoke is None else {"invoke": invoke}),
+            swiglu_limit=self.config.swiglu_limit,
+            fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
         )
 
         return TritonRunnerOutput(hidden_states=out)

@@ -59,6 +59,7 @@ from sglang.srt.managers.schedule_batch import (
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.oft.oft_registry import OFTRef
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
@@ -173,13 +174,6 @@ class GenerateReqInput:
         Optional[Union[List[List[int]], List[int]]],
         PlainValidator(validate_optional_list_i64_1d_2d),
     ] = None
-    # Exact token IDs appended after text/multimodal preprocessing. This is an
-    # opt-in prefill-scoring contract: the scheduler derives logprob_start_len
-    # from the final processed sequence and never retokenizes these suffix IDs.
-    scoring_suffix_ids: Annotated[
-        Optional[Union[List[List[int]], List[int]]],
-        PlainValidator(validate_optional_list_i64_1d_2d),
-    ] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -257,13 +251,14 @@ class GenerateReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
-    # Active weight version, resolved atomically with lora_id.
+    # Active weight version, resolved atomically with lora_id by tokenizer manager.
     lora_version: Optional[Union[List[Optional[int]], int]] = None
 
-    # The path and resolved identity/version of canonical OFT adapters.
-    adapter_path: Optional[Union[List[Optional[str]], str]] = None
-    adapter_id: Optional[Union[List[Optional[str]], str]] = None
-    adapter_version: Optional[Union[List[Optional[int]], int]] = None
+    # The path and resolved identity of single-active OFT adapters.
+    oft_path: Optional[Union[List[Optional[str]], str]] = None
+    oft_id: Optional[Union[List[Optional[str]], str]] = None
+    # Adapter weight version, resolved atomically with oft_id by tokenizer manager.
+    oft_version: Optional[Union[List[Optional[int]], int]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -495,20 +490,9 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
-            if self.scoring_suffix_ids is not None:
-                self.scoring_suffix_ids = [self.scoring_suffix_ids]
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
-        if self.scoring_suffix_ids is not None and (
-            not isinstance(self.scoring_suffix_ids, list)
-            or not self.scoring_suffix_ids
-            or isinstance(self.scoring_suffix_ids[0], list)
-        ):
-            raise ValueError(
-                "scoring_suffix_ids should be a non-empty list of token IDs "
-                "for a single request."
-            )
         if self.sampling_params is None:
             self.sampling_params = {}
         if self.rid is None:
@@ -543,12 +527,11 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
-        self._normalize_scoring_suffix_ids()
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_lora_versions(num)
-        self._normalize_adapter_paths(num)
-        self._normalize_adapter_versions(num)
+        self._normalize_oft_paths(num)
+        self._normalize_oft_versions(num)
         self._normalize_image_data(num)
         self._normalize_mm_hashes(num)
         self._normalize_video_data(num)
@@ -580,28 +563,6 @@ class GenerateReqInput:
                 raise ValueError("input_embeds should be a list for batch processing.")
             self.input_embeds = self.input_embeds * self.parallel_sample_num
 
-    def _normalize_scoring_suffix_ids(self):
-        """Normalize exact scoring suffixes without changing the main input shape."""
-        if self.scoring_suffix_ids is None:
-            return
-        if (
-            not isinstance(self.scoring_suffix_ids, list)
-            or not self.scoring_suffix_ids
-            or any(
-                not isinstance(suffix_ids, list) or not suffix_ids
-                for suffix_ids in self.scoring_suffix_ids
-            )
-        ):
-            raise ValueError(
-                "scoring_suffix_ids should contain one non-empty list of token IDs "
-                "per batch item."
-            )
-        if len(self.scoring_suffix_ids) != self.batch_size:
-            raise ValueError(
-                "The length of scoring_suffix_ids should be equal to the batch size."
-            )
-        self.scoring_suffix_ids = self.scoring_suffix_ids * self.parallel_sample_num
-
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
         if self.lora_path is not None:
@@ -613,6 +574,7 @@ class GenerateReqInput:
                 raise ValueError("lora_path should be a list or a string.")
 
     def _normalize_lora_versions(self, num):
+        """Normalize resolved LoRA versions for batch processing."""
         if self.lora_version is None:
             return
         if isinstance(self.lora_version, int):
@@ -622,26 +584,26 @@ class GenerateReqInput:
         else:
             raise ValueError("lora_version should be a list or an integer.")
 
-    def _normalize_adapter_paths(self, num):
-        """Normalize canonical OFT paths for batch processing."""
-        if self.adapter_path is not None:
-            if isinstance(self.adapter_path, str):
-                self.adapter_path = [self.adapter_path] * num
-            elif isinstance(self.adapter_path, list):
-                self.adapter_path = self.adapter_path * self.parallel_sample_num
+    def _normalize_oft_paths(self, num):
+        """Normalize single-active OFT paths for batch processing."""
+        if self.oft_path is not None:
+            if isinstance(self.oft_path, str):
+                self.oft_path = [self.oft_path] * num
+            elif isinstance(self.oft_path, list):
+                self.oft_path = self.oft_path * self.parallel_sample_num
             else:
-                raise ValueError("adapter_path should be a list or a string.")
+                raise ValueError("oft_path should be a list or a string.")
 
-    def _normalize_adapter_versions(self, num):
+    def _normalize_oft_versions(self, num):
         """Normalize resolved OFT versions for batch processing."""
-        if self.adapter_version is None:
+        if self.oft_version is None:
             return
-        if isinstance(self.adapter_version, int):
-            self.adapter_version = [self.adapter_version] * num
-        elif isinstance(self.adapter_version, list):
-            self.adapter_version = self.adapter_version * self.parallel_sample_num
+        if isinstance(self.oft_version, int):
+            self.oft_version = [self.oft_version] * num
+        elif isinstance(self.oft_version, list):
+            self.oft_version = self.oft_version * self.parallel_sample_num
         else:
-            raise ValueError("adapter_version should be a list or an integer.")
+            raise ValueError("oft_version should be a list or an integer.")
 
     def _normalize_image_data(self, num):
         """Normalize image data for batch processing."""
@@ -936,11 +898,6 @@ class GenerateReqInput:
             session_id=self.session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
-            scoring_suffix_ids=(
-                self.scoring_suffix_ids[i]
-                if self.scoring_suffix_ids is not None
-                else None
-            ),
             input_embeds=(
                 self.input_embeds[i] if self.input_embeds is not None else None
             ),
@@ -981,14 +938,12 @@ class GenerateReqInput:
                 if isinstance(self.lora_version, list)
                 else self.lora_version
             ),
-            adapter_path=(
-                self.adapter_path[i] if self.adapter_path is not None else None
-            ),
-            adapter_id=self.adapter_id[i] if self.adapter_id is not None else None,
-            adapter_version=(
-                self.adapter_version[i]
-                if isinstance(self.adapter_version, list)
-                else self.adapter_version
+            oft_path=self.oft_path[i] if self.oft_path is not None else None,
+            oft_id=self.oft_id[i] if self.oft_id is not None else None,
+            oft_version=(
+                self.oft_version[i]
+                if isinstance(self.oft_version, list)
+                else self.oft_version
             ),
             custom_logit_processor=(
                 self.custom_logit_processor[i]
@@ -1068,11 +1023,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # tokenizer-manager-side: the scheduler ships arrays either way.
     return_flat_raw_top_logprobs: bool = False
 
-    # Length of an exact scoring suffix appended by the tokenizer manager.
-    # The scheduler derives the absolute logprob boundary only after session
-    # composition and model-specific multimodal padding are complete.
-    scoring_suffix_len: Optional[int] = field(default=None, kw_only=True)
-
     # Whether to return hidden states
     return_hidden_states: ReturnHiddenStatesMode = False
 
@@ -1089,9 +1039,13 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
 
-    # Canonical OFT identity resolved by the tokenizer manager.
-    adapter_id: Optional[str] = None  # None means just use the base model
-    adapter_version: Optional[int] = None
+    # Single-active OFT related
+    oft_id: Optional[str] = None  # None means just use the base model
+    # Adapter weight version at admission time, resolved tokenizer-side from the
+    # registry. Carried so the radix key can separate KV computed under different
+    # on-policy weights of the SAME adapter (see Req.__init__). None for base
+    # requests. Native LoRA carries its independent version in the final field.
+    oft_version: Optional[int] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -1152,7 +1106,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
 
-    # Active native LoRA version. Keep this final for positional IPC compatibility.
+    # Active native LoRA weight version. This must remain the final declared
+    # field to preserve older positional IPC payloads.
     lora_version: Optional[int] = None
 
     def wrap_pickle_fields(self):
@@ -1224,8 +1179,13 @@ class EmbeddingReqInput:
     lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], str]] = None
-    # Active weight version, resolved atomically with lora_id.
+    # Active weight version, resolved atomically with lora_id by tokenizer manager.
     lora_version: Optional[Union[List[Optional[int]], int]] = None
+    # The path and resolved identity of single-active OFT adapters.
+    oft_path: Optional[Union[List[Optional[str]], str]] = None
+    oft_id: Optional[Union[List[Optional[str]], str]] = None
+    # Adapter weight version, resolved atomically with oft_id by tokenizer manager.
+    oft_version: Optional[Union[List[Optional[int]], int]] = None
     # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     positional_embed_overrides: Any = None
@@ -1255,12 +1215,6 @@ class EmbeddingReqInput:
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
-
-    # Canonical OFT path and tokenizer-resolved identity/version. These are
-    # trailing fields to preserve positional IPC compatibility.
-    adapter_path: Optional[Union[List[Optional[str]], str]] = None
-    adapter_id: Optional[Union[List[Optional[str]], str]] = None
-    adapter_version: Optional[Union[List[Optional[int]], int]] = None
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -1332,10 +1286,37 @@ class EmbeddingReqInput:
 
             self._normalize_lora_paths(self.batch_size)
             self._normalize_lora_versions(self.batch_size)
-            self._normalize_adapter_paths(self.batch_size)
-            self._normalize_adapter_versions(self.batch_size)
+            self._normalize_oft_paths(self.batch_size)
+            self._normalize_oft_versions(self.batch_size)
 
         self._validate_rid_uniqueness()
+
+    def _normalize_oft_paths(self, num):
+        """Normalize single-active OFT paths for batch processing."""
+        if self.oft_path is not None:
+            if isinstance(self.oft_path, str):
+                self.oft_path = [self.oft_path] * num
+            elif isinstance(self.oft_path, list):
+                if len(self.oft_path) != num:
+                    raise ValueError(
+                        f"oft_path list length ({len(self.oft_path)}) must match batch size ({num})"
+                    )
+            else:
+                raise ValueError("oft_path should be a list or a string.")
+
+    def _normalize_oft_versions(self, num):
+        """Normalize resolved OFT versions for batch processing."""
+        if self.oft_version is None:
+            return
+        if isinstance(self.oft_version, int):
+            self.oft_version = [self.oft_version] * num
+        elif isinstance(self.oft_version, list):
+            if len(self.oft_version) != num:
+                raise ValueError(
+                    f"oft_version list length ({len(self.oft_version)}) must match batch size ({num})"
+                )
+        else:
+            raise ValueError("oft_version should be a list or an integer.")
 
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
@@ -1351,6 +1332,7 @@ class EmbeddingReqInput:
                 raise ValueError("lora_path should be a list or a string.")
 
     def _normalize_lora_versions(self, num):
+        """Normalize resolved LoRA versions for batch processing."""
         if self.lora_version is None:
             return
         if isinstance(self.lora_version, int):
@@ -1358,41 +1340,10 @@ class EmbeddingReqInput:
         elif isinstance(self.lora_version, list):
             if len(self.lora_version) != num:
                 raise ValueError(
-                    f"lora_version list length ({len(self.lora_version)}) "
-                    f"must match batch size ({num})"
+                    f"lora_version list length ({len(self.lora_version)}) must match batch size ({num})"
                 )
         else:
             raise ValueError("lora_version should be a list or an integer.")
-
-    def _normalize_adapter_paths(self, num):
-        """Normalize canonical OFT paths for batch processing."""
-        if self.adapter_path is None:
-            return
-        if isinstance(self.adapter_path, str):
-            self.adapter_path = [self.adapter_path] * num
-        elif isinstance(self.adapter_path, list):
-            if len(self.adapter_path) != num:
-                raise ValueError(
-                    f"adapter_path list length ({len(self.adapter_path)}) "
-                    f"must match batch size ({num})"
-                )
-        else:
-            raise ValueError("adapter_path should be a list or a string.")
-
-    def _normalize_adapter_versions(self, num):
-        """Normalize resolved OFT versions for batch processing."""
-        if self.adapter_version is None:
-            return
-        if isinstance(self.adapter_version, int):
-            self.adapter_version = [self.adapter_version] * num
-        elif isinstance(self.adapter_version, list):
-            if len(self.adapter_version) != num:
-                raise ValueError(
-                    f"adapter_version list length ({len(self.adapter_version)}) "
-                    f"must match batch size ({num})"
-                )
-        else:
-            raise ValueError("adapter_version should be a list or an integer.")
 
     def contains_mm_input(self) -> bool:
         return (
@@ -1430,18 +1381,12 @@ class EmbeddingReqInput:
                     if isinstance(self.lora_version, list)
                     else self.lora_version
                 ),
-                adapter_path=(
-                    self.adapter_path[i] if self.adapter_path is not None else None
-                ),
-                adapter_id=(
-                    self.adapter_id[i]
-                    if isinstance(self.adapter_id, list)
-                    else self.adapter_id
-                ),
-                adapter_version=(
-                    self.adapter_version[i]
-                    if isinstance(self.adapter_version, list)
-                    else self.adapter_version
+                oft_path=self.oft_path[i] if self.oft_path is not None else None,
+                oft_id=self.oft_id[i] if self.oft_id is not None else None,
+                oft_version=(
+                    self.oft_version[i]
+                    if isinstance(self.oft_version, list)
+                    else self.oft_version
                 ),
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
@@ -1476,18 +1421,12 @@ class EmbeddingReqInput:
                     if isinstance(self.lora_version, list)
                     else self.lora_version
                 ),
-                adapter_path=(
-                    self.adapter_path[i] if self.adapter_path is not None else None
-                ),
-                adapter_id=(
-                    self.adapter_id[i]
-                    if isinstance(self.adapter_id, list)
-                    else self.adapter_id
-                ),
-                adapter_version=(
-                    self.adapter_version[i]
-                    if isinstance(self.adapter_version, list)
-                    else self.adapter_version
+                oft_path=self.oft_path[i] if self.oft_path is not None else None,
+                oft_id=self.oft_id[i] if self.oft_id is not None else None,
+                oft_version=(
+                    self.oft_version[i]
+                    if isinstance(self.oft_version, list)
+                    else self.oft_version
                 ),
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
@@ -1519,6 +1458,13 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     sampling_params: SamplingParams
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
+
+    # Single-active OFT related
+    oft_id: Optional[str] = None  # None means just use the base model
+    # Adapter weight version at admission time, resolved tokenizer-side from
+    # the registry. Mirrors TokenizedGenerateReqInput.oft_version exactly.
+    oft_version: Optional[int] = None
+
     # Embedding overrides to place at specific token positions.
     positional_embed_overrides: Optional[PositionalEmbeds] = None
     # For DP routing
@@ -1536,14 +1482,9 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
 
-    # Active native LoRA version. New wire fields are appended after this one
-    # so older positional payloads retain its index.
+    # Active native LoRA weight version. This must remain the final declared
+    # field to preserve older positional IPC payloads.
     lora_version: Optional[int] = None
-
-    # Canonical OFT identity. Appended after all pre-existing fields so older
-    # positional payloads keep their original field mapping.
-    adapter_id: Optional[str] = None
-    adapter_version: Optional[int] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)
@@ -2032,10 +1973,6 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
-    # Optional streamed adapter metadata.
-    adapter_config: Optional[dict] = None
-    adapter_name: Optional[str] = None
-    adapter_id: Optional[str] = None
 
 
 class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
@@ -2044,19 +1981,31 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
 
 
 class UpdateAdapterFromDistributedReqInput(BaseReq, kw_only=True):
-    """Two-phase native LoRA STAGE request over the weight-sync group."""
-
+    # Double-buffer OFT/LoRA weight-sync STAGE over NCCL. Mirrors
+    # UpdateWeightsFromDistributedReqInput; adds adapter metadata + the
+    # double_buffer flag. Versions arrive as STRINGS on the orbit wire
+    # (adapter_version == weight_version invariant); the model_runner boundary
+    # converts to int for the manager's int OFTRef.version/LoRARef.version.
     names: List[str]
     dtypes: List[str]
     shapes: List[List[int]]
+    # The group name
     group_name: str = "weight_update_group"
     weight_version: Optional[str] = None
     adapter_version: Optional[str] = None
+    # "oft_adapter" | "lora_adapter"
     load_format: Optional[str] = None
     adapter_config: Optional[dict] = None
     adapter_name: Optional[str] = None
+    # Stable per-adapter id set tokenizer-side by register_oft_ref (single-active
+    # OFT: id == adapter_name == "orbit_oft"). Threaded to the manager so the DB
+    # stage registers memory_pool.uid_to_buffer_id[adapter_id]=active_idx, which
+    # per-request /generate routing resolves against (LoRA ignores it).
     adapter_id: Optional[str] = None
+    # flattened-bucket meta (orbit _flatten_meta_to_json); None on non-NCCL paths
     payload_metadata: Optional[dict] = None
+    # True  -> STAGE only (lock-free, overlaps decode)
+    # False -> STAGE then ACTIVATE-in-place in the same call (caller idle, no drain)
     double_buffer: bool = False
 
 
@@ -2066,16 +2015,21 @@ class UpdateAdapterFromDistributedReqOutput(BaseReq, kw_only=True):
     staged_adapter_version: Optional[str] = None
     adapter_version: Optional[str] = None
     weight_version: Optional[str] = None
+    # set only when double_buffer=False (stage-then-activate-in-place)
     active_adapter_version: Optional[str] = None
 
 
 class ActivateAdapterVersionReqInput(BaseReq, kw_only=True):
-    """Activate one exact native LoRA version after request drain."""
-
+    # Double-buffer OFT/LoRA weight-sync ACTIVATE (the drained atomic swap). The
+    # drain-to-empty lives tokenizer-side (model_update_lock.writer_lock);
+    # by the time this reaches the scheduler the running batch is drained, so
+    # the handler is a simple staging->active flip.
     adapter_name: str
     adapter_version: str
     weight_version: Optional[str] = None
     load_format: Optional[str] = None
+    # Symmetric with UpdateAdapterFromDistributedReqInput (set by register_oft_ref);
+    # carried for the activate-side version bump.
     adapter_id: Optional[str] = None
 
 
@@ -2096,10 +2050,6 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
     # Optional format specification for loading
     load_format: Optional[str] = None
-    # Optional streamed adapter metadata.
-    adapter_config: Optional[dict] = None
-    adapter_name: Optional[str] = None
-    adapter_id: Optional[str] = None
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
@@ -2111,6 +2061,11 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
+    # Optional: streamed adapter (LoRA/OFT) metadata for
+    # load_format in {"lora_adapter", "oft_adapter"}
+    adapter_config: Optional[dict] = None
+    adapter_name: Optional[str] = None
+    adapter_id: Optional[str] = None
 
 
 class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
@@ -2639,6 +2594,89 @@ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
 ) = LoadLoRAAdapterFromDistributedReqOutput = LoRAUpdateOutput
 
 
+class LoadOFTAdapterReqInput(BaseReq, kw_only=True):
+    # The name of the OFT adapter to newly loaded.
+    oft_name: str
+    # The path of loading.
+    oft_path: str
+    # Whether to pin the OFT adapter in memory.
+    pinned: bool = False
+    # The unique identifier for the OFT adapter, automatically generated in the `TokenizerManager`.
+    oft_id: Optional[str] = None
+
+    def to_ref(self) -> OFTRef:
+        return OFTRef(
+            oft_id=self.oft_id,
+            oft_name=self.oft_name,
+            oft_path=self.oft_path,
+            pinned=self.pinned,
+        )
+
+
+class UnloadOFTAdapterReqInput(BaseReq, kw_only=True):
+    oft_name: str
+    oft_id: Optional[str] = None
+
+    def to_ref(self) -> OFTRef:
+        return OFTRef(oft_id=self.oft_id, oft_name=self.oft_name)
+
+
+class LoadOFTAdapterFromTensorsReqInput(BaseReq, kw_only=True):
+    oft_name: str
+    # The PEFT adapter_config.json, already JSON.
+    config_dict: Dict[str, Any]
+    # One serialized copy of the adapter tensors per TP rank; each rank
+    # deserializes only its own copy.
+    serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
+    pinned: bool = False
+    oft_id: Optional[str] = None
+    load_format: Optional[str] = None
+    # If already loaded, refresh weights in place instead of failing.
+    upsert: bool = False
+
+    def to_ref(self) -> OFTRef:
+        return OFTRef(
+            oft_id=self.oft_id,
+            oft_name=self.oft_name,
+            oft_path="__tensor__",
+            pinned=self.pinned,
+            reloadable=False,
+        )
+
+
+class LoadOFTAdapterFromDistributedReqInput(BaseReq, kw_only=True):
+    oft_name: str
+    config_dict: Dict[str, Any]
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    group_name: str = "weight_update_group"
+    pinned: bool = False
+    oft_id: Optional[str] = None
+    # If already loaded, refresh weights in place instead of failing.
+    upsert: bool = False
+
+    def to_ref(self) -> OFTRef:
+        return OFTRef(
+            oft_id=self.oft_id,
+            oft_name=self.oft_name,
+            oft_path="__distributed__",
+            pinned=self.pinned,
+            reloadable=False,
+        )
+
+
+class OFTUpdateOutput(BaseReq, kw_only=True):
+    success: bool
+    error_message: Optional[str] = None
+    loaded_adapters: Optional[Dict[str, Union[str, OFTRef]]] = None
+
+
+LoadOFTAdapterReqOutput = UnloadOFTAdapterReqOutput = (
+    LoadOFTAdapterFromTensorsReqOutput
+) = LoadOFTAdapterFromDistributedReqOutput = OFTUpdateOutput
+
+
 class BlockReqType(Enum):
     BLOCK = 1
     UNBLOCK = 2
@@ -2704,15 +2742,6 @@ def _check_all_req_types():
             raise ValueError(
                 f"{name} is a subclass of BaseReq but not follow the naming convention."
             )
-
-
-def __getattr__(name):
-    """Lazily re-export canonical OFT IPC types without creating a cycle."""
-    from sglang.srt.oft import io_types
-
-    if name in io_types.__all__:
-        return getattr(io_types, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 _check_all_req_types()

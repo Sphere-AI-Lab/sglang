@@ -111,7 +111,6 @@ class TorchNativeOFTBackend(BaseOFTBackend):
             dim=0,
             out=self.cuda_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
         )
-        self._init_cuda_graph_moe_buffers(max_bs_in_cuda_graph * num_tokens_per_bs)
 
     def prepare_oft_batch(
         self,
@@ -125,34 +124,31 @@ class TorchNativeOFTBackend(BaseOFTBackend):
             weight_indices, dtype=torch.int32, device="cpu"
         )
 
-        if self.is_moe_oft:
-            seg_lens = original_seq_lens.pin_memory()
-            weight_indices_tensor = original_weight_indices_tensor.pin_memory()
-        else:
-            unique_weight_indices_tensor, inverse_weight_indices_tensor = (
-                torch.unique_consecutive(
-                    original_weight_indices_tensor, return_inverse=True
-                )
+        unique_weight_indices_tensor, inverse_weight_indices_tensor = (
+            torch.unique_consecutive(
+                original_weight_indices_tensor, return_inverse=True
             )
+        )
 
-            seg_lens = (
-                torch.zeros_like(
-                    unique_weight_indices_tensor, dtype=torch.int32, device="cpu"
-                )
-                .scatter_add_(
-                    0,
-                    inverse_weight_indices_tensor,
-                    original_seq_lens,
-                )
-                .pin_memory()
+        seg_lens = (
+            torch.zeros_like(
+                unique_weight_indices_tensor, dtype=torch.int32, device="cpu"
             )
-            weight_indices_tensor = unique_weight_indices_tensor.pin_memory()
+            .scatter_add_(
+                0,
+                inverse_weight_indices_tensor,
+                original_seq_lens,
+            )
+            .pin_memory()
+        )
 
         seg_indptr = torch.zeros(
             (len(seg_lens) + 1,), dtype=torch.int32, pin_memory=True
         )
         seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
 
+        # Use pinned memory to avoid synchronizations during host-to-device transfer
+        weight_indices_tensor = unique_weight_indices_tensor.pin_memory()
         oft_block_sizes_tensor = torch.tensor(
             oft_block_sizes, dtype=torch.int32, pin_memory=True, device="cpu"
         )
@@ -203,7 +199,6 @@ class TorchNativeOFTBackend(BaseOFTBackend):
             seg_indptr,
             seg_lens,
         )
-        batch_info.has_active_oft = any(index != 0 for index in weight_indices)
-        self.batch_info = self._add_moe_oft_info(forward_batch, batch_info)
+        self.batch_info = batch_info
         if use_cuda_graph:
             self.refresh_cuda_graph_grouped_batch_infos()

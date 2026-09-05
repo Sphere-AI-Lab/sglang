@@ -55,6 +55,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
+    OFTUpdateOutput,
     OpenSessionReqInput,
     ProfileReq,
     ProfileReqOutput,
@@ -139,6 +140,7 @@ _COMMUNICATOR_SPECS = [
     ("begin_weight_update", BeginWeightUpdateReqOutput),
     ("end_weight_update", EndWeightUpdateReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
+    ("update_oft_adapter", OFTUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
@@ -173,15 +175,7 @@ class TokenizerControlMixin:
 
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
         dispatch_pairs = []
-        # Canonical OFT IPC types are resolved lazily: sglang.srt.oft.io_types
-        # imports managers.io_struct, so a module-level import here would close
-        # the very cycle that io_struct.__getattr__ exists to avoid.
-        from sglang.srt.oft.io_types import OFTUpdateOutput
-
-        self._communicator_specs = list(_COMMUNICATOR_SPECS) + [
-            ("update_oft_adapter", OFTUpdateOutput),
-        ]
-        for spec in self._communicator_specs:
+        for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
             comm = FanOutCommunicator(
@@ -205,7 +199,7 @@ class TokenizerControlMixin:
         else:
             control_fan_out = worker_count
 
-        for spec in getattr(self, "_communicator_specs", _COMMUNICATOR_SPECS):
+        for spec in _COMMUNICATOR_SPECS:
             getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
 
         self.get_internal_state_communicator.set_fan_out(control_fan_out)
@@ -535,7 +529,13 @@ class TokenizerControlMixin:
         return success, message
 
     def _assert_native_lora_available(self, lora_path) -> None:
-        """Reject adapters quarantined by a partial activation failure."""
+        """Reject a request naming an adapter quarantined by a partial native
+        LoRA activation failure. Runs unconditionally for every generate/
+        embedding request with a lora_path (see _resolve_lora_path in
+        tokenizer_manager.py) -- not gated on enable_lora_staging, since
+        self.failed_lora_activations is initialized unconditionally in
+        __init__ and a previously staged-and-quarantined adapter name must
+        stay rejected regardless of the server's current staging config."""
         names = [lora_path] if isinstance(lora_path, str) else (lora_path or [])
         for name in names:
             if name in self.failed_lora_activations:
@@ -545,7 +545,7 @@ class TokenizerControlMixin:
                 )
 
     def _staging_backend_for(self, obj):
-        from sglang.srt.adapter_sync.tokenizer_backend import get_staging_backend
+        from sglang.srt.managers.staging_backend import get_staging_backend
 
         return get_staging_backend(self, obj)
 
@@ -554,19 +554,24 @@ class TokenizerControlMixin:
         obj: UpdateAdapterFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        """Stage native LoRA or canonical OFT adapter weights."""
+        """Double-buffer OFT/LoRA STAGE over NCCL.
+
+        double_buffer=True: LOCK-FREE stage into the reserved staging slot while
+        generation continues (overlaps decode); no writer_lock. double_buffer=
+        False: the synchronous distributed path stages then ACTIVATEs-in-place in
+        the scheduler in one round-trip, so we hold model_update_lock.writer_lock
+        (drain-to-idle, mirror update_weights_from_distributed) around it."""
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for adapter staging"
-
-        from sglang.srt.oft import tokenizer_hooks as oft_tokenizer_hooks
+        ), "dp_size must be 1 or dp attention must be enabled for update adapter from distributed"
 
         backend = self._staging_backend_for(obj)
         if backend is not None:
             await backend.reserve_stage(obj)
         else:
-            await oft_tokenizer_hooks.register_oft_ref(self, obj)
+            # The existing OFT path remains register-before-dispatch.
+            await self.register_oft_ref(obj)
 
         if obj.double_buffer:
             results = await self.update_adapter_from_distributed_communicator(obj)
@@ -574,6 +579,7 @@ class TokenizerControlMixin:
             if backend is not None:
                 return success, message
         else:
+            # Hold is_pause_cond while updating to prevent unpause from racing.
             async with self.is_pause_cond:
                 is_paused = self.is_pause
                 if is_paused:
@@ -582,7 +588,6 @@ class TokenizerControlMixin:
                     )
                     if backend is not None:
                         backend_result = await backend.finish_activation(obj, results)
-
             if not is_paused:
                 async with self.model_update_lock.writer_lock:
                     results = await self.update_adapter_from_distributed_communicator(
@@ -590,12 +595,11 @@ class TokenizerControlMixin:
                     )
                     if backend is not None:
                         backend_result = await backend.finish_activation(obj, results)
-
             if backend is not None:
                 return backend_result
             success, message = FanOutCommunicator.merge_results(results)
 
-        message += await oft_tokenizer_hooks.bump_oft_version(self, obj, success)
+        message += await self.bump_oft_version(obj, success)
         return success, message
 
     async def activate_adapter_version(
@@ -603,16 +607,23 @@ class TokenizerControlMixin:
         obj: ActivateAdapterVersionReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        """Drain admission and activate native LoRA or canonical OFT."""
+        """Double-buffer OFT/LoRA ACTIVATE (the drained atomic swap). The drain lives
+        HERE: model_update_lock.writer_lock waits for all in-flight generation
+        reader_locks to release (drain running_batch to empty) and blocks new
+        admission -- exactly what update_weights_from_disk/from_distributed use.
+        Only THEN is the activate control request sent to the scheduler (a simple
+        staging->active flip, since the batch is already drained); releasing the
+        lock on return resumes admission."""
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for adapter activation"
+        ), "dp_size must be 1 or dp attention must be enabled for activate adapter version"
 
         backend = self._staging_backend_for(obj)
         if backend is not None:
             backend.prepare_activation(obj)
 
+        # Hold is_pause_cond while updating to prevent unpause from racing.
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:
@@ -628,7 +639,9 @@ class TokenizerControlMixin:
 
         if backend is not None:
             return backend_result
-        return FanOutCommunicator.merge_results(results)
+
+        success, message = FanOutCommunicator.merge_results(results)
+        return success, message
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
@@ -675,11 +688,13 @@ class TokenizerControlMixin:
             obj.serialized_named_tensors
         )
 
-        from sglang.srt.oft import tokenizer_hooks as oft_tokenizer_hooks
-
-        newly_registered_oft_ref = await oft_tokenizer_hooks.register_oft_ref(
-            self, obj
-        )
+        # OFT register-before-dispatch: mint/lookup the streamed adapter's ref
+        # and set obj.adapter_id, so a later generate request naming this
+        # adapter resolves against self.oft_ref_cache. Triggered by
+        # obj.adapter_name; without it, streamed adapters loaded into the
+        # scheduler were never registered tokenizer-side -> generate 400s
+        # with "never been loaded".
+        newly_registered_oft_ref = await self.register_oft_ref(obj)
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -696,9 +711,15 @@ class TokenizerControlMixin:
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
-        message += await oft_tokenizer_hooks.bump_oft_version(self, obj, success)
+        message += await self.bump_oft_version(obj, success)
         if not success and newly_registered_oft_ref:
-            await oft_tokenizer_hooks.rollback_oft_ref(self, obj.adapter_name)
+            # The backend load this ref was minted for failed (e.g. the
+            # retired load_format="oft_adapter" path's graceful reject) --
+            # without rolling back, the name stays registered tokenizer-side
+            # with nothing actually resident on the backend, so a later
+            # /generate naming it reaches the GPU-side code instead of
+            # getting a clean "adapter not found" rejection here.
+            await self.rollback_oft_ref(obj.adapter_name)
 
         return success, message
 
@@ -970,6 +991,11 @@ class TokenizerControlMixin:
                 # With upsert, a same-name adapter keeps its lora_id so the
                 # backend refreshes it in place instead of failing the
                 # duplicate check; otherwise this resolves to a fresh ref.
+                # bump_version so the radix cache key (extended with
+                # lora_version) actually changes across the in-place
+                # refresh -- this route doesn't manage version itself, so
+                # without this every upsert of the same name would be keyed
+                # identically to the pre-upsert weights.
                 new_adapter, reused = await self.lora_registry.register_or_reuse(
                     LoRARef(
                         lora_name=obj.lora_name,
@@ -1062,6 +1088,7 @@ class TokenizerControlMixin:
                 return result
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
+
 
     async def get_weights_by_name(
         self: TokenizerManager,

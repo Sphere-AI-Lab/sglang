@@ -10,7 +10,7 @@ Semantics of the math this replaces
 
 Why this exists
 ---------------
-The PyTorch reference implementation (``dequant_fp8`` in
+The PyTorch reference implementation (``peft/fp8_utils.py::dequant_fp8`` in
 Megatron-Bridge, and ``_bridge_dequant_fp8`` in sglang) does:
 
     w = w_fp8.float().reshape(E, sr, BH, sc, BW)   # full fp32 copy

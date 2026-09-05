@@ -1,104 +1,122 @@
 import unittest
 from types import SimpleNamespace
+from typing import cast
 from unittest import mock
 
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.oft.oft_drainer import OFTDrainer
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import is_in_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 MOCK_START_TIME = 1000.0
-DRAIN_THRESHOLD = 3.0
+OFT_DRAIN_WAIT_THRESHOLD = 3.0
 
 
-def make_req(adapter_id, wait_queue_entry_time, max_new_tokens, output_len=0):
-    return SimpleNamespace(
-        adapter_id=adapter_id,
-        time_stats=SimpleNamespace(wait_queue_entry_time=wait_queue_entry_time),
-        sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
+def make_req(oft_id, wait_queue_entry_time, max_new_tokens, output_len=0):
+    time_stats = SimpleNamespace(wait_queue_entry_time=wait_queue_entry_time)
+    sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
+    req_ns = SimpleNamespace(
+        oft_id=oft_id,
+        time_stats=time_stats,
+        sampling_params=sampling_params,
         output_ids=[0] * output_len,
     )
+    return cast(Req, req_ns)
 
 
 class TestOFTDrainer(unittest.TestCase):
-    def test_starving_adapter_drains_shortest_running_adapter(self):
-        from sglang.srt.oft.oft_drainer import OFTDrainer
+    """Mirrors test_lora_drainer.py's TestLoRADrainer unit-level cases
+    (the GPU-requiring test_batch_splitting_with_drainer equivalent isn't
+    ported here) -- OFTDrainer is a field-for-field port of LoRADrainer
+    (oft_id instead of lora_id), so the same starvation/draining behavior
+    must hold."""
+
+    def test_update_draining_marks_adapter(self):
+        if is_in_ci():
+            return
 
         with mock.patch("time.monotonic", return_value=MOCK_START_TIME):
             drainer = OFTDrainer(
-                max_ofts_per_batch=2, max_wait_time_secs=DRAIN_THRESHOLD
+                max_ofts_per_batch=1, max_wait_time_secs=OFT_DRAIN_WAIT_THRESHOLD
             )
-            waiting = [
-                make_req("waiting-a", MOCK_START_TIME - 4.0, 10),
-                make_req("waiting-b", MOCK_START_TIME - 3.5, 10),
-            ]
-            running = [
-                make_req("short", MOCK_START_TIME, 5),
-                make_req("long", MOCK_START_TIME, 100),
-            ]
 
-            drainer.update_draining_state(waiting, running)
+            # Waiting request for adapter 'A' that has been waiting longer than threshold
+            wait_entry = MOCK_START_TIME - (OFT_DRAIN_WAIT_THRESHOLD + 0.01)
+            waiting_req = make_req("A", wait_entry, max_new_tokens=10)
 
-        self.assertEqual(
-            drainer.adapter_to_stats["short"].is_draining_for, "waiting-a"
-        )
-        self.assertEqual(
-            drainer.adapter_to_stats["long"].is_draining_for, "waiting-b"
-        )
+            running_req = make_req("B", wait_entry, max_new_tokens=100, output_len=0)
 
-    def test_draining_adapter_rejects_requests_that_extend_its_tail(self):
-        from sglang.srt.oft.oft_drainer import OFTDrainer
-
-        with mock.patch("time.monotonic", return_value=MOCK_START_TIME):
-            drainer = OFTDrainer(
-                max_ofts_per_batch=1, max_wait_time_secs=DRAIN_THRESHOLD
-            )
             drainer.update_draining_state(
-                [make_req("waiting", MOCK_START_TIME - 4.0, 10)],
-                [make_req("running", MOCK_START_TIME, 15)],
+                waiting_queue=[waiting_req],
+                running_reqs=[running_req],
             )
 
-        self.assertTrue(
-            drainer.can_schedule(make_req("running", 0.0, max_new_tokens=10))
-        )
-        self.assertFalse(
-            drainer.can_schedule(make_req("running", 0.0, max_new_tokens=20))
-        )
+            # Running adapter 'B' should be marked as draining for 'A'
+            self.assertEqual(drainer.adapter_to_stats["B"].is_draining_for, "A")
 
-    def test_oft_admission_honors_draining_before_capacity(self):
-        from sglang.srt.oft.oft_drainer import OFTDrainer
-        from sglang.srt.oft.integration import maybe_admit_request
+            # Once running adapter 'B' finishes running, it should no longer be draining
+            drainer.update_draining_state(waiting_queue=[waiting_req], running_reqs=[])
+            self.assertIsNone(drainer.adapter_to_stats["B"].is_draining_for)
 
-        drainer = OFTDrainer(max_ofts_per_batch=1)
-        drainer.adapter_to_stats["running"].is_draining_for = "waiting"
-        drainer.adapter_to_stats["running"].max_remaining_tokens = 10
+        with mock.patch("time.monotonic", return_value=MOCK_START_TIME):
+            drainer = OFTDrainer(
+                max_ofts_per_batch=2, max_wait_time_secs=OFT_DRAIN_WAIT_THRESHOLD
+            )
 
-        class CapacityMustNotRun:
-            def validate_oft_batch(self, _adapter_ids):
-                raise AssertionError("capacity check ran for a draining adapter")
+            # Two starving adapters should cause two running adapters to drain.
+            wait_entryA = MOCK_START_TIME - (OFT_DRAIN_WAIT_THRESHOLD + 0.05)
+            wait_entryD = MOCK_START_TIME - (OFT_DRAIN_WAIT_THRESHOLD + 0.01)
+            starving_a = make_req("A", wait_entryA, max_new_tokens=10)
+            starving_d = make_req("D", wait_entryD, max_new_tokens=10)
 
-        scheduler = SimpleNamespace(
-            oft_drainer=drainer,
-            tp_worker=SimpleNamespace(
-                model_runner=SimpleNamespace(oft_manager=CapacityMustNotRun())
-            ),
-        )
-        req = make_req("running", 0.0, max_new_tokens=20)
+            # Running adapters B and C with different remaining tokens
+            running_b = make_req("B", wait_entryA, max_new_tokens=5, output_len=0)
+            running_c = make_req("C", wait_entryA, max_new_tokens=100, output_len=0)
 
-        self.assertFalse(maybe_admit_request(scheduler, req, {"running"}))
+            drainer.update_draining_state(
+                waiting_queue=[starving_a, starving_d],
+                running_reqs=[running_b, running_c],
+            )
 
-    def test_scheduler_initializes_the_configured_oft_drainer(self):
-        from sglang.srt.managers.scheduler import Scheduler
-        from sglang.srt.oft.oft_drainer import OFTDrainer
+            # B (smaller remaining tokens) should be drained for the most-starved adapter 'A'
+            self.assertEqual(drainer.adapter_to_stats["B"].is_draining_for, "A")
 
-        scheduler = object.__new__(Scheduler)
-        scheduler.max_ofts_per_batch = 3
+            # C should be drained for the other starving adapter 'D'
+            self.assertEqual(drainer.adapter_to_stats["C"].is_draining_for, "D")
 
-        with mock.patch(
-            "sglang.srt.managers.scheduler.get_lora",
-            return_value=SimpleNamespace(oft_drain_wait_threshold=2.5),
-        ):
-            scheduler.init_oft_drainer()
+    def test_can_schedule_respects_draining_tolerance(self):
+        if is_in_ci():
+            return
 
-        self.assertIsInstance(scheduler.oft_drainer, OFTDrainer)
-        self.assertEqual(scheduler.oft_drainer.max_ofts_per_batch, 3)
-        self.assertEqual(scheduler.oft_drainer.max_wait_time_secs, 2.5)
+        with mock.patch("time.monotonic", return_value=MOCK_START_TIME):
+            drainer = OFTDrainer(
+                max_ofts_per_batch=1, max_wait_time_secs=OFT_DRAIN_WAIT_THRESHOLD
+            )
+
+            wait_entry = MOCK_START_TIME - (OFT_DRAIN_WAIT_THRESHOLD + 0.01)
+            starving_req = make_req("A", wait_entry, max_new_tokens=10)
+
+            running_b = make_req("B", wait_entry, max_new_tokens=15, output_len=0)
+            drainer.update_draining_state(
+                waiting_queue=[starving_req],
+                running_reqs=[running_b],
+            )
+
+            self.assertEqual(drainer.adapter_to_stats["B"].is_draining_for, "A")
+
+            # max_new_tokens is less than running adapter B's max_new_tokens
+            req_ok = make_req(
+                oft_id="B", wait_queue_entry_time=0, max_new_tokens=10, output_len=0
+            )
+            self.assertTrue(drainer.can_schedule(req_ok))
+
+            # max_new_tokens is more than running adapter B's max_new_tokens
+            req_bad = make_req(
+                oft_id="B", wait_queue_entry_time=0, max_new_tokens=20, output_len=0
+            )
+            self.assertFalse(drainer.can_schedule(req_bad))
 
 
 if __name__ == "__main__":

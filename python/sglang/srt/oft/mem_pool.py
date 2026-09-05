@@ -1,11 +1,14 @@
 import logging
+from contextlib import nullcontext
 from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import divide
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.oft.base.mem_pool import EMPTY_SLOT, AdapterMemPool, EmptySlot
+from sglang.srt.lora.eviction_policy import get_eviction_policy
+from sglang.srt.lora.utils import get_stacked_multiply as _lora_get_stacked_multiply
 from sglang.srt.oft.layers import BaseLayerWithOFT
 from sglang.srt.oft.oft import OFTAdapter
 from sglang.srt.oft.oft_config import OFTConfig
@@ -24,28 +27,23 @@ logger = logging.getLogger(__name__)
 
 
 # Fused HF projection leaf -> tuple of split leaves. Inverse of the LoRA
-# params mapping used by native LoRA, kept local here because the OFT
+# params_mapping in sglang.srt.lora.utils, kept local here because the OFT
 # load path needs the forward direction (split-leaf -> fused).
 MERGED_OFT_PROJ_GROUPS = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj"),
     "gate_up_proj": ("gate_proj", "up_proj"),
     "fused_qkv_a_proj_with_mqa": ("q_a_proj", "kv_a_proj_with_mqa"),
+    # GDN (GatedDeltaNet) packed input projections, e.g. Qwen3.5.
+    "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+    "in_proj_ba": ("in_proj_b", "in_proj_a"),
 }
 
 
 def get_stacked_multiply(module_name: str) -> int:
-    """Return a fused projection's output stacking factor."""
-    stacked_rank = {
-        "qkv_proj": 3,
-        "in_proj_qkvz": 4,
-        "in_proj_ba": 2,
-        "gate_up_proj": 2,
-        "gate_up_proj_moe": 2,
-        "gate_up_proj_shared_moe": 2,
-        "in_proj": 2,
-        "fused_qkv_a_proj_with_mqa": 2,
-    }
-    return stacked_rank.get(module_name.rsplit(".", 1)[-1], 1)
+    """Like :func:`sglang.srt.lora.utils.get_stacked_multiply` but accepts a
+    dotted FQN (``model.layers.0.self_attn.qkv_proj``) as well as the bare
+    leaf."""
+    return _lora_get_stacked_multiply(module_name.rsplit(".", 1)[-1])
 
 
 def _replace_leaf_module_name(key: str, old_leaf: str, new_leaf: str) -> str:
@@ -103,19 +101,6 @@ def normalize_merged_oft_weights(
     return result
 
 
-def resolve_fused_oft_slice(key: str) -> Tuple[str, int, int]:
-    """If ``key`` references a split CanonicalOFT projection
-    (``q_proj.oft_r`` etc.) return ``(fused_key, slice_index, split_count)``.
-    For non-split keys, return ``(key, 0, 1)``."""
-    for fused_leaf, split_leaves in MERGED_OFT_PROJ_GROUPS.items():
-        for index, split_leaf in enumerate(split_leaves):
-            token = "." + split_leaf + "."
-            if token in key:
-                fused = key.replace(token, "." + fused_leaf + ".", 1)
-                return fused, index, len(split_leaves)
-    return key, 0, 1
-
-
 def _contains_leaf(key: str, leaf: str) -> bool:
     return f".{leaf}." in key
 
@@ -149,6 +134,28 @@ def _fill_identity(buffer_view: torch.Tensor, block_size: int) -> None:
         block_size, dtype=buffer_view.dtype, device=buffer_view.device
     )
     buffer_view[:, :block_size, :block_size] = eye
+
+
+def _fill_expert_oft_identity(buffer: torch.Tensor) -> None:
+    """Fill an expert-OFT R buffer view with identity (OFT passthrough).
+
+    Expert-OFT groups (``w13_oft_r``/``w1_oft_r``/``w3_oft_r``/``w2_oft_r``)
+    have no max-block-size padding concept unlike the dense ``_fill_identity``
+    above -- ``buffer.shape[-1]`` (the block dim) IS the block size, so the
+    whole trailing (block_size, block_size) sub-matrix is set to eye, not just
+    a top-left sub-block. Moved here (from ``oft_manager.py``) so this module
+    -- which already owns ``_fill_identity``, the dense equivalent -- can call
+    it from ``reset_buffer_slot_to_identity`` without a circular import
+    (``oft_manager.py`` imports from this module, not the reverse);
+    ``oft_manager.py`` re-imports it under the same name for its own
+    boot-time ``active_idx`` fill.
+    """
+    buffer.zero_()
+    if buffer.numel() == 0:
+        return
+    block_size = buffer.shape[-1]
+    eye = torch.eye(block_size, dtype=buffer.dtype, device=buffer.device)
+    buffer[...] = eye
 
 
 def _write_oft_r_block(
@@ -222,11 +229,31 @@ def _write_oft_r_block(
     buffer_slot[:num_blocks_adapter, :block_size, :block_size] = r
 
 
-class OFTMemoryPool(AdapterMemPool):
+class EmptySlot:
+    """Singleton class to represent an empty slot in the memory pool."""
+
+    __slots__ = ()
+
+    def __repr__(self):
+        return "|EMPTY|"
+
+    def __new__(cls):
+        if not hasattr(cls, "_instance"):
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+
+EMPTY_SLOT = EmptySlot()
+
+
+class OFTMemoryPool:
     """Memory pool for OFT adapter weights.
 
     Unlike LoRA which has separate A and B buffers, OFT uses a single R buffer
     per module, storing compact upper-triangular parameters of skew-symmetric blocks.
+
+    Tracks which adapter UID occupies which buffer slot and how to evict a
+    slot when the pool is full.
     """
 
     def __init__(
@@ -248,15 +275,22 @@ class OFTMemoryPool(AdapterMemPool):
         memory_saver_cpu_backup: bool = False,
         double_buffer: bool = False,
     ):
-        super().__init__(
-            max_adapters_per_batch=max_ofts_per_batch,
-            dtype=dtype,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            eviction_policy=eviction_policy,
-            memory_saver_adapter=memory_saver_adapter,
-            memory_saver_cpu_backup=memory_saver_cpu_backup,
-        )
+        # Default slot layout: single-active adapter at 0, staging twin at 1.
+        # OFT overrides active_idx/staging_idx (base identity occupies slot 0).
+        self.max_adapters_per_batch = max_ofts_per_batch
+        self.dtype = dtype
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        self.memory_saver_adapter = memory_saver_adapter
+        self.memory_saver_cpu_backup = memory_saver_cpu_backup
+        self.eviction_policy = get_eviction_policy(eviction_policy)
+        self.uid_to_buffer_id = {}
+        self.buffer_id_to_uid = [EMPTY_SLOT] * max_ofts_per_batch
+        self._groups = {}
+        self._active_version = None
+        self._staged_version = None
+        self.active_idx = 0
+        self.staging_idx = 1
         if double_buffer:
             # base=0 (unchanged), active=1, staging=max_ofts_per_batch-1
             # (=2 when orbit passes max_ofts_per_batch=3).
@@ -273,8 +307,8 @@ class OFTMemoryPool(AdapterMemPool):
         self.external_target_modules: Set[str] = external_target_modules or set()
         self.oft_modules: Optional[List[Dict[str, BaseLayerWithOFT]]] = oft_modules
         self.oft_added_tokens_size: int = oft_added_tokens_size
-        # Single global split(canonical)-vs-fused signal
-        # (sglang.srt.oft.config.OFTArgs.oft_type); drives the MoE group layout
+        # Single global split(canonical)-vs-fused signal (sglang.srt.oft.config.
+        # OFTArgs.oft_type); drives which MoE expert gate/up group layout
         # _declare_expert_groups registers (w1_oft_r+w3_oft_r split vs w13_oft_r
         # fused).
         self.oft_type: str = oft_type
@@ -294,7 +328,7 @@ class OFTMemoryPool(AdapterMemPool):
         # R duplicated into q/k/v) load via ``_broadcast_legacy_single_R``,
         # which writes the same R into all three slices.
         #
-        # The tensors themselves now live in the base ``AdapterMemPool`` group
+        # The tensors themselves now live in this class's own group
         # registry (``self._groups["R:{target}"]``, populated by
         # ``_declare_groups``); ``self.R_buffer`` below is a read-only accessor
         # kept for existing internal readers.
@@ -308,9 +342,78 @@ class OFTMemoryPool(AdapterMemPool):
 
         self.init_buffers(base_model)
 
+    def _weights_memory_saver_region(self):
+        adapter = self.memory_saver_adapter
+        if (
+            adapter is None
+            or not getattr(adapter, "enabled", False)
+            or not self.memory_saver_cpu_backup
+        ):
+            return nullcontext()
+        return adapter.region(
+            GPU_MEMORY_TYPE_WEIGHTS,
+            enable_cpu_backup=True,
+        )
+
+    def get_buffer_id(self, uid):
+        return self.uid_to_buffer_id[uid]
+
+    def register_buffer_group(self, name, per_key_shape, dtype=None, device=None):
+        dt = dtype or self.dtype
+        self._groups[name] = {
+            key: torch.empty(
+                self.max_adapters_per_batch, *shape, dtype=dt, device=device or "cuda"
+            )
+            for key, shape in per_key_shape.items()
+        }
+
+    def slot(self, name, key, slot_idx):
+        return self._groups[name][key][slot_idx]
+
+    def active_view(self, name, key):
+        return self.slot(name, key, self.active_idx)
+
+    def stage(self, version, named_tensors):
+        self._fill_slot(self.staging_idx, named_tensors)
+        self._staged_version = version
+
+    def activate(self, version):
+        if self._staged_version != version:
+            raise RuntimeError(
+                f"inactive_slot_busy: staged={self._staged_version} requested={version}"
+            )
+        for name, keyed in self._groups.items():
+            for key in keyed:
+                self.slot(name, key, self.active_idx).copy_(
+                    self.slot(name, key, self.staging_idx)
+                )
+        self._active_version = version
+        self._staged_version = None
+
+    def _init_staging_from_active(self):
+        """Boot-time hardening: seed each group's STAGING slot with its
+        neutral-initialized ACTIVE slot, so a PARTIAL-coverage stage (a sync
+        that fills only a subset of the registered groups) does not leave the
+        staging slot as ``torch.empty`` garbage that ``activate()`` would then
+        blanket-copy into the active slot.
+
+        Call ONLY when double-buffer is on, AFTER the active slot has been
+        neutral-initialized (end of the manager's init_state). It is a pure
+        no-op for orbit's full-coverage syncs (every stage overwrites staging
+        before activate); it only affects the never-orbit-hit partial-coverage
+        case. The ``staging_idx == active_idx`` guard makes it safe to call when
+        double-buffer collapses the two indices."""
+        if self.staging_idx == self.active_idx:
+            return
+        for name, keyed in self._groups.items():
+            for key in keyed:
+                self.slot(name, key, self.staging_idx).copy_(
+                    self.slot(name, key, self.active_idx)
+                )
+
     @property
     def R_buffer(self) -> Dict[str, Dict[int, torch.Tensor]]:
-        """Thin accessor over the base ``AdapterMemPool`` group registry.
+        """Thin accessor over this class's own group registry.
 
         ``R_buffer[target][layer]`` returns the group's full
         ``[max_ofts_per_batch, ...]`` tensor for that target/layer — the same
@@ -494,7 +597,7 @@ class OFTMemoryPool(AdapterMemPool):
 
     def _declare_groups(self):
         """Register one buffer group per dense fused-target module (``R:{target}``)
-        on the base ``AdapterMemPool`` registry.
+        on this class's own registry.
 
         Same shape and initial values (block-diagonal identity) the legacy
         ``self.R_buffer`` dict-of-lists construction produced — this only
@@ -554,9 +657,9 @@ class OFTMemoryPool(AdapterMemPool):
     def _find_fused_moe_layers(self) -> Dict[int, torch.nn.Module]:
         """Layer-id-indexed FusedMoE modules found in the base model.
 
-        Mirrors ``AdapterManager._find_fused_moe_modules`` (base/manager.py);
+        Mirrors ``OFTManager._find_fused_moe_modules`` (oft_manager.py);
         duplicated here (not imported) because the pool only has
-        ``self.base_model`` to scan, not an ``AdapterManager`` instance.
+        ``self.base_model`` to scan, not an ``OFTManager`` instance.
         """
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
@@ -691,11 +794,61 @@ class OFTMemoryPool(AdapterMemPool):
         oft_refs: Dict[str, OFTRef],
         oft_embed_tokens_module: Optional[BaseLayerWithOFT],
         oft_lm_head_module: Optional[BaseLayerWithOFT],
-        expert_loader: Optional[Callable[[OFTAdapter, int], None]] = None,
     ):
         # Mark all adapters in current batch as used (for LRU tracking)
         for uid in cur_uids:
             self.eviction_policy.mark_used(uid)
+
+        def get_available_buffer_slot() -> int:
+            """Lazy-admission fallback for a real uid with already-
+            materialized weights (``oft_adapters``) but no serving slot yet
+            -- e.g. a brand-new adapter that the staged path (StagedOFTManager
+            .activate_adapter) just registered CPU-side only, with no on-disk
+            preload path left to have admitted it eagerly. Mirrors
+            LoRAMemoryPool.prepare_lora_batch's inline ``get_available_buffer_
+            slot`` closure, adapted to OFT's own eviction conventions
+            (established by allocate_buffer_slot_with_eviction, the native-RPC
+            admission path): the base/identity placeholder (uid=None) is
+            never an eviction candidate, and neither is a pinned ref nor a
+            non-reloadable one (an adapter loaded over the wire has no CPU-
+            side artifact to re-page from).
+            """
+            # 1. Prioritize empty slots
+            for buffer_id in range(self.max_ofts_per_batch):
+                if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
+                    return buffer_id
+
+            # 2. Memory pool is full, need to evict using policy
+            candidates: Set[Optional[str]] = set()
+            for buffer_id in range(self.max_ofts_per_batch):
+                victim_uid = self.buffer_id_to_uid[buffer_id]
+                if victim_uid is None:
+                    continue
+                if victim_uid in cur_uids:
+                    continue
+                ref = oft_refs.get(victim_uid)
+                if ref is not None and (ref.pinned or not ref.reloadable):
+                    continue
+                candidates.add(victim_uid)
+
+            if not candidates:
+                raise ValueError(
+                    "No available buffer slots for lazy OFT admission. "
+                    "Please ensure the number of active (pinned) adapters "
+                    "and adapters loaded over the wire (no on-disk artifact "
+                    "to reload from, never evicted) is less than "
+                    f"max_ofts_per_batch={self.max_ofts_per_batch}."
+                )
+
+            victim_uid = self.eviction_policy.select_victim(candidates)
+            victim_buffer_id = self.uid_to_buffer_id.pop(victim_uid)
+            self.eviction_policy.remove(victim_uid)
+            self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
+            logger.debug(
+                f"Evicting OFT adapter {victim_uid} from buffer slot "
+                f"{victim_buffer_id} for lazy admission."
+            )
+            return victim_buffer_id
 
         # Deterministic order: cur_uids is a set, and per-process hash
         # randomization would otherwise let each TP rank map the same adapters
@@ -703,34 +856,89 @@ class OFTMemoryPool(AdapterMemPool):
         # Mirrors upstream LoRAMemoryPool.prepare_lora_batch.
         for uid in sorted(cur_uids, key=lambda uid: (uid is not None, uid or "")):
             if uid not in self.uid_to_buffer_id:
-                buffer_id = self._acquire_buffer_slot(cur_uids, oft_refs)
-                oft_adapter = oft_adapters.get(uid, None)
-                try:
-                    self.load_oft_weight_to_buffer(
-                        uid,
-                        buffer_id,
-                        oft_adapter,
-                        oft_modules,
-                        oft_embed_tokens_module,
-                        oft_lm_head_module,
+                if uid is None:
+                    # The base/identity placeholder's own one-time boot
+                    # registration (OFTManager.init_memory_pool's
+                    # fetch_new_ofts({None}) call, against a freshly
+                    # constructed, entirely empty pool) -- not admission for
+                    # a real adapter, so it needs no eviction fallback and is
+                    # unrelated to the (now-retired) on-disk (--peft-paths)
+                    # lazy admission this loop used to also perform. Always
+                    # lands in the first empty slot (slot 0 on a fresh pool);
+                    # never evicted afterward (see allocate_buffer_slot_with_
+                    # eviction's uid=None exclusion), so this branch never
+                    # runs again post-boot.
+                    buffer_id = next(
+                        (
+                            i
+                            for i in range(self.max_ofts_per_batch)
+                            if self.buffer_id_to_uid[i] == EMPTY_SLOT
+                        ),
+                        None,
                     )
-                    if expert_loader is not None and oft_adapter is not None:
-                        expert_loader(oft_adapter, buffer_id)
-                except Exception:
+                    if buffer_id is None:
+                        raise ValueError(
+                            "No empty buffer slot available for the base/"
+                            "identity placeholder's boot registration -- this "
+                            "should be unreachable (it is the very first uid "
+                            "ever admitted, against a freshly constructed, "
+                            "entirely empty pool)."
+                        )
                     self.reset_buffer_slot_to_identity(buffer_id)
-                    raise
+                    self.uid_to_buffer_id[uid] = buffer_id
+                    self.buffer_id_to_uid[buffer_id] = uid
+                    continue
+                # A real uid with no serving slot yet: admit it lazily from
+                # its already-materialized CPU-side adapter (``oft_adapters``
+                # -- populated by StagedOFTManager.activate_adapter's
+                # deferred-registration path for a brand-new staged adapter,
+                # or already present for any other resident real uid). The
+                # native-RPC path (OFTManager.load_adapter_from_tensors)
+                # still admits eagerly at load time via
+                # allocate_buffer_slot_with_eviction, so this fallback is
+                # normally only reached by the staged path.
+                buffer_id = get_available_buffer_slot()
+                # Identity-fill BEFORE writing real weights: load_oft_weight_
+                # to_buffer only overwrites the dense R_buffer/embedding
+                # groups, never the expert-OFT groups (w1/w3/w13/w2_oft_r), so
+                # a freshly-acquired (or evicted-and-reused) slot must be
+                # identity-safe first -- mirrors the native-RPC path's own
+                # allocate_buffer_slot_with_eviction -> reset_buffer_slot_to_
+                # identity call pattern (Task 4b).
+                self.reset_buffer_slot_to_identity(buffer_id)
+                oft_adapter = oft_adapters.get(uid, None)
+                self.load_oft_weight_to_buffer(
+                    uid,
+                    buffer_id,
+                    oft_adapter,
+                    oft_modules,
+                    oft_embed_tokens_module,
+                    oft_lm_head_module,
+                )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
 
     def load_oft_weight_to_buffer(
         self,
-        uid: Optional[str],
+        uid: str,
         buffer_id: int,
         oft_adapter: Optional[OFTAdapter],
         oft_modules: List[Dict[str, BaseLayerWithOFT]],
         oft_embed_tokens_module: Optional[BaseLayerWithOFT],
         oft_lm_head_module: Optional[BaseLayerWithOFT],
     ):
+        """Write an already-materialized real adapter's compact checkpoint
+        weights into buffer slot ``buffer_id``, precomputing each module's R
+        matrix on the way in.
+
+        General-purpose admission helper for any not-yet-resident real uid
+        with a materialized ``OFTAdapter`` -- used by ``prepare_oft_batch``'s
+        lazy-admission fallback (analogous to ``LoRAMemoryPool.
+        load_lora_weight_to_buffer``). ``uid`` is never ``None`` here: the
+        base/identity placeholder is registered by ``prepare_oft_batch``'s own
+        boot-registration branch instead, which never calls this method.
+        """
+
         def precompute_and_store_R(
             buffer_view: torch.Tensor,
             compact_weight: Optional[torch.Tensor],
@@ -738,9 +946,9 @@ class OFTMemoryPool(AdapterMemPool):
         ):
             """Precompute R from compact weights and store in buffer.
 
-            Replaces load_weight_tensor: instead of storing compact 2D weights,
-            precomputes the full orthogonal rotation matrices via Cayley transform
-            and stores the 3D result (num_blocks, block_size, block_size).
+            Instead of storing compact 2D weights, precomputes the full
+            orthogonal rotation matrices via Cayley transform and stores the
+            3D result (num_blocks, block_size, block_size).
 
             When compact_weight is None (the adapter has no weights for this
             module), the buffer is filled with the block-diagonal *identity*
@@ -758,9 +966,7 @@ class OFTMemoryPool(AdapterMemPool):
                 _fill_identity(buffer_view, block_size)
                 return
 
-            R = precompute_oft_r(
-                compact_weight.to(buffer_view.device), block_size
-            )
+            R = precompute_oft_r(compact_weight.to(buffer_view.device), block_size)
             num_blocks_adapter = R.shape[0]
             total_blocks_buffer = buffer_view.shape[0]
 
@@ -771,24 +977,12 @@ class OFTMemoryPool(AdapterMemPool):
             else:
                 buffer_view[:num_blocks_adapter, :block_size, :block_size] = R
 
-        if uid is None:
-            # Base model: zero all R buffers (kernel does passthrough when block_size=0)
-            for i in range(self.num_layer):
-                for k in self.R_buffer:
-                    self.R_buffer[k][i][buffer_id] = 0
-            for k in self.embedding_R_buffer:
-                self.embedding_R_buffer[k][buffer_id] = 0
-            for k in self.lm_head_R_buffer:
-                self.lm_head_R_buffer[k][buffer_id] = 0
-            return
-
         if oft_adapter is None:
-            # A registry/GPU-pool divergence (e.g. a batch names a uid the
-            # GPU pool no longer has a CPU-side OFTAdapter for -- a wire-
-            # loaded adapter that was, or should never have been, evicted)
-            # slipping through some path not yet foreseen. Raise a clear,
-            # catchable error instead of asserting, so this can never crash
-            # the engine outright.
+            # A registry/GPU-pool divergence (e.g. a batch names a uid whose
+            # CPU-side OFTAdapter is missing from oft_adapters even though the
+            # pool's admission bookkeeping expects one) slipping through some
+            # path not yet foreseen. Raise a clear, catchable error instead of
+            # asserting, so this can never crash the engine outright.
             raise ValueError(
                 f"No OFTAdapter available to load for uid={uid!r} into buffer "
                 f"slot {buffer_id}. This uid is resident in the memory pool's "
@@ -826,9 +1020,7 @@ class OFTMemoryPool(AdapterMemPool):
 
             for name, weights in temp_R_buffer.items():
                 target_buffer = self.R_buffer[name][layer_id]
-                precompute_and_store_R(
-                    target_buffer[buffer_id], weights, block_size
-                )
+                precompute_and_store_R(target_buffer[buffer_id], weights, block_size)
 
         # Load embedding layer weights (precompute R)
         if oft_adapter.embedding_layers:
@@ -868,8 +1060,10 @@ class OFTMemoryPool(AdapterMemPool):
         """
 
         # Prefer exact fused runtime leaves first, so ``gate_up_proj`` does not
-        # get interpreted as the split ``up_proj`` leaf.
-        for target in self.R_buffer:
+        # get interpreted as the split ``up_proj`` leaf. Longer (more
+        # qualified) names are checked first so "indexer.wq_b" wins over a
+        # shorter bare name like "wq_b" that also substring-matches it.
+        for target in sorted(self.R_buffer, key=len, reverse=True):
             if _contains_leaf(name, target):
                 return target, None, 1
 
@@ -880,7 +1074,7 @@ class OFTMemoryPool(AdapterMemPool):
                 if _contains_leaf(name, split_leaf):
                     return fused_target, index, len(split_leaves)
 
-        for target in self.target_modules:
+        for target in sorted(self.target_modules, key=len, reverse=True):
             if _contains_leaf(name, target):
                 return target, None, 1
 
@@ -1050,65 +1244,21 @@ class OFTMemoryPool(AdapterMemPool):
             else:
                 buffer[buffer_id, :num_blocks_adapter, :block_size, :block_size] = R
 
-    def allocate_buffer_slot(self) -> int:
-        """Allocate a buffer slot for direct-to-GPU loading.
-
-        Returns the buffer_id of an available slot (preferring empty slots).
-        Raises ValueError if no slot is available.
-        """
-        for buffer_id in range(self.max_ofts_per_batch):
-            if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
-                return buffer_id
-
-        # Diagnostic: dump the actual contents of each slot on failure so we
-        # can tell what's holding things up. With max_ofts_per_batch=1 this is
-        # what surfaces "the streamed identity adapter can't allocate even at
-        # init"-type bugs. Logged at error level since we're about to raise.
-        slot_summary = ", ".join(
-            f"slot[{i}]={self.buffer_id_to_uid[i]!r}"
-            for i in range(self.max_ofts_per_batch)
-        )
-        uid_summary = ", ".join(
-            f"{uid!r}->buffer[{bid}]"
-            for uid, bid in self.uid_to_buffer_id.items()
-        )
-        logger.error(
-            "allocate_buffer_slot: pool full at max_ofts_per_batch=%d. "
-            "Slot contents: {%s}. UID->buffer map: {%s}.",
-            self.max_ofts_per_batch,
-            slot_summary,
-            uid_summary,
-        )
-        raise ValueError(
-            "No available buffer slots for direct OFT loading. "
-            f"All slots are occupied. (max_ofts_per_batch={self.max_ofts_per_batch}, "
-            f"slot contents: {{{slot_summary}}}, "
-            f"uid_to_buffer_id={dict(self.uid_to_buffer_id)})"
-        )
-
     def allocate_buffer_slot_with_eviction(
         self, refs: Dict[str, OFTRef]
     ) -> Tuple[int, Optional[str]]:
-        """Like allocate_buffer_slot, but for the native multi-tenant RPC
-        admission path: if no slot is empty, LRU-evict an unpinned,
-        reloadable resident real adapter to make room, mirroring
-        AdapterMemPool._acquire_buffer_slot's pattern (the lazy per-batch
-        admission path used by disk-loaded adapters) -- except the
-        base/identity slot (uid=None) is never a candidate here (there is no
-        "current batch" context to safely re-admit it into afterwards,
-        unlike _acquire_buffer_slot's caller), and neither is a pinned ref
-        (the caller's explicit "keep this one resident" request) nor a
-        non-reloadable one (an adapter loaded over the wire has no CPU-side
-        artifact to re-page from, so evicting it would be unrecoverable --
-        mirrors the retired streamed path's _make_streamed_ref, which always
-        pinned such adapters for exactly this reason).
+        """Admission for the native multi-tenant RPC path: if no slot is
+        empty, LRU-evict an unpinned, reloadable resident real adapter to
+        make room. The base/identity slot (uid=None) is never a candidate
+        here (Task 4b review fix), and neither is a pinned ref (the caller's
+        explicit "keep this one resident" request) nor a non-reloadable one
+        (an adapter loaded over the wire has no CPU-side artifact to re-page
+        from, so evicting it would be unrecoverable -- mirrors the retired
+        streamed path's _make_streamed_ref, which always pinned such
+        adapters for exactly this reason).
 
         Returns (buffer_id, evicted_uid); evicted_uid is None when an empty
         slot was found and no eviction was needed.
-
-        Does not change allocate_buffer_slot()'s own behavior: the legacy
-        single-active streamed path calls that method directly and keeps
-        its hard-fail-when-full behavior unchanged.
         """
         for buffer_id in range(self.max_ofts_per_batch):
             if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
@@ -1174,23 +1324,25 @@ class OFTMemoryPool(AdapterMemPool):
             _fill_identity(self.embedding_R_buffer[k][buffer_id], bs)
         for k in self.lm_head_R_buffer:
             _fill_identity(self.lm_head_R_buffer[k][buffer_id], bs)
-        for group_name in ("w1_oft_r", "w3_oft_r", "w13_oft_r", "w2_oft_r"):
-            for tensor in self._groups.get(group_name, {}).values():
-                slot = tensor[buffer_id]
-                slot.zero_()
-                if bs > 0:
-                    eye = torch.eye(bs, dtype=slot.dtype, device=slot.device)
-                    slot[:, :, :, :] = eye
+
+        # Expert-OFT groups (w13_oft_r / w1_oft_r / w3_oft_r / w2_oft_r) are
+        # NOT covered by the R_buffer loop above (_declare_expert_groups
+        # registers them separately in self._groups) and were never reset
+        # per-slot before -- only slot active_idx ever got identity-filled,
+        # at boot (_init_identity_expert_oft_for_cuda_graph). Without this, a
+        # token whose adapter has no MoE weights for a layer (or a freshly
+        # (re)assigned slot before any real weights are written) reads
+        # uninitialized torch.empty memory here instead of identity.
+        for group_name in ("w13_oft_r", "w1_oft_r", "w3_oft_r", "w2_oft_r"):
+            groups = self._groups.get(group_name)
+            if groups is None:
+                continue
+            for tensor in groups.values():
+                _fill_expert_oft_identity(tensor[buffer_id])
 
     def get_tensor(self, target_module: str, layer_id: int) -> torch.Tensor:
         """Get the R buffer tensor for a given module and layer."""
         return self.R_buffer[target_module][layer_id]
-
-    def get_expert_tensor(
-        self, group_name: str, layer_id: int
-    ) -> Optional[torch.Tensor]:
-        """Get the full slot group for one expert OFT projection and layer."""
-        return self._groups.get(group_name, {}).get(layer_id)
 
     def get_embedding_tensor(
         self, target_module: str

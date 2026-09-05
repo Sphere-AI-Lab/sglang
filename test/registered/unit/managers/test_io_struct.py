@@ -383,56 +383,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(len(req.input_ids), 4)  # 2 original * 2 parallel
 
-    def test_scoring_suffix_ids_single_request(self):
-        req = GenerateReqInput(text="prompt", scoring_suffix_ids=[41, 42])
-
-        req.normalize_batch_and_arguments()
-
-        self.assertTrue(req.is_single)
-        self.assertEqual(req.scoring_suffix_ids, [41, 42])
-
-    def test_scoring_suffix_ids_single_request_rejects_empty_or_nested_ids(self):
-        for suffix_ids in ([], [[41, 42]]):
-            with self.subTest(suffix_ids=suffix_ids), self.assertRaisesRegex(
-                ValueError, "non-empty list of token IDs"
-            ):
-                GenerateReqInput(
-                    text="prompt", scoring_suffix_ids=suffix_ids
-                ).normalize_batch_and_arguments()
-
-    def test_scoring_suffix_ids_batch_request(self):
-        req = GenerateReqInput(
-            text=["prompt-a", "prompt-b"],
-            scoring_suffix_ids=[[41, 42], [51, 52]],
-        )
-
-        req.normalize_batch_and_arguments()
-
-        self.assertEqual(req[0].scoring_suffix_ids, [41, 42])
-        self.assertEqual(req[1].scoring_suffix_ids, [51, 52])
-
-    def test_scoring_suffix_ids_follow_parallel_sampling_expansion(self):
-        req = GenerateReqInput(
-            text="prompt",
-            scoring_suffix_ids=[41, 42],
-            sampling_params={"n": 2},
-        )
-
-        req.normalize_batch_and_arguments()
-
-        self.assertEqual(req.scoring_suffix_ids, [[41, 42], [41, 42]])
-        self.assertEqual(req[0].scoring_suffix_ids, [41, 42])
-        self.assertEqual(req[1].scoring_suffix_ids, [41, 42])
-
-    def test_scoring_suffix_ids_batch_size_must_match(self):
-        req = GenerateReqInput(
-            text=["prompt-a", "prompt-b"],
-            scoring_suffix_ids=[[41, 42]],
-        )
-
-        with self.assertRaisesRegex(ValueError, "scoring_suffix_ids.*batch size"):
-            req.normalize_batch_and_arguments()
-
     def test_input_embeds_normalization(self):
         """Test normalization of input_embeds."""
         # Test single input_embeds

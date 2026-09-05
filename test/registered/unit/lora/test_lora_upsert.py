@@ -31,7 +31,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -200,6 +199,9 @@ class TestLoRARegistryRegisterOrReuse(CustomTestCase):
             )
 
     def test_bump_version_advances_past_existing_on_reuse(self):
+        # Regression: an upsert reuse used to never touch ``version``, so the
+        # radix cache key (extended with lora_version) never changed across
+        # an in-place weight refresh of the same adapter name.
         registry = LoRARegistry()
         asyncio.run(
             registry.register(LoRARef(lora_name="a", lora_path="/x", version=5))
@@ -212,6 +214,51 @@ class TestLoRARegistryRegisterOrReuse(CustomTestCase):
 
         self.assertTrue(reused)
         self.assertEqual(resolved.version, 6)
+
+    def test_bump_version_advances_again_from_new_baseline(self):
+        # A second successive upsert must bump from the freshly-committed
+        # version, not reset to a fixed constant.
+        registry = LoRARegistry()
+        existing = LoRARef(lora_name="a", lora_path="/x", version=5)
+        asyncio.run(registry.register(existing))
+
+        resolved_1, _ = asyncio.run(
+            registry.register_or_reuse(
+                LoRARef(lora_name="a", lora_path="__distributed__"),
+                True,
+                bump_version=True,
+            )
+        )
+        self.assertEqual(resolved_1.version, 6)
+        asyncio.run(registry.refresh(resolved_1))
+
+        resolved_2, _ = asyncio.run(
+            registry.register_or_reuse(
+                LoRARef(lora_name="a", lora_path="__distributed__"),
+                True,
+                bump_version=True,
+            )
+        )
+        self.assertEqual(resolved_2.version, 7)
+
+    def test_without_bump_version_keeps_callers_explicit_version(self):
+        # The native staged double-buffer protocol manages its own version
+        # numbering explicitly and must NOT have it overwritten here -- it
+        # calls register_or_reuse without bump_version, so a caller-supplied
+        # version (even one that doesn't equal existing.version + 1) must
+        # come back unchanged.
+        registry = LoRARegistry()
+        asyncio.run(
+            registry.register(LoRARef(lora_name="a", lora_path="/x", version=1))
+        )
+
+        candidate = LoRARef(lora_name="a", lora_path="__distributed__", version=9)
+        resolved, reused = asyncio.run(
+            registry.register_or_reuse(candidate, True, preserve_pinned=True)
+        )
+
+        self.assertTrue(reused)
+        self.assertEqual(resolved.version, 9)
 
 
 class TestUpsertRollback(CustomTestCase):
@@ -368,14 +415,6 @@ class TestValidateNewAdapterDuplicates(CustomTestCase):
         manager.validate_new_adapter(config, existing, is_update=True)
 
 
-def _publish_parallel_config(case: CustomTestCase) -> None:
-    parallel_config = get_context().override_server_args(
-        dp_size=1, enable_dp_attention=False
-    )
-    parallel_config.install()
-    case.addCleanup(parallel_config.restore)
-
-
 def _make_tokenizer_manager(tokenizer_worker_num: int = 1) -> TokenizerManager:
     tm = TokenizerManager.__new__(TokenizerManager)
     tm.server_args = MagicMock()
@@ -475,23 +514,28 @@ class TestLoadFromDistributedUpsert(CustomTestCase):
         self.assertEqual(registered.lora_id, existing.lora_id)
         self.assertTrue(registered.pinned)
 
-    def test_successive_upserts_bump_registry_version(self):
+    def test_upsert_bumps_registry_version(self):
+        # Regression: load_lora_adapter_from_distributed's upsert path never
+        # set a version on its fresh LoRARef, so register_or_reuse carried
+        # the default 0 through every refresh -- the radix cache key
+        # (extended with lora_version) never changed across an in-place
+        # weight update of the same adapter name.
         tm = _make_tokenizer_manager()
-        existing = LoRARef(
-            lora_name="a", lora_path="__distributed__", version=3
-        )
+        existing = LoRARef(lora_name="a", lora_path="__distributed__", version=3)
         asyncio.run(tm.lora_registry.register(existing))
 
-        first = _make_distributed_req(upsert=True)
-        first_result = asyncio.run(tm.load_lora_adapter_from_distributed(first))
+        obj = _make_distributed_req(upsert=True)
+        result = asyncio.run(tm.load_lora_adapter_from_distributed(obj))
 
-        self.assertTrue(first_result.success)
-        self.assertEqual(tm.lora_registry.get_all_adapters()["a"].version, 4)
+        self.assertTrue(result.success)
+        registered = tm.lora_registry.get_all_adapters()["a"]
+        self.assertEqual(registered.version, 4)
 
-        second = _make_distributed_req(upsert=True)
-        second_result = asyncio.run(tm.load_lora_adapter_from_distributed(second))
-
-        self.assertTrue(second_result.success)
+        # A second successive upsert bumps again from the new baseline, not
+        # back to a fixed constant.
+        obj2 = _make_distributed_req(upsert=True)
+        result2 = asyncio.run(tm.load_lora_adapter_from_distributed(obj2))
+        self.assertTrue(result2.success)
         self.assertEqual(tm.lora_registry.get_all_adapters()["a"].version, 5)
 
     def test_failed_backend_load_keeps_registry_untouched(self):
@@ -515,10 +559,6 @@ class TestLoadFromTensorsUpsertUnsupported(CustomTestCase):
     """Only the from_distributed route supports in-place refresh; the
     from_tensors route must reject upsert explicitly instead of minting a
     fresh uuid and dying later on the backend duplicate check."""
-
-    def setUp(self):
-        super().setUp()
-        _publish_parallel_config(self)
 
     def test_upsert_rejected_explicitly(self):
         tm = _make_tokenizer_manager()
@@ -558,10 +598,6 @@ class TestLoadFromTensorsUpsertUnsupported(CustomTestCase):
 class TestUpsertMultiTokenizerWorkerGuard(CustomTestCase):
     """Upsert resolves names against a per-process registry; with >1 tokenizer
     workers that resolution is nondeterministic, so it must fail loudly."""
-
-    def setUp(self):
-        super().setUp()
-        _publish_parallel_config(self)
 
     def test_distributed_upsert_rejected_with_multiple_workers(self):
         tm = _make_tokenizer_manager(tokenizer_worker_num=2)

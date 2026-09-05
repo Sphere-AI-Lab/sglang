@@ -44,15 +44,6 @@ def get_hf_text_config(config: AutoConfig) -> AutoConfig:
 
 
 @dataclass
-class MoEOFTBatchInfo:
-    seg_indptr: torch.Tensor
-    req_to_oft: torch.Tensor
-    adapter_enabled: torch.Tensor
-    token_oft_mapping: torch.Tensor
-    num_tokens: int
-
-
-@dataclass
 class OFTBatchInfo:
     # The forward mode is using CUDA Graph.
     use_cuda_graph: bool
@@ -82,12 +73,6 @@ class OFTBatchInfo:
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
     permutation: Optional[torch.Tensor]
 
-    # Request-aware OFT metadata consumed by MoE OFT execution.
-    moe_oft_info: Optional[MoEOFTBatchInfo] = None
-
-    # CPU-side flag that at least one request in the batch uses OFT.
-    has_active_oft: bool = False
-
 
 def _intermediate_for_layer(config: AutoConfig, layer_idx: int) -> int:
     """Pick MLP intermediate size for a given layer.
@@ -103,6 +88,14 @@ def _intermediate_for_layer(config: AutoConfig, layer_idx: int) -> int:
     if n_routed and moe_inter and layer_idx >= first_dense:
         return moe_inter
     return config.intermediate_size
+
+
+# DSA indexer projections are qualified with their parent module name because
+# the bare leaf names collide with unrelated modules in other models (e.g.
+# DeepSeek-V4 attention's own "wq_b").
+DSA_INDEXER_OFT_NAMES = frozenset(
+    {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
+)
 
 
 def get_hidden_dim(
@@ -162,6 +155,21 @@ def get_hidden_dim(
                 return config.hidden_size, q_lora_rank + kv_lora_rank + qk_rope
             # o_proj differs from non-MLA: input dim is num_heads * v_head_dim.
             return num_heads * v_head, config.hidden_size
+        if module_name in DSA_INDEXER_OFT_NAMES:
+            from sglang.srt.configs.model_config import (
+                get_dsa_index_head_dim,
+                get_dsa_index_n_heads,
+            )
+
+            if module_name == "indexer.wq_b":
+                return (
+                    config.q_lora_rank,
+                    get_dsa_index_n_heads(config) * get_dsa_index_head_dim(config),
+                )
+            elif module_name == "indexer.wk":
+                return config.hidden_size, get_dsa_index_head_dim(config)
+            else:  # indexer.weights_proj
+                return config.hidden_size, get_dsa_index_n_heads(config)
         if module_name == "qkv_proj":
             return config.hidden_size, head_dim * (
                 config.num_attention_heads + config.num_key_value_heads * 2
@@ -216,6 +224,8 @@ def get_normalized_target_modules(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
+        "in_proj_b": "in_proj_ba",
+        "in_proj_a": "in_proj_ba",
         "q_a_proj": "fused_qkv_a_proj_with_mqa",
         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
         "embed_tokens": "embed_tokens",
@@ -225,25 +235,26 @@ def get_normalized_target_modules(
         "lm_head": "lm_head",
         "output": "lm_head",
         "unembed_tokens": "lm_head",
+        # DSA indexer wk / weights_proj don't collide with any other OFT
+        # target, so the bare leaf name can map straight to the qualified
+        # form. wq_b is deliberately NOT mapped here: unlike LoRA, OFT
+        # already uses bare "wq_b" for DeepSeek V4 attention's own query
+        # projection, so the indexer's query projection must be requested
+        # via the fully qualified "indexer.wq_b" (passed through as-is
+        # below, never stripped to its bare leaf name).
+        "wk": "indexer.wk",
+        "weights_proj": "indexer.weights_proj",
     }
 
     result = set()
     for name in target_modules:
+        if name in DSA_INDEXER_OFT_NAMES:
+            result.add(name)
+            continue
         base_name = name.split(".")[-1]
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
     return result
-
-
-def get_stacked_multiply(module_name: str) -> int:
-    """
-    Mapping an OFT module name to its magnification at output dimension.
-    """
-    stacked_rank = {
-        "qkv_proj": 3,
-        "gate_up_proj": 2,
-    }
-    return stacked_rank[module_name] if module_name in stacked_rank else 1
 
 
 def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> str:
@@ -252,8 +263,12 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
     If there is a target module name in target_modules that can match full_module_name, return this name.
     Else raise ValueError.
+
+    Longer (more qualified) candidates are checked first so a qualified name
+    like "indexer.wq_b" wins over a shorter bare name like "wq_b" that also
+    happens to substring-match the same full_module_name.
     """
-    for target_module in target_modules:
+    for target_module in sorted(target_modules, key=len, reverse=True):
         if target_module in full_module_name:
             return target_module
     raise ValueError(
@@ -263,68 +278,6 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_OFT_NAMES = ["o_proj", "down_proj", "wo_b"]
-
-
-def detect_canonical_split_active() -> bool:
-    """True iff the global server args indicate canonical-split OFT will run.
-
-    Detection rule: peft_method == "oft" AND oft_type == "canonical_oft".
-    ``oft_type`` (``sglang.srt.oft.config.OFTArgs.oft_type``) is the single
-    global split-vs-fused signal for OFT -- it also drives the MoE expert
-    gate/up group layout (``oft/mem_pool.py``'s ``_declare_expert_groups``)
-    and the dense split-buffer forward (``oft/layers.py``'s
-    ``_split_stacked_R``), so this helper simply reads that one flag rather
-    than re-deriving split-vs-fused from ``peft_target_modules`` (which cannot
-    disambiguate: a FusedMoE/QKV/gate-up module collapses both a legacy and a
-    split adapter's leaves to the same fused target name).
-
-    Called at process_weights_after_loading time, BEFORE OFT adapters have
-    been loaded -- we infer the future configuration from server args.
-
-    CONTRACT: this is the single source of truth for "is canonical-split
-    active for this run?". Any quant scheme that branches on this must call
-    this helper rather than re-implementing the rule.
-
-    SGLANG_DISABLE_PREPACK_SPLIT=1 forces this to return False regardless of
-    server args -- used for the launcher A/B baseline (Task 7).
-    """
-    from sglang.srt.utils import get_bool_env_var
-
-    if get_bool_env_var("SGLANG_DISABLE_PREPACK_SPLIT"):
-        return False
-    try:
-        from sglang.srt.server_args import get_global_server_args
-    except ImportError:
-        return False
-    try:
-        args = get_global_server_args()
-    except Exception:
-        return False
-    if args.peft_method != "oft":
-        return False
-    return args.oft_type == "canonical_oft"
-
-
-def assert_canonical_split_supported(scheme_name: str) -> None:
-    """Fail-fast when canonical-split OFT is requested but this MoE scheme
-    doesn't implement split-aware prepack/forward.
-
-    Called from process_weights_after_loading. If canonical-split is
-    detected via server args but the scheme has no split-aware path, raise
-    NotImplementedError now (at model load) instead of failing at first
-    forward inside the Triton MoE runner.
-    """
-    if not detect_canonical_split_active():
-        return
-    raise NotImplementedError(
-        f"Canonical-split OFT (gate_proj + up_proj both in "
-        f"--oft-target-modules) is not yet supported for MoE scheme "
-        f"{scheme_name!r}. Only INT4 W4A16 via CompressedTensorsWNA16MoE "
-        "has a split-aware kernel path at this time. "
-        "For FP8/NVFP4, either use legacy single-R OFT (--oft-type oft) "
-        "or wait for the follow-up plan to implement the split-aware "
-        "kernel for this scheme."
-    )
 
 
 def generate_sequence_lengths(

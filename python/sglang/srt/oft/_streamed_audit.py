@@ -43,10 +43,6 @@ def _path_for_rank(base: str, tp_rank: int) -> Path:
     return Path(f"{base}.sglang_streamed.tp{tp_rank}.jsonl")
 
 
-def enabled() -> bool:
-    return _base() is not None
-
-
 def _tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
     detached = tensor.detach()
     if detached.numel() == 0:

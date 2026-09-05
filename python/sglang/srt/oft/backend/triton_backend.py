@@ -70,26 +70,6 @@ class TritonOFTBackend(BaseOFTBackend):
             )
         return sgemm_oft_r_fwd(x, weights, self.batch_info, num_slices=1)
 
-    def run_grouped_oft_r_sgemm(
-        self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        *args,
-        n_groups: int,
-        **kwargs,
-    ) -> torch.Tensor:
-        if self._use_single_adapter_fast_path:
-            if n_groups <= 0:
-                raise ValueError(f"n_groups must be positive, got {n_groups}")
-            return self.run_oft_r_sgemm(x, weights, *args, **kwargs)
-        return super().run_grouped_oft_r_sgemm(
-            x,
-            weights,
-            *args,
-            n_groups=n_groups,
-            **kwargs,
-        )
-
     def run_qkv_oft(
         self,
         x: torch.Tensor,
@@ -242,9 +222,6 @@ class TritonOFTBackend(BaseOFTBackend):
                     1 : max_bs_in_cuda_graph + 1
                 ],
             )
-            self._init_cuda_graph_moe_buffers(
-                max_bs_in_cuda_graph * num_tokens_per_bs
-            )
 
     def prepare_oft_batch(
         self,
@@ -291,9 +268,7 @@ class TritonOFTBackend(BaseOFTBackend):
             else:
                 self._use_single_adapter_fast_path = True
 
-            if self.is_moe_oft:
-                self._use_single_adapter_fast_path = False
-            elif self._use_single_adapter_fast_path:
+            if self._use_single_adapter_fast_path:
                 adapter_idx = int(weight_indices[0]) if weight_indices else 0
                 if 0 <= adapter_idx < len(oft_block_sizes):
                     block_size_val = int(oft_block_sizes[adapter_idx])
@@ -319,7 +294,7 @@ class TritonOFTBackend(BaseOFTBackend):
             weight_indices, dtype=torch.int32, device="cpu"
         )
 
-        if use_cuda_graph or self.is_moe_oft:
+        if use_cuda_graph:
             # CUDA graph captures the Triton launch grid. Keep one segment per
             # graph row so padded replay rows remain covered even when runtime
             # adapter ids differ from the all-empty capture batch.
@@ -414,7 +389,6 @@ class TritonOFTBackend(BaseOFTBackend):
             seg_indptr_cpu,
             seg_lens_cpu,
         )
-        batch_info.has_active_oft = any(index != 0 for index in weight_indices)
-        self.batch_info = self._add_moe_oft_info(forward_batch, batch_info)
+        self.batch_info = batch_info
         if use_cuda_graph:
             self.refresh_cuda_graph_grouped_batch_infos()

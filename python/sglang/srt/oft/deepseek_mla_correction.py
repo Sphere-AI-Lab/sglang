@@ -6,7 +6,7 @@ pre-computed ``w_kc`` / ``w_vc`` weights, which are built from the RAW
 ``kv_b_proj.weight``. A ``ColumnParallelLinearWithOFT`` wrapper on ``kv_b_proj``
 would therefore never see the activations and its input rotation ``R`` would be
 silently dropped -- the OFT analogue of the LoRA gap handled in
-the corresponding native LoRA correction. Megatron trains ``kv_b`` with a
+``sglang.srt.lora.deepseek_mla_correction``. Megatron trains ``kv_b`` with a
 materialized MLA, so it *does* apply ``R``; dropping it on the rollout side is a
 K2.5(MLA)-specific train/rollout divergence.
 

@@ -11,6 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""OFT counterpart of ``lora/lora_drainer.py`` -- same starvation-prevention
+policy, ported field-for-field (``req.lora_id`` -> ``req.oft_id``,
+``max_loras_per_batch`` -> ``max_ofts_per_batch``). ``max_ofts_per_batch``
+caps concurrent OFT adapter residency the same way ``max_loras_per_batch``
+does for LoRA, so the same starvation risk applies: once that cap is
+saturated, a request naming a not-currently-resident adapter would otherwise
+never get a slot if a popular adapter keeps the batch full indefinitely."""
 
 import logging
 import time
@@ -44,7 +51,12 @@ class AdapterStats:
 
 
 class OFTDrainer:
-    """Manage OFT request draining to prevent adapter starvation."""
+    """
+    Drainer for OFT requests that manages draining. It tracks:
+    - Number of waiting requests per adapter
+    - Maximum wait time for requests needing each adapter
+    - Maximum number of tokens needed for running requests for each adapter
+    """
 
     def __init__(self, max_ofts_per_batch: int, max_wait_time_secs: float = 0.0):
         self.max_ofts_per_batch = max_ofts_per_batch
@@ -58,6 +70,12 @@ class OFTDrainer:
         waiting_queue: List[Req],
         running_reqs: List[Req],
     ) -> None:
+        """
+        Update OFT drainer state based on current waiting queue and running requests.
+
+        This method updates adapter statistics, identifies starving adapters that need
+        to be scheduled, and marks adapters for draining to make room for starving ones.
+        """
         self._update_adapter_stats(waiting_queue, running_reqs)
         self._update_draining_ofts(running_reqs)
         self._update_fully_drained_ofts(running_reqs)
@@ -71,7 +89,8 @@ class OFTDrainer:
             stats._reset_stats()
 
         for req in waiting_queue:
-            stats = self.adapter_to_stats[req.adapter_id]
+            stats = self.adapter_to_stats[req.oft_id]
+
             stats.num_waiting_reqs += 1
             stats.max_wait_time_secs = max(
                 stats.max_wait_time_secs,
@@ -79,16 +98,25 @@ class OFTDrainer:
             )
 
         for req in running_reqs:
-            stats = self.adapter_to_stats[req.adapter_id]
+            stats = self.adapter_to_stats[req.oft_id]
+
             stats.max_remaining_tokens = max(
                 stats.max_remaining_tokens,
                 req.sampling_params.max_new_tokens - len(req.output_ids),
             )
 
     def _update_draining_ofts(self, running_reqs: List[Req]) -> None:
-        running_adapter_ids = {req.adapter_id for req in running_reqs}
+        """
+        Select OFT adapters to drain based on starvation detection.
+
+        This method identifies adapters in the waiting queue that are "starving"
+        (waiting too long) and marks currently running adapters as "draining"
+        to make room for the starving adapters. Draining adapters will not
+        accept new requests, allowing them to complete and free up slots.
+        """
+        running_adapter_ids = {req.oft_id for req in running_reqs}
         if len(running_adapter_ids) < self.max_ofts_per_batch:
-            return
+            return None
 
         starving_adapters = set()
         draining_for_adapters = set()
@@ -96,18 +124,20 @@ class OFTDrainer:
             if stats.is_starving(self.max_wait_time_secs):
                 starving_adapters.add(adapter_id)
 
-            if stats.is_draining_for is not None:
-                draining_for_adapters.add(stats.is_draining_for)
+            draining_for_adapter = stats.is_draining_for
+            if draining_for_adapter is not None:
+                draining_for_adapters.add(draining_for_adapter)
 
         new_starving_adapters = starving_adapters - draining_for_adapters
         if not new_starving_adapters:
-            return
+            return None
 
         sorted_new_starving_adapters = sorted(
             new_starving_adapters,
             key=lambda adapter: self.adapter_to_stats[adapter].max_wait_time_secs,
             reverse=True,
         )
+
         eligible_to_drain_adapters = {
             adapter
             for adapter in running_adapter_ids
@@ -118,32 +148,47 @@ class OFTDrainer:
             if not eligible_to_drain_adapters:
                 break
 
-            adapter_to_drain = min(
+            min_eligible_adapter = min(
                 eligible_to_drain_adapters,
                 key=lambda adapter_id: self.adapter_to_stats[
                     adapter_id
                 ].max_remaining_tokens,
             )
-            self.adapter_to_stats[adapter_to_drain].is_draining_for = starving_adapter
-            logger.debug(
-                "OFT adapter %s is draining for %s",
-                adapter_to_drain,
-                starving_adapter,
+
+            self.adapter_to_stats[min_eligible_adapter].is_draining_for = (
+                starving_adapter
             )
-            eligible_to_drain_adapters.remove(adapter_to_drain)
+            logger.debug(
+                f"OFT adapter {min_eligible_adapter} is draining for {starving_adapter}"
+            )
+
+            eligible_to_drain_adapters.remove(min_eligible_adapter)
 
     def _update_fully_drained_ofts(self, running_reqs: List[Req]) -> None:
-        running_adapter_ids = {req.adapter_id for req in running_reqs}
+        """
+        Clear draining state for adapters that have fully drained.
+
+        An adapter is considered fully drained when it was marked as draining
+        but no longer has any running requests.
+        """
+        running_adapter_ids = {req.oft_id for req in running_reqs}
         for adapter_id, stats in self.adapter_to_stats.items():
             if stats.is_draining_for is None:
                 continue
 
             if adapter_id not in running_adapter_ids:
-                logger.debug("OFT adapter %s finished draining", adapter_id)
+                logger.debug(f"OFT adapter {adapter_id} finished draining")
                 stats.is_draining_for = None
 
     def can_schedule(self, req: Req) -> bool:
-        stats = self.adapter_to_stats[req.adapter_id]
+        """
+        Check if a request can be scheduled based on draining state.
+
+        If the adapter for this request is currently draining, only allow
+        scheduling if the request's max_new_tokens is within tolerance of
+        the max remaining tokens for the draining adapter.
+        """
+        stats = self.adapter_to_stats[req.oft_id]
         if not stats.is_draining_for:
             return True
 

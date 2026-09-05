@@ -57,17 +57,13 @@ def pull(
     target_version: int,
     pre_read_hook: Optional[str] = None,
 ) -> None:
-    """Bring the host-local checkpoint to exactly ``target_version``.
+    """Bring the host-local checkpoint up to ``target_version``.
 
     Seeds from the newest full checkpoint at or below the target — the engine's
     own base (``base_dir``) for a pure-delta stream, a published full version
     otherwise — then applies the remaining deltas in order. A local checkpoint
-    already past the seed point but at or below the target just continues its
-    delta chain; one AHEAD of the target is reseeded, because its state belongs
-    to a dead stream (a previous run of the trainer) and nothing can ever chain
-    from it — without the reseed a rerun would silently keep serving the old
-    stream's weights. Raises on any per-tensor checksum mismatch (fail loud,
-    never serve bad weights).
+    already past the seed point just continues its delta chain. Raises on any
+    per-tensor checksum mismatch (fail loud, never serve bad weights).
     """
     # Object-store-backed shared filesystems lack cross-host read-after-write
     # consistency: the publisher's files only appear here after an explicit
@@ -77,18 +73,6 @@ def pull(
         _load_hook(pre_read_hook)(source_dir, target_version)
     with _pull_lock(local_checkpoint_dir):
         applied = _read_applied_version(local_checkpoint_dir)  # None on a fresh host
-        if applied is not None and applied > target_version:
-            # Local state left by a previous stream (a rerun reusing this dir,
-            # or an explicit rollback). Its version numbers mean nothing in the
-            # current stream, so treat the host as fresh rather than clamping
-            # to the stale marker — clamping is how a rerun ends up reloading
-            # the previous run's weights.
-            logger.info(
-                "Local checkpoint at v%d is ahead of requested v%d; reseeding",
-                applied,
-                target_version,
-            )
-            applied = None
         # Scan back from the target for the newest full version. Stop at the
         # local state — below it a reset can never be needed (or, on a fresh
         # host, at 0 = the engine's base).

@@ -20,7 +20,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.lora.lora_moe_runners import LoRAHooks
-    from sglang.srt.oft.oft_moe_runners import OFTInfo
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +36,10 @@ class MoeRunner:
         self.config = config
         self.lora_enabled = lora_enabled
         self.peft_enabled = peft_enabled
+        # Set by FusedMoEWithOFT on its dedicated runner. The OFT invoker reads
+        # the owning layer's live buffers without placing them in quant_info.
+        # Expert OFT rotates before GEMM, so direct-dispatch cores receive this
+        # layer directly while Triton applies it through a replacement invoker.
         self._peft_layer = None
 
         # --moe-runner-backend hpc_ops makes the standard dispatcher keep
@@ -80,9 +83,7 @@ class MoeRunner:
 
                 self.runner_core = MarlinLoraRunnerCore(config)
             elif peft_enabled:
-                from sglang.srt.oft.oft_moe_runner_marlin import (
-                    MarlinOFTRunnerCore,
-                )
+                from sglang.srt.oft.oft_moe_runner_marlin import MarlinOFTRunnerCore
 
                 self.runner_core = MarlinOFTRunnerCore(config)
             else:
@@ -151,11 +152,7 @@ class MoeRunner:
             self.fused_func = None
 
     def run(
-        self,
-        dispatch_output: DispatchOutput,
-        quant_info: MoeQuantInfo,
-        lora_info=None,
-        oft_info: OFTInfo | None = None,
+        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
         if (
             self.fused_func is not None
@@ -195,7 +192,6 @@ class MoeRunner:
                     quant_info,
                     self.config,
                     peft_layer=self._peft_layer,
-                    oft_info=oft_info,
                 )
             hooks = _maybe_build_lora_hooks(dispatch_output)
             return self.runner_core.run_from_dispatch(
@@ -228,7 +224,7 @@ class MoeRunner:
             from sglang.srt.oft.oft_moe_runners import make_oft_invoke
 
             run_kwargs["invoke"] = make_oft_invoke(
-                self._peft_layer, invoke_fused_moe_kernel, oft_info
+                self._peft_layer, invoke_fused_moe_kernel
             )
 
         runner_output = self.runner_core.run(

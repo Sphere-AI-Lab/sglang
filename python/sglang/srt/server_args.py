@@ -64,8 +64,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
     parse_cuda_graph_config_arg,
 )
-from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.oft.config import OFTArgs, register_oft_args, validate_oft_args
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.true_on_policy.contracts import (
@@ -3265,10 +3265,6 @@ class ServerArgs(OFTArgs):
         Optional[str],
         "Import path of a hook(source_dir, target_version) that /pull_weights calls before reading the published weights. POSIX shared filesystems need no hook; object-store-backed mounts often lack cross-host read-after-write consistency, so another host's writes only become visible after an explicit refresh.",
     ] = None
-    custom_pull_weights_pre_read_hook: A[
-        Optional[str],
-        "Import path of a hook(source_dir, target_version) that /pull_weights calls before reading the published weights. POSIX shared filesystems need no hook; object-store-backed mounts often lack cross-host read-after-write consistency, so another host's writes only become visible after an explicit refresh.",
-    ] = None
     weight_loader_disable_mmap: A[
         bool, "Disable mmap while loading weight using safetensors.", NS("model")
     ] = False
@@ -4671,13 +4667,18 @@ class ServerArgs(OFTArgs):
             ),
             # Dynamo blocks LoRA under tc_piecewise (per-batch LoRABatchInfo
             # rebinds break guards); breakable/full support LoRA.
-            ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
+            (
+                "LoRA",
+                lambda: bool(self.lora_paths) or self.enable_lora,
+            ),
             (
                 "OFT",
-                # The OFT layer forward reads batch metadata populated by the
-                # real prepare step, which is unavailable to tc_piecewise's
-                # dummy compile forward.
-                lambda: self.peft_method == "oft",
+                # Same tc_piecewise incompatibility as LoRA: the OFT layer forward
+                # reads oft_backend.batch_info, which is only populated by the real
+                # prepare step, not the torch.compile dummy forward -- so the
+                # compile pass raises "AttributeError: 'TritonOFTBackend' object has
+                # no attribute 'batch_info'".
+                lambda: self.enable_oft,
             ),
             (
                 "multimodal model",
@@ -8747,8 +8748,8 @@ class ServerArgs(OFTArgs):
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
 
-        # OFTArgs uses import-light namespace annotations, so its dedicated
-        # registrar owns the canonical OFT CLI surface.
+        # OFT fields are bare-typed on OFTArgs, so the auto-generator above
+        # skips them; register them manually here.
         register_oft_args(parser)
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
@@ -9279,7 +9280,7 @@ class ServerArgs(OFTArgs):
         # Check LoRA
         self.check_lora_server_args()
 
-        # Check canonical OFT independently from native multi-tenant LoRA.
+        # Check OFT args
         validate_oft_args(self)
 
         # Check speculative decoding
@@ -9431,6 +9432,9 @@ class ServerArgs(OFTArgs):
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
+        if self.enable_lora_staging and not self.enable_lora:
+            raise ValueError("--enable-lora-staging requires --enable-lora")
+
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
             if self.enable_lora is None:
@@ -9442,9 +9446,6 @@ class ServerArgs(OFTArgs):
                 logger.warning(
                     "--enable-lora is set to False, any provided lora_paths will be ignored."
                 )
-
-        if self.enable_lora_staging and not self.enable_lora:
-            raise ValueError("--enable-lora-staging requires --enable-lora")
 
         if self.enable_lora:
             if self.enable_lora_overlap_loading is None:

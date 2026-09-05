@@ -193,11 +193,6 @@ class StagedLoRAManager(LoRAManager):
                 base_vocab_size=self.base_hf_config.vocab_size,
             )
             old_ref = self.lora_refs.get(uid)
-            if old_ref is not None and version <= old_ref.version:
-                raise ValueError(
-                    f"LoRA adapter version {version} must be newer than active "
-                    f"version {old_ref.version}."
-                )
             old_config = self.configs.get(uid)
             old_adapter = self.loras.get(uid)
             new_ref = LoRARef(
@@ -317,10 +312,7 @@ class StagedLoRAManager(LoRAManager):
         return self.create_lora_update_result(success=True)
 
 
-from sglang.srt.adapter_sync.tokenizer_backend import AdapterStagingBackend
-
-
-class LoRAStagingBackend(AdapterStagingBackend):
+class LoRAStagingBackend:
     """Tokenizer-layer staging for native LoRA. Wraps TokenizerManager's
     lora_registry/lora_ref_cache/failed_lora_activations/pending_lora_stage
     state — same objects tokenizer_control_mixin.py used directly before
@@ -372,13 +364,6 @@ class LoRAStagingBackend(AdapterStagingBackend):
                 "staging slot already reserved for "
                 f"name={pending.lora_name} id={pending.lora_id} "
                 f"version={pending.version}"
-            )
-
-        active = self._tm.lora_registry.get_all_adapters().get(obj.adapter_name)
-        if active is not None and version <= active.version:
-            raise ValueError(
-                f"LoRA adapter version {version} must be newer than active "
-                f"version {active.version}."
             )
 
         candidate, _ = await self._tm.lora_registry.register_or_reuse(

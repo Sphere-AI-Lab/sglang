@@ -44,7 +44,8 @@ class LoRARef(msgspec.Struct, frozen=True, array_like=True):
     # Trailing field with a default keeps the array_like wire format
     # compatible with refs encoded before this field existed.
     reloadable: bool = True
-    # Active weight version. Keep this final for positional wire compatibility.
+    # Active weight version. Keep this as the final field so older positional
+    # payloads decode with version zero.
     version: int = 0
 
     def __post_init__(self):
@@ -87,8 +88,10 @@ class LoRARegistry:
             "Please file an issue if you see this error."
         )
 
-        # Admission snapshots and lease increments use the writer lock so an
-        # unload cannot race between lookup and counter acquisition.
+        # A read-write lock to ensure adapters loading / unloading operations are exclusive.
+        # Admission increments run under the writer lock so lookup, version
+        # snapshot, and lease acquisition are atomic. Releases use the reader
+        # lock and can proceed concurrently.
         self._registry_lock = RWLock()
         # An ordered dictionary to hold LoRARef objects, mapping from LoRA name to LoRARef.
         # The LoRARefs are stored in LRU order, such that LoRA adapters that have been
@@ -153,6 +156,18 @@ class LoRARegistry:
         Nothing is registered here: the caller commits the resolved ref with
         ``register`` / ``refresh`` once the backend load succeeded, keeping
         failed loads invisible to the registry.
+
+        With ``bump_version``, the returned ref's ``version`` advances past
+        the existing entry's on reuse (``existing.version + 1``) instead of
+        keeping whatever ``lora_ref`` carries. The radix cache key is
+        extended with this version (see ``_extend_lora_extra_key`` in
+        schedule_batch.py), so KV computed under the pre-upsert weights must
+        live under a different key than requests arriving after this
+        in-place refresh -- otherwise a prompt re-served after an upsert
+        could silently return output computed with the stale weights via a
+        cached KV prefix. Callers that manage their own explicit version
+        numbering (e.g. the native staged double-buffer protocol) must leave
+        this ``False`` so their supplied version is kept verbatim.
         """
         if not upsert:
             return lora_ref, False
@@ -221,6 +236,8 @@ class LoRARegistry:
     async def _acquire_refs(
         self, lora_name: Union[str, List[Optional[str]]]
     ) -> List[Optional[LoRARef]]:
+        # Lookup, version snapshot, and counter increment are one atomic
+        # admission step. An unload cannot remove the adapter between them.
         async with self._registry_lock.writer_lock:
             refs = self._lookup_refs_for_admission(lora_name)
             await self._increment_ref_counters(refs)
@@ -240,7 +257,7 @@ class LoRARegistry:
         Tuple[str, int],
         Tuple[List[Optional[str]], List[Optional[int]]],
     ]:
-        """Acquire leases and atomically snapshot adapter IDs and versions."""
+        """Acquire request leases and atomically snapshot IDs and versions."""
         refs = await self._acquire_refs(lora_name)
         ids = [ref.lora_id if ref is not None else None for ref in refs]
         versions = [ref.version if ref is not None else None for ref in refs]

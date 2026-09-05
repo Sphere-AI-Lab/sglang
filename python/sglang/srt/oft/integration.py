@@ -1,76 +1,98 @@
-"""OFT integration façade — the thin seam ``model_runner.py`` calls through.
+"""OFT integration façade — the thin seam ``model_runner.py`` calls through
+for the OFT-manager lifecycle (init), plus ``reconstruct_oft_staging``, a
+wire-format helper shared by native-LoRA-staged, OFT-staged, and OFT-sibling
+NCCL adapter payloads (see model_runner_components/weight_updater.py).
 
-Owns the OFT-manager lifecycle (init/load/unload). Task 6 imports this module
-as ``oft`` and keeps the model runner's call-outs thin, while this provider
-owns the canonical adapter lifecycle.
+``model_runner.py`` imports this module as ``oft_integration`` and makes a
+thin guarded call-out (``oft_integration.maybe_init_oft_manager(self,
+server_args)``) so upstream rebases stay cheap -- ``model_runner.py`` is a
+frozen orchestration-only file (see the ``large-class-style`` skill), so the
+manager-construction logic that LoRA's own (older, non-conformant)
+``init_lora_manager`` inlines directly cannot live there.
+
+Every OTHER caller whose LoRA equivalent lives inline (not behind a separate
+module) does the same for OFT instead of routing through here, matching
+LoRA's own code shape exactly: schedule_batch.py's ``_extend_oft_extra_key``
+(next to ``_extend_lora_extra_key``), scheduler.py's
+``Scheduler._can_schedule_oft_req`` (next to ``_can_schedule_lora_req``),
+forward_batch_info.py's inline ``ForwardBatch.init_new`` block (next to the
+``enable_lora`` block), the cuda-graph runners' direct
+``model_runner.oft_manager`` calls (next to their ``lora_manager`` calls,
+with ``DecodeCudaGraphRunner._prepare_oft_replay_batch`` the one exception --
+its multi-step temporary-swap logic has no LoRA equivalent, since LoRA's
+``lora_ids`` restores generically via ``buffer_registry.fill_from`` while
+``oft_ids`` isn't a registered buffer field), and
+model_runner_components/weight_updater.py's direct
+``model_runner.oft_manager.stage_adapter``/``activate_adapter`` calls (next
+to the native-LoRA and OFT-staged branches).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.oft.oft_registry import OFTRef
-from sglang.srt.oft.streamed_weight_loader import (
-    FlattenedOFTTensorPayload,
-)
-from sglang.srt.utils import get_available_gpu_memory
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.forward_batch_info import ForwardBatch
-    from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "FlattenedOFTTensorPayload",
-    "OFTRef",
-    "NOT_HANDLED",
     "maybe_init_oft_manager",
     "reconstruct_oft_staging",
-    "maybe_load_adapter",
-    "maybe_load_adapter_from_tensors",
-    "maybe_load_adapter_from_distributed",
-    "maybe_unload_adapter",
-    "maybe_dummy_ids",
-    "maybe_prepare_oft_batch",
-    "maybe_admit_request",
-    "maybe_extend_extra_key",
-    "maybe_init_cuda_graph_batch_info",
-    "maybe_prepare_replay_batch",
-    "maybe_apply_forward",
-    "stage_adapter",
-    "activate_adapter",
 ]
-
-# Sentinel returned when a weight update is not an OFT adapter payload.
-NOT_HANDLED = object()
 
 
 def maybe_init_oft_manager(
     model_runner: "ModelRunner", server_args: "ServerArgs"
 ) -> None:
-    """Build the canonical staged-capable OFT manager when OFT is enabled."""
-    if server_args.peft_method == "oft":
+    """Single OFT init seam ``model_runner.py`` calls: build the adapter
+    manager when ``server_args.enable_oft`` is set, building an OFTManager on
+    ``model_runner.oft_manager``. No-op otherwise.
+    """
+    if server_args.enable_oft:
         _init_oft_manager(model_runner, server_args)
+
+
+def _get_oft_manager_class(server_args: "ServerArgs"):
+    """Resolve the OFTManager class for ``server_args.oft_impl``, mirroring
+    ``ModelRunner._get_lora_manager_class``'s pattern for OFT's two choices.
+
+    Imported lazily: OFTManager pulls in vocab_parallel_embedding ->
+    communicator -> forward_batch_info, which forms an import cycle when a
+    module in that chain imports this façade at module scope (e.g.
+    forward_batch_info). Deferring keeps ``oft.integration`` light to import.
+    """
+    if server_args.oft_impl == "staged":
+        from sglang.srt.oft.staged_manager import StagedOFTManager
+
+        return StagedOFTManager
+    from sglang.srt.oft.oft_manager import OFTManager
+
+    return OFTManager
 
 
 def _init_oft_manager(model_runner: "ModelRunner", server_args: "ServerArgs") -> None:
     """Body of the former ``ModelRunner.init_oft_manager``."""
-    # Imported lazily to avoid the model-runner/forward-batch import cycle.
-    from sglang.srt.oft.staged_manager import StagedOFTManager
+    OFTManager = _get_oft_manager_class(server_args)
 
-    logger.info("OFT implementation: %s", StagedOFTManager.__module__)
-    model_runner.oft_manager = StagedOFTManager(
+    # Runtime witness: every boot names the stack that actually serves (sibling
+    # vs staged), so "which implementation ran" is in the log, not inferred.
+    logger.info(
+        "OFT implementation: %s (oft_impl=%s)",
+        OFTManager.__module__,
+        server_args.oft_impl,
+    )
+
+    model_runner.oft_manager = OFTManager(
         base_model=model_runner.model,
         base_hf_config=model_runner.model_config.hf_config,
         max_ofts_per_batch=model_runner.server_args.max_ofts_per_batch,
@@ -81,8 +103,7 @@ def _init_oft_manager(model_runner: "ModelRunner", server_args: "ServerArgs") ->
         tp_size=model_runner.ps.tp_size,
         tp_rank=model_runner.ps.tp_rank,
         max_oft_block_size=model_runner.server_args.max_oft_block_size,
-        target_modules=model_runner.server_args.peft_target_modules,
-        adapter_paths=model_runner.server_args.peft_paths,
+        target_modules=model_runner.server_args.oft_target_modules,
         memory_saver_adapter=model_runner.memory_saver_adapter,
         memory_saver_cpu_backup=model_runner.server_args.enable_weights_cpu_backup,
     )
@@ -138,216 +159,3 @@ def reconstruct_oft_staging(
     unique_tensors = [t for _, t in unique_named_tensors]
     # entries is list of [name, unique_index] (JSON arrays become lists).
     return [(name, unique_tensors[int(idx)]) for name, idx in entries]
-
-
-def stage_adapter(
-    model_runner: "ModelRunner",
-    load_format,
-    tensors,
-    adapter_config: Optional[dict],
-    adapter_name: Optional[str],
-    adapter_id: Optional[str],
-    version,
-    *,
-    payload_metadata: Optional[dict] = None,
-    double_buffer: bool = True,
-):
-    """Canonical OFT STAGING fill. Reconstructs the NCCL wire payload, then
-    calls the resolved manager's ``stage_adapter``. Returns ``NOT_HANDLED``
-    for non-OFT payloads.
-
-    ``double_buffer=False`` (distributed sync without ``--adapter-double-
-    buffer``) is rejected for OFT: with DB-off sizing the pool inherits the
-    ``AdapterMemPool`` base defaults (active_idx=0, staging_idx=1), and
-    ``_acquire_buffer_slot`` gives the base-identity placeholder slot 0
-    (==active_idx) and the live per-token adapter gather slot 1
-    (==staging_idx). ``stage()`` correctly fills slot 1 (the adapter's own
-    gather slot), but ``activate()`` unconditionally copies every group's
-    staging_idx->active_idx (slot1->slot0) -- CLOBBERING the base-identity
-    slot with adapter data instead of updating the adapter in place (the
-    runtime already reads the adapter's weights straight from slot 1; there
-    is no correct use for copying into slot 0).
-    """
-    if payload_metadata is not None:
-        tensors = reconstruct_oft_staging(tensors, payload_metadata)
-
-    if load_format == "oft_adapter":
-        if not double_buffer:
-            raise ValueError(
-                "distributed non-double-buffer OFT adapter sync via "
-                "stage/activate is not supported; enable "
-                "--adapter-double-buffer (double-buffer) or use the "
-                "IPC/colocate weight-sync."
-            )
-        return model_runner.oft_manager.stage_adapter(
-            tensors, adapter_config, adapter_name, version, adapter_id=adapter_id
-        )
-
-    return NOT_HANDLED
-
-
-def activate_adapter(
-    model_runner: "ModelRunner", adapter_name: str, version, adapter_id=None
-):
-    """Activate the staged OFT identity, or return ``NOT_HANDLED`` if disabled."""
-    if model_runner.server_args.peft_method == "oft":
-        return model_runner.oft_manager.activate_adapter(
-            adapter_name, version, adapter_id=adapter_id
-        )
-    return NOT_HANDLED
-
-
-def maybe_load_adapter(model_runner: "ModelRunner", oft_ref: "OFTRef"):
-    """Body of the former ``ModelRunner.load_oft_adapter``."""
-    logger.info(
-        f"OFT adapter loading starts: {oft_ref}. "
-        f"avail mem={get_available_gpu_memory(model_runner.device, model_runner.gpu_id):.2f} GB"
-    )
-
-    result = model_runner.oft_manager.load_oft_adapter(oft_ref)
-
-    logger.info(
-        f"OFT adapter loading completes: {oft_ref}. "
-        f"avail mem={get_available_gpu_memory(model_runner.device, model_runner.gpu_id):.2f} GB"
-    )
-
-    return result
-
-
-def maybe_load_adapter_from_tensors(
-    model_runner: "ModelRunner",
-    oft_ref: "OFTRef",
-    tensors,
-    config_dict,
-    *,
-    upsert: bool = False,
-):
-    """Body of the former ``ModelRunner.load_oft_adapter_from_tensors``."""
-    logger.info(f"OFT adapter loading from tensors starts: {oft_ref}.")
-    result = model_runner.oft_manager.load_adapter_from_tensors(
-        oft_ref, tensors, config_dict, upsert=upsert
-    )
-    logger.info(f"OFT adapter loading from tensors completes: {oft_ref}.")
-    return result
-
-
-def maybe_load_adapter_from_distributed(
-    model_runner: "ModelRunner",
-    oft_ref: "OFTRef",
-    names,
-    dtypes,
-    shapes,
-    config_dict,
-    group_name,
-    *,
-    upsert: bool = False,
-):
-    """Load native OFT tensors received by the model runner's updater."""
-    logger.info(f"OFT adapter loading from distributed starts: {oft_ref}.")
-    result = model_runner.oft_manager.load_adapter_from_distributed(
-        oft_ref,
-        names,
-        dtypes,
-        shapes,
-        config_dict,
-        group_name,
-        model_runner.weight_updater,
-        upsert=upsert,
-    )
-    logger.info(f"OFT adapter loading from distributed completes: {oft_ref}.")
-    return result
-
-
-def maybe_unload_adapter(model_runner: "ModelRunner", oft_ref: "OFTRef"):
-    """Body of the former ``ModelRunner.unload_oft_adapter``."""
-    logger.info(
-        f"OFT adapter unloading starts: {oft_ref}. "
-        f"avail mem={get_available_gpu_memory(model_runner.device, model_runner.gpu_id):.2f} GB"
-    )
-
-    result = model_runner.oft_manager.unload_oft_adapter(oft_ref)
-
-    logger.info(
-        f"OFT adapter unloading completes: {oft_ref}. "
-        f"avail mem={get_available_gpu_memory(model_runner.device, model_runner.gpu_id):.2f} GB"
-    )
-
-    return result
-
-
-def maybe_dummy_ids(server_args: "ServerArgs", batch_size: int):
-    """Returns ``[None] * batch_size`` if OFT is enabled, else ``None``."""
-    if server_args.peft_method == "oft":
-        return [None] * batch_size
-    return None
-
-
-def maybe_prepare_oft_batch(
-    model_runner: "ModelRunner", forward_batch: "ForwardBatch"
-) -> None:
-    """Prepare OFT batch metadata for graph capture or eager execution."""
-    if (
-        model_runner.server_args.peft_method == "oft"
-        and forward_batch.adapter_ids is not None
-    ):
-        model_runner.oft_manager.prepare_oft_batch(forward_batch)
-
-
-def maybe_admit_request(scheduler: "Scheduler", req: "Req", running_ofts) -> bool:
-    """Body of the former inline OFT admission check in ``Scheduler``.
-
-    Returns True to admit the request, False if the caller should ``continue``.
-    """
-    if scheduler.oft_drainer and not scheduler.oft_drainer.can_schedule(req):
-        return False
-
-    if req.adapter_id in running_ofts:
-        return True
-
-    if scheduler.enable_oft_overlap_loading:
-        return scheduler.oft_overlap_loader.try_overlap_load_oft(
-            req.adapter_id, running_ofts
-        )
-
-    new_oft_set = {req.adapter_id} | running_ofts
-    return scheduler.tp_worker.model_runner.oft_manager.validate_oft_batch(
-        new_oft_set
-    )
-
-
-def maybe_extend_extra_key(extra_key, adapter_id, adapter_version) -> str:
-    """Body of the former inline OFT extra_key extension in ``Req.__init__``."""
-    if adapter_id is not None:
-        extra_key = (extra_key or "") + f"|oft:{adapter_id}:v{0 if adapter_version is None else adapter_version}"
-    return extra_key
-
-
-def maybe_init_cuda_graph_batch_info(
-    model_runner: "ModelRunner", max_bs: int, num_tokens_per_bs: int
-) -> None:
-    """Body of the former inline OFT cuda-graph batch-info init in ``CudaGraphRunner``."""
-    if model_runner.server_args.peft_method == "oft":
-        model_runner.oft_manager.init_cuda_graph_batch_info(
-            max_bs_in_cuda_graph=max_bs, num_tokens_per_bs=num_tokens_per_bs
-        )
-
-
-def maybe_prepare_replay_batch(
-    model_runner: "ModelRunner", forward_batch: "ForwardBatch", bs: int, raw_bs: int
-) -> None:
-    """Body of the former inline OFT replay-batch prep in ``CudaGraphRunner``."""
-    if model_runner.server_args.peft_method == "oft" and forward_batch.adapter_ids is not None:
-        original_batch_size = forward_batch.batch_size
-        original_oft_ids = forward_batch.adapter_ids
-        forward_batch.batch_size = bs
-        forward_batch.adapter_ids = original_oft_ids + [None] * (bs - raw_bs)
-        model_runner.oft_manager.prepare_oft_batch(forward_batch)
-        forward_batch.batch_size = original_batch_size
-        forward_batch.adapter_ids = original_oft_ids
-
-
-def maybe_apply_forward(model_runner: "ModelRunner", forward_batch: "ForwardBatch") -> None:
-    """Body of the former inline OFT apply in ``ForwardBatch.init_new``."""
-    if model_runner.server_args.peft_method == "oft":
-        model_runner.oft_manager.fetch_new_ofts(set(forward_batch.adapter_ids))
-        model_runner.oft_manager.prepare_oft_batch(forward_batch)

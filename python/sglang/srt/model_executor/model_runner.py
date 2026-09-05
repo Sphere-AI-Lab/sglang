@@ -172,7 +172,7 @@ from sglang.srt.model_loader.loader import (
     postprocess_weight,
     restore_weight,
 )
-from sglang.srt.oft import integration as oft
+from sglang.srt.oft import integration as oft_integration
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -769,7 +769,8 @@ class ModelRunner:
             self.init_lora_manager()
 
     def maybe_init_oft_manager(self):
-        oft.maybe_init_oft_manager(self, self.server_args)
+        # Init the OFT adapter manager. No-op when enable_oft is not set.
+        oft_integration.maybe_init_oft_manager(self, self.server_args)
 
     def maybe_enable_batch_invariant_mode(self):
         if get_exec().deterministic.enable_deterministic_inference:
@@ -1366,23 +1367,18 @@ class ModelRunner:
         return self.lora_manager.unload_lora_adapter(lora_ref)
 
     def load_oft_adapter(self, oft_ref):
-        """Load an OFT adapter dynamically. Mirrors load_lora_adapter().
-
-        The body lives in oft.integration so the OFT provider stays self-contained;
-        this method restores the transport entry point that srt/oft shipped without.
-        """
-        from sglang.srt.oft import integration as _oft
-
-        return _oft.maybe_load_adapter(self, oft_ref)
+        """Load a new OFT adapter from disk or huggingface."""
+        return self.oft_manager.load_oft_adapter(oft_ref)
 
     def load_oft_adapter_from_tensors(
         self, oft_ref, tensors, config_dict, *, upsert: bool = False
     ):
-        from sglang.srt.oft import integration as _oft
-
-        return _oft.maybe_load_adapter_from_tensors(
-            self, oft_ref, tensors, config_dict, upsert=upsert
+        logger.info(f"OFT adapter loading from tensors starts: {oft_ref}.")
+        result = self.oft_manager.load_adapter_from_tensors(
+            oft_ref, tensors, config_dict, upsert=upsert
         )
+        logger.info(f"OFT adapter loading from tensors completes: {oft_ref}.")
+        return result
 
     def load_oft_adapter_from_distributed(
         self,
@@ -1395,29 +1391,22 @@ class ModelRunner:
         *,
         upsert: bool = False,
     ):
-        from sglang.srt.oft import integration as _oft
-
-        return _oft.maybe_load_adapter_from_distributed(
-            self,
+        logger.info(f"OFT adapter loading from distributed starts: {oft_ref}.")
+        result = self.oft_manager.load_adapter_from_distributed(
             oft_ref,
             names,
             dtypes,
             shapes,
             config_dict,
             group_name,
+            self.weight_updater,
             upsert=upsert,
         )
+        logger.info(f"OFT adapter loading from distributed completes: {oft_ref}.")
+        return result
 
     def unload_oft_adapter(self, oft_ref):
-        """Unload an OFT adapter. Mirrors unload_lora_adapter().
-
-        Note the OFT-specific semantics preserved in the provider: unloading must
-        reset the slot to identity (a zeroed rotation is not a no-op, unlike a
-        zeroed additive LoRA delta) and clear streamed MoE expert bindings.
-        """
-        from sglang.srt.oft import integration as _oft
-
-        return _oft.maybe_unload_adapter(self, oft_ref)
+        return self.oft_manager.unload_adapter(oft_ref)
 
     @property
     def effective_max_total_num_tokens(self):

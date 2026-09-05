@@ -34,59 +34,9 @@ these without a design decision:
     backend/{chunked,ascend}_backend.py,      upstream-specific backends/experiments with no
     marlin_lora_temp/, trtllm_lora_temp/      OFT counterpart planned.
 
-The local ``base/`` layer provides shared adapter identity and pool behavior.
+OFT server flags live in ``sglang.srt.oft.config.OFTArgs``.
 
-Imports are LAZY (PEP 562): eager
-OFTManager import at package init pulls the full stack and hits a circular
-import during engine boot.
+Every caller imports submodules directly (``from sglang.srt.oft.oft_manager
+import OFTManager``, etc.) rather than through this package's own namespace,
+so this file carries no re-exports.
 """
-
-import importlib
-from typing import TYPE_CHECKING
-
-_LAZY_EXPORTS = {
-    "OFTManager": "sglang.srt.oft.oft_manager",
-    "OFTRef": "sglang.srt.oft.oft_registry",
-    "StagedOFTManager": "sglang.srt.oft.staged_manager",
-    "OFTStagingBackend": "sglang.srt.oft.staged_manager",
-    "OFTArgs": "sglang.srt.oft.config",
-    "register_oft_args": "sglang.srt.oft.config",
-    "validate_oft_args": "sglang.srt.oft.config",
-    "OFTTokenizerMixin": "sglang.srt.oft.tokenizer_mixin",
-    "init_tokenizer_oft": "sglang.srt.oft.tokenizer_hooks",
-    "register_oft_ref": "sglang.srt.oft.tokenizer_hooks",
-    "bump_oft_version": "sglang.srt.oft.tokenizer_hooks",
-    "resolve_oft_path": "sglang.srt.oft.tokenizer_hooks",
-    "maybe_resolve_oft_path": "sglang.srt.oft.tokenizer_hooks",
-    "maybe_init_oft_manager": "sglang.srt.oft.integration",
-    "maybe_prepare_oft_batch": "sglang.srt.oft.integration",
-}
-
-__all__ = list(_LAZY_EXPORTS)
-
-
-def __getattr__(name):  # PEP 562
-    module_path = _LAZY_EXPORTS.get(name)
-    if module_path is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return getattr(importlib.import_module(module_path), name)
-
-
-def __dir__():
-    return sorted(list(globals()) + __all__)
-
-
-if TYPE_CHECKING:  # for type checkers / IDEs only; not executed at runtime
-    from sglang.srt.oft.config import OFTArgs, register_oft_args, validate_oft_args
-    from sglang.srt.oft.integration import maybe_init_oft_manager, maybe_prepare_oft_batch
-    from sglang.srt.oft.oft_manager import OFTManager
-    from sglang.srt.oft.oft_registry import OFTRef
-    from sglang.srt.oft.staged_manager import OFTStagingBackend, StagedOFTManager
-    from sglang.srt.oft.tokenizer_hooks import (
-        bump_oft_version,
-        init_tokenizer_oft,
-        maybe_resolve_oft_path,
-        register_oft_ref,
-        resolve_oft_path,
-    )
-    from sglang.srt.oft.tokenizer_mixin import OFTTokenizerMixin

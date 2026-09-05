@@ -126,6 +126,38 @@ class SchedulerWeightUpdaterManager:
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
 
+    def _flush_radix_after_adapter_activate(self, recv_req) -> None:
+        """Invalidate the radix cache after a double-buffer adapter activate.
+
+        The DB stage/activate path is flush-free by design (lock-free stage +
+        drained atomic flip), so a prompt prefix cached before the swap would be
+        served with KV computed under the old adapter weights unless something
+        invalidates it.
+
+        OFT no longer needs this: the radix key carries the adapter WEIGHT
+        VERSION (Req.__init__ -> maybe_extend_extra_key), so KV produced under
+        version k lives under a different key than requests arriving at k+1 and
+        can never be matched. Entries for retired versions become unreachable
+        and age out through the cache's normal LRU eviction. Dropping the flush
+        keeps every prefix the swap did NOT invalidate -- above all the
+        base-model prefixes (shared system prompts, the KL/reference path),
+        which a full flush discarded on every training step.
+
+        LoRA still needs the flush: our single-active LoRA path names no adapter
+        per request, so its keys have nothing to version by. It gets per-request
+        identity once per-adapter versioned staging exists for LoRA; until then,
+        flush.
+
+        Ordering note: this does NOT replace the tokenizer-side drain
+        (model_update_lock.writer_lock around activate). That drain prevents a
+        request from spanning the weight swap; keying prevents cache reuse
+        across versions. Both are required, for different reasons.
+        """
+        if recv_req.load_format != "lora_adapter":
+            return
+        flushed = self.flush_cache(empty_cache=False)
+        assert flushed, "radix flush failed after peft double-buffer activate"
+
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
 
@@ -259,9 +291,14 @@ class SchedulerWeightUpdaterManager:
             )
 
     def update_adapter_from_distributed(
-        self, recv_req: UpdateAdapterFromDistributedReqInput
+        self,
+        recv_req: UpdateAdapterFromDistributedReqInput,
     ) -> UpdateAdapterFromDistributedReqOutput:
-        """Stage native LoRA weights while the active version keeps serving."""
+        """Double-buffer STAGE (mirrors update_weights_from_distributed). STAGE
+        is lock-free (fills the reserved staging slot while generation runs). For
+        the synchronous distributed-but-NOT-double-buffer path (double_buffer=
+        False) the caller holds the writer_lock (engine idle), so we also
+        ACTIVATE-in-place in the same call and return active_adapter_version."""
         with self._observe_weight_load("distributed_adapter"):
             stage_success, message = self.tp_worker.update_adapter_from_distributed(
                 recv_req
@@ -269,9 +306,15 @@ class SchedulerWeightUpdaterManager:
             success = stage_success
             active_version = None
             if stage_success and not recv_req.double_buffer:
-                success, message = self.tp_worker.activate_adapter_version(recv_req)
-                if success:
+                act_success, act_message = self.tp_worker.activate_adapter_version(
+                    recv_req
+                )
+                success = act_success
+                if act_success:
                     active_version = recv_req.adapter_version
+                    self._flush_radix_after_adapter_activate(recv_req)
+                else:
+                    message = act_message
             if not success:
                 logger.error(message)
             return UpdateAdapterFromDistributedReqOutput(
@@ -286,12 +329,19 @@ class SchedulerWeightUpdaterManager:
             )
 
     def activate_adapter_version(
-        self, recv_req: ActivateAdapterVersionReqInput
+        self,
+        recv_req: ActivateAdapterVersionReqInput,
     ) -> ActivateAdapterVersionReqOutput:
-        """Promote the exact native LoRA stage after tokenizer-side drain."""
+        """Double-buffer ACTIVATE (the drained atomic swap). The drain-to-empty
+        happened tokenizer-side via model_update_lock.writer_lock, so by the time
+        this control request is processed the running batch is empty and this is
+        a simple staging->active flip + version bump. A missing staged version
+        surfaces as success=False (inactive_slot_busy) from the manager."""
         with self._observe_weight_load("activate_adapter"):
             success, message = self.tp_worker.activate_adapter_version(recv_req)
-            if not success:
+            if success:
+                self._flush_radix_after_adapter_activate(recv_req)
+            else:
                 logger.error(message)
             return ActivateAdapterVersionReqOutput(
                 success=success,

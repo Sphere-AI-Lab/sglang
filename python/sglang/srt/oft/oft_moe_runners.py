@@ -20,22 +20,21 @@ never rebound -- so the LoRA ``after_down`` hook and the combine path keep seein
 the ORIGINAL ``topk_weights``/``topk_ids``/``topk`` by construction, which the
 previous design had to preserve by hand via renamed variables.
 
-``_oft_prerotate`` and the split gate-up body are verbatim moves of the
-in-kernel originals, so numerics stay bit-identical. The OFT MoE golden tests
-guard this contract across three configurations with zero permitted drift.
+``_oft_prerotate`` and the split gate-up body are VERBATIM moves (originally from
+the now-deleted ``peft/oft/moe_hooks.py``, itself a verbatim move of the in-kernel
+originals) so numerics stay bit-identical to the in-kernel originals; this was
+checked against an A/B golden (drift MUST be 0, 3 configs) before the legacy
+package was deleted.
 
-The wrapper closes over immutable per-forward ``OFTInfo``. Its tensors are full
-pool groups, so in-place slot updates stay visible under CUDA-graph replay
-without publishing adapter state on the MoE module.
+The wrapper closes over the LAYER and re-reads ``layer.w*_oft_r`` on EVERY call,
+so a streamed in-place weight sync stays visible under CUDA-graph replay, and an
+identity boot (buffers injected after the wrapper is built) is picked up. It is
+self-gating: with no OFT buffer present it delegates straight to the real kernel.
 """
 
-from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
-
-from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.oft.utils import MoEOFTBatchInfo
 
 _QUANT_KWARGS = (
     "use_fp8_w8a8",
@@ -45,106 +44,10 @@ _QUANT_KWARGS = (
     "per_channel_quant",
 )
 
-OFT_ALIGNMENT_BLOCK_SIZE = 64
-
-
-@dataclass(frozen=True)
-class OFTInfo:
-    w13_oft_r: torch.Tensor | None
-    w1_oft_r: torch.Tensor | None
-    w3_oft_r: torch.Tensor | None
-    w2_oft_r: torch.Tensor | None
-    batch_info: MoEOFTBatchInfo
-    num_experts: int
-    max_ofts: int
-    has_active_oft: bool
-    cg_buffers: dict | None = None
-
-
-def _compute_oft_alignment(
-    topk_ids: torch.Tensor,
-    oft_info: OFTInfo,
-    row_group_factor: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Group routed rows by adapter slot and expert for OFT rotation."""
-    from sglang.kernels.ops.moe.moe_lora_align import moe_lora_align_block_size
-
-    if row_group_factor < 1:
-        raise ValueError(f"row_group_factor must be positive, got {row_group_factor}")
-
-    block_size_m = OFT_ALIGNMENT_BLOCK_SIZE
-    max_ofts = oft_info.max_ofts
-    max_num_tokens_padded = topk_ids.numel() + oft_info.num_experts * (
-        block_size_m - 1
-    )
-    max_num_tokens_padded = (
-        (max_num_tokens_padded + block_size_m - 1) // block_size_m
-    ) * block_size_m
-    max_num_m_blocks = max_num_tokens_padded // block_size_m
-    device = topk_ids.device
-    cg = oft_info.cg_buffers if get_is_capture_mode() else None
-
-    if cg is None:
-        sorted_token_ids = torch.empty(
-            max_ofts * max_num_tokens_padded,
-            dtype=torch.int32,
-            device=device,
-        )
-        expert_ids = torch.empty(
-            max_ofts * max_num_m_blocks,
-            dtype=torch.int32,
-            device=device,
-        )
-        num_tokens_post_padded = torch.zeros(
-            max_ofts,
-            dtype=torch.int32,
-            device=device,
-        )
-        oft_ids = torch.arange(max_ofts, dtype=torch.int32, device=device)
-    else:
-        sorted_token_ids = cg["sorted_token_ids_oft"][
-            : max_ofts * max_num_tokens_padded
-        ]
-        expert_ids = cg["expert_ids_oft"][: max_ofts * max_num_m_blocks]
-        num_tokens_post_padded = cg["num_tokens_post_padded_oft"][:max_ofts]
-        num_tokens_post_padded.zero_()
-        oft_ids = cg["oft_ids"][:max_ofts]
-
-    batch = oft_info.batch_info
-    seg_indptr = batch.seg_indptr
-    if row_group_factor != 1:
-        seg_indptr = seg_indptr * row_group_factor
-
-    moe_lora_align_block_size(
-        topk_ids,
-        seg_indptr,
-        batch.req_to_oft,
-        int(oft_info.num_experts),
-        block_size_m,
-        int(max_ofts),
-        int(max_num_tokens_padded),
-        int(max_num_m_blocks),
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        batch.adapter_enabled,
-        oft_ids,
-        cumsum_buffer=cg.get("cumsum_buffer") if cg is not None else None,
-        token_mask=cg.get("token_mask") if cg is not None else None,
-    )
-
-    return (
-        sorted_token_ids.view(max_ofts, max_num_tokens_padded),
-        expert_ids.view(max_ofts, max_num_m_blocks),
-        num_tokens_post_padded,
-        oft_ids,
-    )
-
 
 def _oft_prerotate(
     A,
     oft_r,
-    oft_info,
     C,
     topk_weights,
     topk_ids,
@@ -167,35 +70,268 @@ def _oft_prerotate(
     )
     from sglang.srt.oft.triton_ops import apply_oft_rotation_triton
 
-    if oft_info is None:
-        raise RuntimeError("MoE OFT rotation requires request-aware OFTInfo")
-    num_batch_tokens = oft_info.batch_info.num_tokens
-    if num_batch_tokens <= 0 or A.shape[0] % num_batch_tokens != 0:
-        raise ValueError(
-            f"OFT MoE rows {A.shape[0]} are not grouped by {num_batch_tokens} batch tokens"
-        )
-    row_group_factor = A.shape[0] // num_batch_tokens
-    (
-        oft_sorted_token_ids,
-        oft_expert_ids,
-        oft_num_tokens_post_padded,
-        oft_ids,
-    ) = _compute_oft_alignment(
-        topk_ids,
-        oft_info,
-        row_group_factor=row_group_factor,
-    )
-
     A = apply_oft_rotation_triton(
         A,
         oft_r,
         topk_ids,
-        oft_sorted_token_ids,
-        oft_expert_ids,
-        oft_num_tokens_post_padded,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        block_m=block_size_m,
+    )
+    C = C.reshape(-1, 1, C.shape[-1])
+    topk_weights = topk_weights.reshape(-1, 1)
+    topk_ids = topk_ids.reshape(-1, 1)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size_m, num_experts
+    )
+    return (
+        A,
+        C,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    )
+
+
+def _oft_prerotate_multi_tenant(
+    A,
+    oft_r_all_slots,
+    slot_ids,
+    C,
+    topk_weights,
+    topk_ids,
+    sorted_token_ids,
+    expert_ids,
+    num_tokens_post_padded,
+    top_k,
+    num_experts,
+    block_size_m,
+):
+    """Multi-tenant sibling of _oft_prerotate: selects each token's own
+    adapter's R-block (via slot_ids) instead of applying one shared R to
+    the whole batch. Exercised whenever ANY real resident adapter is
+    referenced in the current forward batch -- not just ">=2 distinct"
+    adapters: in the plain native-RPC ("sibling") pool, buffer slot 0
+    (memory_pool.active_idx) is permanently reserved for the boot-time
+    base/identity registration, so a real adapter can never land there,
+    meaning OFTManager._compute_moe_multi_tenant_slot_ids already takes
+    this general per-token path for any batch with a single real adapter
+    too (see that function's docstring for the full history). Also forced
+    under CUDA-graph capture of the "oft_multi" dual-capture variant
+    (decode_cuda_graph_runner.py's _resolve_record_oft_variant_graph /
+    _resolve_oft_variant), even for the zero-real-adapter capture-time
+    dummy batch, so the captured graph learns to read per-token slot ids
+    at all -- see the 2026-09-01-oft-moe-cuda-graph-dual-capture plan. The
+    single-adapter fast path (_oft_prerotate) is completely unaffected by
+    this function's existence.
+    """
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    from sglang.srt.oft.triton_ops import apply_oft_rotation_triton_multi_slot
+
+    A = apply_oft_rotation_triton_multi_slot(
+        A,
+        oft_r_all_slots,
+        slot_ids,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        block_m=block_size_m,
+    )
+    C = C.reshape(-1, 1, C.shape[-1])
+    topk_weights = topk_weights.reshape(-1, 1)
+    topk_ids = topk_ids.reshape(-1, 1)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size_m, num_experts
+    )
+    return (
+        A,
+        C,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    )
+
+
+# Below this configured adapter capacity, the per-slot-aligned tl.dot kernel
+# (apply_oft_rotation_triton_multi_slot_dot) wins: its grid launches
+# max_ofts_per_batch-many alignment passes, but each rotates via a real
+# tensor-core matmul instead of an elementwise gather. Above it, the extra
+# per-slot alignment/launch overhead dominates and the shared-alignment
+# elementwise kernel (apply_oft_rotation_triton_multi_slot) wins instead.
+# Benchmarked crossover: consistently faster below ~16 configured slots
+# across decode (M=1..128) and prefill (M=2048) batch sizes, expert counts
+# (64/256) and block sizes (32/64); roughly a wash at 16; up to ~5x slower
+# at 64. See the session notes for the actual numbers.
+_DOT_MULTI_TENANT_MAX_OFTS_THRESHOLD = 16
+
+OFT_ALIGNMENT_BLOCK_SIZE = 64
+
+
+def _should_use_dot_multi_tenant(batch_info, max_ofts_per_batch) -> bool:
+    """Gate for the per-slot-aligned tl.dot multi-tenant rotation kernel.
+
+    Restricted to eager (non-CUDA-graph) batches: batch_info.use_cuda_graph
+    is True both while a decode graph variant is being CAPTURED and on every
+    REPLAY afterward, and the dual-capture CUDA-graph machinery
+    (OFTManager._compute_moe_multi_tenant_slot_ids /
+    decode_cuda_graph_runner.py's dual-capture variants) was built and
+    proven only for the existing shared-alignment elementwise kernel -- this
+    stays out of that path entirely rather than risk it. Prefill/extend
+    batches (where this fork's own benchmarking showed the largest wins)
+    are not CUDA-graph-captured by default, so this still covers the
+    highest-value case.
+    """
+    return (
+        batch_info is not None
+        and not batch_info.use_cuda_graph
+        and max_ofts_per_batch <= _DOT_MULTI_TENANT_MAX_OFTS_THRESHOLD
+    )
+
+
+def _compute_dot_alignment(
+    topk_ids: torch.Tensor,
+    batch_info,
+    max_ofts_per_batch: int,
+    num_experts: int,
+    block_size_m: int = OFT_ALIGNMENT_BLOCK_SIZE,
+    row_group_factor: int = 1,
+):
+    """Build the per-adapter-slot alignment apply_oft_rotation_triton_multi_slot_dot
+    needs, via the same moe_lora_align_block_size kernel LoRA's own multi-tenant
+    MoE path uses. Eager-only (see _should_use_dot_multi_tenant): tensors are
+    freshly allocated per call, no CUDA-graph-persistent buffers.
+
+    row_group_factor: batch_info.seg_indptr counts ORIGINAL (unexpanded)
+    tokens per request, but the down-GEMM's A/topk_ids have already been
+    expanded router_topk-fold into adjacent rows per token (see
+    _oft_prerotate_multi_tenant's own docstring on the down-GEMM row
+    layout) -- so seg_indptr must be scaled by the same factor to describe
+    THIS A's actual row layout, exactly like run_grouped_oft_r_sgemm's
+    n_groups does for the dense/Marlin paths.
+    """
+    from sglang.kernels.ops.moe.moe_lora_align import moe_lora_align_block_size
+
+    if row_group_factor < 1:
+        raise ValueError(f"row_group_factor must be positive, got {row_group_factor}")
+
+    device = topk_ids.device
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size_m - 1)
+    max_num_tokens_padded = (
+        (max_num_tokens_padded + block_size_m - 1) // block_size_m
+    ) * block_size_m
+    max_num_m_blocks = max_num_tokens_padded // block_size_m
+
+    sorted_token_ids = torch.empty(
+        max_ofts_per_batch * max_num_tokens_padded, dtype=torch.int32, device=device
+    )
+    expert_ids = torch.empty(
+        max_ofts_per_batch * max_num_m_blocks, dtype=torch.int32, device=device
+    )
+    num_tokens_post_padded = torch.zeros(
+        max_ofts_per_batch, dtype=torch.int32, device=device
+    )
+    oft_ids = torch.arange(max_ofts_per_batch, dtype=torch.int32, device=device)
+    # adapter_enabled is a REQUIRED INPUT gate for moe_lora_align_block_size
+    # (verified empirically), not an output it derives -- a slot left at 0
+    # is skipped entirely, so every slot this batch's requests actually use
+    # must be marked before the call.
+    adapter_enabled = torch.zeros(max_ofts_per_batch, dtype=torch.int32, device=device)
+    num_segments = batch_info.num_segments
+    active_slots = batch_info.weight_indices[:num_segments].unique()
+    adapter_enabled[active_slots.to(torch.long)] = 1
+
+    seg_indptr = batch_info.seg_indptr[: num_segments + 1]
+    if row_group_factor != 1:
+        seg_indptr = seg_indptr * row_group_factor
+
+    moe_lora_align_block_size(
+        topk_ids,
+        seg_indptr,
+        batch_info.weight_indices[:num_segments],
+        num_experts,
+        block_size_m,
+        max_ofts_per_batch,
+        max_num_tokens_padded,
+        max_num_m_blocks,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        adapter_enabled,
         oft_ids,
-        oft_info.batch_info.adapter_enabled,
-        top_k=top_k,
+    )
+    return (
+        sorted_token_ids.view(max_ofts_per_batch, max_num_tokens_padded),
+        expert_ids.view(max_ofts_per_batch, max_num_m_blocks),
+        num_tokens_post_padded,
+        oft_ids,
+        adapter_enabled,
+    )
+
+
+def _oft_prerotate_multi_tenant_dot(
+    A,
+    oft_r_all_slots,
+    batch_info,
+    max_ofts_per_batch,
+    C,
+    topk_weights,
+    topk_ids,
+    sorted_token_ids,
+    expert_ids,
+    num_tokens_post_padded,
+    top_k,
+    num_experts,
+    block_size_m,
+    row_group_factor=1,
+):
+    """Per-slot-aligned tl.dot sibling of _oft_prerotate_multi_tenant. Same
+    contract (rotate, collapse top_k->1, re-align for the real GEMM); only
+    the rotation kernel and how its alignment is built differ.
+
+    row_group_factor: see _compute_dot_alignment -- must be the down-GEMM's
+    router_topk (matching slot_ids.repeat_interleave(router_topk) at the
+    call site) so the alignment's segment boundaries describe THIS A's
+    already-expanded row layout, not the original per-request token counts.
+    """
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    from sglang.srt.oft.triton_ops import apply_oft_rotation_triton_multi_slot_dot
+
+    (
+        dot_sorted_token_ids,
+        dot_expert_ids,
+        dot_num_tokens_post_padded,
+        oft_ids,
+        adapter_enabled,
+    ) = _compute_dot_alignment(
+        topk_ids,
+        batch_info,
+        max_ofts_per_batch,
+        num_experts,
+        row_group_factor=row_group_factor,
+    )
+
+    A = apply_oft_rotation_triton_multi_slot_dot(
+        A,
+        oft_r_all_slots,
+        topk_ids,
+        dot_sorted_token_ids,
+        dot_expert_ids,
+        dot_num_tokens_post_padded,
+        oft_ids,
+        adapter_enabled,
+        top_k,
         block_m=OFT_ALIGNMENT_BLOCK_SIZE,
     )
     C = C.reshape(-1, 1, C.shape[-1])
@@ -215,6 +351,71 @@ def _oft_prerotate(
     )
 
 
+def _dispatch_oft_prerotate_multi_tenant(
+    layer,
+    A,
+    oft_r_all_slots,
+    slot_ids,
+    C,
+    topk_weights,
+    topk_ids,
+    sorted_token_ids,
+    expert_ids,
+    num_tokens_post_padded,
+    top_k,
+    num_experts,
+    block_size_m,
+    row_group_factor=1,
+):
+    """Shared dispatch point for both multi-tenant call sites (plain gate-up/
+    down and the split gate-up path): picks the per-slot-aligned tl.dot
+    kernel when eligible (see _should_use_dot_multi_tenant), else the
+    existing shared-alignment elementwise kernel -- same return contract
+    either way.
+
+    row_group_factor: forwarded to _oft_prerotate_multi_tenant_dot only --
+    the elementwise kernel doesn't need it because its caller already
+    pre-expands slot_ids itself (slot_ids.repeat_interleave(router_topk)),
+    unlike batch_info.seg_indptr, which the dot path derives its alignment
+    from directly.
+    """
+    batch_info = getattr(layer, "_oft_moe_multi_tenant_batch_info", None)
+    max_ofts_per_batch = getattr(layer, "_oft_max_ofts_per_batch", None)
+    if max_ofts_per_batch is not None and _should_use_dot_multi_tenant(
+        batch_info, max_ofts_per_batch
+    ):
+        return _oft_prerotate_multi_tenant_dot(
+            A,
+            oft_r_all_slots,
+            batch_info,
+            max_ofts_per_batch,
+            C,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            top_k,
+            num_experts,
+            block_size_m,
+            row_group_factor=row_group_factor,
+        )
+    return _oft_prerotate_multi_tenant(
+        A,
+        oft_r_all_slots,
+        slot_ids,
+        C,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        num_experts,
+        block_size_m,
+    )
+
+
 def _assert_unquantized(kw):
     """The split/canonical gate-up path is BF16-only. Was the caller-side guard
     in ``_fused_moe_kernel_sequence``; lives here now so the upstream file keeps
@@ -230,7 +431,6 @@ def _assert_unquantized(kw):
 def _run_gate_up_split(
     layer,
     real_invoke,
-    oft_info,
     A,
     B,
     bias,
@@ -252,16 +452,16 @@ def _run_gate_up_split(
 
     Verbatim body (was ``moe_hooks.py::_oft_run_gate_up_split``, itself the
     ``if split_w13_oft:`` block from ``_fused_moe_kernel_sequence``). Rotates
-    gate/up inputs independently and writes the two ``N // 2`` halves of ``C``
-    (= intermediate_cache1).
+    gate/up inputs independently (``layer.w1_oft_r`` / ``layer.w3_oft_r``, read
+    live) and writes the two ``N // 2`` halves of ``C`` (= intermediate_cache1).
     Each half GEMM writes a contiguous scratch buffer (the kernel needs a
     contiguous C), then copies into the non-contiguous half-column view.
 
     ``N``/``total_tokens`` are derived from ``C`` -- upstream allocates it as
     ``torch.empty((total_tokens, N))`` -- instead of being threaded down.
     """
-    w1_oft_r = oft_info.w1_oft_r
-    w3_oft_r = oft_info.w3_oft_r
+    w1_oft_r = layer.w1_oft_r
+    w3_oft_r = layer.w3_oft_r
     if w1_oft_r is None or w3_oft_r is None:
         raise RuntimeError(
             "Split expert gate/up OFT requires both w1_oft_r and w3_oft_r"
@@ -270,6 +470,7 @@ def _run_gate_up_split(
     c_sorted = kw.get("c_sorted", False)
     filter_expert = kw.get("filter_expert", True)
     compute_type = kw["compute_type"]
+    slot_ids = getattr(layer, "_oft_moe_multi_tenant_slot_ids", None)
 
     for half_slice, oft_r in (
         (slice(None, N // 2), w1_oft_r),
@@ -281,29 +482,59 @@ def _run_gate_up_split(
             dtype=A.dtype,
         )
         b_half = B[:, half_slice, :].contiguous()
-        (
-            a_in,
-            c_in,
-            tw,
-            ti,
-            sti,
-            ei,
-            ntpp,
-        ) = _oft_prerotate(
-            A,
-            oft_r,
-            oft_info,
-            half_cache,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            # the gate-up GEMM's own top_k (rotation collapses it to 1)
-            top_k,
-            b_half.shape[0],
-            config["BLOCK_SIZE_M"],
-        )
+        if slot_ids is not None:
+            oft_r_all_slots = (
+                layer._oft_w1_oft_r_all_slots
+                if oft_r is w1_oft_r
+                else layer._oft_w3_oft_r_all_slots
+            )
+            (
+                a_in,
+                c_in,
+                tw,
+                ti,
+                sti,
+                ei,
+                ntpp,
+            ) = _dispatch_oft_prerotate_multi_tenant(
+                layer,
+                A,
+                oft_r_all_slots,
+                slot_ids,
+                half_cache,
+                topk_weights,
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                # the gate-up GEMM's own top_k (rotation collapses it to 1)
+                top_k,
+                b_half.shape[0],
+                config["BLOCK_SIZE_M"],
+            )
+        else:
+            (
+                a_in,
+                c_in,
+                tw,
+                ti,
+                sti,
+                ei,
+                ntpp,
+            ) = _oft_prerotate(
+                A,
+                oft_r,
+                half_cache,
+                topk_weights,
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                # the gate-up GEMM's own top_k (rotation collapses it to 1)
+                top_k,
+                b_half.shape[0],
+                config["BLOCK_SIZE_M"],
+            )
         real_invoke(
             a_in,
             b_half,
@@ -333,26 +564,20 @@ def _run_gate_up_split(
         C[:, half_slice].copy_(half_cache)
 
 
-def make_oft_invoke(
-    layer: Any,
-    real_invoke: Callable,
-    oft_info: OFTInfo | None = None,
-) -> Callable:
+def make_oft_invoke(layer: Any, real_invoke: Callable) -> Callable:
     """Build the OFT-rotating replacement for ``invoke_fused_moe_kernel``.
 
-    Dispatches on the BASE WEIGHT TENSOR IDENTITY: ``triton.py`` passes
+    Dispatches on the WEIGHT TENSOR IDENTITY: ``triton.py`` passes
     ``w1=quant_info.w13_weight`` / ``w2=quant_info.w2_weight``, and both
     ``unquant.py`` and ``fp8.py`` build those as ``layer.w13_weight`` /
     ``layer.w2_weight`` -- the very objects this closure holds. The split path's
     inner half-GEMMs call ``real_invoke`` directly (with a freshly sliced weight),
     so there is no recursion.
 
-    Self-gating: a GEMM whose per-forward OFT buffer is ``None`` falls through to
+    Self-gating: a GEMM whose OFT buffer is ``None`` falls through to
     ``real_invoke`` unchanged, so there is no separate "is any hook set?" gate to
     get wrong (the WS-A Finding-#1 bug class becomes unrepresentable).
     """
-
-    base_layer = getattr(layer, "base_layer", layer)
 
     def invoke(
         A,
@@ -372,8 +597,8 @@ def make_oft_invoke(
         config,
         **kw,
     ):
-        is_gate_up = B is base_layer.w13_weight
-        is_down = B is base_layer.w2_weight
+        is_gate_up = B is layer.w13_weight
+        is_down = B is layer.w2_weight
         if not (is_gate_up or is_down):
             # Not one of this layer's two expert GEMMs (e.g. the split path's own
             # sliced half-weights, or a future extra GEMM): no rotation to apply.
@@ -384,8 +609,8 @@ def make_oft_invoke(
             )
 
         if is_gate_up:
-            w13 = oft_info.w13_oft_r if oft_info is not None else None
-            w1 = oft_info.w1_oft_r if oft_info is not None else None
+            w13 = getattr(layer, "w13_oft_r", None)
+            w1 = getattr(layer, "w1_oft_r", None)
             if w13 is not None and w1 is not None:
                 # Invariant (enforced by the OFT manager via oft_type): a layer
                 # carries EITHER the legacy fused w13 rotation OR the split w1/w3
@@ -397,29 +622,13 @@ def make_oft_invoke(
             if w1 is not None:
                 _assert_unquantized(kw)
                 return _run_gate_up_split(
-                    layer,
-                    real_invoke,
-                    oft_info,
-                    A,
-                    B,
-                    bias,
-                    C,
-                    A_scale,
-                    B_scale,
-                    B_zp,
-                    topk_weights,
-                    topk_ids,
-                    sorted_token_ids,
-                    expert_ids,
-                    num_tokens_post_padded,
-                    mul_routed_weight,
-                    top_k,
-                    config,
-                    kw,
+                    layer, real_invoke, A, B, bias, C, A_scale, B_scale, B_zp,
+                    topk_weights, topk_ids, sorted_token_ids, expert_ids,
+                    num_tokens_post_padded, mul_routed_weight, top_k, config, kw,
                 )
             oft_r = w13
         else:
-            oft_r = oft_info.w2_oft_r if oft_info is not None else None
+            oft_r = getattr(layer, "w2_oft_r", None)
 
         if oft_r is None:
             return real_invoke(
@@ -454,20 +663,107 @@ def make_oft_invoke(
             A = dequant_fp8_block_triton(A, A_scale, out_dtype=C.dtype)
             A_scale = None
 
-        a, c, tw, ti, sti, ei, ntpp = _oft_prerotate(
-            A,
-            oft_r,
-            oft_info,
-            C,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            top_k,
-            B.shape[0],
-            config["BLOCK_SIZE_M"],
-        )
+        # This branch IS the hot path under a replayed decode CUDA graph for
+        # a correctly-configured server, and that is now SAFE: the
+        # 2026-09-01-oft-moe-cuda-graph-dual-capture plan's dual-capture
+        # mechanism captures a dedicated "oft_multi" graph variant whenever
+        # any real resident adapter is possible
+        # (decode_cuda_graph_runner.py's _resolve_record_oft_variant_graph /
+        # _resolve_oft_variant), and OFTManager._compute_moe_multi_tenant_
+        # slot_ids writes this batch's routing decision IN PLACE into a
+        # persistent buffer (allocated once by init_cuda_graph_batch_info)
+        # rather than a fresh per-call tensor -- so the captured kernel's
+        # pointer stays valid across every replay instead of going stale.
+        # Capture-time forcing (get_capture_oft_variant() == "oft_multi")
+        # makes sure the graph that gets captured is the one that actually
+        # reads slot_ids, even though the capture-time dummy batch itself
+        # carries zero real adapters. oft/config.py's validate_oft_args
+        # only disables decode CUDA graphs for the residual configurations
+        # dual-capture does NOT cover (DP-attention, insufficient effective
+        # adapter capacity -- see _resolve_record_oft_variant_graph's
+        # docstring); everywhere dual-capture does engage, this branch runs
+        # under replay by design, not by accident. The slot_ids-is-None path
+        # below (reading the persistent, in-place-updated pool buffers) is
+        # the OTHER captured variant ("oft_single"), read when the batch has
+        # zero real resident adapters at all -- in the plain native-RPC pool
+        # a real adapter can never land at active_idx, so slot_ids is None
+        # only for that zero-real-adapter case; the moment one real
+        # MoE-target adapter loads, this branch (not the slot_ids-is-None
+        # one) is what runs, exactly as intended.
+        slot_ids = getattr(layer, "_oft_moe_multi_tenant_slot_ids", None)
+        if slot_ids is not None:
+            all_slots_attr = (
+                "_oft_w13_oft_r_all_slots" if is_gate_up else "_oft_w2_oft_r_all_slots"
+            )
+            oft_r_all_slots = getattr(layer, all_slots_attr, None)
+            if oft_r_all_slots is None:
+                # A legacy-fused static adapter loaded at boot short-circuits
+                # _init_identity_expert_oft_for_cuda_graph before it binds this
+                # attribute (see oft_manager.py), so it can be legitimately
+                # absent even with multi-tenancy active elsewhere. Fail loud
+                # rather than let a bare AttributeError hit the forward-pass
+                # hot path.
+                raise RuntimeError(
+                    f"Multi-tenant expert OFT is active for this layer but "
+                    f"{all_slots_attr} is not bound (unsupported layer "
+                    "configuration for multi-tenancy)"
+                )
+            # slot_ids arrives with one entry per ORIGINAL token, which is what
+            # the gate-up GEMM wants: its A is (num_tokens, K) and it is invoked
+            # with the real top_k, so the rotation kernel does the top_k
+            # expansion itself.
+            #
+            # The DOWN GEMM is the other shape. Its A is the gate-up output,
+            # already expanded to num_tokens * router_topk rows in TOKEN-MAJOR
+            # order (row = token * router_topk + k -- see fused_moe.py's
+            # `intermediate_cache1[: num_tokens * topk].view(num_tokens, topk, N)`
+            # and `intermediate_cache3 = torch.empty((num_tokens, topk, ...))`),
+            # and it is invoked with top_k=1, so the kernel expands nothing.
+            # slot_ids must therefore arrive already per-row. `router_topk` is
+            # threaded into kw at that call site for exactly this purpose.
+            #
+            # Not handled: `down_moe_use_tma` lays A out expert-SORTED and
+            # block-padded (`c_sorted=down_moe_use_tma` on the gate-up GEMM), so
+            # row != token * router_topk + k and A gains padding rows. That
+            # layout already breaks the pre-existing single-slot down rotation
+            # (which indexes A[sorted_ids] the same token-major way), so it is
+            # out of scope here rather than newly broken; it is opt-in via
+            # USE_TMA in a tuned down config. apply_oft_rotation_triton_multi_slot's
+            # own length check rejects it loudly instead of mis-rotating,
+            # because the padded A has more rows than the expansion produces.
+            router_topk = kw.get("router_topk", 1)
+            if is_down and router_topk != 1:
+                slot_ids = slot_ids.repeat_interleave(router_topk)
+            a, c, tw, ti, sti, ei, ntpp = _dispatch_oft_prerotate_multi_tenant(
+                layer,
+                A,
+                oft_r_all_slots,
+                slot_ids,
+                C,
+                topk_weights,
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                top_k,
+                B.shape[0],
+                config["BLOCK_SIZE_M"],
+                row_group_factor=router_topk if is_down else 1,
+            )
+        else:
+            a, c, tw, ti, sti, ei, ntpp = _oft_prerotate(
+                A,
+                oft_r,
+                C,
+                topk_weights,
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                top_k,
+                B.shape[0],
+                config["BLOCK_SIZE_M"],
+            )
         # The rotation collapses top_k -> 1 for this GEMM. The down GEMM already
         # ran at top_k=1; kw's own `router_topk` (the ORIGINAL topk) passes
         # through untouched, as the combine path requires.

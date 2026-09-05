@@ -589,10 +589,12 @@ class _GenerationStreamAccumulator:
                     )
                 else:
                     # Mirror output_ids_through_stop: spec verify steps can
-                    # overshoot finished_len.
+                    # overshoot finished_len. max(...,1) keeps the prefill
+                    # hidden-state block for max_new_tokens=0 requests, where
+                    # finished_len==0 would otherwise slice to empty.
                     hs = req.hidden_states
                     if req.finished_len is not None:
-                        hs = hs[: req.finished_len]
+                        hs = hs[: max(req.finished_len, 1)]
                     self.output_hidden_states.append(hs)
             else:
                 self.output_hidden_states.append(None)

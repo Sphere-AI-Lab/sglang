@@ -136,7 +136,6 @@ from sglang.srt.managers.io_struct import (
     LoadOFTAdapterFromDistributedReqInput,
     LoadOFTAdapterFromTensorsReqInput,
     LoadOFTAdapterReqInput,
-    UnloadOFTAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
@@ -149,6 +148,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UnloadOFTAdapterReqInput,
     UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -1494,24 +1494,28 @@ async def update_weights_from_distributed(
 async def update_adapter_from_distributed(
     obj: Annotated[UpdateAdapterFromDistributedReqInput, Body()], request: Request
 ):
-    """Stage native LoRA weights received over the distributed sync group."""
-    success, message = (
-        await _global_state.tokenizer_manager.update_adapter_from_distributed(
-            obj, request
-        )
+    """Double-buffer OFT/LoRA STAGE over NCCL. double_buffer=True stages
+    only; double_buffer=False stages then activates-in-place (caller idle)."""
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.update_adapter_from_distributed(
+        obj, request
     )
+
+    # Response schema orbit's nccl.py validators require (all string versions,
+    # echoed from the request; version fields only meaningful on success).
     content = {"success": success, "message": message}
     if success:
-        content.update(
-            staged_adapter_version=obj.adapter_version,
-            adapter_version=obj.adapter_version,
-            weight_version=obj.weight_version,
-        )
+        content["staged_adapter_version"] = obj.adapter_version
+        content["adapter_version"] = obj.adapter_version
+        content["weight_version"] = obj.weight_version
         if not obj.double_buffer:
             content["active_adapter_version"] = obj.adapter_version
-        return ORJSONResponse(content, status_code=HTTPStatus.OK)
-    content["error"] = message
-    return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+        return ORJSONResponse(content, status_code=200)
+    else:
+        content["error"] = message
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/activate_adapter_version")
@@ -1519,16 +1523,19 @@ async def update_adapter_from_distributed(
 async def activate_adapter_version(
     obj: Annotated[ActivateAdapterVersionReqInput, Body()], request: Request
 ):
-    """Drain requests and activate one exact staged native LoRA version."""
-    success, message = (
-        await _global_state.tokenizer_manager.activate_adapter_version(obj, request)
+    """Double-buffer OFT/LoRA ACTIVATE (drained atomic swap). Drains in-flight
+    generation (tokenizer-side writer_lock) then flips staging->active."""
+    success, message = await _global_state.tokenizer_manager.activate_adapter_version(
+        obj, request
     )
+
     content = {"success": success, "message": message}
     if success:
         content["active_adapter_version"] = obj.adapter_version
-        return ORJSONResponse(content, status_code=HTTPStatus.OK)
-    content["error"] = message
-    return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+        return ORJSONResponse(content, status_code=200)
+    else:
+        content["error"] = message
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/update_weights_from_ipc")
@@ -1703,26 +1710,26 @@ async def unload_lora_adapter(
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
-@app.api_route("/load_oft_adapter_from_tensors", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def load_oft_adapter_from_tensors(
-    obj: Annotated[LoadOFTAdapterFromTensorsReqInput, Body()], request: Request
-):
-    """Load an OFT adapter from tensors without re-launching the server."""
-    result = await _global_state.tokenizer_manager.load_oft_adapter_from_tensors(
-        obj, request
-    )
-    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
-    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
-
-
 @app.api_route("/load_oft_adapter", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_oft_adapter(
     obj: Annotated[LoadOFTAdapterReqInput, Body()], request: Request
 ):
-    """Load an OFT adapter from a path without re-launching the server."""
+    """Load a new OFT adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_oft_adapter(obj, request)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/load_oft_adapter_from_tensors", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def load_oft_adapter_from_tensors(
+    obj: Annotated[LoadOFTAdapterFromTensorsReqInput, Body()], request: Request
+):
+    """Load a new OFT adapter from tensors without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_oft_adapter_from_tensors(
+        obj, request
+    )
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
@@ -1732,7 +1739,7 @@ async def load_oft_adapter(
 async def load_oft_adapter_from_distributed(
     obj: Annotated[LoadOFTAdapterFromDistributedReqInput, Body()], request: Request
 ):
-    """Load an OFT adapter broadcast over a process group."""
+    """Load a new OFT adapter broadcast over a process group without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_oft_adapter_from_distributed(
         obj, request
     )
