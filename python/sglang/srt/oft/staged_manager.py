@@ -302,6 +302,7 @@ class StagedOFTManager(OFTManager):
         uid = oft_id if oft_id is not None else name
         try:
             version = int(version)
+            self._validate_dense_materialization_adapter(uid)
             pending = self._pending_oft_stage
             if pending is not None:
                 if (pending.uid, pending.version) == (uid, version):
@@ -403,6 +404,7 @@ class StagedOFTManager(OFTManager):
         uid = oft_id if oft_id is not None else name
         try:
             version = int(version)
+            self._validate_dense_materialization_adapter(uid)
         except Exception as error:
             return self.create_oft_update_result(
                 success=False, error_message=str(error)
@@ -422,19 +424,29 @@ class StagedOFTManager(OFTManager):
                 ),
             )
 
-        # A brand-new uid has no serving slot reserved yet -- unlike an
-        # update to an already-resident adapter, there is no physical
-        # staging->active copy to perform. Mirrors StagedLoRAManager.
-        # activate_adapter's `if destination is not None:` gating exactly:
-        # skip memory_pool.activate() and fall through to the CPU-side
-        # registration below, which is what actually makes the adapter
-        # resolvable. Real GPU admission for a genuinely new uid happens
-        # lazily, on the next batch that references it (see
-        # OFTMemoryPool.prepare_oft_batch's lazy-admission fallback).
+        # The standard path admits a new uid lazily on its first batch.
+        # Dense materialization instead needs a serving slot now, while the
+        # caller has paused inference, so activation can fold the staged R
+        # into the live weights before returning.
+        dense_materialization = getattr(self, "dense_oft_materialization", False)
         destination = self.memory_pool.uid_to_buffer_id.get(uid)
+        if dense_materialization and destination is None:
+            try:
+                destination, _ = self.memory_pool.allocate_buffer_slot_with_eviction(
+                    self.oft_refs
+                )
+            except Exception as admission_error:
+                return self.create_oft_update_result(
+                    success=False, error_message=str(admission_error)
+                )
         if destination is not None:
             try:
                 self.memory_pool.activate(uid, version, destination)
+                if dense_materialization:
+                    self.memory_pool.uid_to_buffer_id[uid] = destination
+                    self.memory_pool.buffer_id_to_uid[destination] = uid
+                    self.memory_pool.eviction_policy.mark_used(uid)
+                    self._materialize_dense_oft_slot(destination)
             except Exception as activation_error:
                 return self.create_oft_update_result(
                     success=False, error_message=str(activation_error)

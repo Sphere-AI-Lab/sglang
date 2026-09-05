@@ -1492,6 +1492,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             or forward_batch.oft_ids is None
         ):
             return
+        oft_manager = self.model_runner.oft_manager
+        if getattr(oft_manager, "dense_oft_materialization", False):
+            # Folded weights consume no slot metadata. Validate real requests
+            # before adding graph padding, which is never a base-model request.
+            oft_manager.prepare_oft_batch(forward_batch)
+            return
         original_batch_size = forward_batch.batch_size
         original_oft_ids = forward_batch.oft_ids
         forward_batch.batch_size = bs
