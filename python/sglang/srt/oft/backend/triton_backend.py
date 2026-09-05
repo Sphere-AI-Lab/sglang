@@ -8,7 +8,15 @@ from sglang.srt.oft.utils import OFTBatchInfo, generate_sequence_lengths
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+# Fixed segment slots (one per request) baked into the captured prefill OFT
+# kernel grids; batches with more requests fall back to eager prefill
+# (mirrors PREFILL_CUDA_GRAPH_LORA_SEGMENTS).
+PREFILL_CUDA_GRAPH_OFT_SEGMENTS = 32
+
+
 class TritonOFTBackend(BaseOFTBackend):
+    supports_prefill_cuda_graph = True
+
     name = "triton"
 
     def __init__(
@@ -33,11 +41,20 @@ class TritonOFTBackend(BaseOFTBackend):
         # The kernel itself handles slot 0 (block_size_val=0) by taking an
         # identity-passthrough branch — just memory copy, no GEMM. So the
         # ref-model forward is essentially free beyond the kernel launch.
-        # When max_ofts_per_batch > 2 we assume a multi-tenant setup where
-        # different requests in a single batch may target different adapters;
-        # the segmented `sgemm_oft_r_fwd` kernel is correct for that case.
-        # `prepare_oft_batch` enables the fast path only for uniform batches.
-        self.single_adapter_mode = max_ofts_per_batch <= 2
+        # When more than 2 slots are ADDRESSABLE by requests we assume a
+        # multi-tenant setup where different requests in a single batch may
+        # target different adapters; the segmented `sgemm_oft_r_fwd` kernel is
+        # correct for that case. `prepare_oft_batch` enables the fast path only
+        # for uniform batches. The double-buffer staging slot
+        # (--oft-double-buffer reserves slot max_ofts_per_batch-1 in
+        # OFTMemoryPool) is never referenced by a request, so it does not
+        # count: orbit's async double-buffer run (max_ofts_per_batch=3 = base
+        # + active + staging) keeps the single-adapter fast path exactly like
+        # its sync run (max_ofts_per_batch=2).
+        server_args = kwargs.get("server_args")
+        double_buffer = server_args is not None and server_args.oft_double_buffer
+        addressable_slots = max_ofts_per_batch - (1 if double_buffer else 0)
+        self.single_adapter_mode = addressable_slots <= 2
         self._use_single_adapter_fast_path = False
         if self.single_adapter_mode:
             with torch.device(device):
@@ -223,12 +240,41 @@ class TritonOFTBackend(BaseOFTBackend):
                 ],
             )
 
+    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
+        """Allocate the static OFT batch metadata the prefill CUDA graph reads.
+
+        Mirrors TritonLoRABackend.init_prefill_cuda_graph_batch_info: ``bs``
+        and ``num_segments`` are pinned at the slot count so the captured
+        segmented-kernel grids cover any replay batch; slots past the live
+        batch keep ``seg_lens == 0`` and ``_sgemm_oft_r_kernel`` returns early
+        for them. ``max_len`` is refreshed per prepare (at capture it is the
+        bucket's token count, the largest any replay segment can reach).
+        """
+        num_slots = PREFILL_CUDA_GRAPH_OFT_SEGMENTS
+        with torch.device(self.device):
+            self.prefill_cuda_graph_batch_info = OFTBatchInfo(
+                use_cuda_graph=True,
+                bs=num_slots,
+                num_segments=num_slots,
+                seg_lens=torch.zeros(num_slots, dtype=torch.int32),
+                seg_indptr=torch.zeros(num_slots + 1, dtype=torch.int32),
+                weight_indices=torch.zeros(num_slots, dtype=torch.int32),
+                oft_block_sizes=torch.zeros(
+                    self.max_ofts_per_batch, dtype=torch.int32
+                ),
+                permutation=None,
+                max_len=max_num_tokens,
+            )
+        self.prefill_cuda_graph_max_bs = num_slots
+        self.prefill_cuda_graph_max_tokens = max_num_tokens
+
     def prepare_oft_batch(
         self,
         forward_batch: ForwardBatch,
         weight_indices: list[int],
         oft_block_sizes: list[int],
         use_cuda_graph: bool,
+        use_prefill_cuda_graph: bool = False,
     ):
         import os as _os, sys as _sys
         _trace_enabled = _os.environ.get("SGLANG_OFT_PREPARE_TRACE", "0").strip() not in ("0", "false", "False")
@@ -294,7 +340,7 @@ class TritonOFTBackend(BaseOFTBackend):
             weight_indices, dtype=torch.int32, device="cpu"
         )
 
-        if use_cuda_graph:
+        if use_cuda_graph or use_prefill_cuda_graph:
             # CUDA graph captures the Triton launch grid. Keep one segment per
             # graph row so padded replay rows remain covered even when runtime
             # adapter ids differ from the all-empty capture batch.
@@ -344,6 +390,18 @@ class TritonOFTBackend(BaseOFTBackend):
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = num_segments
             batch_info.max_len = int(max(seg_lens_cpu))
+        elif use_prefill_cuda_graph:
+            assert (
+                self.prefill_cuda_graph_batch_info is not None
+            ), "Prefill CUDA Graph batch info is not initialized."
+            batch_info = self.prefill_cuda_graph_batch_info
+            assert num_segments <= batch_info.num_segments, (
+                f"prefill CUDA graph OFT batch has {num_segments} requests but "
+                f"only {batch_info.num_segments} static segment slots"
+            )
+            # bs / num_segments stay pinned at the slot count (the captured
+            # grids); max_len sizes the token-tile grid at capture time.
+            batch_info.max_len = int(max(seg_lens_cpu))
         else:
             max_len = int(max(seg_lens_cpu))
 
@@ -376,12 +434,25 @@ class TritonOFTBackend(BaseOFTBackend):
         batch_info.weight_indices[:num_segments].copy_(
             weight_indices_tensor, non_blocking=True
         )
-        batch_info.seg_indptr[: num_segments + 1].copy_(
-            seg_indptr_cpu, non_blocking=True
-        )
-        batch_info.seg_lens[:num_segments].copy_(
-            seg_lens_cpu, non_blocking=True
-        )
+        if use_prefill_cuda_graph:
+            # Slots past the live batch must read as empty segments for the
+            # pinned captured grid: zero their lengths (and indices, for
+            # hygiene) and rebuild the CSR pointers on device -- no sync.
+            batch_info.weight_indices[num_segments:].zero_()
+            batch_info.seg_lens[:num_segments].copy_(
+                seg_lens_cpu, non_blocking=True
+            )
+            batch_info.seg_lens[num_segments:].zero_()
+            torch.cumsum(
+                batch_info.seg_lens, dim=0, out=batch_info.seg_indptr[1:]
+            )
+        else:
+            batch_info.seg_indptr[: num_segments + 1].copy_(
+                seg_indptr_cpu, non_blocking=True
+            )
+            batch_info.seg_lens[:num_segments].copy_(
+                seg_lens_cpu, non_blocking=True
+            )
 
         self._last_prepare_cpu_tensors = (
             oft_block_sizes_tensor,

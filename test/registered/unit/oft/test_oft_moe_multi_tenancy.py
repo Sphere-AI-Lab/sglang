@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.oft.oft_manager import OFTManager
+from sglang.srt.oft.utils import generate_sequence_lengths
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -50,6 +51,59 @@ def _forward_batch(
     )
 
 
+class _LazyBackendStub:
+    """Stand-in for the OFT backend AFTER its prepare_oft_batch ran for this
+    batch, i.e. the per-segment metadata it uploads (eager: consecutive
+    same-slot requests merged into segments; CUDA graph: one entry per
+    request). Lazy so tests whose forward batch is a bare SimpleNamespace
+    (the early-return cases) never touch it."""
+
+    def __init__(self, weight_indices, forward_batch, fast_path_slot=None):
+        self._weight_indices = weight_indices
+        self._forward_batch = forward_batch
+        self._use_single_adapter_fast_path = fast_path_slot is not None
+        if fast_path_slot is not None:
+            self._single_adapter_idx = fast_path_slot
+
+    def _lengths(self):
+        return generate_sequence_lengths(
+            self._forward_batch, device=torch.device("cpu")
+        ).to(torch.int32)
+
+    @property
+    def cuda_graph_batch_info(self):
+        device = self._forward_batch.input_ids.device
+        return SimpleNamespace(
+            num_segments=len(self._weight_indices),
+            weight_indices=torch.tensor(self._weight_indices, dtype=torch.int32).to(device),
+            seg_lens=self._lengths().to(device),
+        )
+
+    @property
+    def batch_info(self):
+        device = self._forward_batch.input_ids.device
+        wi = torch.tensor(self._weight_indices, dtype=torch.int32)
+        uniq, inverse = torch.unique_consecutive(wi, return_inverse=True)
+        seg_lens = torch.zeros_like(uniq).scatter_add_(0, inverse, self._lengths())
+        return SimpleNamespace(
+            num_segments=len(uniq),
+            weight_indices=uniq.to(device),
+            seg_lens=seg_lens.to(device),
+        )
+
+
+def _bind_slot_ids_with_backend_stub(tm, fast_path_slot=None):
+    """Bind OFTManager._compute_moe_multi_tenant_slot_ids to ``tm`` with the
+    backend stub installed from the call's own arguments, mirroring
+    production where the backend's prepare_oft_batch ran just before."""
+    real = MethodType(OFTManager._compute_moe_multi_tenant_slot_ids, tm)
+
+    def call(weight_indices, forward_batch, use_cuda_graph):
+        tm.oft_backend = _LazyBackendStub(weight_indices, forward_batch, fast_path_slot)
+        return real(weight_indices, forward_batch, use_cuda_graph=use_cuda_graph)
+
+    return call
+
 class TestMoeMultiTenancyDecision(unittest.TestCase):
     def _make_tm(self, active_idx: int = 0):
         tm = SimpleNamespace()
@@ -60,9 +114,7 @@ class TestMoeMultiTenancyDecision(unittest.TestCase):
         # native-RPC OFTManager always reserves buffer slot 0 for the base/
         # identity placeholder and never assigns it to a real adapter).
         tm.memory_pool = SimpleNamespace(active_idx=active_idx)
-        tm._compute_moe_multi_tenant_slot_ids = MethodType(
-            OFTManager._compute_moe_multi_tenant_slot_ids, tm
-        )
+        tm._compute_moe_multi_tenant_slot_ids = _bind_slot_ids_with_backend_stub(tm)
         return tm
 
     # A bare SimpleNamespace forward_batch raises AttributeError on ANY field
@@ -159,9 +211,7 @@ class TestMoeMultiTenantSlotIdsArePerToken(unittest.TestCase):
         # change the outcome, but _compute_moe_multi_tenant_slot_ids always
         # reads it to build its fast-path comparison set.
         tm.memory_pool = SimpleNamespace(active_idx=0)
-        tm._compute_moe_multi_tenant_slot_ids = MethodType(
-            OFTManager._compute_moe_multi_tenant_slot_ids, tm
-        )
+        tm._compute_moe_multi_tenant_slot_ids = _bind_slot_ids_with_backend_stub(tm)
         return tm
 
     def test_extend_batch_expands_slots_to_one_entry_per_token(self):
@@ -798,9 +848,7 @@ class TestPersistentSlotIdsBufferAndCaptureForcing(unittest.TestCase):
         tm._moe_cg_slot_ids_buffer = buffer
         tm.memory_pool = SimpleNamespace(active_idx=active_idx)
         tm.enable_dp_attention = enable_dp_attention
-        tm._compute_moe_multi_tenant_slot_ids = MethodType(
-            OFTManager._compute_moe_multi_tenant_slot_ids, tm
-        )
+        tm._compute_moe_multi_tenant_slot_ids = _bind_slot_ids_with_backend_stub(tm)
         return tm
 
     def test_capture_forcing_bypasses_no_real_adapter_early_return(self):
@@ -1014,10 +1062,19 @@ class TestPrepareOftBatchEagerDemotionOnOverflow(unittest.TestCase):
         }
         tm.configs = {}
         tm.enable_dp_attention = False
-        tm._find_fused_moe_modules = lambda: {}
-        tm.oft_backend = SimpleNamespace(
-            prepare_oft_batch=mock.Mock(), batch_info=None
-        )
+        # An MoE model (the slot path only runs when FusedMoE modules exist)
+        # whose backend exposes the per-segment metadata it uploaded once its
+        # prepare_oft_batch ran for this batch.
+        tm._find_fused_moe_modules = lambda: {0: SimpleNamespace()}
+        tm.can_use_prefill_cuda_graph = lambda forward_batch: False
+        backend = _LazyBackendStub([], None)
+
+        def _record_prepare(**kwargs):
+            backend._weight_indices = kwargs["weight_indices"]
+            backend._forward_batch = kwargs["forward_batch"]
+
+        backend.prepare_oft_batch = mock.Mock(side_effect=_record_prepare)
+        tm.oft_backend = backend
         tm._compute_moe_multi_tenant_slot_ids = MethodType(
             OFTManager._compute_moe_multi_tenant_slot_ids, tm
         )
@@ -1175,3 +1232,194 @@ class TestInitCudaGraphBatchInfoAllocatesSlotIdsBuffer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestPrepareOftBatchSkipsMoeSlotPathForDenseModels(unittest.TestCase):
+    """``OFTManager.prepare_oft_batch`` must not build (or push) the
+    multi-tenant MoE per-token slot tensor when the model has no FusedMoE
+    module at all: nothing ever reads it there, and building it costs a
+    host-to-device copy on every prepare -- every decode step under
+    CUDA-graph replay -- for a dense model."""
+
+    def _make_tm(self, moe_modules):
+        calls = []
+        tm = SimpleNamespace()
+        tm.max_ofts_per_batch = 3
+        tm.max_bs_in_cuda_graph = 8
+        tm._moe_cg_slot_ids_buffer = None
+        slots = {None: 0, "a": 1}
+        tm.memory_pool = SimpleNamespace(
+            active_idx=1,
+            uid_to_buffer_id=slots,
+            get_buffer_id=lambda uid: slots[uid],
+        )
+        tm.adapters = {}
+        tm.configs = {"a": SimpleNamespace(block_size=128)}
+        tm._moe_multi_tenant_slot_ids = "stale-from-previous-batch"
+        tm._find_fused_moe_modules = lambda: moe_modules
+        tm.can_use_prefill_cuda_graph = lambda forward_batch: False
+        tm._compute_moe_multi_tenant_slot_ids = (
+            lambda *a, **k: calls.append("compute") or "slot-ids"
+        )
+        tm._push_moe_multi_tenant_slot_ids = lambda: calls.append("push_slot_ids")
+        tm._push_moe_multi_tenant_batch_info = lambda: calls.append(
+            "push_batch_info"
+        )
+        tm.oft_backend = SimpleNamespace(
+            prepare_oft_batch=lambda **kw: calls.append(
+                ("backend", kw["weight_indices"], kw["oft_block_sizes"], kw["use_cuda_graph"])
+            )
+        )
+        tm.prepare_oft_batch = MethodType(OFTManager.prepare_oft_batch, tm)
+        return tm, calls
+
+    def _decode_batch(self):
+        fb = _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=2, batch_size=2)
+        fb.oft_ids = ["a", None]
+        return fb
+
+    def test_dense_model_only_preps_the_backend(self):
+        tm, calls = self._make_tm(moe_modules={})
+        tm.prepare_oft_batch(self._decode_batch())
+        self.assertEqual(calls, [("backend", [1, 0], [0, 128, 0], True)])
+        self.assertIsNone(tm._moe_multi_tenant_slot_ids)
+
+    def test_moe_fast_path_pushes_none_batch_info_instead_of_crashing(self):
+        # Real method under test: the backend stand-in has batch_info None,
+        # exactly like TritonOFTBackend after its single-adapter fast-path
+        # early return (BaseOFTBackend initializes it to None; the state at
+        # decode-graph capture).
+        moe = SimpleNamespace()
+        tm = SimpleNamespace()
+        tm.max_ofts_per_batch = 2
+        tm.oft_backend = SimpleNamespace(batch_info=None)
+        tm._find_fused_moe_modules = lambda: {0: moe}
+        OFTManager._push_moe_multi_tenant_batch_info(tm)
+        self.assertIsNone(moe._oft_moe_multi_tenant_batch_info)
+        self.assertEqual(moe._oft_max_ofts_per_batch, 2)
+
+    def test_moe_slot_ids_are_derived_after_the_backend_uploaded_its_metadata(self):
+        tm, calls = self._make_tm(moe_modules={0: SimpleNamespace()})
+        tm.prepare_oft_batch(self._decode_batch())
+        self.assertEqual(calls[0][0], "backend")
+        self.assertEqual(calls[1], "compute")
+
+    def test_moe_model_still_computes_and_pushes_slot_ids(self):
+        tm, calls = self._make_tm(moe_modules={0: SimpleNamespace()})
+        tm.prepare_oft_batch(self._decode_batch())
+        self.assertEqual(
+            calls,
+            [
+                ("backend", [1, 0], [0, 128, 0], True),
+                "compute",
+                "push_slot_ids",
+                "push_batch_info",
+            ],
+        )
+        self.assertEqual(tm._moe_multi_tenant_slot_ids, "slot-ids")
+
+
+class TestMoeSlotExpansionNeverSyncsTheDevice(unittest.TestCase):
+    """The per-token expansion is derived on the device from the per-segment
+    metadata the backend already uploaded, sized by host-known token counts:
+    no extra host-to-device copy, and no device-side repeat_interleave that
+    has to size its output from a device tensor (a device-to-host sync on
+    every prepare -- every decode step under CUDA-graph replay)."""
+
+    def _make_tm(self, buffer=None, fast_path_slot=None):
+        tm = SimpleNamespace()
+        tm._moe_multi_tenant_slot_ids = None
+        tm.memory_pool = SimpleNamespace(active_idx=0)
+        tm.enable_dp_attention = False
+        tm._moe_cg_slot_ids_buffer = buffer
+        tm._compute_moe_multi_tenant_slot_ids = _bind_slot_ids_with_backend_stub(
+            tm, fast_path_slot=fast_path_slot
+        )
+        return tm
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device to observe")
+    def test_expansion_runs_on_host_tensors_only(self):
+        # Production shape: input_ids and extend_seq_lens live on the GPU,
+        # extend_seq_lens_cpu is the host copy that sizes the expansion.
+        tm = self._make_tm()
+        fb = _forward_batch(
+            forward_mode=ForwardMode.EXTEND,
+            num_tokens=8,
+            batch_size=3,
+            extend_seq_lens=[4, 1, 3],
+        )
+        fb.input_ids = fb.input_ids.cuda()
+        fb.extend_seq_lens = fb.extend_seq_lens.cuda()
+        seen = []
+        original = torch.repeat_interleave
+
+        def spy(*args, **kwargs):
+            seen.append((args[0].device.type, kwargs.get("output_size")))
+            return original(*args, **kwargs)
+
+        with patch.object(torch, "repeat_interleave", spy):
+            result = tm._compute_moe_multi_tenant_slot_ids(
+                [1, 2, 1], fb, use_cuda_graph=False
+            )
+        # One device-side expansion, sized from the host: no sync, no copy.
+        self.assertEqual(seen, [("cuda", 8)])
+        self.assertEqual(result.device.type, "cuda")
+        self.assertTrue(
+            torch.equal(
+                result.cpu(), torch.tensor([1, 1, 1, 1, 2, 1, 1, 1], dtype=torch.long)
+            )
+        )
+
+    def test_cuda_graph_fast_path_fills_the_buffer_with_the_uniform_slot(self):
+        buffer = torch.full((8,), -1, dtype=torch.long)
+        tm = self._make_tm(buffer=buffer, fast_path_slot=1)
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            [1, 1, 1, 1],
+            _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=4, batch_size=4),
+            use_cuda_graph=True,
+        )
+        self.assertEqual(result.data_ptr(), buffer.data_ptr())
+        self.assertTrue(torch.equal(result, torch.tensor([1, 1, 1, 1], dtype=torch.long)))
+
+    def test_eager_fast_path_returns_a_uniform_tensor_without_backend_metadata(self):
+        tm = self._make_tm(fast_path_slot=2)
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            [2, 2],
+            _forward_batch(
+                forward_mode=ForwardMode.EXTEND,
+                num_tokens=5,
+                batch_size=2,
+                extend_seq_lens=[3, 2],
+            ),
+            use_cuda_graph=False,
+        )
+        self.assertTrue(torch.equal(result, torch.tensor([2, 2, 2, 2, 2], dtype=torch.long)))
+
+    def test_target_verify_graph_repeats_each_request_by_the_draft_width(self):
+        buffer = torch.full((8,), -1, dtype=torch.long)
+        tm = self._make_tm(buffer=buffer)
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            [1, 2],
+            _forward_batch(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_tokens=6,
+                batch_size=2,
+                draft_token_num=3,
+            ),
+            use_cuda_graph=True,
+        )
+        self.assertTrue(
+            torch.equal(result, torch.tensor([1, 1, 1, 2, 2, 2], dtype=torch.long))
+        )
+
+    def test_cuda_graph_path_fills_the_persistent_buffer_in_place(self):
+        buffer = torch.full((8,), -1, dtype=torch.long)
+        tm = self._make_tm(buffer=buffer)
+        result = tm._compute_moe_multi_tenant_slot_ids(
+            [1, 1, 1, 0],
+            _forward_batch(forward_mode=ForwardMode.DECODE, num_tokens=3, batch_size=4),
+            use_cuda_graph=True,
+        )
+        self.assertEqual(result.data_ptr(), buffer.data_ptr())
+        self.assertTrue(torch.equal(result, torch.tensor([1, 1, 1, 0], dtype=torch.long)))
+        self.assertTrue(torch.equal(buffer[4:], torch.full((4,), -1, dtype=torch.long)))

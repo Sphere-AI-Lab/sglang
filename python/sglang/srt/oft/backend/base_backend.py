@@ -1,4 +1,5 @@
 from dataclasses import replace
+from typing import Optional
 
 import torch
 
@@ -20,10 +21,36 @@ class BaseOFTBackend:
         device: the device where the backend runs.
     """
 
+    # Supporting backends implement init_prefill_cuda_graph_batch_info() and
+    # honor use_prefill_cuda_graph in prepare_oft_batch() (mirrors
+    # BaseLoRABackend.supports_prefill_cuda_graph).
+    supports_prefill_cuda_graph: bool = False
+    # TritonOFTBackend's single-adapter fast path: single_adapter_mode is fixed
+    # at construction (<= 2 addressable slots); _use_single_adapter_fast_path is
+    # set per batch by prepare_oft_batch when every row shares one slot. Other
+    # backends never take it.
+    single_adapter_mode: bool = False
+    _use_single_adapter_fast_path: bool = False
+
     def __init__(self, max_ofts_per_batch: int, device: torch.device):
         self.max_ofts_per_batch = max_ofts_per_batch
         self.device = device
         self._cuda_graph_grouped_batch_infos = {}
+        # Per-batch segmented metadata bound by prepare_oft_batch; stays None
+        # while the single-adapter fast path uploads no per-request metadata.
+        self.batch_info: Optional["OFTBatchInfo"] = None
+        # Static metadata read by prefill-CUDA-graph kernels, refreshed in
+        # place every prefill batch.
+        self.prefill_cuda_graph_batch_info: Optional["OFTBatchInfo"] = None
+        self.prefill_cuda_graph_max_bs: Optional[int] = None
+        self.prefill_cuda_graph_max_tokens: Optional[int] = None
+
+    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
+        """Allocate static OFT batch metadata for the prefill CUDA graph,
+        sized by the largest captured token bucket."""
+        raise NotImplementedError(
+            f"OFT backend {type(self).__name__} does not support the prefill CUDA graph."
+        )
 
     def run_oft_r_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -214,6 +241,7 @@ class BaseOFTBackend:
         weight_indices: list[int],
         oft_block_sizes: list[int],
         use_cuda_graph: bool,
+        use_prefill_cuda_graph: bool = False,
     ):
         """Prepare the OFT weights and batch info for current forward batch.
         This method provides a hook for each backend to conduct its own preparation

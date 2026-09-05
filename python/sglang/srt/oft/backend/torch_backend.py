@@ -118,6 +118,7 @@ class TorchNativeOFTBackend(BaseOFTBackend):
         weight_indices: list[int],
         oft_block_sizes: list[int],
         use_cuda_graph: bool,
+        use_prefill_cuda_graph: bool = False,
     ):
         original_seq_lens = generate_sequence_lengths(forward_batch, device="cpu")
         original_weight_indices_tensor = torch.tensor(

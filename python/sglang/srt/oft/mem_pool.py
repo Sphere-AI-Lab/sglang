@@ -1340,6 +1340,15 @@ class OFTMemoryPool:
             for tensor in groups.values():
                 _fill_expert_oft_identity(tensor[buffer_id])
 
+    def has_expert_oft_groups(self) -> bool:
+        """Whether any expert-OFT group (w13_oft_r / w1_oft_r / w3_oft_r /
+        w2_oft_r) was declared, i.e. some FusedMoE module carries expert-OFT
+        buffers."""
+        return any(
+            name in self._groups
+            for name in ("w13_oft_r", "w1_oft_r", "w3_oft_r", "w2_oft_r")
+        )
+
     def get_tensor(self, target_module: str, layer_id: int) -> torch.Tensor:
         """Get the R buffer tensor for a given module and layer."""
         return self.R_buffer[target_module][layer_id]

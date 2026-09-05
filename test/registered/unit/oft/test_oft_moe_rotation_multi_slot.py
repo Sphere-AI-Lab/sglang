@@ -243,6 +243,19 @@ class TestManagerSlotIdsFeedTheKernel(unittest.TestCase):
         tm._compute_moe_multi_tenant_slot_ids = MethodType(
             OFTManager._compute_moe_multi_tenant_slot_ids, tm
         )
+        # What the backend's prepare_oft_batch uploaded for this batch: the
+        # slot expansion is derived on the device from it (no consecutive
+        # same-slot requests here, so one segment per request).
+        tm.oft_backend = SimpleNamespace(
+            _use_single_adapter_fast_path=False,
+            batch_info=SimpleNamespace(
+                num_segments=len(weight_indices),
+                weight_indices=torch.tensor(
+                    weight_indices, dtype=torch.int32, device=device
+                ),
+                seg_lens=torch.tensor(extend_seq_lens, dtype=torch.int32, device=device),
+            ),
+        )
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             batch_size=len(weight_indices),

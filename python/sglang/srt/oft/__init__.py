@@ -24,9 +24,6 @@ these without a design decision:
     reset_batch_state / reset_lora_batch      DP-attention idle forwards unsupported in OFT;
                                               a set_oft layer without a prepared batch should
                                               fail loudly (see oft_active docstring).
-    init_prefill_cuda_graph_batch_info,       OFT prefill CUDA-graph capture runs through the
-    supports/can_use/prefill_cuda_graph_max_bs  peft integration facade + prepare_oft_batch,
-                                              not a dedicated prefill batch-info protocol.
     eviction_policy.py, lora_drainer.py,      B1 multi-tenancy keeps every boot adapter resident
     lora_overlap_loader.py                    (capacity-capped in init_state), so pool-overflow
                                               eviction/drainer/overlap-load stay out until B2.

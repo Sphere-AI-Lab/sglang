@@ -257,6 +257,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.enable_lora = model_runner.server_args.enable_lora
+        self.enable_oft = model_runner.server_args.enable_oft
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
@@ -361,6 +362,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._is_full_backend = False
         # Same ordering requirement: capture_prepare reads this.
         self._capture_lora = False
+        self._capture_oft = False
         self.enable_cp_v2_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
         # TcPiecewise does its compile pass during backend construction.
@@ -401,6 +403,31 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     lora_max_bs,
                 )
                 self._capture_req_slots = lora_max_bs
+        # OFT mirrors the LoRA protocol above: BCG/Full record the OFT kernels,
+        # so their batch metadata must live in static buffers refreshed in
+        # place per batch (TritonOFTBackend.prefill_cuda_graph_batch_info).
+        # Configurations the protocol excludes (DP attention, MoE-expert OFT)
+        # keep OFT prefill eager through can_run_graph's oft clause.
+        self._capture_oft = (
+            self.enable_oft
+            and isinstance(
+                self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
+            )
+            and model_runner.oft_manager.supports_prefill_cuda_graph
+        )
+        if self._capture_oft:
+            model_runner.oft_manager.init_prefill_cuda_graph_batch_info(
+                max_num_tokens=self.max_num_tokens
+            )
+            oft_max_bs = model_runner.oft_manager.prefill_cuda_graph_max_bs
+            if self._capture_req_slots > oft_max_bs:
+                logger.info(
+                    "Clamping full prefill CUDA graph request slots from %d to %d "
+                    "to fit the OFT backend's static segment slots.",
+                    self._capture_req_slots,
+                    oft_max_bs,
+                )
+                self._capture_req_slots = oft_max_bs
 
         self._full_cg_seq_lens_cpu = (
             torch.zeros((self._capture_req_slots,), dtype=torch.int64, device="cpu")
@@ -1138,11 +1165,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             return_logprob=forward_batch.return_logprob,
-            lora_ineligible=self.enable_lora
-            and not (
-                self._capture_lora
-                and self.model_runner.lora_manager.can_use_prefill_cuda_graph(
-                    forward_batch
+            lora_ineligible=(
+                self.enable_lora
+                and not (
+                    self._capture_lora
+                    and self.model_runner.lora_manager.can_use_prefill_cuda_graph(
+                        forward_batch
+                    )
+                )
+            )
+            or (
+                # OFT replays need prepare_oft_batch's static prefill
+                # metadata; same gate as LoRA above.
+                self.enable_oft
+                and not (
+                    self._capture_oft
+                    and self.model_runner.oft_manager.can_use_prefill_cuda_graph(
+                        forward_batch
+                    )
                 )
             ),
             chunked_prefix_uncapturable=(
@@ -1427,6 +1467,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # TritonOFTBackend.batch_info (AttributeError at the first OFT-wrapped
         # projection). load_batch re-preps with the real oft_ids at replay.
         if forward_batch.oft_ids is not None:
+            if self._capture_oft:
+                # Fill the static prefill OFT batch info the captured kernels
+                # will read (all-None ids: base slot, kernels pass through).
+                assert self.model_runner.oft_manager.can_use_prefill_cuda_graph(
+                    forward_batch
+                ), (
+                    f"Capture batch (req slots {self._capture_req_slots}, bucket "
+                    f"{num_tokens}) exceeds the OFT backend's prefill CUDA graph "
+                    "limits; the graph would read stale OFT metadata at replay."
+                )
             self.model_runner.oft_manager.prepare_oft_batch(forward_batch)
 
         def run_once():
@@ -1678,8 +1728,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Re-prep the OFT adapter batch_info for replay with the REAL
         # oft_ids (capture used dummy base ids): the captured single-
         # adapter idx flips base->active here. Runs eagerly outside the
-        # compiled region, same as decode's replay re-prep.
-        if static_forward_batch.oft_ids is not None:
+        # compiled region, same as decode's replay re-prep. Guarded on
+        # enable_oft like DecodeCudaGraphRunner._prepare_oft_replay_batch:
+        # ForwardBatch.init_new always fills oft_ids (a list of None) even
+        # when OFT is off, and there is no oft_manager to call then.
+        if self.enable_oft and static_forward_batch.oft_ids is not None:
             self.model_runner.oft_manager.prepare_oft_batch(static_forward_batch)
 
         return static_forward_batch

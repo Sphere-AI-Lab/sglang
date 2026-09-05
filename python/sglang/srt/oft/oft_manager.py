@@ -313,6 +313,76 @@ class OFTManager:
             num_tokens_per_bs=num_tokens_per_bs,
         )
 
+    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
+        """Allocate the static prefill-CUDA-graph OFT metadata, sized by the
+        largest captured token bucket. Called before capture (mirrors
+        LoRAManager.init_prefill_cuda_graph_batch_info)."""
+        self.oft_backend.init_prefill_cuda_graph_batch_info(
+            max_num_tokens=max_num_tokens
+        )
+
+    def _has_moe_expert_oft_buffers(self) -> bool:
+        """Whether the pool declared expert-OFT groups, i.e. some FusedMoE
+        module carries expert-OFT buffers. Their per-token routing tensor is
+        rebuilt per batch (a fresh tensor in eager mode), so a captured prefill
+        graph would replay against a freed one."""
+        return self.memory_pool.has_expert_oft_groups()
+
+    @property
+    def supports_prefill_cuda_graph(self) -> bool:
+        """Whether OFT kernels can be captured into the prefill CUDA graph;
+        excludes DP attention and MoE-expert OFT (mirrors LoRAManager)."""
+        return (
+            self.oft_backend.supports_prefill_cuda_graph
+            and not self.enable_dp_attention
+            and not self._has_moe_expert_oft_buffers()
+        )
+
+    @property
+    def prefill_cuda_graph_max_bs(self) -> Optional[int]:
+        """Request-count cap for prefill-graph OFT batches; None until
+        init_prefill_cuda_graph_batch_info() ran."""
+        return self.oft_backend.prefill_cuda_graph_max_bs
+
+    def can_use_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this batch can use the static prefill-graph OFT metadata;
+        shared by prepare_oft_batch and PrefillCudaGraphRunner.can_run_graph so
+        they stay consistent (mirrors LoRAManager.can_use_prefill_cuda_graph).
+
+        One OFT-specific rule: TritonOFTBackend picks its single-adapter fast
+        path per batch (every row on one slot), and a captured graph holds
+        whichever kernel variant ran at capture (all-base dummy ids, i.e. the
+        fast path in single_adapter_mode). A mixed base/adapter batch would
+        need the segmented kernels instead, so it replays eagerly.
+        """
+        backend = self.oft_backend
+        max_bs = backend.prefill_cuda_graph_max_bs
+        max_tokens = backend.prefill_cuda_graph_max_tokens
+        if max_bs is None or max_tokens is None:
+            return False
+        # DP attention: per-rank eligibility could diverge across ranks and
+        # desync collectives; keep OFT prefill eager.
+        if self.enable_dp_attention:
+            return False
+        # Decode-CUDA-graph extend modes (TARGET_VERIFY, DLLM_EXTEND) are
+        # owned by the decode static batch info path.
+        if (
+            not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_cuda_graph()
+        ):
+            return False
+        if forward_batch.extend_num_tokens is None or forward_batch.oft_ids is None:
+            return False
+        if (
+            backend.single_adapter_mode
+            and len(set(forward_batch.oft_ids)) > 1
+        ):
+            return False
+        return (
+            forward_batch.batch_size <= max_bs
+            and forward_batch.extend_num_tokens <= max_tokens
+        )
+
     def moe_expert_oft_multi_tenant_ready(self) -> bool:
         """Ground truth (post-boot-load) for whether every wrapped MoE-expert
         module's OFT buffers this manager actually populated have their
@@ -436,10 +506,15 @@ class OFTManager:
             # the ref via register_streamed_adapter (which also sets the routing);
             # this registers the fresh-uuid ref for it. Avoids double-registering.
             self.oft_refs.setdefault(ref.oft_id, ref)
+        # The distributed stage/activate routes (weight_updater.stage_adapter /
+        # activate_adapter_version) read ``.success`` off the result, exactly as
+        # they do for StagedOFTManager; failures surface as exceptions there.
+        return self.create_oft_update_result(success=True)
 
     def activate_adapter(self, name, version):
         self.memory_pool.activate(version)
         self._bump_ref_version(name, version)
+        return self.create_oft_update_result(success=True)
 
     def _weights_memory_saver_region(self):
         adapter = getattr(self, "memory_saver_adapter", None)
@@ -1158,8 +1233,24 @@ class OFTManager:
             }:
                 return None
 
-        device = forward_batch.input_ids.device
-        tokens_per_request = generate_sequence_lengths(forward_batch, device=device)
+        # Everything below derives the per-token tensor ON THE DEVICE from
+        # the per-segment metadata the backend's prepare_oft_batch already
+        # uploaded for this batch (prepare_oft_batch runs the backend first
+        # for exactly this reason), so this adds no host-to-device copy and
+        # no device-to-host sync. The previous device-side repeat_interleave
+        # sized its output from a CUDA `repeats` tensor, which is a sync on
+        # every prepare -- every decode step under CUDA-graph replay --
+        # serializing the scheduler's CPU work with the GPU. Host-side token
+        # counts (decode: one per request over the padded batch_size;
+        # target-verify: draft_token_num; extend: extend_seq_lens_cpu) only
+        # SIZE the result: under decode-CUDA-graph replay
+        # _prepare_oft_replay_batch pads batch_size and oft_ids to the capture
+        # bucket WITHOUT touching input_ids, so the expansion legitimately
+        # sums to the PADDED count and is never cross-checked against
+        # input_ids.shape[0].
+        tokens_per_request = generate_sequence_lengths(
+            forward_batch, device=torch.device("cpu")
+        )
         if tokens_per_request.shape[0] != len(weight_indices):
             raise RuntimeError(
                 "Multi-tenant MoE OFT slot expansion needs one token count per "
@@ -1167,24 +1258,49 @@ class OFTManager:
                 f"{len(weight_indices)} requests "
                 f"(forward_mode={forward_batch.forward_mode})"
             )
-        per_request_slots = torch.tensor(weight_indices, dtype=torch.long, device=device)
-        # Deliberately NO output_size= here, even though passing one would
-        # avoid the device-to-host sync repeat_interleave needs to size its
-        # own output from a CUDA `repeats` tensor: there is no host-side value
-        # that is correct for every batch. forward_batch.input_ids.shape[0]
-        # (the obvious candidate) is the RAW token count, but under
-        # decode-CUDA-graph replay DecodeCudaGraphRunner's
-        # _prepare_oft_replay_batch pads forward_batch.batch_size and
-        # oft_ids up to the capture-bucket size WITHOUT touching
-        # input_ids, so tokens_per_request (built off batch_size) legitimately
-        # sums to the PADDED count instead. A mismatch there is not a
-        # catchable error on CUDA -- it is a device-side assert that poisons
-        # the context and kills the engine process. The sync costs less than
-        # that.
-        expanded = per_request_slots.repeat_interleave(tokens_per_request.to(torch.long))
+        num_tokens = int(tokens_per_request.sum())
+        backend = self.oft_backend
 
-        if not use_cuda_graph:
-            return expanded
+        if backend._use_single_adapter_fast_path:
+            # Single-adapter fast path: the backend uploaded no per-request
+            # metadata because every token of this batch shares one slot.
+            uniform_slot = int(backend._single_adapter_idx)
+            if not use_cuda_graph:
+                return torch.full(
+                    (num_tokens,),
+                    uniform_slot,
+                    dtype=torch.long,
+                    device=forward_batch.input_ids.device,
+                )
+            expanded = None
+        elif use_cuda_graph:
+            # Per-request weight_indices live in the backend's persistent
+            # cuda_graph_batch_info (refreshed for this replay). Every request
+            # carries the same token count here (1 for decode, the draft width
+            # for target-verify), so an int `repeats` suffices -- no sync.
+            bs = forward_batch.batch_size
+            tokens_per_bs, remainder = divmod(num_tokens, bs)
+            if remainder != 0:
+                raise RuntimeError(
+                    "CUDA-graph OFT batches must carry a uniform token count "
+                    f"per request, got {num_tokens} tokens for batch_size={bs} "
+                    f"(forward_mode={forward_batch.forward_mode})"
+                )
+            expanded = backend.cuda_graph_batch_info.weight_indices[:bs].to(
+                torch.long
+            )
+            if tokens_per_bs != 1:
+                expanded = expanded.repeat_interleave(tokens_per_bs)
+        else:
+            # Eager: the backend merged consecutive same-slot requests into
+            # segments; output_size is host-known, so no sync.
+            info = backend.batch_info
+            num_segments = info.num_segments
+            return torch.repeat_interleave(
+                info.weight_indices[:num_segments].to(torch.long),
+                info.seg_lens[:num_segments].to(torch.long),
+                output_size=num_tokens,
+            )
 
         if self.enable_dp_attention:
             raise RuntimeError(
@@ -1200,7 +1316,6 @@ class OFTManager:
             "True before init_cuda_graph_batch_info allocated the persistent "
             "slot_ids buffer."
         )
-        num_tokens = expanded.shape[0]
         if num_tokens > self._moe_cg_slot_ids_buffer.shape[0]:
             # Last-resort backstop, not the primary defense: prepare_oft_batch's
             # own early estimate (mirroring LoRAManager.prepare_lora_batch's
@@ -1223,8 +1338,12 @@ class OFTManager:
                 "the eager path before reaching here -- investigate rather "
                 "than silently truncate or overrun the buffer."
             )
-        self._moe_cg_slot_ids_buffer[:num_tokens].copy_(expanded)
-        return self._moe_cg_slot_ids_buffer[:num_tokens]
+        buffer = self._moe_cg_slot_ids_buffer[:num_tokens]
+        if expanded is None:
+            buffer.fill_(uniform_slot)
+        else:
+            buffer.copy_(expanded)
+        return buffer
 
     def _push_moe_multi_tenant_slot_ids(self) -> None:
         """Make this batch's MoE multi-tenancy decision visible to every
@@ -1247,6 +1366,15 @@ class OFTManager:
         needs both to build its own moe_lora_align_block_size alignment,
         which is request-segmented, not per-token like slot_ids.
         """
+        # The single-adapter fast path (TritonOFTBackend.prepare_oft_batch's
+        # early return) never binds backend.batch_info: every row of that
+        # batch shares one slot, so the segmented metadata is neither built
+        # nor read, and the MoE runner takes its own fast path off the
+        # uniform slot_ids (see _compute_moe_multi_tenant_slot_ids). The push
+        # is None then: BaseOFTBackend initializes batch_info to None (before
+        # that, the unbound attribute crashed the very first prepare -- the
+        # decode-graph capture with all-base dummy ids -- of any engine in
+        # single_adapter_mode).
         batch_info = self.oft_backend.batch_info
         for moe in self._find_fused_moe_modules().values():
             moe._oft_moe_multi_tenant_batch_info = batch_info
@@ -1286,6 +1414,10 @@ class OFTManager:
             if estimated_num_tokens > self._moe_cg_slot_ids_buffer.shape[0]:
                 use_cuda_graph = False
 
+        use_prefill_cuda_graph = not use_cuda_graph and self.can_use_prefill_cuda_graph(
+            forward_batch
+        )
+
         weight_indices = [0] * len(forward_batch.oft_ids)
         oft_block_sizes = [0] * self.max_ofts_per_batch
         for i, uid in enumerate(forward_batch.oft_ids):
@@ -1314,22 +1446,33 @@ class OFTManager:
                     oft_block_sizes[weight_indices[i]] = self.configs[uid].block_size
                 else:
                     raise KeyError(f"OFT adapter {uid} not found in ofts or configs")
-        # Decide whether this batch needs the multi-tenant MoE OFT path. Only
-        # the MoE slot tensor is expanded to per-token there; weight_indices
-        # itself stays per-request for the dense backend call below.
-        self._moe_multi_tenant_slot_ids = self._compute_moe_multi_tenant_slot_ids(
-            weight_indices, forward_batch, use_cuda_graph=use_cuda_graph
-        )
-        self._push_moe_multi_tenant_slot_ids()
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
-        # could use CUDA graph.
+        # could use CUDA graph. Runs FIRST: _compute_moe_multi_tenant_slot_ids
+        # below derives the per-token MoE slot tensor from the per-segment
+        # metadata this call uploads.
         self.oft_backend.prepare_oft_batch(
             forward_batch=forward_batch,
             weight_indices=weight_indices,
             oft_block_sizes=oft_block_sizes,
             use_cuda_graph=use_cuda_graph,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
-        self._push_moe_multi_tenant_batch_info()
+        # The multi-tenant MoE per-token slot tensor is only ever read by
+        # FusedMoE expert kernels. On a model with no FusedMoE module (dense)
+        # nothing consumes it, so skip building and pushing it: doing so
+        # anyway cost device work on every prepare -- every decode step under
+        # CUDA-graph replay -- for nothing.
+        if self._find_fused_moe_modules():
+            # Decide whether this batch needs the multi-tenant MoE OFT path. Only
+            # the MoE slot tensor is expanded to per-token there; weight_indices
+            # itself stays per-request for the dense backend call above.
+            self._moe_multi_tenant_slot_ids = self._compute_moe_multi_tenant_slot_ids(
+                weight_indices, forward_batch, use_cuda_graph=use_cuda_graph
+            )
+            self._push_moe_multi_tenant_slot_ids()
+            self._push_moe_multi_tenant_batch_info()
+        else:
+            self._moe_multi_tenant_slot_ids = None
 
     def update_oft_info(self):
         """Associate all adapter modules with the latest memory buffer."""
