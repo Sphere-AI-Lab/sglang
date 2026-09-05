@@ -8,4 +8,5 @@ from sglang.srt.oft.triton_ops.fused_rotate_project import (
 from sglang.srt.oft.triton_ops.block_rotate import (
     apply_oft_rotation_triton,
     apply_oft_rotation_triton_multi_slot,
+    apply_oft_rotation_triton_multi_slot_dot,
 )

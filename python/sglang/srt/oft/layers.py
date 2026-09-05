@@ -936,6 +936,14 @@ class FusedMoEWithOFT(nn.Module):
     def __init__(self, base_layer, oft_backend: BaseOFTBackend):
         super().__init__()
         self.base_layer = base_layer
+        self.oft_backend = oft_backend
+        # Also bound on base_layer (not just the wrapper): OFT buffer
+        # injection (oft_manager.py's _find_fused_moe_modules) "sees
+        # through" this wrapper and writes w13_oft_r/w2_oft_r/etc. directly
+        # onto base_layer, and MoeRunner._peft_layer is base_layer too (not
+        # this wrapper) -- so the Marlin runner's request-segmented rotation
+        # needs oft_backend reachable from base_layer, not just here.
+        base_layer.oft_backend = oft_backend
         # Copy the config the runner path reads (mirror FusedMoEWithLoRA).
         self.quant_method = base_layer.quant_method
         self.moe_runner_config = base_layer.moe_runner_config

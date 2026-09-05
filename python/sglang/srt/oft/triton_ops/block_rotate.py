@@ -365,3 +365,211 @@ def apply_oft_rotation_triton_multi_slot(
 
     return A_rot
 
+
+@triton.jit
+def _oft_block_rotate_kernel_multi_slot_dot(
+    # Input: (M, K)
+    A_ptr,
+    stride_am,
+    stride_ak,
+    # Output: (M_expanded, K) — one row per token-expert pair
+    A_rot_ptr,
+    stride_arm,
+    stride_ark,
+    # R matrices: (S, E, num_blocks, bs, bs)
+    R_ptr,
+    stride_rs,
+    stride_re,
+    stride_rb,
+    stride_ri,
+    stride_rj,
+    # Per-slot token routing (each program handles exactly one slot, so a
+    # BLOCK_M tile always shares one adapter -- unlike the shared-alignment
+    # multi-slot kernel above, this can batch the rotation as one tl.dot)
+    sorted_token_ids_ptr,
+    stride_sts,
+    stride_stm,
+    expert_ids_ptr,
+    stride_eis,
+    stride_eim,
+    num_tokens_post_padded_ptr,
+    stride_ntpp,
+    oft_ids_ptr,
+    adapter_enabled_ptr,
+    num_valid_tokens,
+    # Dimensions
+    top_k: tl.constexpr,
+    K: tl.constexpr,
+    OFT_BLOCK_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    TILE_K: tl.constexpr,
+):
+    """Per-slot-aligned sibling of _oft_block_rotate_kernel_multi_slot.
+
+    Grid: (slot, cdiv(EM, BLOCK_M), num_blocks) -- pid_slot indexes a
+    PER-SLOT alignment (each slot's own moe_align_block_size-style routing,
+    built by moe_lora_align_block_size), so every BLOCK_M-sized tile shares
+    one adapter slot AND one expert, enabling a real tl.dot matmul per tile
+    instead of the shared-alignment kernel's per-row elementwise gather.
+    Trades O(1) alignment cost for O(num_configured_slots) grid/launch
+    overhead -- see the module docstring for when each kernel wins.
+    """
+    pid_slot = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_blk = tl.program_id(2)
+
+    slot_id = tl.load(oft_ids_ptr + pid_slot).to(tl.int64)
+    if slot_id < 0:
+        return
+    if tl.load(adapter_enabled_ptr + slot_id) == 0:
+        return
+
+    num_tokens_post_padded = tl.load(
+        num_tokens_post_padded_ptr + slot_id * stride_ntpp
+    )
+    if pid_m * BLOCK_M >= num_tokens_post_padded:
+        return
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    sorted_ids = tl.load(
+        sorted_token_ids_ptr + slot_id * stride_sts + offs_m * stride_stm
+    )
+    sorted_ids = sorted_ids.to(tl.int64)
+    token_mask = sorted_ids < num_valid_tokens
+
+    expert = tl.load(
+        expert_ids_ptr + slot_id * stride_eis + pid_m * stride_eim
+    ).to(tl.int64)
+
+    orig_ids = sorted_ids // top_k
+    k_base = pid_blk * OFT_BLOCK_SIZE
+
+    # EP-dispatched non-local experts are encoded as -1; skip exactly as the
+    # shared-alignment kernel does, to avoid reading outside the R tensor.
+    if expert < 0:
+        return
+
+    # OFT convention: rot_accum[t, c] = sum_k A[t, k_base+k] * R[slot, expert, pid_blk, k, c]
+    rot_accum = tl.zeros((BLOCK_M, OFT_BLOCK_SIZE), dtype=tl.float32)
+
+    if OFT_BLOCK_SIZE >= 16:
+        for k_off in range(0, OFT_BLOCK_SIZE, TILE_K):
+            k_tile_offs = (k_base + k_off + tl.arange(0, TILE_K)).to(tl.int64)
+            a_ptrs = A_ptr + orig_ids[:, None] * stride_am + k_tile_offs[None, :] * stride_ak
+            a_tile = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+
+            r_row_offs = (k_off + tl.arange(0, TILE_K)).to(tl.int64)
+            r_col_offs = tl.arange(0, OFT_BLOCK_SIZE).to(tl.int64)
+            r_ptrs = (
+                R_ptr
+                + slot_id * stride_rs
+                + expert * stride_re
+                + pid_blk * stride_rb
+                + r_row_offs[:, None] * stride_ri
+                + r_col_offs[None, :] * stride_rj
+            )
+            r_sub = tl.load(r_ptrs)
+
+            # input_precision="ieee": a no-op for bf16 (Triton only honors it
+            # for fp32xfp32) but kept defensive in case R is ever promoted.
+            rot_accum += tl.dot(a_tile, r_sub, input_precision="ieee")
+    else:
+        out_cols = tl.arange(0, OFT_BLOCK_SIZE).to(tl.int64)
+        for k in range(OFT_BLOCK_SIZE):
+            a_col = tl.load(
+                A_ptr + orig_ids * stride_am + (k_base + k) * stride_ak,
+                mask=token_mask,
+                other=0.0,
+            ).to(tl.float32)
+            r_row = tl.load(
+                R_ptr
+                + slot_id * stride_rs
+                + expert * stride_re
+                + pid_blk * stride_rb
+                + k * stride_ri
+                + out_cols * stride_rj
+            ).to(tl.float32)
+            rot_accum += a_col[:, None] * r_row[None, :]
+
+    out_k_offs = (k_base + tl.arange(0, OFT_BLOCK_SIZE)).to(tl.int64)
+    out_ptrs = A_rot_ptr + sorted_ids[:, None] * stride_arm + out_k_offs[None, :] * stride_ark
+    tl.store(out_ptrs, rot_accum.to(A_rot_ptr.dtype.element_ty), mask=token_mask[:, None])
+
+
+def apply_oft_rotation_triton_multi_slot_dot(
+    A: torch.Tensor,               # (M, K)
+    oft_r_all_slots: torch.Tensor, # (S, E, num_blocks, bs, bs)
+    topk_ids: torch.Tensor,        # (M, top_k)
+    sorted_token_ids: torch.Tensor,     # (S, max_num_tokens_padded)
+    expert_ids: torch.Tensor,           # (S, max_num_m_blocks)
+    num_tokens_post_padded: torch.Tensor,  # (S,)
+    oft_ids: torch.Tensor,               # (S,)
+    adapter_enabled: torch.Tensor,       # (S,)
+    top_k: int,
+    block_m: int = 64,
+) -> torch.Tensor:
+    """Per-slot-aligned tl.dot sibling of apply_oft_rotation_triton_multi_slot.
+
+    Alignment tensors must come from a PER-SLOT alignment pass (e.g.
+    moe_lora_align_block_size), not the shared moe_align_block_size used by
+    the elementwise multi-slot kernel -- each row of sorted_token_ids/
+    expert_ids belongs to one adapter slot's own routing.
+
+    Returns A_rot of shape (M * top_k, K), same contract as the other
+    multi-slot entry point.
+    """
+    M, K = A.shape
+    if oft_r_all_slots.dim() != 5:
+        raise ValueError(
+            "oft_r_all_slots must be 5D (slots, experts, blocks, bs, bs), "
+            f"got {tuple(oft_r_all_slots.shape)}"
+        )
+    bs = oft_r_all_slots.shape[-1]
+    from sglang.srt.oft.utils import validate_oft_block_size
+
+    validate_oft_block_size(bs)
+    if tuple(oft_r_all_slots.shape[-2:]) != (bs, bs):
+        raise ValueError(
+            f"OFT blocks must be square, got {tuple(oft_r_all_slots.shape[-2:])}"
+        )
+    if K % bs != 0:
+        raise ValueError(f"OFT hidden size {K} must be divisible by block size {bs}")
+    num_blocks = K // bs
+    if oft_r_all_slots.shape[2] != num_blocks:
+        raise ValueError(
+            f"oft_r_all_slots has {oft_r_all_slots.shape[2]} blocks, "
+            f"expected {num_blocks} for K={K}, BS={bs}"
+        )
+    if sorted_token_ids.dim() != 2 or expert_ids.dim() != 2:
+        raise ValueError("per-slot alignment tensors must be two-dimensional")
+    if num_tokens_post_padded.dim() != 1 or oft_ids.dim() != 1:
+        raise ValueError("per-slot padded counts and slot IDs must be one-dimensional")
+    if sorted_token_ids.shape[0] != oft_ids.numel():
+        raise ValueError("alignment slot dimension must match oft_ids")
+
+    A_rot = A[:, None, :].expand(-1, top_k, -1).reshape(-1, K).clone()
+
+    tile_k = min(64, bs)
+    max_num_m_blocks = expert_ids.shape[1]
+    grid = (oft_ids.numel(), max_num_m_blocks, num_blocks)
+
+    _oft_block_rotate_kernel_multi_slot_dot[grid](
+        A, A.stride(0), A.stride(1),
+        A_rot, A_rot.stride(0), A_rot.stride(1),
+        oft_r_all_slots,
+        oft_r_all_slots.stride(0), oft_r_all_slots.stride(1), oft_r_all_slots.stride(2),
+        oft_r_all_slots.stride(3), oft_r_all_slots.stride(4),
+        sorted_token_ids, sorted_token_ids.stride(0), sorted_token_ids.stride(1),
+        expert_ids, expert_ids.stride(0), expert_ids.stride(1),
+        num_tokens_post_padded, num_tokens_post_padded.stride(0),
+        oft_ids, adapter_enabled,
+        topk_ids.numel(),
+        top_k=top_k,
+        K=K,
+        OFT_BLOCK_SIZE=bs,
+        BLOCK_M=block_m,
+        TILE_K=tile_k,
+    )
+
+    return A_rot
+

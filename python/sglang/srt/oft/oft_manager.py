@@ -1225,6 +1225,24 @@ class OFTManager:
         for moe in self._find_fused_moe_modules().values():
             moe._oft_moe_multi_tenant_slot_ids = self._moe_multi_tenant_slot_ids
 
+    def _push_moe_multi_tenant_batch_info(self) -> None:
+        """Companion to _push_moe_multi_tenant_slot_ids, called AFTER
+        self.oft_backend.prepare_oft_batch (which is what actually sets
+        self.oft_backend.batch_info for THIS batch -- calling this any
+        earlier would push the previous batch's stale batch_info).
+
+        Exposes this batch's OFTBatchInfo (seg_indptr/weight_indices) and the
+        server's configured adapter capacity the same live-attribute way as
+        slot_ids: the per-slot-aligned tl.dot rotation kernel (eager /
+        non-CUDA-graph only -- see oft_moe_runners._should_use_dot_multi_tenant)
+        needs both to build its own moe_lora_align_block_size alignment,
+        which is request-segmented, not per-token like slot_ids.
+        """
+        batch_info = self.oft_backend.batch_info
+        for moe in self._find_fused_moe_modules().values():
+            moe._oft_moe_multi_tenant_batch_info = batch_info
+            moe._oft_max_ofts_per_batch = self.max_ofts_per_batch
+
     def prepare_oft_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all oft modules
         bs = forward_batch.batch_size
@@ -1302,6 +1320,7 @@ class OFTManager:
             oft_block_sizes=oft_block_sizes,
             use_cuda_graph=use_cuda_graph,
         )
+        self._push_moe_multi_tenant_batch_info()
 
     def update_oft_info(self):
         """Associate all adapter modules with the latest memory buffer."""

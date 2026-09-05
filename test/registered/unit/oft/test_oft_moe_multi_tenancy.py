@@ -1016,7 +1016,7 @@ class TestPrepareOftBatchEagerDemotionOnOverflow(unittest.TestCase):
         tm.enable_dp_attention = False
         tm._find_fused_moe_modules = lambda: {}
         tm.oft_backend = SimpleNamespace(
-            prepare_oft_batch=mock.Mock()
+            prepare_oft_batch=mock.Mock(), batch_info=None
         )
         tm._compute_moe_multi_tenant_slot_ids = MethodType(
             OFTManager._compute_moe_multi_tenant_slot_ids, tm
@@ -1024,6 +1024,9 @@ class TestPrepareOftBatchEagerDemotionOnOverflow(unittest.TestCase):
         tm.prepare_oft_batch = MethodType(OFTManager.prepare_oft_batch, tm)
         tm._push_moe_multi_tenant_slot_ids = MethodType(
             OFTManager._push_moe_multi_tenant_slot_ids, tm
+        )
+        tm._push_moe_multi_tenant_batch_info = MethodType(
+            OFTManager._push_moe_multi_tenant_batch_info, tm
         )
         return tm
 
