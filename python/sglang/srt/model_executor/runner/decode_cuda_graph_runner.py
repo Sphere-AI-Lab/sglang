@@ -1478,14 +1478,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _prepare_oft_replay_batch(
         self, forward_batch: ForwardBatch, bs: int, raw_bs: int
     ) -> None:
-        """Re-prep the OFT batch_info for the real replay batch (padded bs,
-        the request's real oft_ids -- capture used dummy base ids).
-        No-op unless enable_oft. Mirrors v0.5.9 CudaGraphRunner.replay_prepare.
+        """Prepare OFT's persistent metadata for the padded replay batch.
 
-        Unlike LoRA's lora_ids (restored generically by buffer_registry.
-        fill_from above), oft_ids isn't a registered buffer field, so
-        prepare_oft_batch needs the real padded batch_size/oft_ids
-        temporarily swapped in, then the originals restored.
+        Unlike LoRA's merged decode routing over live rows, OFT's segmented
+        path needs one segment per graph row, including padding rows.
         """
         if (
             not self.model_runner.server_args.enable_oft
@@ -1494,8 +1490,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return
         original_batch_size = forward_batch.batch_size
         original_oft_ids = forward_batch.oft_ids
+        padding_oft_id = None
+        if (
+            bs > raw_bs
+            and self.model_runner.oft_manager.oft_backend.single_adapter_mode
+            and original_oft_ids
+            and all(uid == original_oft_ids[0] for uid in original_oft_ids)
+        ):
+            # Dummy outputs are discarded. Keep the batch uniform so padding
+            # does not force the backend to upload segmented metadata.
+            padding_oft_id = original_oft_ids[0]
         forward_batch.batch_size = bs
-        forward_batch.oft_ids = original_oft_ids + [None] * (bs - raw_bs)
+        forward_batch.oft_ids = original_oft_ids + [padding_oft_id] * (bs - raw_bs)
         self.model_runner.oft_manager.prepare_oft_batch(forward_batch)
         forward_batch.batch_size = original_batch_size
         forward_batch.oft_ids = original_oft_ids
