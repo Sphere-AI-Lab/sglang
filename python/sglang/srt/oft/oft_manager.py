@@ -1247,9 +1247,10 @@ class OFTManager:
         needs both to build its own moe_lora_align_block_size alignment,
         which is request-segmented, not per-token like slot_ids.
         """
-        batch_info = self.oft_backend.batch_info
         for moe in self._find_fused_moe_modules().values():
-            moe._oft_moe_multi_tenant_batch_info = batch_info
+            # Dense-only single-adapter batches need no segmented metadata;
+            # Triton's uniform fast path does not create batch_info.
+            moe._oft_moe_multi_tenant_batch_info = self.oft_backend.batch_info
             moe._oft_max_ofts_per_batch = self.max_ofts_per_batch
 
     def prepare_oft_batch(self, forward_batch: ForwardBatch):
