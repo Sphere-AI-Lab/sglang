@@ -1968,20 +1968,24 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if self.rust_server is not None:
-                    # Embedded Rust server: every control-request response goes
-                    # back through the egress ring (the zmq tokenizer socket is
-                    # not consumed); the Rust api_server shapes it per-endpoint.
-                    self.rust_server.push_control_output(recv_req, output)
-                elif isinstance(output, RpcReqOutput):
-                    if self.ipc_channels.recv_from_rpc is not None:
-                        sock_send(self.ipc_channels.recv_from_rpc, output)
-                else:
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+                self._send_control_output(recv_req, output)
+
+        staged = self.weight_updater.poll_adapter_stage()
+        if staged is not None:
+            self._send_control_output(*staged)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+
+    def _send_control_output(self, recv_req, output):
+        if self.rust_server is not None:
+            self.rust_server.push_control_output(recv_req, output)
+        elif isinstance(output, RpcReqOutput):
+            if self.ipc_channels.recv_from_rpc is not None:
+                sock_send(self.ipc_channels.recv_from_rpc, output)
+        else:
+            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
     def _materialize_cuda_vmm_inputs(self, recv_req):
         """Release VMM slices before request handling can reject the request."""

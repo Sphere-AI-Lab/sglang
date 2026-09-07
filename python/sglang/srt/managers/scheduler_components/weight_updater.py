@@ -50,6 +50,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.scheduler_components.async_adapter_stage import (
+    AsyncAdapterStage,
+)
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils.weight_checker import overall_checksum
@@ -103,12 +106,13 @@ class SchedulerWeightUpdaterManager:
     # Runner selector for the open session, recorded at begin_weight_update and
     # reused by end_weight_update so the same set is restored and finalized.
     _weight_update_selector: str = "all"
+    _async_adapter_stage: Optional[AsyncAdapterStage] = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
         # Edge-trigger weight_load_duration_seconds at the end of each
-        # update_weights_from_* call. Engine is paused during the update so
-        # the periodic log_stats path can't carry this.
+        # update_weights_from_* call. Full-weight updates pause the engine;
+        # double-buffer OFT staging runs on its dedicated worker instead.
         # `source` distinguishes disk vs distributed vs tensor vs ipc.
         t0 = time.perf_counter()
         try:
@@ -293,6 +297,41 @@ class SchedulerWeightUpdaterManager:
     def update_adapter_from_distributed(
         self,
         recv_req: UpdateAdapterFromDistributedReqInput,
+    ) -> Optional[UpdateAdapterFromDistributedReqOutput]:
+        if (
+            recv_req.double_buffer
+            and recv_req.load_format == "oft_adapter"
+            and self.scheduler is not None
+            and self.scheduler.device == "cuda"
+            and self.scheduler.server_args.oft_impl == "sibling"
+        ):
+            if self._async_adapter_stage is None:
+                self._async_adapter_stage = AsyncAdapterStage(
+                    torch.cuda.current_device(), self.tp_cpu_group
+                )
+            self._async_adapter_stage.submit(
+                recv_req, self._stage_adapter_from_distributed, self.scheduler.forward_ct
+            )
+            return None
+        return self._stage_adapter_from_distributed(recv_req)
+
+    def poll_adapter_stage(self):
+        if self._async_adapter_stage is None:
+            return None
+        result = self._async_adapter_stage.poll()
+        if result is not None:
+            req, output = result
+            logger.info(
+                "event=oft_stage_complete version=%s success=%s forwards_during_stage=%d",
+                req.adapter_version,
+                output.success,
+                self.scheduler.forward_ct - self._async_adapter_stage.start_forward_ct,
+            )
+        return result
+
+    def _stage_adapter_from_distributed(
+        self,
+        recv_req: UpdateAdapterFromDistributedReqInput,
     ) -> UpdateAdapterFromDistributedReqOutput:
         """Double-buffer STAGE (mirrors update_weights_from_distributed). STAGE
         is lock-free (fills the reserved staging slot while generation runs). For
@@ -332,11 +371,12 @@ class SchedulerWeightUpdaterManager:
         self,
         recv_req: ActivateAdapterVersionReqInput,
     ) -> ActivateAdapterVersionReqOutput:
-        """Double-buffer ACTIVATE (the drained atomic swap). The drain-to-empty
-        happened tokenizer-side via model_update_lock.writer_lock, so by the time
-        this control request is processed the running batch is empty and this is
-        a simple staging->active flip + version bump. A missing staged version
-        surfaces as success=False (inactive_slot_busy) from the manager."""
+        """Activate while admission is writer-locked or generation is paused.
+
+        In-place pause retains running requests; the scheduler stream's existing
+        forward-read fence orders active-slot writes safely before resume.
+        Sibling OFT copies staging into stable CUDA-graph addresses.
+        """
         with self._observe_weight_load("activate_adapter"):
             success, message = self.tp_worker.activate_adapter_version(recv_req)
             if success:

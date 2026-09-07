@@ -599,7 +599,8 @@ class TokenizerControlMixin:
                 return backend_result
             success, message = FanOutCommunicator.merge_results(results)
 
-        message += await self.bump_oft_version(obj, success)
+        if not obj.double_buffer:
+            message += await self.bump_oft_version(obj, success)
         return success, message
 
     async def activate_adapter_version(
@@ -630,18 +631,30 @@ class TokenizerControlMixin:
                 results = await self.activate_adapter_version_communicator(obj)
                 if backend is not None:
                     backend_result = await backend.finish_activation(obj, results)
+                else:
+                    await self._publish_oft_activation(obj, results)
 
         if not is_paused:
             async with self.model_update_lock.writer_lock:
                 results = await self.activate_adapter_version_communicator(obj)
                 if backend is not None:
                     backend_result = await backend.finish_activation(obj, results)
+                else:
+                    await self._publish_oft_activation(obj, results)
 
         if backend is not None:
             return backend_result
 
         success, message = FanOutCommunicator.merge_results(results)
         return success, message
+
+    async def _publish_oft_activation(self, obj, results):
+        # STAGE must not advertise a new serving version. Publish only after
+        # ACTIVATE, while admission is still paused or writer-locked.
+        success, _ = FanOutCommunicator.merge_results(results)
+        if success and obj.load_format == "oft_adapter" and self.oft_registry is not None:
+            obj.adapter_id = self.oft_ref_cache[obj.adapter_name].oft_id
+            await self.bump_oft_version(obj, success)
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
