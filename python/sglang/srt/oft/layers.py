@@ -128,6 +128,95 @@ def _apply_block_R(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
     ).reshape_as(x)
 
 
+def materialize_dense_oft_weight(
+    base_weight: torch.Tensor,
+    R: torch.Tensor,
+    *,
+    output_sizes: Optional[List[int]] = None,
+    destination: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fold block-diagonal OFT input rotations into a dense linear weight.
+
+    SGLang's runtime OFT path computes ``F.linear(x @ R, W)``.  For a
+    dedicated single-adapter server this is algebraically identical to
+    ``F.linear(x, W @ R.T)``.  Materializing that product once per adapter
+    update removes every per-token rotation kernel from rollout inference.
+
+    ``R`` is 3D: ``(num_blocks, block, block)``.  Fused QKV/gate-up weights
+    use independently trained rotations for each output slice, stacked on
+    the block dimension; pass their local ``output_sizes`` to fold each
+    weight slice with the corresponding rotation.  If ``destination`` is
+    supplied it is updated in place, preserving the data pointer captured by
+    CUDA graphs.
+    """
+    if base_weight.dim() != 2:
+        raise ValueError(
+            f"Dense OFT materialization requires a 2D weight, got "
+            f"shape={tuple(base_weight.shape)}."
+        )
+    if R.dim() != 3 or R.shape[-1] != R.shape[-2]:
+        raise ValueError(
+            "Dense OFT materialization requires R with shape "
+            f"(num_blocks, block, block), got shape={tuple(R.shape)}."
+        )
+    if base_weight.dtype != R.dtype or base_weight.device != R.device:
+        raise ValueError(
+            "Dense OFT materialization requires weight and R to share dtype "
+            f"and device; got weight=({base_weight.dtype}, {base_weight.device}) "
+            f"and R=({R.dtype}, {R.device})."
+        )
+    if destination is None:
+        destination = torch.empty_like(base_weight)
+    elif (
+        destination.shape != base_weight.shape
+        or destination.dtype != base_weight.dtype
+        or destination.device != base_weight.device
+    ):
+        raise ValueError(
+            "Dense OFT materialization destination must match the base weight; "
+            f"got base=({tuple(base_weight.shape)}, {base_weight.dtype}, "
+            f"{base_weight.device}) and destination=({tuple(destination.shape)}, "
+            f"{destination.dtype}, {destination.device})."
+        )
+
+    if output_sizes is None:
+        weight_slices = [base_weight]
+        destination_slices = [destination]
+        r_slices = [R]
+    else:
+        if not output_sizes or sum(output_sizes) != base_weight.shape[0]:
+            raise ValueError(
+                f"output_sizes={output_sizes} do not partition weight output "
+                f"dimension {base_weight.shape[0]}."
+            )
+        weight_slices = list(torch.split(base_weight, output_sizes, dim=0))
+        destination_slices = list(torch.split(destination, output_sizes, dim=0))
+        r_slices = _split_stacked_R(R, len(output_sizes))
+
+    for weight_slice, destination_slice, r_slice in zip(
+        weight_slices, destination_slices, r_slices
+    ):
+        block_size = r_slice.shape[-1]
+        num_blocks = r_slice.shape[0]
+        if weight_slice.shape[1] != num_blocks * block_size:
+            raise ValueError(
+                f"Rotation geometry ({num_blocks} blocks x {block_size}) does "
+                f"not match weight input dimension {weight_slice.shape[1]}."
+            )
+        # Each weight row is partitioned into the same blocks as the input.
+        # For y=(xR)W^T=x(RW^T), the folded row is W R^T.
+        weight_blocks = weight_slice.reshape(
+            weight_slice.shape[0], num_blocks, block_size
+        ).permute(1, 0, 2)
+        folded_blocks = torch.bmm(
+            weight_blocks, r_slice.transpose(-1, -2)
+        )
+        folded = folded_blocks.permute(1, 0, 2).reshape_as(weight_slice)
+        destination_slice.copy_(folded)
+
+    return destination
+
+
 def _first_stacked_R_slice(R: torch.Tensor, split_count: int) -> torch.Tensor:
     blocks_per_slice = R.shape[-3] // split_count
     return R[..., :blocks_per_slice, :, :].contiguous()
@@ -341,6 +430,11 @@ class BaseLayerWithOFT(nn.Module):
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
 
+        # Set explicitly so every wrapper takes a stable Python branch during
+        # CUDA graph capture. The manager enables this before graph capture.
+        self._oft_dense_materialization_enabled = False
+        self._oft_dense_base_weight = None
+
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
 
@@ -362,7 +456,45 @@ class BaseLayerWithOFT(nn.Module):
         base-path fallback. Revisit together with a ``reset_batch_state``
         mirror if DP-idle support ever lands.
         """
-        return self.set_oft
+        return self.set_oft and not self._oft_dense_materialization_enabled
+
+    def enable_dense_materialization(self) -> None:
+        """Snapshot the immutable base weight and select the dense path.
+
+        The live ``base_layer.weight`` object is never replaced: activation
+        copies a newly folded weight into it so decode CUDA graphs retain a
+        valid captured pointer.
+        """
+        if not _is_unquantized_dense_linear(self.base_layer):
+            raise ValueError(
+                "Dense OFT materialization only supports unquantized dense "
+                f"linears; got {type(self.base_layer).__name__} with "
+                f"quant_method={type(getattr(self.base_layer, 'quant_method', None)).__name__}."
+            )
+        weight = getattr(self.base_layer, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+            raise ValueError(
+                "Dense OFT materialization requires a 2D base-layer weight; "
+                f"got {type(weight).__name__}."
+            )
+        self._oft_dense_base_weight = weight.detach().clone()
+        self._oft_dense_materialization_enabled = True
+
+    def dense_materialization_output_sizes(self) -> Optional[List[int]]:
+        return None
+
+    def materialize_dense_weight(self, R: torch.Tensor) -> None:
+        if not self._oft_dense_materialization_enabled:
+            return
+        if self._oft_dense_base_weight is None:
+            raise RuntimeError("Dense OFT base-weight snapshot is missing.")
+        with torch.no_grad():
+            materialize_dense_oft_weight(
+                self._oft_dense_base_weight,
+                R,
+                output_sizes=self.dense_materialization_output_sizes(),
+                destination=self.base_layer.weight,
+            )
 
     def get_oft_input_dim(self) -> int:
         if hasattr(self.base_layer, "input_size_per_partition"):
@@ -682,6 +814,12 @@ class MergedColumnParallelLinearWithOFT(ColumnParallelLinearWithOFT):
     def slice_oft_r_weights(self, R: torch.Tensor):
         return R
 
+    def dense_materialization_output_sizes(self) -> List[int]:
+        output_sizes = [int(s) for s in self.base_layer.output_sizes]
+        if self.base_layer.tp_size > 1:
+            output_sizes = [s // self.base_layer.tp_size for s in output_sizes]
+        return output_sizes
+
     def forward(self, input_: torch.Tensor):
         if not self.oft_active:
             return self.base_layer.forward(input_)
@@ -733,6 +871,12 @@ class QKVParallelLinearWithOFT(ColumnParallelLinearWithOFT):
 
     def slice_oft_r_weights(self, R: torch.Tensor):
         return R
+
+    def dense_materialization_output_sizes(self) -> List[int]:
+        return [
+            int(size) // self.base_layer.tp_size
+            for size in self.base_layer.output_sizes
+        ]
 
     def forward(self, input_: torch.Tensor):
         if not self.oft_active:
@@ -886,6 +1030,9 @@ class ReplicatedLinearWithOFT(BaseLayerWithOFT):
 
     def slice_oft_r_weights(self, R: torch.Tensor):
         return R  # replicated: no sharding
+
+    def dense_materialization_output_sizes(self) -> List[int]:
+        return [int(size) for size in self.base_layer.output_sizes]
 
     def forward(self, x: torch.Tensor):
         # Mirror ReplicatedLinear.forward: single un-sharded GEMM, no gather,

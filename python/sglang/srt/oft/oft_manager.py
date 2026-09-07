@@ -66,6 +66,24 @@ def _orbit_log_weight_sync_enabled() -> bool:
     }
 
 
+def _dense_oft_materialization_requested() -> bool:
+    return os.getenv("SGLANG_OFT_MATERIALIZE_DENSE", "").strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+    }
+
+
+def _uniform_oft_batch_required() -> bool:
+    return os.getenv("SGLANG_OFT_REQUIRE_UNIFORM_BATCH", "").strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+    }
+
+
 def _expert_oft_delta_summary(buffer: Optional[torch.Tensor], block_size: int):
     if buffer is None or buffer.numel() == 0:
         return 0, 0.0
@@ -218,6 +236,8 @@ class OFTManager:
         self.oft_added_tokens_size: Optional[int] = None
         self.memory_saver_adapter = memory_saver_adapter
         self.memory_saver_cpu_backup = memory_saver_cpu_backup
+        self.dense_oft_materialization = _dense_oft_materialization_requested()
+        self._dense_materialized_oft_id: Optional[str] = None
 
         # Every resident adapter fits the pool by construction (boot capacity
         # check in init_state), so eviction never fires and the policy is not
@@ -494,6 +514,8 @@ class OFTManager:
     def stage_adapter(self, named_tensors, config, name, version, oft_id=None):
         """Fill the staging slot (lock-free). Reuses _load_weights/expert fills
         with slot_idx=staging_idx via mem_pool.stage()."""
+        if getattr(self, "dense_oft_materialization", False):
+            self._validate_dense_materialization_adapter(oft_id or name)
         self._stage_fill(named_tensors, config, name, version)
         # Identity-boot deployments (e.g. orbit) start with empty refs; the
         # adapter name first arrives with the stage request. Register it so
@@ -513,8 +535,108 @@ class OFTManager:
 
     def activate_adapter(self, name, version):
         self.memory_pool.activate(version)
+        if getattr(self, "dense_oft_materialization", False):
+            self._materialize_dense_oft_slot(self.memory_pool.active_idx)
         self._bump_ref_version(name, version)
         return self.create_oft_update_result(success=True)
+
+    def _validate_dense_materialization_adapter(self, oft_id: str) -> None:
+        """Enforce the dedicated single-adapter contract before mutation."""
+        if not getattr(self, "dense_oft_materialization", False):
+            return
+        active_id = getattr(self, "_dense_materialized_oft_id", None)
+        if active_id is not None and active_id != oft_id:
+            raise ValueError(
+                "SGLANG_OFT_MATERIALIZE_DENSE is a dedicated single-adapter "
+                f"mode: adapter {active_id!r} is already materialized, so "
+                f"adapter {oft_id!r} cannot be admitted."
+            )
+        other_ids = {
+            ref_id for ref_id in getattr(self, "oft_refs", {}) if ref_id != oft_id
+        }
+        if other_ids:
+            raise ValueError(
+                "SGLANG_OFT_MATERIALIZE_DENSE permits one real adapter; "
+                f"already resident: {sorted(other_ids)}."
+            )
+
+    def _materialize_dense_oft_slot(self, slot_idx: int) -> None:
+        """Fold one active OFT slot into every wrapped dense base weight."""
+        if not getattr(self, "dense_oft_materialization", False):
+            return
+        oft_id = self.memory_pool.buffer_id_to_uid[slot_idx]
+        if oft_id is None or oft_id is EMPTY_SLOT:
+            raise RuntimeError(
+                "Dense OFT materialization requires a real adapter in slot "
+                f"{slot_idx}, got {oft_id!r}."
+            )
+        self._validate_dense_materialization_adapter(oft_id)
+
+        materialized = 0
+        for layer_modules in self.oft_modules:
+            for module in layer_modules.values():
+                module.materialize_dense_weight(module.R_buffer[slot_idx])
+                materialized += 1
+        self._dense_materialized_oft_id = oft_id
+        logger.info(
+            "event=oft_dense_materialized adapter=%s slot=%d modules=%d",
+            oft_id,
+            slot_idx,
+            materialized,
+        )
+
+    def _configure_dense_oft_materialization(self, n_expert_wrapped: int) -> None:
+        """Validate and snapshot dense weights before CUDA graph capture."""
+        if not self.dense_oft_materialization:
+            return
+        if not _uniform_oft_batch_required():
+            raise ValueError(
+                "SGLANG_OFT_MATERIALIZE_DENSE=1 requires "
+                "SGLANG_OFT_REQUIRE_UNIFORM_BATCH=1."
+            )
+        if n_expert_wrapped:
+            raise ValueError(
+                "Dense OFT materialization does not support MoE expert targets."
+            )
+        if self.embed_tokens_module is not None or self.lm_head_module is not None:
+            raise ValueError(
+                "Dense OFT materialization does not support embed_tokens or lm_head."
+            )
+
+        modules = [
+            module
+            for layer_modules in self.oft_modules
+            for module in layer_modules.values()
+        ]
+        if not modules:
+            raise ValueError(
+                "Dense OFT materialization requires at least one dense OFT module."
+            )
+        for module in modules:
+            r_buffer = getattr(module, "R_buffer", None)
+            weight = getattr(module.base_layer, "weight", None)
+            if not isinstance(r_buffer, torch.Tensor):
+                raise ValueError(
+                    f"Dense OFT module {type(module).__name__} has no R buffer."
+                )
+            if not isinstance(weight, torch.Tensor) or r_buffer.dtype != weight.dtype:
+                raise ValueError(
+                    "Dense OFT materialization requires R buffers to match "
+                    f"base-weight dtype; got R={getattr(r_buffer, 'dtype', None)} "
+                    f"and weight={getattr(weight, 'dtype', None)} for "
+                    f"{type(module).__name__}."
+                )
+            module.enable_dense_materialization()
+        backup_bytes = sum(
+            module._oft_dense_base_weight.numel()
+            * module._oft_dense_base_weight.element_size()
+            for module in modules
+        )
+        logger.info(
+            "event=oft_dense_materialization_enabled modules=%d base_backup_gib=%.3f",
+            len(modules),
+            backup_bytes / (1024**3),
+        )
 
     def _weights_memory_saver_region(self):
         adapter = getattr(self, "memory_saver_adapter", None)
@@ -629,6 +751,11 @@ class OFTManager:
         """
         Validate if an adapter can be loaded into the current OFT memory pool and generate error if it is incompatible.
         """
+        if getattr(self, "dense_oft_materialization", False):
+            raise ValueError(
+                "SGLANG_OFT_MATERIALIZE_DENSE only supports streamed adapter "
+                "updates; disk-loaded adapters are not supported."
+            )
         if oft_config.oft_added_tokens_size > 0:
             raise ValueError(
                 f"OFT serving currently doesn't support adapters that add tokens to the vocabulary"
@@ -891,6 +1018,7 @@ class OFTManager:
                 return self.create_oft_update_result(
                     success=False, error_message=resolve_error
                 )
+            self._validate_dense_materialization_adapter(ref.oft_id)
 
             existing_id = None
             for ref_id, existing_ref in list(self.oft_refs.items()):
@@ -995,6 +1123,7 @@ class OFTManager:
                 return self.create_oft_update_result(
                     success=False, error_message=error_message
                 )
+            self._materialize_dense_oft_slot(buffer_id)
         except Exception as e:
             return self.create_oft_update_result(success=False, error_message=str(e))
         return self.create_oft_update_result(success=True)
@@ -1375,12 +1504,27 @@ class OFTManager:
         # that, the unbound attribute crashed the very first prepare -- the
         # decode-graph capture with all-base dummy ids -- of any engine in
         # single_adapter_mode).
-        batch_info = self.oft_backend.batch_info
         for moe in self._find_fused_moe_modules().values():
-            moe._oft_moe_multi_tenant_batch_info = batch_info
+            # Dense-only single-adapter batches need no segmented metadata;
+            # Triton's uniform fast path does not create batch_info.
+            moe._oft_moe_multi_tenant_batch_info = self.oft_backend.batch_info
             moe._oft_max_ofts_per_batch = self.max_ofts_per_batch
 
     def prepare_oft_batch(self, forward_batch: ForwardBatch):
+        if getattr(self, "dense_oft_materialization", False):
+            materialized_id = getattr(self, "_dense_materialized_oft_id", None)
+            if materialized_id is not None and any(
+                uid != materialized_id for uid in forward_batch.oft_ids
+            ):
+                raise RuntimeError(
+                    "SGLANG_OFT_MATERIALIZE_DENSE only serves adapter "
+                    f"{materialized_id!r} after activation; received oft_ids="
+                    f"{forward_batch.oft_ids}."
+                )
+
+            # The wrapped layers use the live dense weights, including during
+            # identity warm-up. No rotation kernel consumes batch slot metadata.
+            return
         # set up batch info shared by all oft modules
         bs = forward_batch.batch_size
 
@@ -1537,6 +1681,7 @@ class OFTManager:
             )
         self.init_memory_pool()
         self.update_oft_info()
+        self._configure_dense_oft_materialization(n_expert_wrapped)
         self._init_identity_expert_oft_for_cuda_graph()
         # Double-buffer hardening: seed the STAGING slot from the now-neutral
         # (identity) ACTIVE slot so a partial-coverage stage can't leave garbage
