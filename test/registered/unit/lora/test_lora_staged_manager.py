@@ -11,15 +11,15 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
+from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.staged_manager import (
     PendingLoRAStage,
     StagedLoRAManager,
     StagedLoRAMemoryPool,
 )
-from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import LoRAType
-
 
 CONFIG_DICT = {"target_modules": ["q_proj"], "r": 4, "lora_alpha": 8}
 
@@ -38,22 +38,57 @@ def _pool(n_slots=2, n_layers=2, rank=4, hidden=8):
     pool.B_buffer = {
         "q_proj": [torch.zeros(wide, hidden, rank) for _ in range(n_layers)]
     }
-    pool.embedding_A_buffer = {
-        "embed_tokens": torch.zeros(wide, rank, hidden)
-    }
-    pool.embedding_B_buffer = {
-        "embed_tokens": torch.zeros(wide, hidden, rank)
-    }
+    pool.embedding_A_buffer = {"embed_tokens": torch.zeros(wide, rank, hidden)}
+    pool.embedding_B_buffer = {"embed_tokens": torch.zeros(wide, hidden, rank)}
     pool.lm_head_A_buffer = {"lm_head": torch.zeros(wide, rank, hidden)}
     pool.lm_head_B_buffer = {"lm_head": torch.zeros(wide, hidden, rank)}
-    pool.new_embeddings_buffer = {
-        "input_embeddings": torch.zeros(wide, 2, hidden)
-    }
+    pool.new_embeddings_buffer = {"input_embeddings": torch.zeros(wide, 2, hidden)}
     serving_uids = [f"id-{chr(ord('a') + i)}" for i in range(n_slots)]
     pool.uid_to_buffer_id = {uid: i for i, uid in enumerate(serving_uids)}
     pool.buffer_id_to_uid = list(serving_uids)
     pool.can_support = Mock(return_value=True)
+    pool.num_layer = 0
+    pool.target_modules = {"embed_tokens", "lm_head"}
+    pool.base_hf_config = MagicMock(vocab_size=8)
+    pool.tp_size = 1
+    pool.tp_rank = 0
+    pool.strict_loading = True
+    pool.pin_memory_available = False
+    pool.enable_lora_overlap_loading = False
     return pool
+
+
+def _embed_only_adapter(rank=4, vocab=8):
+    adapter = MagicMock()
+    adapter.config.r = rank
+    adapter.config.lora_added_tokens_size = 0
+    adapter.layers = []
+    adapter.embedding_layers = {
+        "base_model.model.model.embed_tokens.lora_embedding_A": torch.full(
+            (rank, vocab), 2.0
+        ),
+        "base_model.model.model.embed_tokens.lora_embedding_B": torch.full(
+            (vocab, rank), 3.0
+        ),
+    }
+    adapter.added_tokens_embeddings = {}
+    adapter.pinned_embedding_layers = {}
+    adapter.pinned_added_tokens_embeddings = {}
+    return adapter
+
+
+def _optional_buffers(pool):
+    return [
+        tensor
+        for buffers in (
+            pool.embedding_A_buffer,
+            pool.embedding_B_buffer,
+            pool.lm_head_A_buffer,
+            pool.lm_head_B_buffer,
+            pool.new_embeddings_buffer,
+        )
+        for tensor in buffers.values()
+    ]
 
 
 def _manager(existing_ref=None):
@@ -117,6 +152,69 @@ class TestSlotReservation(CustomTestCase):
 
 
 class TestNativePoolStaging(CustomTestCase):
+    def test_stage_clears_omitted_optional_rows_before_hidden_slot_reuse(self):
+        pool = _pool(n_slots=2)
+        adapter = _embed_only_adapter()
+        for tensor in _optional_buffers(pool):
+            tensor.fill_(7)
+
+        pool.stage(
+            uid="embed-only",
+            version=1,
+            adapter=adapter,
+            lora_modules=[],
+            embed_module=None,
+            lm_head_module=None,
+        )
+
+        row = pool.staging_idx
+        torch.testing.assert_close(
+            pool.embedding_A_buffer["embed_tokens"][row],
+            torch.full((4, 8), 2.0),
+        )
+        torch.testing.assert_close(
+            pool.embedding_B_buffer["embed_tokens"][row],
+            torch.full((8, 4), 3.0),
+        )
+        for buffers in (
+            pool.lm_head_A_buffer,
+            pool.lm_head_B_buffer,
+            pool.new_embeddings_buffer,
+        ):
+            for tensor in buffers.values():
+                torch.testing.assert_close(tensor[row], torch.zeros_like(tensor[row]))
+
+    def test_loader_clears_omitted_optional_rows_before_serving_slot_reuse(self):
+        pool = _pool(n_slots=2)
+        adapter = _embed_only_adapter()
+        for tensor in _optional_buffers(pool):
+            tensor.fill_(7)
+
+        pool.load_lora_weight_to_buffer(
+            uid="embed-only",
+            buffer_id=0,
+            lora_adapter=adapter,
+            lora_modules=[],
+            lora_embed_tokens_module=None,
+            lora_lm_head_module=None,
+        )
+
+        torch.testing.assert_close(
+            pool.embedding_A_buffer["embed_tokens"][0],
+            torch.full((4, 8), 2.0),
+        )
+        torch.testing.assert_close(
+            pool.embedding_B_buffer["embed_tokens"][0],
+            torch.full((8, 4), 3.0),
+        )
+        for buffers in (
+            pool.lm_head_A_buffer,
+            pool.lm_head_B_buffer,
+            pool.new_embeddings_buffer,
+        ):
+            for tensor in buffers.values():
+                torch.testing.assert_close(tensor[0], torch.zeros_like(tensor[0]))
+
     def test_stage_calls_native_loader_for_hidden_slot(self):
         pool = _pool(n_slots=2)
         adapter = MagicMock()
@@ -212,6 +310,70 @@ class TestNativePoolStaging(CustomTestCase):
 
 
 class TestNativeManagerStaging(CustomTestCase):
+    def test_partial_stage_cancellation_tolerates_rank_without_pending_state(self):
+        staged_rank, failed_rank = _manager(), _manager()
+        self.assertTrue(
+            staged_rank.stage_adapter([], CONFIG_DICT, "policy", 4, "id-a").success
+        )
+        failed_rank._create_lora_adapter_from_tensors.side_effect = RuntimeError(
+            "rank 1 stage failed"
+        )
+        self.assertFalse(
+            failed_rank.stage_adapter([], CONFIG_DICT, "policy", 4, "id-a").success
+        )
+        ref = staged_rank._pending_lora_stage.ref
+
+        for manager in (staged_rank, failed_rank):
+            result = manager.unload_lora_adapter(ref)
+            self.assertTrue(result.success, result.error_message)
+            self.assertIsNone(manager._pending_lora_stage)
+            self.assertIsNone(manager.memory_pool.staged_identity())
+
+    def test_pending_cancellation_tolerates_rank_that_failed_before_manager_stage(self):
+        manager = _manager()
+        ref = LoRARef(lora_id="id-a", lora_name="policy")
+        result = manager.unload_lora_adapter(ref)
+        self.assertTrue(result.success, result.error_message)
+        self.assertIsNone(manager._pending_lora_stage)
+
+    def test_unload_discards_a_pending_only_stage(self):
+        manager = _manager()
+        self.assertTrue(
+            manager.stage_adapter([], CONFIG_DICT, "policy", 4, "id-a").success
+        )
+        pending_ref = manager._pending_lora_stage.ref
+
+        with patch.object(LoRAManager, "unload_lora_adapter") as unload_active:
+            result = manager.unload_lora_adapter(pending_ref)
+
+        self.assertTrue(result.success)
+        self.assertIsNone(manager._pending_lora_stage)
+        self.assertIsNone(manager.memory_pool.staged_identity())
+        unload_active.assert_not_called()
+
+    def test_unload_discards_pending_update_before_unloading_active_copy(self):
+        old_ref = LoRARef(
+            lora_id="id-a",
+            lora_name="policy",
+            lora_path="__tensor__",
+            version=3,
+        )
+        manager = _manager(old_ref)
+        self.assertTrue(
+            manager.stage_adapter([], CONFIG_DICT, "policy", 4, "id-a").success
+        )
+        success = MagicMock(success=True)
+
+        with patch.object(
+            LoRAManager, "unload_lora_adapter", return_value=success
+        ) as unload_active:
+            result = manager.unload_lora_adapter(old_ref)
+
+        self.assertIs(result, success)
+        self.assertIsNone(manager._pending_lora_stage)
+        self.assertIsNone(manager.memory_pool.staged_identity())
+        unload_active.assert_called_once_with(old_ref)
+
     def test_stage_preserves_active_state(self):
         old_ref = LoRARef(
             lora_id="id-a",
@@ -275,6 +437,22 @@ class TestNativeManagerStaging(CustomTestCase):
         self.assertFalse(result.success)
         self.assertIn("id-a", result.error_message)
         self.assertIn("4", result.error_message)
+
+    def test_rejects_equal_or_stale_versions_of_the_active_adapter(self):
+        old_ref = LoRARef(
+            lora_id="id-a",
+            lora_name="policy",
+            lora_path="__tensor__",
+            version=4,
+        )
+        manager = _manager(old_ref)
+
+        for version in (4, 3):
+            result = manager.stage_adapter([], CONFIG_DICT, "policy", version, "id-a")
+            self.assertFalse(result.success)
+            self.assertIn("newer than active version 4", result.error_message)
+
+        manager._create_lora_adapter_from_tensors.assert_not_called()
 
 
 class TestNativeManagerActivation(CustomTestCase):

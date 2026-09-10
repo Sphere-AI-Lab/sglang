@@ -2,6 +2,7 @@
 
 import threading
 import unittest
+from unittest import mock
 
 import torch
 
@@ -10,6 +11,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
 )
+from sglang.srt.mem_cache.pool_host import base as pool_host_base
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -20,6 +22,16 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestHostKVCache(CustomTestCase):
     def setUp(self):
+        host_memory_patcher = mock.patch.object(
+            pool_host_base.psutil,
+            "virtual_memory",
+            return_value=mock.Mock(
+                available=pool_host_base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1024**3
+            ),
+        )
+        host_memory_patcher.start()
+        self.addCleanup(host_memory_patcher.stop)
+
         self.page_size = 2
         # Small device pool is enough to construct the host pool.
         self.device_pool = MHATokenToKVPool(

@@ -7,8 +7,11 @@ from torch import nn
 
 logger = logging.getLogger(__name__)
 
+import atexit as _atexit
+import os as _os
+import sys as _sys
+
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -20,22 +23,17 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.oft.backend.base_backend import BaseOFTBackend
-from sglang.srt.oft.utils import OFTBatchInfo
+from sglang.srt.runtime_context import get_parallel
 
-
-import atexit as _atexit
-import os as _os
-import sys as _sys
-
-_FUSED_INSTRUMENT_ENABLED = (
-    _os.environ.get("SGLANG_OFT_FUSED_INSTRUMENT", "0").strip()
-    not in ("0", "false", "False")
-)
+_FUSED_INSTRUMENT_ENABLED = _os.environ.get(
+    "SGLANG_OFT_FUSED_INSTRUMENT", "0"
+).strip() not in ("0", "false", "False")
 _FUSED_LOG_EVERY = int(_os.environ.get("SGLANG_OFT_FUSED_LOG_EVERY", "200"))
 _FUSED_COUNTERS = {
     "engaged_qkv_project": 0,
@@ -46,7 +44,6 @@ _FUSED_COUNTERS = {
     "fallback_runtime_error": 0,
 }
 _FUSED_M_HISTOGRAM = {"engaged": {}, "fallback": {}}
-_QUANTIZED_SHARED_FALLBACK_WARNED = set()
 
 
 def _fused_m_bucket(m: int) -> str:
@@ -106,6 +103,16 @@ def _is_unquantized_dense_linear(layer) -> bool:
     return name in {"UnquantizedLinearMethod", "_FakeUnquantizedMethod"}
 
 
+def _require_dense_split_oft(layer) -> None:
+    if not _is_unquantized_dense_linear(layer):
+        quant_method = getattr(layer, "quant_method", None)
+        raise NotImplementedError(
+            f"Canonical OFT for {type(layer).__name__} does not support "
+            f"quant_method={type(quant_method).__name__}; independent projection "
+            "rotations require a dense (unquantized) base layer."
+        )
+
+
 def _split_stacked_R(R: torch.Tensor, num_slices: int) -> List[torch.Tensor]:
     if R.shape[-3] % num_slices != 0:
         raise RuntimeError(
@@ -126,113 +133,6 @@ def _apply_block_R(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
     return torch.einsum(
         "...nb,nbc->...nc", x.view(*x.shape[:-1], num_blocks, block), R
     ).reshape_as(x)
-
-
-def materialize_dense_oft_weight(
-    base_weight: torch.Tensor,
-    R: torch.Tensor,
-    *,
-    output_sizes: Optional[List[int]] = None,
-    destination: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Fold block-diagonal OFT input rotations into a dense linear weight.
-
-    SGLang's runtime OFT path computes ``F.linear(x @ R, W)``.  For a
-    dedicated single-adapter server this is algebraically identical to
-    ``F.linear(x, W @ R.T)``.  Materializing that product once per adapter
-    update removes every per-token rotation kernel from rollout inference.
-
-    ``R`` is 3D: ``(num_blocks, block, block)``.  Fused QKV/gate-up weights
-    use independently trained rotations for each output slice, stacked on
-    the block dimension; pass their local ``output_sizes`` to fold each
-    weight slice with the corresponding rotation.  If ``destination`` is
-    supplied it is updated in place, preserving the data pointer captured by
-    CUDA graphs.
-    """
-    if base_weight.dim() != 2:
-        raise ValueError(
-            f"Dense OFT materialization requires a 2D weight, got "
-            f"shape={tuple(base_weight.shape)}."
-        )
-    if R.dim() != 3 or R.shape[-1] != R.shape[-2]:
-        raise ValueError(
-            "Dense OFT materialization requires R with shape "
-            f"(num_blocks, block, block), got shape={tuple(R.shape)}."
-        )
-    if base_weight.dtype != R.dtype or base_weight.device != R.device:
-        raise ValueError(
-            "Dense OFT materialization requires weight and R to share dtype "
-            f"and device; got weight=({base_weight.dtype}, {base_weight.device}) "
-            f"and R=({R.dtype}, {R.device})."
-        )
-    if destination is None:
-        destination = torch.empty_like(base_weight)
-    elif (
-        destination.shape != base_weight.shape
-        or destination.dtype != base_weight.dtype
-        or destination.device != base_weight.device
-    ):
-        raise ValueError(
-            "Dense OFT materialization destination must match the base weight; "
-            f"got base=({tuple(base_weight.shape)}, {base_weight.dtype}, "
-            f"{base_weight.device}) and destination=({tuple(destination.shape)}, "
-            f"{destination.dtype}, {destination.device})."
-        )
-
-    if output_sizes is None:
-        weight_slices = [base_weight]
-        destination_slices = [destination]
-        r_slices = [R]
-    else:
-        if not output_sizes or sum(output_sizes) != base_weight.shape[0]:
-            raise ValueError(
-                f"output_sizes={output_sizes} do not partition weight output "
-                f"dimension {base_weight.shape[0]}."
-            )
-        weight_slices = list(torch.split(base_weight, output_sizes, dim=0))
-        destination_slices = list(torch.split(destination, output_sizes, dim=0))
-        r_slices = _split_stacked_R(R, len(output_sizes))
-
-    for weight_slice, destination_slice, r_slice in zip(
-        weight_slices, destination_slices, r_slices
-    ):
-        block_size = r_slice.shape[-1]
-        num_blocks = r_slice.shape[0]
-        if weight_slice.shape[1] != num_blocks * block_size:
-            raise ValueError(
-                f"Rotation geometry ({num_blocks} blocks x {block_size}) does "
-                f"not match weight input dimension {weight_slice.shape[1]}."
-            )
-        # Each weight row is partitioned into the same blocks as the input.
-        # For y=(xR)W^T=x(RW^T), the folded row is W R^T.
-        weight_blocks = weight_slice.reshape(
-            weight_slice.shape[0], num_blocks, block_size
-        ).permute(1, 0, 2)
-        folded_blocks = torch.bmm(
-            weight_blocks, r_slice.transpose(-1, -2)
-        )
-        folded = folded_blocks.permute(1, 0, 2).reshape_as(weight_slice)
-        destination_slice.copy_(folded)
-
-    return destination
-
-
-def _first_stacked_R_slice(R: torch.Tensor, split_count: int) -> torch.Tensor:
-    blocks_per_slice = R.shape[-3] // split_count
-    return R[..., :blocks_per_slice, :, :].contiguous()
-
-
-def _warn_quantized_shared_fallback(wrapper_name: str, quant_method_name: str) -> None:
-    key = (wrapper_name, quant_method_name)
-    if key in _QUANTIZED_SHARED_FALLBACK_WARNED:
-        return
-    _QUANTIZED_SHARED_FALLBACK_WARNED.add(key)
-    logger.warning(
-        "%s with quant_method=%s is using shared-input OFT rotation fallback; "
-        "exact split-slice OFT is currently dense-only.",
-        wrapper_name,
-        quant_method_name,
-    )
 
 
 def _batched_equal_output_linear(
@@ -316,7 +216,11 @@ def split_dense_merged_projection(
             ):
                 try:
                     _result = oft_backend.run_fused_rotate_project(
-                        x, R, weight, output_sizes, bias,
+                        x,
+                        R,
+                        weight,
+                        output_sizes,
+                        bias,
                     )
                     _record_fused_outcome("engaged_qkv_project", _tokens)
                     return _result
@@ -373,7 +277,9 @@ def split_dense_merged_projection(
         R_slices = _split_stacked_R(R, len(output_sizes))
         input_slices = [_apply_block_R(x, R_slice) for R_slice in R_slices]
     else:
-        raise RuntimeError(f"Expected 3D or 4D OFT R buffer, got shape={tuple(R.shape)}.")
+        raise RuntimeError(
+            f"Expected 3D or 4D OFT R buffer, got shape={tuple(R.shape)}."
+        )
 
     if len(output_sizes) == 2 and output_sizes[0] == output_sizes[1]:
         return _batched_equal_output_linear(input_slices, W_slices, b_slices)
@@ -430,11 +336,6 @@ class BaseLayerWithOFT(nn.Module):
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
 
-        # Set explicitly so every wrapper takes a stable Python branch during
-        # CUDA graph capture. The manager enables this before graph capture.
-        self._oft_dense_materialization_enabled = False
-        self._oft_dense_base_weight = None
-
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
 
@@ -456,45 +357,7 @@ class BaseLayerWithOFT(nn.Module):
         base-path fallback. Revisit together with a ``reset_batch_state``
         mirror if DP-idle support ever lands.
         """
-        return self.set_oft and not self._oft_dense_materialization_enabled
-
-    def enable_dense_materialization(self) -> None:
-        """Snapshot the immutable base weight and select the dense path.
-
-        The live ``base_layer.weight`` object is never replaced: activation
-        copies a newly folded weight into it so decode CUDA graphs retain a
-        valid captured pointer.
-        """
-        if not _is_unquantized_dense_linear(self.base_layer):
-            raise ValueError(
-                "Dense OFT materialization only supports unquantized dense "
-                f"linears; got {type(self.base_layer).__name__} with "
-                f"quant_method={type(getattr(self.base_layer, 'quant_method', None)).__name__}."
-            )
-        weight = getattr(self.base_layer, "weight", None)
-        if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
-            raise ValueError(
-                "Dense OFT materialization requires a 2D base-layer weight; "
-                f"got {type(weight).__name__}."
-            )
-        self._oft_dense_base_weight = weight.detach().clone()
-        self._oft_dense_materialization_enabled = True
-
-    def dense_materialization_output_sizes(self) -> Optional[List[int]]:
-        return None
-
-    def materialize_dense_weight(self, R: torch.Tensor) -> None:
-        if not self._oft_dense_materialization_enabled:
-            return
-        if self._oft_dense_base_weight is None:
-            raise RuntimeError("Dense OFT base-weight snapshot is missing.")
-        with torch.no_grad():
-            materialize_dense_oft_weight(
-                self._oft_dense_base_weight,
-                R,
-                output_sizes=self.dense_materialization_output_sizes(),
-                destination=self.base_layer.weight,
-            )
+        return self.set_oft
 
     def get_oft_input_dim(self) -> int:
         if hasattr(self.base_layer, "input_size_per_partition"):
@@ -741,6 +604,44 @@ class ColumnParallelLinearWithOFT(BaseLayerWithOFT):
         )
         return rotated_x
 
+    def apply_input_rotation(
+        self,
+        x: torch.Tensor,
+        *,
+        transpose: bool = False,
+        n_groups: int = 1,
+    ) -> torch.Tensor:
+        """Apply only the OFT input rotation without running the base linear.
+
+        Some MLA serving paths algebraically absorb a ColumnParallelLinear's
+        weight into attention-side batched GEMMs and never call ``forward``.
+        This hook lets those paths preserve the same ``x @ R`` semantics.  When
+        the absorbed algebra moves the rotation to the query side, callers can
+        request ``transpose=True`` to apply ``x @ R.T``.
+        """
+        if not self.oft_active:
+            return x
+        if n_groups <= 0:
+            raise ValueError(f"n_groups must be positive, got {n_groups}")
+
+        orig_shape = x.shape
+        if x.dim() != 2:
+            x = x.reshape(-1, orig_shape[-1])
+
+        weights = self.R_buffer.transpose(-1, -2) if transpose else self.R_buffer
+        if n_groups == 1:
+            rotated = self.oft_backend.run_oft_r_sgemm(x=x, weights=weights)
+        else:
+            rotated = self.oft_backend.run_grouped_oft_r_sgemm(
+                x=x,
+                weights=weights,
+                n_groups=n_groups,
+            )
+
+        if rotated.shape != orig_shape:
+            rotated = rotated.reshape(orig_shape)
+        return rotated
+
     def forward(self, input_: torch.Tensor):
         # OFT: rotate input FIRST, then apply base forward
         if self.oft_active:
@@ -751,30 +652,6 @@ class ColumnParallelLinearWithOFT(BaseLayerWithOFT):
         output_parallel = self.base_layer.quant_method.apply(
             self.base_layer, input_, bias
         )
-
-        if self.base_layer.gather_output:
-            output = tensor_model_parallel_all_gather(output_parallel)
-        else:
-            output = output_parallel
-        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
-        return output, output_bias
-
-    def forward_quantized_shared_oft(self, input_: torch.Tensor, split_count: int):
-        quant_method = getattr(self.base_layer, "quant_method", None)
-        if quant_method is None or not hasattr(quant_method, "apply"):
-            raise RuntimeError(
-                f"{type(self).__name__} quantized shared OFT fallback requires "
-                f"a quant_method with apply(); got {type(quant_method).__name__}."
-            )
-        _warn_quantized_shared_fallback(
-            type(self).__name__,
-            type(quant_method).__name__,
-        )
-        shared_R = _first_stacked_R_slice(self.R_buffer, split_count)
-        input_ = self.oft_backend.run_oft_r_sgemm(x=input_, weights=shared_R)
-
-        bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
-        output_parallel = quant_method.apply(self.base_layer, input_, bias)
 
         if self.base_layer.gather_output:
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -800,8 +677,8 @@ class MergedColumnParallelLinearWithOFT(ColumnParallelLinearWithOFT):
     into ``[W_gate; W_up]`` and runs two BF16 GEMMs with their respective
     rotated inputs.
 
-    Quantized bases currently fail loud — per-quant split GEMM lands in a
-    follow-up plan.
+    Quantized bases are rejected during wrapping because a single fused GEMM
+    cannot apply each branch's independent input rotation.
     """
 
     def __init__(
@@ -809,27 +686,15 @@ class MergedColumnParallelLinearWithOFT(ColumnParallelLinearWithOFT):
         base_layer: MergedColumnParallelLinear,
         oft_backend: BaseOFTBackend,
     ) -> None:
+        _require_dense_split_oft(base_layer)
         super().__init__(base_layer, oft_backend)
 
     def slice_oft_r_weights(self, R: torch.Tensor):
         return R
 
-    def dense_materialization_output_sizes(self) -> List[int]:
-        output_sizes = [int(s) for s in self.base_layer.output_sizes]
-        if self.base_layer.tp_size > 1:
-            output_sizes = [s // self.base_layer.tp_size for s in output_sizes]
-        return output_sizes
-
     def forward(self, input_: torch.Tensor):
         if not self.oft_active:
             return self.base_layer.forward(input_)
-
-        if self.R_buffer.shape[-3] % 2 != 0:
-            # Buffer was sized for shared-R; fall back to legacy single-R path.
-            return super().forward(input_)
-
-        if not _is_unquantized_dense_linear(self.base_layer):
-            return self.forward_quantized_shared_oft(input_, split_count=2)
 
         output_sizes = [int(s) for s in self.base_layer.output_sizes]
         # Account for TP sharding: weight stored locally is sum/tp_size.
@@ -867,26 +732,15 @@ class QKVParallelLinearWithOFT(ColumnParallelLinearWithOFT):
         base_layer: QKVParallelLinear,
         oft_backend: BaseOFTBackend,
     ) -> None:
+        _require_dense_split_oft(base_layer)
         super().__init__(base_layer, oft_backend)
 
     def slice_oft_r_weights(self, R: torch.Tensor):
         return R
 
-    def dense_materialization_output_sizes(self) -> List[int]:
-        return [
-            int(size) // self.base_layer.tp_size
-            for size in self.base_layer.output_sizes
-        ]
-
     def forward(self, input_: torch.Tensor):
         if not self.oft_active:
             return self.base_layer.forward(input_)
-
-        if self.R_buffer.shape[-3] % 3 != 0:
-            return super().forward(input_)
-
-        if not _is_unquantized_dense_linear(self.base_layer):
-            return self.forward_quantized_shared_oft(input_, split_count=3)
 
         bl = self.base_layer
         tp_size = bl.tp_size
@@ -940,7 +794,7 @@ class RowParallelLinearWithOFT(BaseLayerWithOFT):
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
             splitted_input = split_tensor_along_last_dim(
                 input_, num_partitions=self.base_layer.tp_size
             )
@@ -950,30 +804,33 @@ class RowParallelLinearWithOFT(BaseLayerWithOFT):
         if self.oft_active:
             input_parallel = self.apply_oft(input_parallel)
 
+        bias_ = (
+            None
+            if (self.base_layer.tp_rank > 0 or self.base_layer.skip_bias_add)
+            else self.base_layer.bias
+        )
         output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_parallel
+            self.base_layer, input_parallel, bias=bias_
         )
 
-        if (
-            self.base_layer.reduce_results
-            and self.base_layer.tp_size > 1
+        should_reduce = (
+            (
+                (self.base_layer.reduce_results and self.base_layer.tp_size > 1)
+                or self.base_layer.use_decode_attn_tp
+            )
             and not skip_all_reduce
-        ):
-            output_ = tensor_model_parallel_all_reduce(output_parallel)
+            and not should_skip_mlp_all_reduce()
+        )
+        if should_reduce:
+            if self.base_layer.use_dp_attention_reduce:
+                output_ = get_parallel().attn_tp_group.all_reduce(output_parallel)
+            else:
+                output_ = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output_ = output_parallel
 
-        if not self.base_layer.skip_bias_add:
-            output = (
-                output_ + self.base_layer.bias
-                if self.base_layer.bias is not None
-                else output_
-            )
-            output_bias = None
-        else:
-            output = output_
-            output_bias = self.base_layer.bias
-        return output, output_bias
+        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+        return output_, output_bias
 
     def slice_oft_r_weights(self, R: torch.Tensor):
         tp_rank = self.get_local_tp_rank()
@@ -1002,37 +859,36 @@ class ReplicatedLinearWithOFT(BaseLayerWithOFT):
     NOT ``ColumnParallelLinearWithOFT`` -- because ``ReplicatedLinear`` has no
     ``tp_size``/``gather_output``/``input_size_per_partition``; inheriting the
     ColumnParallel forward would ``AttributeError`` (mirrors
-    ``ReplicatedLinearWithLoRA``, srt/lora/layers.py).
+    ``ReplicatedLinearWithLoRA`` in the native LoRA provider).
 
-    Mirrors ``MergedColumnParallelLinearWithOFT``'s merged/split detection: an
-    ``R_buffer`` with an odd block count is the legacy shared-R (one rotation
-    over the whole input, then the fused GEMM); an even, 2x-stacked block
-    count is per-branch (``R_q`` rotates the input for the q_a branch,
-    ``R_kv`` for the kv_a branch; each branch's own weight slice runs on its
-    own rotated input via ``split_dense_merged_projection`` -- dense-only, per
-    ``_is_unquantized_dense_linear``).
+    ``oft_type`` selects a shared input rotation (oft) or independent stacked
+    rotations per branch (canonical_oft). Block counts cannot distinguish
+    these layouts: a shared rotation can also have an even number of blocks.
+    OFTManager sets ``first_output_dim`` from the model's q_lora_rank to mark
+    the boundary between the q_a and kv_a outputs for canonical_oft.
     """
+
+    first_output_dim: int = 0
 
     def __init__(
         self,
         base_layer: ReplicatedLinear,
         oft_backend: BaseOFTBackend,
+        oft_type: str = "canonical_oft",
     ) -> None:
         super().__init__(base_layer, oft_backend)
+        self.oft_type = oft_type
 
     def set_oft_info(self, R_buffer: torch.Tensor):
         self.set_oft = True
         self.R_buffer = R_buffer
 
     def apply_oft(self, x: torch.Tensor) -> torch.Tensor:
-        # Legacy shared-R: rotate the WHOLE input once before the fused GEMM.
+        # Shared OFT rotates the whole input once before the fused GEMM.
         return self.oft_backend.run_oft_r_sgemm(x=x, weights=self.R_buffer)
 
     def slice_oft_r_weights(self, R: torch.Tensor):
         return R  # replicated: no sharding
-
-    def dense_materialization_output_sizes(self) -> List[int]:
-        return [int(size) for size in self.base_layer.output_sizes]
 
     def forward(self, x: torch.Tensor):
         # Mirror ReplicatedLinear.forward: single un-sharded GEMM, no gather,
@@ -1040,12 +896,13 @@ class ReplicatedLinearWithOFT(BaseLayerWithOFT):
         if not self.oft_active:
             return self.base_layer.forward(x)
 
-        if self.R_buffer.shape[-3] % 2 != 0:
-            # Buffer was sized for shared-R; legacy single-R path.
+        if self.oft_type == "oft":
             x = self.apply_oft(x)
             bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
             output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
-            output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+            output_bias = (
+                self.base_layer.bias if self.base_layer.skip_bias_add else None
+            )
             return output, output_bias
 
         if not _is_unquantized_dense_linear(self.base_layer):
@@ -1054,7 +911,15 @@ class ReplicatedLinearWithOFT(BaseLayerWithOFT):
                 "currently requires a dense (unquantized) base layer."
             )
 
-        output_sizes = [int(s) for s in self.base_layer.output_sizes]
+        first_dim = self.first_output_dim
+        output_size = self.base_layer.output_size
+        if not isinstance(first_dim, int) or not 0 < first_dim < output_size:
+            raise ValueError(
+                "Canonical OFT for ReplicatedLinear requires an integer "
+                f"first_output_dim strictly between 0 and output_size={output_size}; "
+                f"got first_output_dim={first_dim!r}."
+            )
+        output_sizes = [first_dim, output_size - first_dim]
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
         output = split_dense_merged_projection(
             x,
@@ -1069,31 +934,18 @@ class ReplicatedLinearWithOFT(BaseLayerWithOFT):
 
 
 class FusedMoEWithOFT(nn.Module):
-    """Wrapper around FusedMoE that routes the MoE forward through a dedicated
-    runner so OFT rides a dedicated fused_func=None runner (like LoRA's
-    FusedMoEWithLoRA), letting the base runner drop the _has_expert_adapters gate.
+    """Wrapper around FusedMoE with request-routed, pool-backed OFT."""
 
-    OFT buffers stay on ``self.base_layer`` (w13_oft_r / w1_oft_r / w3_oft_r /
-    w2_oft_r); the runner reads them live via ``_peft_layer`` and applies the
-    rotation through the OFT MoE invoker (oft/oft_moe_runners.py). This is a thin
-    shell: it does NOT move buffers into a pool, so the streamed-sync /
-    double-buffer / cuda-graph machinery keeps working unchanged on base_layer.
-    """
-
-    def __init__(self, base_layer, oft_backend: BaseOFTBackend):
+    def __init__(self, base_layer, oft_backend: BaseOFTBackend, oft_type: str):
         super().__init__()
         self.base_layer = base_layer
         self.oft_backend = oft_backend
-        # Also bound on base_layer (not just the wrapper): OFT buffer
-        # injection (oft_manager.py's _find_fused_moe_modules) "sees
-        # through" this wrapper and writes w13_oft_r/w2_oft_r/etc. directly
-        # onto base_layer, and MoeRunner._peft_layer is base_layer too (not
-        # this wrapper) -- so the Marlin runner's request-segmented rotation
-        # needs oft_backend reachable from base_layer, not just here.
-        base_layer.oft_backend = oft_backend
+        self.oft_type = oft_type
         # Copy the config the runner path reads (mirror FusedMoEWithLoRA).
         self.quant_method = base_layer.quant_method
         self.moe_runner_config = base_layer.moe_runner_config
+        # Shared experts on another stream may still read the input states.
+        self.moe_runner_config.inplace = False
         self.dispatcher = base_layer.dispatcher
         self.num_local_experts = base_layer.num_local_experts
         self.should_fuse_routed_scaling_factor_in_topk = (
@@ -1130,21 +982,31 @@ class FusedMoEWithOFT(nn.Module):
             if runner is None:
                 runner = getattr(getattr(base_layer, "scheme", None), "runner", None)
             runner_backend = (
-                runner.runner_backend
-                if runner is not None
-                else MoeRunnerBackend.TRITON
+                runner.runner_backend if runner is not None else MoeRunnerBackend.TRITON
             )
+
+        if runner_backend.is_marlin() and oft_type == "canonical_oft":
+            raise NotImplementedError(
+                "canonical OFT split-expert rotations are not supported by the "
+                "Marlin MoE runner"
+            )
+
+        self.oft_backend.is_moe_oft = True
+        self.oft_backend._moe_num_experts = max(
+            getattr(self.oft_backend, "_moe_num_experts", 0) or 0,
+            base_layer.num_experts,
+        )
+        self.oft_backend._moe_top_k = max(
+            getattr(self.oft_backend, "_moe_top_k", 0) or 0,
+            base_layer.top_k,
+        )
 
         # Cache the BASE quant_info (no oft_r -- OFT rides the hook). Base weights
         # are stable tensors, so caching once is safe (mirror FusedMoEWithLoRA).
         if runner_backend.is_marlin():
-            self._quant_info = base_layer.quant_method.get_marlin_quant_info(
-                base_layer
-            )
+            self._quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
         elif runner_backend.is_triton():
-            self._quant_info = base_layer.quant_method.get_triton_quant_info(
-                base_layer
-            )
+            self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
         else:
             raise NotImplementedError(
                 f"Expert OFT MoE not supported for backend {runner_backend}"
@@ -1155,39 +1017,94 @@ class FusedMoEWithOFT(nn.Module):
             base_layer.moe_runner_config,
             peft_enabled=True,
         )
-        # The runner builds make_oft_invoke(self._peft_layer, ...) from the live buffers.
-        self._oft_runner._peft_layer = base_layer
+        self._oft_runner._peft_layer = self
+
+        self.w13_oft_r = None
+        self.w1_oft_r = None
+        self.w3_oft_r = None
+        self.w2_oft_r = None
+
+    def set_oft_info(
+        self,
+        *,
+        w13_oft_r,
+        w1_oft_r,
+        w3_oft_r,
+        w2_oft_r,
+    ) -> None:
+        """Bind the full slot groups used for request-routed expert OFT."""
+        self.w13_oft_r = w13_oft_r
+        self.w1_oft_r = w1_oft_r
+        self.w3_oft_r = w3_oft_r
+        self.w2_oft_r = w2_oft_r
+
+    def _get_oft_info(self):
+        """Build immutable expert OFT inputs for the current forward."""
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+        from sglang.srt.oft.oft_moe_runners import OFTInfo
+
+        batch_info = self.oft_backend.batch_info
+        moe_oft_info = batch_info.moe_oft_info
+        assert moe_oft_info is not None
+        oft_info = OFTInfo(
+            w13_oft_r=self.w13_oft_r,
+            w1_oft_r=self.w1_oft_r,
+            w3_oft_r=self.w3_oft_r,
+            w2_oft_r=self.w2_oft_r,
+            batch_info=moe_oft_info,
+            num_experts=self.base_layer.num_experts,
+            max_ofts=self.oft_backend.max_ofts_per_batch,
+            has_active_oft=bool(getattr(batch_info, "has_active_oft", False)),
+            cg_buffers=getattr(self.oft_backend, "moe_cg_buffers", None),
+        )
+        # Match LoRA's inactive-batch bypass, retaining kernels during capture
+        # so later graph replays can use adapters from the same pool buffers.
+        if not get_is_capture_mode() and not oft_info.has_active_oft:
+            return None
+        return oft_info
 
     def forward(self, hidden_states, topk_output, **kwargs):
-        # KNOWN LIMITATION: this reads one shared set of expert-OFT weights
-        # (base_layer.w13_oft_r/w2_oft_r etc.) for the whole batch -- no
-        # per-token adapter routing like LoRA's MoE path (token_lora_mapping)
-        # or the dense OFT path (prepare_oft_batch's weight_indices). Two
-        # concurrently-resident adapters that both carry expert OFT weights
-        # will silently share/clobber this state.
+        if self.oft_backend.batch_info is None:
+            return self.base_layer.forward(hidden_states, topk_output, **kwargs)
+
+        oft_info = self._get_oft_info()
         base_layer = self.base_layer
         dispatch_output = base_layer.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
-        combine_input = self._oft_runner.run(dispatch_output, self._quant_info)
+        combine_input = self._oft_runner.run(
+            dispatch_output, self._quant_info, oft_info=oft_info
+        )
         return base_layer.dispatcher.combine(combine_input=combine_input)
 
 
-def get_oft_layer(layer: nn.Module, oft_backend: BaseOFTBackend) -> nn.Module:
+def get_oft_layer(
+    layer: nn.Module, oft_backend: BaseOFTBackend, oft_type: str
+) -> nn.Module:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     if isinstance(layer, FusedMoE):
-        return FusedMoEWithOFT(layer, oft_backend)
+        return FusedMoEWithOFT(layer, oft_backend, oft_type)
+
+    if isinstance(layer, ReplicatedLinear):
+        return ReplicatedLinearWithOFT(layer, oft_backend, oft_type)
 
     supported_layer_types = {
         # the order matters
         ParallelLMHead: ParallelLMHeadWithOFT,
         VocabParallelEmbedding: VocabParallelEmbeddingWithOFT,
-        QKVParallelLinear: QKVParallelLinearWithOFT,
-        MergedColumnParallelLinear: MergedColumnParallelLinearWithOFT,
+        QKVParallelLinear: (
+            QKVParallelLinearWithOFT
+            if oft_type == "canonical_oft"
+            else ColumnParallelLinearWithOFT
+        ),
+        MergedColumnParallelLinear: (
+            MergedColumnParallelLinearWithOFT
+            if oft_type == "canonical_oft"
+            else ColumnParallelLinearWithOFT
+        ),
         ColumnParallelLinear: ColumnParallelLinearWithOFT,
         RowParallelLinear: RowParallelLinearWithOFT,
-        ReplicatedLinear: ReplicatedLinearWithOFT,
     }
     for src_layer_type, oft_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck

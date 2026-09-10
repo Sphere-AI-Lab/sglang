@@ -4,6 +4,7 @@ import subprocess
 import textwrap
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -15,7 +16,9 @@ from sglang.srt.true_on_policy import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+_PATCH_TARGET = "sglang.srt.runtime_context.get_server_args"
 
 
 def _run_dense_math_script(script_body: str) -> dict[str, object]:
@@ -29,12 +32,14 @@ def _run_dense_math_script(script_body: str) -> dict[str, object]:
         def install_openai_stubs():
             openai_mod = types.ModuleType("openai")
             openai_types_mod = types.ModuleType("openai.types")
+            openai_shared_mod = types.ModuleType("openai.types.shared")
             openai_responses_mod = types.ModuleType("openai.types.responses")
             openai_response_mod = types.ModuleType("openai.types.responses.response")
             openai_tool_mod = types.ModuleType("openai.types.responses.tool")
 
             openai_mod.__spec__ = importlib.machinery.ModuleSpec("openai", loader=None)
             openai_types_mod.__spec__ = importlib.machinery.ModuleSpec("openai.types", loader=None)
+            openai_shared_mod.__spec__ = importlib.machinery.ModuleSpec("openai.types.shared", loader=None)
             openai_responses_mod.__spec__ = importlib.machinery.ModuleSpec(
                 "openai.types.responses", loader=None
             )
@@ -52,14 +57,31 @@ def _run_dense_math_script(script_body: str) -> dict[str, object]:
                 "ResponseOutputMessage",
                 "ResponseOutputText",
                 "ResponseReasoningItem",
+                "ResponseTextConfig",
             ]:
                 setattr(openai_responses_mod, name, type(name, (BaseModel,), {}))
 
             openai_response_mod.ToolChoice = type("ToolChoice", (BaseModel,), {})
             openai_tool_mod.Tool = type("Tool", (BaseModel,), {})
 
+            for module_name, class_name in [
+                (
+                    "openai.types.responses.response_format_text_json_schema_config",
+                    "ResponseFormatTextJSONSchemaConfig",
+                ),
+                (
+                    "openai.types.shared.response_format_json_object",
+                    "ResponseFormatJSONObject",
+                ),
+            ]:
+                module = types.ModuleType(module_name)
+                module.__spec__ = importlib.machinery.ModuleSpec(module_name, loader=None)
+                setattr(module, class_name, type(class_name, (BaseModel,), {}))
+                sys.modules.setdefault(module_name, module)
+
             sys.modules.setdefault("openai", openai_mod)
             sys.modules.setdefault("openai.types", openai_types_mod)
+            sys.modules.setdefault("openai.types.shared", openai_shared_mod)
             sys.modules.setdefault("openai.types.responses", openai_responses_mod)
             sys.modules.setdefault("openai.types.responses.response", openai_response_mod)
             sys.modules.setdefault("openai.types.responses.tool", openai_tool_mod)
@@ -135,38 +157,35 @@ class TestDenseOnPolicyHelpers(unittest.TestCase):
             tp_size=1,
         )
 
-        self.assertFalse(should_force_bfloat16_dense_tensor_math(server_args))
-        self.assertFalse(
-            should_force_bfloat16_lm_head(
-                server_args=server_args,
-                use_fp32_lm_head=False,
-            )
-        )
-        self.assertEqual(get_on_policy_rms_norm_kwargs(server_args), {})
+        with patch(_PATCH_TARGET, return_value=server_args):
+            self.assertFalse(should_force_bfloat16_dense_tensor_math())
+            self.assertFalse(should_force_bfloat16_lm_head(use_fp32_lm_head=False))
+            self.assertEqual(get_on_policy_rms_norm_kwargs(), {})
 
-    def test_on_policy_dense_math_helpers_enable_bfloat16_and_rms_norm_kwargs(self):
+    @patch(_PATCH_TARGET)
+    def test_on_policy_dense_math_helpers_enable_bfloat16_and_rms_norm_kwargs(
+        self, get_server_args
+    ):
         server_args = SimpleNamespace(
             true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
             tp_size=1,
         )
+        get_server_args.return_value = server_args
 
         kwargs = get_on_policy_rms_norm_kwargs(
-            server_args,
             weight_dtype=torch.float32,
             override_orig_dtype=torch.float32,
             fp32_residual=True,
         )
 
-        self.assertTrue(should_force_bfloat16_dense_tensor_math(server_args))
+        self.assertTrue(should_force_bfloat16_dense_tensor_math())
         self.assertTrue(
             should_force_bfloat16_lm_head(
-                server_args=server_args,
                 use_fp32_lm_head=False,
             )
         )
         self.assertFalse(
             should_force_bfloat16_lm_head(
-                server_args=server_args,
                 use_fp32_lm_head=True,
             )
         )
@@ -181,6 +200,7 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
         result = _run_dense_math_script(textwrap.dedent("""
                 import json
                 from types import SimpleNamespace
+                from unittest.mock import patch
 
                 import torch
 
@@ -193,16 +213,19 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                     true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
                     tp_size=1,
                 )
-                norm = RMSNorm(
-                    4,
-                    eps=1e-6,
-                    **get_on_policy_rms_norm_kwargs(
-                        server_args,
-                        weight_dtype=torch.float32,
-                        override_orig_dtype=torch.float32,
-                        fp32_residual=True,
-                    ),
-                )
+                with patch(
+                    "sglang.srt.runtime_context.get_server_args",
+                    return_value=server_args,
+                ):
+                    norm = RMSNorm(
+                        4,
+                        eps=1e-6,
+                        **get_on_policy_rms_norm_kwargs(
+                            weight_dtype=torch.float32,
+                            override_orig_dtype=torch.float32,
+                            fp32_residual=True,
+                        ),
+                    )
                 x = torch.randn(2, 4, dtype=torch.bfloat16)
                 residual = torch.randn(2, 4, dtype=torch.bfloat16)
                 out, residual_out = norm.forward_native(x, residual)
@@ -230,15 +253,20 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                 from sglang.srt.layers.layernorm import RMSNorm
                 from sglang.srt.server_args import (
                     ServerArgs,
-                    get_global_server_args,
                     set_global_server_args_for_scheduler,
                 )
                 from sglang.srt.true_on_policy import QWEN3_DENSE_TRUE_ON_POLICY_V1
 
                 set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-                server_args = get_global_server_args()
-                server_args.true_on_policy_contract = QWEN3_DENSE_TRUE_ON_POLICY_V1
-                server_args.tp_size = 1
+                inactive_norm = RMSNorm(4, eps=1e-6)
+                set_global_server_args_for_scheduler(
+                    ServerArgs(
+                        model_path="dummy",
+                        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                        tp_size=1,
+                    )
+                )
+                default_policy_norm = RMSNorm(4, eps=1e-6)
                 norm = RMSNorm(
                     4,
                     eps=1e-6,
@@ -252,6 +280,8 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                             "weight_dtype": str(norm.weight.dtype),
                             "cast_x_before_out_mul": norm.cast_x_before_out_mul,
                             "fp32_residual": norm.fp32_residual,
+                            "inactive_fp32_residual": inactive_norm.fp32_residual,
+                            "default_policy_fp32_residual": default_policy_norm.fp32_residual,
                             "override_orig_dtype": str(norm.override_orig_dtype),
                         }
                     )
@@ -261,6 +291,8 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
         self.assertEqual(result["weight_dtype"], "torch.float32")
         self.assertTrue(result["cast_x_before_out_mul"])
         self.assertTrue(result["fp32_residual"])
+        self.assertTrue(result["inactive_fp32_residual"])
+        self.assertFalse(result["default_policy_fp32_residual"])
         self.assertEqual(result["override_orig_dtype"], "torch.float32")
 
     def test_on_policy_lm_head_forces_bfloat16_matmul_inputs(self):
@@ -275,7 +307,6 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                 from sglang.srt.layers.logits_processor import LogitsProcessor
                 from sglang.srt.server_args import (
                     ServerArgs,
-                    get_global_server_args,
                     set_global_server_args_for_scheduler,
                 )
                 from sglang.srt.true_on_policy import QWEN3_DENSE_TRUE_ON_POLICY_V1
@@ -292,11 +323,15 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                         super().__init__()
                         self.weight = nn.Parameter(torch.randn(8, 4, dtype=torch.float32))
 
-                set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-                get_global_server_args().enable_dp_lm_head = False
-                get_global_server_args().enable_fp32_lm_head = False
-                get_global_server_args().true_on_policy_contract = QWEN3_DENSE_TRUE_ON_POLICY_V1
-                get_global_server_args().tp_size = 1
+                set_global_server_args_for_scheduler(
+                    ServerArgs(
+                        model_path="dummy",
+                        enable_dp_lm_head=False,
+                        enable_fp32_lm_head=False,
+                        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                        tp_size=1,
+                    )
+                )
 
                 processor = LogitsProcessor(
                     SimpleNamespace(vocab_size=8, final_logit_softcapping=None),

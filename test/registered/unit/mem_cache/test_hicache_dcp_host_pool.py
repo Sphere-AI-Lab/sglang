@@ -133,7 +133,19 @@ class TestDcpKernelIndices(CustomTestCase):
             )
 
 
-class TestHostPoolSizingUnderDcp(CustomTestCase):
+class _HostPoolTestCase(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # These tiny pools test index math, independently of the runner's RAM.
+        memory = mock.patch(
+            "sglang.srt.mem_cache.pool_host.base.psutil.virtual_memory",
+            return_value=SimpleNamespace(available=16 * 1024**3),
+        )
+        memory.start()
+        self.addCleanup(memory.stop)
+
+
+class TestHostPoolSizingUnderDcp(_HostPoolTestCase):
     def test_logical_and_physical_sizing(self):
         pool = _make_host_pool(dcp_rank=3)
         # kernel-facing page is physical
@@ -170,7 +182,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
         self.assertEqual(pool.logical_page_size, PHYSICAL_PAGE)
 
 
-class TestTransferEntryPointsTranslate(CustomTestCase):
+class TestTransferEntryPointsTranslate(_HostPoolTestCase):
     def _run_backup(self, pool, host_indices, device_indices):
         device_pool = SimpleNamespace(
             data_ptrs=torch.zeros(2, dtype=torch.uint64),

@@ -101,13 +101,39 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
         self, target_result, draft_result=None, method="update_weights_from_disk"
     ):
         self.recorded = []
-        return SchedulerWeightUpdaterManager(
-            tp_worker=SimpleNamespace(**{method: lambda recv_req: target_result}),
-            draft_worker=(
+        if method in {
+            "update_weights_from_distributed",
+            "update_weights_from_tensor",
+        }:
+
+            def receive_weights(*args):
+                if not target_result[0]:
+                    raise RuntimeError(target_result[1])
+                return object()
+
+            weight_updater = SimpleNamespace(
+                receive_weights_from_distributed=receive_weights,
+                load_weights=lambda weights: None,
+                update_weights_from_tensor=lambda **kwargs: target_result,
+            )
+            target_runner = SimpleNamespace(weight_updater=weight_updater)
+            tp_worker = SimpleNamespace(
+                model_runner=target_runner,
+                ps=SimpleNamespace(tp_rank=0),
+                iter_runners=lambda: [("", target_runner)],
+            )
+            draft_worker = None
+        else:
+            tp_worker = SimpleNamespace(**{method: lambda recv_req: target_result})
+            draft_worker = (
                 None
                 if draft_result is None
                 else SimpleNamespace(**{method: lambda recv_req: draft_result})
-            ),
+            )
+
+        updater = SchedulerWeightUpdaterManager(
+            tp_worker=tp_worker,
+            draft_worker=draft_worker,
             tp_cpu_group=None,
             memory_saver_adapter=None,
             flush_cache=lambda **kwargs: True,
@@ -118,12 +144,28 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
                 )
             ),
         )
+        if method in {
+            "update_weights_from_distributed",
+            "update_weights_from_tensor",
+        }:
+            updater._weight_update_in_progress = True
+        return updater
 
     def _request(self, **fields):
         return SimpleNamespace(
             weight_version="v2",
             flush_cache=True,
             torch_empty_cache=False,
+            names=[],
+            dtypes=[],
+            shapes=[],
+            group_name="weight_update_group",
+            load_format=None,
+            selector="all",
+            serialized_named_tensors=[b"stub"],
+            adapter_config=None,
+            adapter_name=None,
+            adapter_id=None,
             **fields,
         )
 
@@ -184,7 +226,14 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
             target_result=(True, "ok"), method="update_weights_from_tensor"
         )
 
-        with patch("torch.distributed.barrier"):
+        with (
+            patch("torch.distributed.barrier"),
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater."
+                "MultiprocessingSerializer.deserialize",
+                return_value=[],
+            ),
+        ):
             output = updater.update_weights_from_tensor(
                 self._request(disable_draft_model=True)
             )

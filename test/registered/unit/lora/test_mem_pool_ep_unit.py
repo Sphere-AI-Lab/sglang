@@ -356,6 +356,41 @@ class TestBufferSlotClearing(unittest.TestCase):
         self.assertIs(pool.buffer_id_to_uid[0], EMPTY_SLOT)
         self.assertNotIn("adapter", pool.eviction_policy.access_order)
 
+    def test_clear_optional_slot_preserves_dense_buffers_and_other_rows(self):
+        pool = self._make_pool()
+        dense = [
+            tensor
+            for buffers in (*pool.A_buffer.values(), *pool.B_buffer.values())
+            for tensor in buffers
+        ]
+        optional = [
+            tensor
+            for buffers in (
+                pool.embedding_A_buffer,
+                pool.embedding_B_buffer,
+                pool.lm_head_A_buffer,
+                pool.lm_head_B_buffer,
+                pool.new_embeddings_buffer,
+            )
+            for tensor in buffers.values()
+        ]
+        dense_before = [tensor.clone() for tensor in dense]
+        optional_row_one_before = [tensor[1].clone() for tensor in optional]
+
+        pool._clear_optional_buffer_slot(0)
+
+        for tensor in optional:
+            self.assertTrue(torch.isfinite(tensor[0]).all())
+            torch.testing.assert_close(tensor[0], torch.zeros_like(tensor[0]))
+        for tensor, before in zip(dense, dense_before):
+            self.assertTrue(
+                torch.equal(tensor.view(torch.uint8), before.view(torch.uint8))
+            )
+        for tensor, before in zip(optional, optional_row_one_before):
+            self.assertTrue(
+                torch.equal(tensor[1].view(torch.uint8), before.view(torch.uint8))
+            )
+
 
 def _make_fake_base_model(num_experts: int) -> torch.nn.Module:
     """Return a `torch.nn.Module` whose `.config` exposes `num_experts`.

@@ -351,11 +351,15 @@ class LoRAManager:
         delete the corresponding LoRA modules.
         """
 
-        adapter = self.configs.get(lora_ref.lora_id)
-        lora_ref = self.lora_refs.get(lora_ref.lora_id)
-        assert (
-            adapter is not None and lora_ref is not None
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
+        uid = lora_ref.lora_id
+        adapter = self.configs.get(uid)
+        stored_ref = self.lora_refs.get(uid)
+        if adapter is None and stored_ref is None and uid not in self.loras:
+            # Distributed unload retries use the same ID after some ranks may
+            # already have completed cleanup. The tokenizer validates that the
+            # ID came from an active adapter or failed-unload tombstone.
+            return self.create_lora_update_result(success=True)
+        lora_ref = stored_ref or lora_ref
 
         try:
             pending_events = getattr(self, "pending_lora_load_events", {})
@@ -367,10 +371,11 @@ class LoRAManager:
             removed_slot = self.memory_pool.remove_lora(lora_ref.lora_id)
             if removed_slot is not None:
                 self._notify_lora_slots_updated({removed_slot})
-            del self.configs[lora_ref.lora_id]
-            del self.loras[lora_ref.lora_id]
-            del self.lora_refs[lora_ref.lora_id]
-            self.num_pinned_loras -= int(lora_ref.pinned)
+            self.configs.pop(uid, None)
+            self.loras.pop(uid, None)
+            removed_ref = self.lora_refs.pop(uid, None)
+            if removed_ref is not None:
+                self.num_pinned_loras -= int(removed_ref.pinned)
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,

@@ -35,6 +35,13 @@ def _make(**fields):
 
 
 class TestFastImageProcessorDevice(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # Device-selection tests run outside the global on-policy runtime.
+        on_policy = patch(f"{BASE}.is_true_on_policy_enabled", return_value=False)
+        on_policy.start()
+        self.addCleanup(on_policy.stop)
+
     def _device(self, processor, **platform):
         flags = {"_is_cpu": False, "_is_xpu": False, "_is_npu": False}
         flags.update(platform)
@@ -61,6 +68,10 @@ class TestFastImageProcessorDevice(CustomTestCase):
     def test_rl_on_policy_target_forces_cpu(self):
         processor = _make(base_gpu_id=3, rl_on_policy_target="fsdp")
         self.assertEqual(self._device(processor), "cpu")
+
+    def test_true_on_policy_forces_cpu(self):
+        with patch(f"{BASE}.is_true_on_policy_enabled", return_value=True):
+            self.assertEqual(self._device(_make(base_gpu_id=3)), "cpu")
 
     def test_cpu_and_xpu_platforms_win_over_base_gpu_id(self):
         processor = _make(base_gpu_id=3)

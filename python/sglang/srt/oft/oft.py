@@ -29,10 +29,10 @@ from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.oft.backend.base_backend import BaseOFTBackend
 from sglang.srt.oft.oft_config import OFTConfig
 from sglang.srt.oft.utils import get_hf_config_attr
-from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
@@ -40,9 +40,8 @@ logger = logging.getLogger(__name__)
 _EXPERT_OFT_RE = re.compile(
     r"mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.oft_R"
 )
-_DSV4_EXPERT_OFT_RE = re.compile(
-    r"(?:mlp|ffn)\.experts\.(\d+)\.(w1|w2|w3)\.oft_R"
-)
+_DSV4_EXPERT_OFT_RE = re.compile(r"(?:mlp|ffn)\.experts\.(\d+)\.(w1|w2|w3)\.oft_R")
+
 
 class OFTLayer(nn.Module):
     def __init__(self, config: OFTConfig, base_hf_config: AutoConfig):
@@ -81,9 +80,7 @@ class OFTAdapter(nn.Module):
         self.coft: bool = self.config.coft
         self.block_size: int = self.config.block_size
 
-        num_hidden_layers = get_hf_config_attr(
-            base_hf_config, "num_hidden_layers"
-        )
+        num_hidden_layers = get_hf_config_attr(base_hf_config, "num_hidden_layers")
         self.layers: List[OFTLayer] = nn.ModuleList(
             [OFTLayer(config, base_hf_config) for _ in range(num_hidden_layers)]
         )
@@ -98,9 +95,8 @@ class OFTAdapter(nn.Module):
         # load_format="dummy" (e.g. perf/parity fixtures), that format leaks in
         # via the shared load_config and DefaultModelLoader._prepare_weights
         # hard-raises on DUMMY -- override it to AUTO for the adapter's real
-        # safetensors. No-op for real bases (already AUTO/safetensors). The same
-        # fix applies to any other adapter loader that shares load_config with a
-        # dummy-loaded base.
+        # safetensors. No-op for real bases (already AUTO/safetensors). Mirrors
+        # the equivalent fix in the native LoRA loader.
         load_config = self.load_config
         if load_config.load_format == LoadFormat.DUMMY:
             load_config = dataclasses.replace(load_config, load_format=LoadFormat.AUTO)
@@ -118,7 +114,17 @@ class OFTAdapter(nn.Module):
         self._normalize_weights()
 
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
-        for name, tensor in tensors.items():
+        # Own a snapshot: CPU inputs may be reused by the sender, and received
+        # tensors may be views into a transport buffer. Preserve original names
+        # so restoration uses the same split/expert routing as native loading.
+        self.streamed_named_tensors = [
+            (
+                name.replace("unembed_tokens", "lm_head"),
+                tensor.detach().to(device="cpu", copy=True),
+            )
+            for name, tensor in tensors.items()
+        ]
+        for name, tensor in self.streamed_named_tensors:
             self._process_weight(name, tensor)
 
         self._normalize_weights()
@@ -191,4 +197,3 @@ class OFTAdapter(nn.Module):
 
         for name, weight in self.added_tokens_embeddings.items():
             self.added_tokens_embeddings[name] = weight.pin_memory()
-

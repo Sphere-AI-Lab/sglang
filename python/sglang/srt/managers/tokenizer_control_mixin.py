@@ -25,10 +25,13 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CudaMemoryPeakRankResult,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DiscardAdapterStageReqInput,
+    DiscardAdapterStageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
     EndWeightUpdateReqInput,
@@ -55,17 +58,20 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
-    OFTUpdateOutput,
     OpenSessionReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
     PullWeightsReqInput,
     PullWeightsReqOutput,
+    ReadCudaMemoryPeakReqInput,
+    ReadCudaMemoryPeakReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
+    ResetCudaMemoryPeakReqInput,
+    ResetCudaMemoryPeakReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     ScaleElasticEPReqOutput,
@@ -112,6 +118,7 @@ _COMMUNICATOR_SPECS = [
     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
     ("update_adapter_from_distributed", UpdateAdapterFromDistributedReqOutput),
     ("activate_adapter_version", ActivateAdapterVersionReqOutput),
+    ("discard_adapter_stage", DiscardAdapterStageReqOutput),
     (
         "init_weights_send_group_for_remote_instance",
         InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -123,6 +130,8 @@ _COMMUNICATOR_SPECS = [
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
+    ("reset_cuda_memory_peak", ResetCudaMemoryPeakReqOutput),
+    ("read_cuda_memory_peak", ReadCudaMemoryPeakReqOutput),
     ("check_weights", CheckWeightsReqOutput),
     ("pull_weights", PullWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
@@ -140,7 +149,6 @@ _COMMUNICATOR_SPECS = [
     ("begin_weight_update", BeginWeightUpdateReqOutput),
     ("end_weight_update", EndWeightUpdateReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
-    ("update_oft_adapter", OFTUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
@@ -175,7 +183,15 @@ class TokenizerControlMixin:
 
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
         dispatch_pairs = []
-        for spec in _COMMUNICATOR_SPECS:
+        # Canonical OFT IPC types are resolved lazily: sglang.srt.oft.io_types
+        # imports managers.io_struct, so a module-level import here would close
+        # the very cycle that io_struct.__getattr__ exists to avoid.
+        from sglang.srt.oft.io_types import OFTUpdateOutput
+
+        self._communicator_specs = list(_COMMUNICATOR_SPECS) + [
+            ("update_oft_adapter", OFTUpdateOutput),
+        ]
+        for spec in self._communicator_specs:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
             comm = FanOutCommunicator(
@@ -199,7 +215,7 @@ class TokenizerControlMixin:
         else:
             control_fan_out = worker_count
 
-        for spec in _COMMUNICATOR_SPECS:
+        for spec in getattr(self, "_communicator_specs", _COMMUNICATOR_SPECS):
             getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
 
         self.get_internal_state_communicator.set_fan_out(control_fan_out)
@@ -529,15 +545,14 @@ class TokenizerControlMixin:
         return success, message
 
     def _assert_native_lora_available(self, lora_path) -> None:
-        """Reject a request naming an adapter quarantined by a partial native
-        LoRA activation failure. Runs unconditionally for every generate/
-        embedding request with a lora_path (see _resolve_lora_path in
-        tokenizer_manager.py) -- not gated on enable_lora_staging, since
-        self.failed_lora_activations is initialized unconditionally in
-        __init__ and a previously staged-and-quarantined adapter name must
-        stay rejected regardless of the server's current staging config."""
+        """Reject adapters quarantined by a partial activation failure."""
         names = [lora_path] if isinstance(lora_path, str) else (lora_path or [])
         for name in names:
+            if name in getattr(self, "failed_lora_unloads", {}):
+                raise ValueError(
+                    f"LoRA adapter '{name}' is unavailable after a failed unload; "
+                    "retry unload before loading or serving it"
+                )
             if name in self.failed_lora_activations:
                 raise ValueError(
                     f"LoRA adapter '{name}' is unavailable after a partial "
@@ -545,62 +560,154 @@ class TokenizerControlMixin:
                 )
 
     def _staging_backend_for(self, obj):
-        from sglang.srt.managers.staging_backend import get_staging_backend
+        from sglang.srt.adapter_sync.tokenizer_backend import get_staging_backend
 
-        return get_staging_backend(self, obj)
+        backend = get_staging_backend(self, obj)
+        if (
+            backend is not None
+            and obj.load_format == "oft_adapter"
+            and self.server_args.tokenizer_worker_num > 1
+        ):
+            raise ValueError(
+                "OFT staging requires tokenizer_worker_num == 1 because adapter "
+                "activation cannot globally drain requests across tokenizer workers."
+            )
+        return backend
+
+    async def _run_adapter_activation_safely(self, backend, obj, operation):
+        """Run an irreversible adapter activation as one admission transaction."""
+        from sglang.srt.adapter_sync.tokenizer_backend import (
+            finish_irreversible_update,
+        )
+
+        # A paused request keeps its reader lock for its full response lifetime.
+        # Even retract mode can retain an old versioned radix prefix, so only a
+        # genuinely drained paused engine may activate without corrupting KV.
+        async with self.is_pause_cond:
+            if self.is_pause and await self.model_update_lock.is_locked():
+                return (
+                    False,
+                    "Cannot activate adapter weights while paused requests are "
+                    "still active; continue generation or abort those requests "
+                    "before retrying.",
+                )
+            async with self.model_update_lock.writer_lock:
+                if backend is None:
+                    return await finish_irreversible_update(operation)
+                async with backend.lifecycle_lock:
+                    # Unload or another lifecycle operation may have completed
+                    # while activation waited for inference to drain.
+                    backend.prepare_activation(obj)
+                    return await finish_irreversible_update(operation)
+
+    async def _rollback_failed_adapter_stage(self, backend, obj, stage_message):
+        """Complete rollback under the caller's lifecycle lock and cancel shield."""
+        try:
+            discard = DiscardAdapterStageReqInput(
+                load_format=obj.load_format,
+                adapter_name=obj.adapter_name,
+                adapter_id=obj.adapter_id,
+                adapter_version=obj.adapter_version,
+            )
+            results = await self.discard_adapter_stage_communicator(discard)
+            success, message = FanOutCommunicator.merge_results(results)
+            if not results or not success:
+                raise RuntimeError(message or "No stage rollback responses")
+            backend.clear_stage_reservation(discard)
+        except Exception as error:
+            failure = (
+                f"{stage_message}; stage rollback failed: {error}; restart required"
+            )
+            backend._quarantine(obj.adapter_name, failure)
+            return False, failure
+        return False, f"{stage_message}; stage rollback succeeded"
 
     async def update_adapter_from_distributed(
         self: TokenizerManager,
         obj: UpdateAdapterFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        """Double-buffer OFT/LoRA STAGE over NCCL.
-
-        double_buffer=True: LOCK-FREE stage into the reserved staging slot while
-        generation continues (overlaps decode); no writer_lock. double_buffer=
-        False: the synchronous distributed path stages then ACTIVATEs-in-place in
-        the scheduler in one round-trip, so we hold model_update_lock.writer_lock
-        (drain-to-idle, mirror update_weights_from_distributed) around it."""
+        """Stage native LoRA or canonical OFT adapter weights."""
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update adapter from distributed"
+        ), "dp_size must be 1 or dp attention must be enabled for adapter staging"
+
+        from sglang.srt.oft import tokenizer_hooks as oft_tokenizer_hooks
 
         backend = self._staging_backend_for(obj)
         if backend is not None:
             await backend.reserve_stage(obj)
         else:
-            # The existing OFT path remains register-before-dispatch.
-            await self.register_oft_ref(obj)
+            await oft_tokenizer_hooks.register_oft_ref(self, obj)
 
         if obj.double_buffer:
+            if backend is not None:
+                from sglang.srt.adapter_sync.tokenizer_backend import (
+                    finish_irreversible_update,
+                )
+
+                reserved_id = obj.adapter_id
+                async with backend.lifecycle_lock:
+                    # A retry may have queued behind an in-flight stage while
+                    # unload cancelled its reservation. Revalidate before any
+                    # dispatch, including the ID if a new reservation replaced it.
+                    backend.prepare_activation(obj)
+                    if obj.adapter_id != reserved_id:
+                        raise ValueError("Adapter stage reservation was cancelled")
+
+                    async def stage_and_finish():
+                        try:
+                            results = (
+                                await self.update_adapter_from_distributed_communicator(
+                                    obj
+                                )
+                            )
+                            success, message = FanOutCommunicator.merge_results(results)
+                            if results and success:
+                                return success, message
+                            message = message or "No adapter stage responses"
+                        except Exception as error:
+                            message = f"Adapter stage failed: {error}"
+                        return await self._rollback_failed_adapter_stage(
+                            backend, obj, message
+                        )
+
+                    # Keep unload excluded until every worker has replied even
+                    # when the HTTP caller is cancelled during the fan-out.
+                    return await finish_irreversible_update(stage_and_finish)
+
             results = await self.update_adapter_from_distributed_communicator(obj)
             success, message = FanOutCommunicator.merge_results(results)
-            if backend is not None:
-                return success, message
         else:
-            # Hold is_pause_cond while updating to prevent unpause from racing.
-            async with self.is_pause_cond:
-                is_paused = self.is_pause
-                if is_paused:
-                    results = await self.update_adapter_from_distributed_communicator(
-                        obj
-                    )
-                    if backend is not None:
-                        backend_result = await backend.finish_activation(obj, results)
-            if not is_paused:
-                async with self.model_update_lock.writer_lock:
-                    results = await self.update_adapter_from_distributed_communicator(
-                        obj
-                    )
-                    if backend is not None:
-                        backend_result = await backend.finish_activation(obj, results)
-            if backend is not None:
-                return backend_result
-            success, message = FanOutCommunicator.merge_results(results)
 
-        if not obj.double_buffer:
-            message += await self.bump_oft_version(obj, success)
+            async def stage_activate_and_publish():
+                results = await self.update_adapter_from_distributed_communicator(obj)
+                if backend is not None:
+                    # Missing replies or a completed stage can hide activation.
+                    # Only unanimous pre-activation failure is safe to discard.
+                    if results and all(
+                        not r.success
+                        and r.staged_adapter_version is None
+                        and r.active_adapter_version is None
+                        for r in results
+                    ):
+                        _, message = FanOutCommunicator.merge_results(results)
+                        return await self._rollback_failed_adapter_stage(
+                            backend, obj, message
+                        )
+                    return await backend.finish_activation(obj, results)
+                success, message = FanOutCommunicator.merge_results(results)
+                message += await oft_tokenizer_hooks.bump_oft_version(
+                    self, obj, success
+                )
+                return success, message
+
+            return await self._run_adapter_activation_safely(
+                backend, obj, stage_activate_and_publish
+            )
+
+        message += await oft_tokenizer_hooks.bump_oft_version(self, obj, success)
         return success, message
 
     async def activate_adapter_version(
@@ -608,53 +715,23 @@ class TokenizerControlMixin:
         obj: ActivateAdapterVersionReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        """Double-buffer OFT/LoRA ACTIVATE (the drained atomic swap). The drain lives
-        HERE: model_update_lock.writer_lock waits for all in-flight generation
-        reader_locks to release (drain running_batch to empty) and blocks new
-        admission -- exactly what update_weights_from_disk/from_distributed use.
-        Only THEN is the activate control request sent to the scheduler (a simple
-        staging->active flip, since the batch is already drained); releasing the
-        lock on return resumes admission."""
+        """Drain admission and activate native LoRA or canonical OFT."""
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for activate adapter version"
+        ), "dp_size must be 1 or dp attention must be enabled for adapter activation"
 
         backend = self._staging_backend_for(obj)
-        if backend is not None:
-            backend.prepare_activation(obj)
 
-        # Hold is_pause_cond while updating to prevent unpause from racing.
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.activate_adapter_version_communicator(obj)
-                if backend is not None:
-                    backend_result = await backend.finish_activation(obj, results)
-                else:
-                    await self._publish_oft_activation(obj, results)
+        async def activate_and_publish():
+            results = await self.activate_adapter_version_communicator(obj)
+            if backend is not None:
+                return await backend.finish_activation(obj, results)
+            return FanOutCommunicator.merge_results(results)
 
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.activate_adapter_version_communicator(obj)
-                if backend is not None:
-                    backend_result = await backend.finish_activation(obj, results)
-                else:
-                    await self._publish_oft_activation(obj, results)
-
-        if backend is not None:
-            return backend_result
-
-        success, message = FanOutCommunicator.merge_results(results)
-        return success, message
-
-    async def _publish_oft_activation(self, obj, results):
-        # STAGE must not advertise a new serving version. Publish only after
-        # ACTIVATE, while admission is still paused or writer-locked.
-        success, _ = FanOutCommunicator.merge_results(results)
-        if success and obj.load_format == "oft_adapter" and self.oft_registry is not None:
-            obj.adapter_id = self.oft_ref_cache[obj.adapter_name].oft_id
-            await self.bump_oft_version(obj, success)
+        return await self._run_adapter_activation_safely(
+            backend, obj, activate_and_publish
+        )
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
@@ -701,13 +778,9 @@ class TokenizerControlMixin:
             obj.serialized_named_tensors
         )
 
-        # OFT register-before-dispatch: mint/lookup the streamed adapter's ref
-        # and set obj.adapter_id, so a later generate request naming this
-        # adapter resolves against self.oft_ref_cache. Triggered by
-        # obj.adapter_name; without it, streamed adapters loaded into the
-        # scheduler were never registered tokenizer-side -> generate 400s
-        # with "never been loaded".
-        newly_registered_oft_ref = await self.register_oft_ref(obj)
+        from sglang.srt.oft import tokenizer_hooks as oft_tokenizer_hooks
+
+        newly_registered_oft_ref = await oft_tokenizer_hooks.register_oft_ref(self, obj)
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -724,15 +797,9 @@ class TokenizerControlMixin:
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
-        message += await self.bump_oft_version(obj, success)
+        message += await oft_tokenizer_hooks.bump_oft_version(self, obj, success)
         if not success and newly_registered_oft_ref:
-            # The backend load this ref was minted for failed (e.g. the
-            # retired load_format="oft_adapter" path's graceful reject) --
-            # without rolling back, the name stays registered tokenizer-side
-            # with nothing actually resident on the backend, so a later
-            # /generate naming it reaches the GPU-side code instead of
-            # getting a clean "adapter not found" rejection here.
-            await self.rollback_oft_ref(obj.adapter_name)
+            await oft_tokenizer_hooks.rollback_oft_ref(self, obj.adapter_name)
 
         return success, message
 
@@ -781,6 +848,78 @@ class TokenizerControlMixin:
             self.lora_update_lock.locked()
         ), "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
 
+        pending = self.pending_lora_stage
+        active = self.lora_registry.get_all_adapters().get(obj.lora_name)
+        failed_unloads = getattr(self, "failed_lora_unloads", None)
+        if failed_unloads is None:
+            failed_unloads = self.failed_lora_unloads = {}
+        failed_unload = failed_unloads.get(obj.lora_name)
+        cancelling_pending = pending is not None and pending.lora_name == obj.lora_name
+
+        async def dispatch_unload():
+            try:
+                return _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(obj)
+                )
+            except Exception as error:
+                return LoRAUpdateOutput(success=False, error_message=str(error))
+
+        async def cancel_pending_on_workers():
+            from sglang.srt.adapter_sync.tokenizer_backend import (
+                finish_irreversible_update,
+            )
+
+            async def dispatch_and_validate():
+                try:
+                    result = _merge_lora_update_results(
+                        await self.update_lora_adapter_communicator(obj)
+                    )
+                except Exception as error:
+                    result = LoRAUpdateOutput(success=False, error_message=str(error))
+                if not result.success:
+                    failure = (
+                        f"LoRA adapter '{obj.lora_name}' is quarantined because "
+                        "its staged unload did not succeed on every worker; "
+                        "restart required"
+                    )
+                    self.failed_lora_activations[obj.lora_name] = failure
+                    failed_unloads[obj.lora_name] = active or pending
+                    return LoRAUpdateOutput(
+                        success=False,
+                        error_message=(
+                            f"{result.error_message or 'worker unload failed'} | "
+                            f"{failure}"
+                        ),
+                        loaded_adapters=result.loaded_adapters,
+                    )
+                return result
+
+            return await finish_irreversible_update(dispatch_and_validate)
+
+        if active is None and failed_unload is not None:
+            obj.lora_id = failed_unload.lora_id
+
+            from sglang.srt.adapter_sync.tokenizer_backend import (
+                finish_irreversible_update,
+            )
+
+            async def retry_and_finalize():
+                result = await dispatch_unload()
+                if result.success:
+                    failed_unloads.pop(obj.lora_name, None)
+                    self.failed_lora_activations.pop(obj.lora_name, None)
+                    self.lora_ref_cache.pop(obj.lora_name, None)
+                return result
+
+            return await finish_irreversible_update(retry_and_finalize)
+
+        if active is None and cancelling_pending:
+            # A freshly staged adapter is intentionally absent from the serving
+            # registry. Unload acts as cancellation of that pending transaction.
+            obj.lora_id = pending.lora_id
+            self.pending_lora_stage = None
+            return await cancel_pending_on_workers()
+
         # Unregister the LoRA adapter from the registry to stop new requests for this adapter
         # from being started.
         lora_id = await self.lora_registry.unregister(obj.lora_name)
@@ -789,10 +928,15 @@ class TokenizerControlMixin:
         # Initiate the actual unloading operation at the backend processes only after all
         # ongoing requests using this LoRA adapter are finished.
         await self.lora_registry.wait_for_unload(lora_id)
-        result = _merge_lora_update_results(
-            await self.update_lora_adapter_communicator(obj)
-        )
+        if cancelling_pending:
+            # Once unload fan-out begins, any worker may discard this stage.
+            # It is no longer safe to activate even if another worker fails.
+            self.pending_lora_stage = None
+            return await cancel_pending_on_workers()
 
+        result = await dispatch_unload()
+        if not result.success:
+            failed_unloads[obj.lora_name] = active
         return result
 
     async def load_lora_adapter(
@@ -818,6 +962,7 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                self._ensure_no_pending_lora_load(obj.lora_name)
                 # Generate new uniquely identifiable LoRARef object.
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
@@ -891,6 +1036,19 @@ class TokenizerControlMixin:
                 "making upsert nondeterministic across workers."
             )
 
+    def _ensure_no_pending_lora_load(self, lora_name: str) -> None:
+        if lora_name in getattr(self, "failed_lora_unloads", {}):
+            raise ValueError(
+                f"Cannot load LoRA adapter '{lora_name}' after a failed unload; "
+                "retry unload first."
+            )
+        pending = self.pending_lora_stage
+        if pending is not None and pending.lora_name == lora_name:
+            raise ValueError(
+                f"Cannot load LoRA adapter '{lora_name}' while staged version "
+                f"{pending.version} is pending; activate or unload it first."
+            )
+
     async def load_lora_adapter_from_tensors(
         self: TokenizerManager,
         obj: LoadLoRAAdapterFromTensorsReqInput,
@@ -926,6 +1084,7 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                self._ensure_no_pending_lora_load(obj.lora_name)
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path="__tensor__",
@@ -999,35 +1158,99 @@ class TokenizerControlMixin:
                 obj.group_name,
             )
 
-            async with self.lora_update_lock:
-                self._validate_lora_upsert_supported(obj)
-                # With upsert, a same-name adapter keeps its lora_id so the
-                # backend refreshes it in place instead of failing the
-                # duplicate check; otherwise this resolves to a fresh ref.
-                # bump_version so the radix cache key (extended with
-                # lora_version) actually changes across the in-place
-                # refresh -- this route doesn't manage version itself, so
-                # without this every upsert of the same name would be keyed
-                # identically to the pre-upsert weights.
-                new_adapter, reused = await self.lora_registry.register_or_reuse(
-                    LoRARef(
-                        lora_name=obj.lora_name,
-                        lora_path="__distributed__",
-                        pinned=obj.pinned,
-                        reloadable=False,
-                    ),
-                    upsert=obj.upsert,
-                    bump_version=True,
-                )
+            self._validate_lora_upsert_supported(obj)
+            candidate = LoRARef(
+                lora_name=obj.lora_name,
+                lora_path="__distributed__",
+                pinned=obj.pinned,
+                reloadable=False,
+            )
+
+            async def update_and_publish(new_adapter, reused):
                 obj.lora_id = new_adapter.lora_id
                 result = (await self.update_lora_adapter_communicator(obj))[0]
-
                 if result.success:
                     if reused:
                         await self.lora_registry.refresh(new_adapter)
                     else:
                         await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
+                return result
+
+            # Once a refresh has been dispatched it cannot be recalled. Keep
+            # shielding it through repeated caller cancellations so admission
+            # resumes only after backend completion and registry publication.
+            async def finish_despite_cancellation(new_adapter):
+                task = asyncio.create_task(update_and_publish(new_adapter, reused=True))
+                caller_cancelled = False
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        if task.cancelled():
+                            raise
+                        caller_cancelled = True
+                result = task.result()
+                if caller_cancelled:
+                    raise asyncio.CancelledError
+                return result
+
+            while True:
+                # Preflight without the lifecycle lock. If the adapter exists,
+                # take locks in the same order as inference (model -> LoRA
+                # lifecycle), avoiding a cycle with implicit adapter reload.
+                needs_drain = obj.upsert and (
+                    await self.lora_registry.get_lora_id(obj.lora_name) is not None
+                )
+                if not needs_drain:
+                    async with self.lora_update_lock:
+                        self._ensure_no_pending_lora_load(obj.lora_name)
+                        new_adapter, reused = (
+                            await self.lora_registry.register_or_reuse(
+                                candidate,
+                                upsert=obj.upsert,
+                                bump_version=True,
+                            )
+                        )
+                        if not reused:
+                            # A fresh adapter is invisible until this finishes
+                            # and need not stop unrelated inference.
+                            result = await update_and_publish(new_adapter, reused=False)
+                            break
+                    # Another load published this name after preflight. Retry
+                    # outside the lifecycle lock through the draining path.
+                    continue
+
+                retry_as_fresh = False
+                async with self.is_pause_cond:
+                    if self.is_pause:
+                        raise ValueError(
+                            "Cannot upsert an existing LoRA adapter while "
+                            "generation is paused; continue generation before "
+                            "retrying."
+                        )
+                    async with self.model_update_lock.writer_lock:
+                        async with self.lora_update_lock:
+                            self._ensure_no_pending_lora_load(obj.lora_name)
+                            # Re-resolve after draining because a concurrent
+                            # unload may have removed the adapter. If so, retry
+                            # it as a fresh load without the global writer.
+                            new_adapter, reused = (
+                                await self.lora_registry.register_or_reuse(
+                                    candidate,
+                                    upsert=obj.upsert,
+                                    bump_version=True,
+                                )
+                            )
+                            if reused:
+                                result = await finish_despite_cancellation(new_adapter)
+                            else:
+                                retry_as_fresh = True
+                if retry_as_fresh:
+                    continue
+                break
+
+            async with self.lora_update_lock:
                 if self.server_args.max_loaded_loras is not None:
                     while (
                         self.lora_registry.num_registered_loras
@@ -1058,7 +1281,7 @@ class TokenizerControlMixin:
                             )
                         del result.loaded_adapters[lru_lora_name]
 
-                return result
+            return result
         except ValueError as e:
             return LoadLoRAAdapterFromDistributedReqOutput(
                 success=False,
@@ -1090,7 +1313,11 @@ class TokenizerControlMixin:
                 obj.lora_name,
             )
 
-            async with self.lora_update_lock:
+            from sglang.srt.adapter_sync.tokenizer_backend import (
+                finish_irreversible_update,
+            )
+
+            async def unload_and_finalize():
                 result = await self._unload_lora_adapter_locked(obj)
                 # Explicit unload is a DELETE: drop the reload-catalog entry too.
                 # The max_loaded_loras LRU loop calls _unload_lora_adapter_locked
@@ -1099,9 +1326,13 @@ class TokenizerControlMixin:
                 if result.success:
                     self.lora_ref_cache.pop(obj.lora_name, None)
                 return result
+
+            async with self.lora_update_lock:
+                # Keep unregister, lease drainage, worker cleanup, and catalog
+                # finalization serialized through repeated caller cancellation.
+                return await finish_irreversible_update(unload_and_finalize)
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
-
 
     async def get_weights_by_name(
         self: TokenizerManager,
@@ -1170,6 +1401,66 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
+
+    async def reset_cuda_memory_peak(
+        self: TokenizerManager, sample_id: str
+    ) -> ResetCudaMemoryPeakReqOutput:
+        return await self._cuda_memory_peak_control(sample_id, "reset")
+
+    async def read_cuda_memory_peak(
+        self: TokenizerManager, sample_id: str
+    ) -> ReadCudaMemoryPeakReqOutput:
+        return await self._cuda_memory_peak_control(sample_id, "read")
+
+    async def _cuda_memory_peak_control(self: TokenizerManager, sample_id, operation):
+        if not isinstance(sample_id, str) or not sample_id.strip():
+            raise ValueError("sample_id must be a nonempty string")
+        # The tokenizer parent has configuration but no live PP process group.
+        if self.server_args.dp_size != 1 or self.server_args.pp_size != 1:
+            raise ValueError("CUDA peak control supports only DP1/PP1")
+        request_type, output_type = (
+            (ResetCudaMemoryPeakReqInput, ResetCudaMemoryPeakReqOutput)
+            if operation == "reset"
+            else (ReadCudaMemoryPeakReqInput, ReadCudaMemoryPeakReqOutput)
+        )
+        self.auto_create_handle_loop()
+        responses = await getattr(self, f"{operation}_cuda_memory_peak_communicator")(
+            request_type(sample_id=sample_id)
+        )
+        if not isinstance(responses, list) or len(responses) != 1:
+            raise RuntimeError("expected exactly one CUDA peak TP consensus response")
+        result = responses[0]
+        if not isinstance(result, output_type):
+            raise RuntimeError("invalid CUDA peak consensus response type")
+        if result.success is not True:
+            raise RuntimeError(f"CUDA peak {operation} failed: {result.message}")
+        if result.sample_id != sample_id or result.operation != operation:
+            raise RuntimeError("CUDA peak consensus sample/operation mismatch")
+        if (
+            not isinstance(result.ranks, list)
+            or len(result.ranks) != self.server_args.tp_size
+        ):
+            raise RuntimeError("incomplete CUDA peak TP rank evidence")
+        for rank, row in enumerate(result.ranks):
+            if (
+                not isinstance(row, CudaMemoryPeakRankResult)
+                or type(row.rank) is not int
+                or row.rank != rank
+                or row.sample_id != sample_id
+                or row.operation != operation
+                or row.success is not True
+            ):
+                raise RuntimeError("invalid CUDA peak TP rank identity or outcome")
+            if operation == "read":
+                if (
+                    type(row.allocated_bytes) is not int
+                    or type(row.reserved_bytes) is not int
+                    or not 0 <= row.allocated_bytes <= row.reserved_bytes
+                ):
+                    raise RuntimeError("invalid CUDA peak TP metrics")
+            elif row.allocated_bytes is not None or row.reserved_bytes is not None:
+                raise RuntimeError("unexpected CUDA reset metrics")
+        return result
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
         self.auto_create_handle_loop()

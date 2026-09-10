@@ -519,10 +519,11 @@ def _fused_moe_kernel_sequence(
     topk = topk_ids.shape[1]
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
-    # LoRA hooks consume and update route-major intermediate buffers. The TMA
-    # down path keeps those buffers in expert-sorted, block-padded order, which
-    # is incompatible with the hook contract.
-    if hooks and (hooks.after_gate_up is not None or hooks.after_down is not None):
+    # LoRA hooks and OFT input rotations require route-major intermediates.
+    # The TMA down path keeps them in expert-sorted, block-padded order.
+    if (
+        hooks and (hooks.after_gate_up is not None or hooks.after_down is not None)
+    ) or invoke is not invoke_fused_moe_kernel:
         down_moe_use_tma = False
 
     if a1_q is not None:

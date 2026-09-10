@@ -25,9 +25,9 @@ from sglang.srt.true_on_policy import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
-_PATCH_TARGET = "sglang.srt.server_args.get_global_server_args"
+_PATCH_TARGET = "sglang.srt.runtime_context.get_server_args"
 
 
 def _run_server_args_script(argv: list[str]) -> dict[str, object]:
@@ -45,12 +45,14 @@ def _run_server_args_script(argv: list[str]) -> dict[str, object]:
         def install_openai_stubs():
             openai_mod = types.ModuleType("openai")
             openai_types_mod = types.ModuleType("openai.types")
+            openai_shared_mod = types.ModuleType("openai.types.shared")
             openai_responses_mod = types.ModuleType("openai.types.responses")
             openai_response_mod = types.ModuleType("openai.types.responses.response")
             openai_tool_mod = types.ModuleType("openai.types.responses.tool")
 
             openai_mod.__spec__ = importlib.machinery.ModuleSpec("openai", loader=None)
             openai_types_mod.__spec__ = importlib.machinery.ModuleSpec("openai.types", loader=None)
+            openai_shared_mod.__spec__ = importlib.machinery.ModuleSpec("openai.types.shared", loader=None)
             openai_responses_mod.__spec__ = importlib.machinery.ModuleSpec(
                 "openai.types.responses", loader=None
             )
@@ -68,14 +70,31 @@ def _run_server_args_script(argv: list[str]) -> dict[str, object]:
                 "ResponseOutputMessage",
                 "ResponseOutputText",
                 "ResponseReasoningItem",
+                "ResponseTextConfig",
             ]:
                 setattr(openai_responses_mod, name, type(name, (BaseModel,), {}))
 
             openai_response_mod.ToolChoice = type("ToolChoice", (BaseModel,), {})
             openai_tool_mod.Tool = type("Tool", (BaseModel,), {})
 
+            for module_name, class_name in [
+                (
+                    "openai.types.responses.response_format_text_json_schema_config",
+                    "ResponseFormatTextJSONSchemaConfig",
+                ),
+                (
+                    "openai.types.shared.response_format_json_object",
+                    "ResponseFormatJSONObject",
+                ),
+            ]:
+                module = types.ModuleType(module_name)
+                module.__spec__ = importlib.machinery.ModuleSpec(module_name, loader=None)
+                setattr(module, class_name, type(class_name, (BaseModel,), {}))
+                sys.modules.setdefault(module_name, module)
+
             sys.modules.setdefault("openai", openai_mod)
             sys.modules.setdefault("openai.types", openai_types_mod)
+            sys.modules.setdefault("openai.types.shared", openai_shared_mod)
             sys.modules.setdefault("openai.types.responses", openai_responses_mod)
             sys.modules.setdefault("openai.types.responses.response", openai_response_mod)
             sys.modules.setdefault("openai.types.responses.tool", openai_tool_mod)
@@ -114,7 +133,7 @@ def _run_server_args_script(argv: list[str]) -> dict[str, object]:
                     "enable_flashinfer_allreduce_fusion": server_args.enable_flashinfer_allreduce_fusion,
                     "rl_on_policy_target": server_args.rl_on_policy_target,
                     "true_on_policy_contract": server_args.true_on_policy_contract,
-                    "sampling_backend": server_args.sampling_backend,
+                    "sampling_backend": server_args._resolved().sampling_backend,
                 }
             )
         )
@@ -399,6 +418,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
         from sglang.srt.layers.communicator import (
             CommunicateWithAllReduceAndLayerNormFn,
         )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         hidden_states = torch.ones(2, 4)
         residual = torch.full((2, 4), 3.0)
@@ -429,7 +449,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
                 CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual(
                     hidden_states,
                     residual,
-                    forward_batch=None,
+                    forward_batch=SimpleNamespace(forward_mode=ForwardMode.DECODE),
                     layernorm=FakeNorm(),
                     context=SimpleNamespace(attn_dp_size=1, cache=None),
                     residual_input_mode=None,

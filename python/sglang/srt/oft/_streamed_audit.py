@@ -10,6 +10,7 @@ Debug-only: with the env var set, every recorded write does a CUDA->CPU sync
 (`.abs().max().item()` and friends) which adds non-trivial per-sync latency.
 Do not enable in production. Production runs without the env var pay nothing.
 """
+
 from __future__ import annotations
 
 import json
@@ -20,7 +21,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-
 
 _LOCK = threading.Lock()
 
@@ -41,6 +41,10 @@ def _distributed_rank() -> int:
 
 def _path_for_rank(base: str, tp_rank: int) -> Path:
     return Path(f"{base}.sglang_streamed.tp{tp_rank}.jsonl")
+
+
+def enabled() -> bool:
+    return _base() is not None
 
 
 def _tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
@@ -110,6 +114,8 @@ def record_expert_partition(
         layer_id=int(layer_id),
         expert_id=int(expert_id),
         proj=proj,
-        num_local_experts=(None if num_local_experts is None else int(num_local_experts)),
+        num_local_experts=(
+            None if num_local_experts is None else int(num_local_experts)
+        ),
         tensor=_tensor_summary(tensor),
     )

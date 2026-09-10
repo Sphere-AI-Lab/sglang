@@ -74,9 +74,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
-    LoadOFTAdapterFromDistributedReqInput,
-    LoadOFTAdapterFromTensorsReqInput,
-    LoadOFTAdapterReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
     ProfileReq,
@@ -87,7 +84,6 @@ from sglang.srt.managers.io_struct import (
     RpcReqInput,
     RpcReqOutput,
     UnloadLoRAAdapterReqInput,
-    UnloadOFTAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -389,7 +385,7 @@ class Engine(EngineScoreMixin, EngineBase):
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
-        oft_path: Optional[List[Optional[str]]] = None,
+        adapter_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         require_reasoning: bool = False,
         return_hidden_states: Union[
@@ -412,6 +408,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        scoring_suffix_ids: Optional[Union[List[List[int]], List[int]]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -436,7 +433,7 @@ class Engine(EngineScoreMixin, EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
-            oft_path=oft_path,
+            adapter_path=adapter_path,
             custom_logit_processor=custom_logit_processor,
             require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
@@ -453,6 +450,7 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             session_params=session_params,
             priority=priority,
+            scoring_suffix_ids=scoring_suffix_ids,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -504,7 +502,7 @@ class Engine(EngineScoreMixin, EngineBase):
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
-        oft_path: Optional[List[Optional[str]]] = None,
+        adapter_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         require_reasoning: bool = False,
         return_hidden_states: Union[
@@ -527,6 +525,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        scoring_suffix_ids: Optional[Union[List[List[int]], List[int]]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -551,7 +550,7 @@ class Engine(EngineScoreMixin, EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
-            oft_path=oft_path,
+            adapter_path=adapter_path,
             require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
@@ -568,6 +567,7 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             session_params=session_params,
             priority=priority,
+            scoring_suffix_ids=scoring_suffix_ids,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -584,6 +584,7 @@ class Engine(EngineScoreMixin, EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+        adapter_path: Optional[Union[List[Optional[str]], str]] = None,
         embed_override_token_id: Optional[int] = None,
         embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
@@ -600,6 +601,7 @@ class Engine(EngineScoreMixin, EngineBase):
             video_data=video_data,
             dimensions=dimensions,
             lora_path=lora_path,
+            adapter_path=adapter_path,
             embed_override_token_id=embed_override_token_id,
             embed_overrides=embed_overrides,
             external_trace_header=external_trace_header,
@@ -617,6 +619,7 @@ class Engine(EngineScoreMixin, EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+        adapter_path: Optional[Union[List[Optional[str]], str]] = None,
         embed_override_token_id: Optional[int] = None,
         embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
@@ -635,6 +638,7 @@ class Engine(EngineScoreMixin, EngineBase):
             video_data=video_data,
             dimensions=dimensions,
             lora_path=lora_path,
+            adapter_path=adapter_path,
             embed_override_token_id=embed_override_token_id,
             embed_overrides=embed_overrides,
             external_trace_header=external_trace_header,
@@ -1539,7 +1543,7 @@ class Engine(EngineScoreMixin, EngineBase):
             )
         else:
             return [
-                MultiprocessingSerializer.serialize(tensors)
+                MultiprocessingSerializer.serialize(tensors, cpu_tensors_as_bytes=True)
                 for _ in range(self.server_args.tp_size)
             ]
 
@@ -1591,6 +1595,60 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.load_lora_adapter_from_distributed(lora_req, None)
         )
 
+    def load_oft_adapter_from_tensors(
+        self,
+        adapter_name: str,
+        tensors: Union[Dict[str, torch.Tensor], List[SerializedTensorPayload]],
+        config_dict: Dict,
+        load_format: Optional[str] = None,
+        pinned: bool = False,
+        upsert: bool = False,
+    ):
+        from sglang.srt.oft.io_types import LoadOFTAdapterFromTensorsReqInput
+
+        serialized_named_tensors = self._serialize_tensors_per_rank(
+            tensors, load_format
+        )
+        request = LoadOFTAdapterFromTensorsReqInput(
+            adapter_name=adapter_name,
+            config_dict=config_dict,
+            serialized_named_tensors=serialized_named_tensors,
+            load_format=load_format,
+            pinned=pinned,
+            upsert=upsert,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_oft_adapter_from_tensors(request, None)
+        )
+
+    def load_oft_adapter_from_distributed(
+        self,
+        adapter_name: str,
+        config_dict: Dict,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "weight_update_group",
+        pinned: bool = False,
+        upsert: bool = False,
+    ):
+        """Load an OFT adapter broadcast over an initialized process group."""
+        from sglang.srt.oft.io_types import LoadOFTAdapterFromDistributedReqInput
+
+        request = LoadOFTAdapterFromDistributedReqInput(
+            adapter_name=adapter_name,
+            config_dict=config_dict,
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            pinned=pinned,
+            upsert=upsert,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_oft_adapter_from_distributed(request, None)
+        )
+
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
         """Load a new LoRA adapter without re-launching the engine."""
 
@@ -1612,6 +1670,53 @@ class Engine(EngineScoreMixin, EngineBase):
         return self.loop.run_until_complete(
             self.tokenizer_manager.unload_lora_adapter(obj, None)
         )
+
+    def load_oft_adapter(
+        self, adapter_name: str, adapter_path: str, pinned: bool = False
+    ):
+        """Load an OFT adapter without re-launching the engine.
+
+        Mirrors load_lora_adapter(). OFT previously had no public adapter
+        lifecycle API -- adapters could only be supplied at startup via
+        --peft-paths -- so this restores parity with LoRA.
+        """
+        from sglang.srt.oft.io_types import LoadOFTAdapterReqInput
+
+        obj = LoadOFTAdapterReqInput(
+            adapter_name=adapter_name, adapter_path=adapter_path, pinned=pinned
+        )
+
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_oft_adapter(obj, None)
+        )
+
+    def unload_oft_adapter(self, adapter_name: str):
+        """Unload an OFT adapter without re-launching the engine.
+
+        Mirrors unload_lora_adapter(). The OFT-specific semantics (resetting the
+        rotation slot to identity, clearing streamed MoE expert bindings) are
+        preserved in the provider -- only the transport mirrors LoRA.
+        """
+        from sglang.srt.oft.io_types import UnloadOFTAdapterReqInput
+
+        obj = UnloadOFTAdapterReqInput(adapter_name=adapter_name)
+
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.unload_oft_adapter(obj, None)
+        )
+
+    async def async_load_oft_adapter(
+        self, adapter_name: str, adapter_path: str, pinned: bool = False
+    ):
+        """Asynchronous version of load_oft_adapter."""
+        from sglang.srt.oft.io_types import LoadOFTAdapterReqInput
+
+        obj = LoadOFTAdapterReqInput(
+            adapter_name=adapter_name,
+            adapter_path=adapter_path,
+            pinned=pinned,
+        )
+        return await self.tokenizer_manager.load_oft_adapter(obj, None)
 
     async def async_load_lora_adapter(
         self, lora_name: str, lora_path: str, pinned: bool = False
@@ -1640,95 +1745,6 @@ class Engine(EngineScoreMixin, EngineBase):
         obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
 
         return await self.tokenizer_manager.unload_lora_adapter(obj, None)
-
-    def load_oft_adapter(self, oft_name: str, oft_path: str, pinned: bool = False):
-        """Load a new OFT adapter without re-launching the engine."""
-
-        obj = LoadOFTAdapterReqInput(
-            oft_name=oft_name,
-            oft_path=oft_path,
-            pinned=pinned,
-        )
-
-        return self.loop.run_until_complete(
-            self.tokenizer_manager.load_oft_adapter(obj, None)
-        )
-
-    async def async_load_oft_adapter(
-        self, oft_name: str, oft_path: str, pinned: bool = False
-    ):
-        """
-        Asynchronous version of load_oft_adapter.
-
-        See load_oft_adapter() for detailed documentation.
-        """
-
-        obj = LoadOFTAdapterReqInput(
-            oft_name=oft_name,
-            oft_path=oft_path,
-            pinned=pinned,
-        )
-
-        return await self.tokenizer_manager.load_oft_adapter(obj, None)
-
-    def load_oft_adapter_from_tensors(
-        self,
-        oft_name: str,
-        tensors: Union[Dict[str, torch.Tensor], List[SerializedTensorPayload]],
-        config_dict: Dict,
-        load_format: Optional[str] = None,
-        pinned: bool = False,
-        upsert: bool = False,
-    ):
-        serialized_named_tensors = self._serialize_tensors_per_rank(
-            tensors, load_format
-        )
-        req = LoadOFTAdapterFromTensorsReqInput(
-            oft_name=oft_name,
-            config_dict=config_dict,
-            serialized_named_tensors=serialized_named_tensors,
-            load_format=load_format,
-            pinned=pinned,
-            upsert=upsert,
-        )
-        return self.loop.run_until_complete(
-            self.tokenizer_manager.load_oft_adapter_from_tensors(req, None)
-        )
-
-    def load_oft_adapter_from_distributed(
-        self,
-        oft_name: str,
-        config_dict: Dict,
-        names: list[str],
-        dtypes: list[str],
-        shapes: list[list[int]],
-        group_name: str = "weight_update_group",
-        pinned: bool = False,
-        upsert: bool = False,
-    ):
-        """Load a new OFT adapter whose weights are broadcast over a
-        process group. The weight-update group must already be initialized
-        via `init_weights_update_group`."""
-        req = LoadOFTAdapterFromDistributedReqInput(
-            oft_name=oft_name,
-            config_dict=config_dict,
-            names=names,
-            dtypes=dtypes,
-            shapes=shapes,
-            group_name=group_name,
-            pinned=pinned,
-            upsert=upsert,
-        )
-        return self.loop.run_until_complete(
-            self.tokenizer_manager.load_oft_adapter_from_distributed(req, None)
-        )
-
-    def unload_oft_adapter(self, oft_name: str):
-        """Unload an OFT adapter without re-launching the engine."""
-        obj = UnloadOFTAdapterReqInput(oft_name=oft_name)
-        return self.loop.run_until_complete(
-            self.tokenizer_manager.unload_oft_adapter(obj, None)
-        )
 
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)

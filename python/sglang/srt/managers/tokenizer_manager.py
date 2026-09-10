@@ -89,7 +89,11 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    TensorTransportMode,
+    extend_mrope_positions_for_retracted_request,
+    wrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -121,7 +125,7 @@ from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
-from sglang.srt.oft.tokenizer_mixin import OFTTokenizerMixin
+from sglang.srt.oft import tokenizer_hooks as oft_tokenizer_hooks
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -232,6 +236,7 @@ class ReqState:
     # scheduler never saw the rid, so the dispatch path must resolve the
     # request as aborted instead of sending it.
     abort_before_dispatch: bool = False
+    dispatched: bool = False
 
     # The LoRA lease for this request has already been released. Every terminal
     # path funnels through TokenizerManager._finalize_lora_lease, which uses
@@ -240,8 +245,9 @@ class ReqState:
     # negative, which hangs it just the same (it waits for exactly zero).
     lora_lease_released: bool = False
 
-    # Same idempotency guard as lora_lease_released, for the OFT adapter
-    # lease released via OFTTokenizerMixin.finalize_oft_lease.
+    # Canonical OFT uses the same request-lifetime lease contract as LoRA.
+    # Keep a separate guard because either PEFT implementation may be active,
+    # and every terminal path can be observed more than once.
     oft_lease_released: bool = False
 
     # For streaming output
@@ -402,7 +408,138 @@ class InputFormat(Enum):
 _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
 
-class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManagerScoreMixin):
+def _append_scoring_suffix(
+    obj: Union[GenerateReqInput, EmbeddingReqInput],
+    input_ids: List[int],
+    mm_inputs: Any,
+    token_type_ids: Optional[List[int]],
+) -> List[int]:
+    """Append exact IDs after preprocessing for an opt-in prefill-scoring request."""
+    if not isinstance(obj, GenerateReqInput) or obj.scoring_suffix_ids is None:
+        return input_ids
+
+    suffix_ids = obj.scoring_suffix_ids
+    if not suffix_ids:
+        raise ValueError("scoring_suffix_ids must not be empty.")
+    if obj.input_embeds is not None:
+        raise ValueError("scoring_suffix_ids does not support input_embeds.")
+    if obj.return_logprob is not True:
+        raise ValueError("scoring_suffix_ids requires return_logprob=True.")
+    if obj.multi_item_delimiter_indices is not None:
+        raise ValueError(
+            "scoring_suffix_ids does not support multi_item_delimiter_indices; "
+            "multi-item scoring uses a different logprob boundary."
+        )
+    if (obj.sampling_params or {}).get("max_new_tokens") != 0:
+        raise ValueError(
+            "scoring_suffix_ids requires sampling_params.max_new_tokens=0."
+        )
+    if obj.logprob_start_len != -1:
+        raise ValueError(
+            "logprob_start_len must be omitted when scoring_suffix_ids is provided; "
+            "SGLang derives it from the processed prefix."
+        )
+    if token_type_ids is not None:
+        raise ValueError("scoring_suffix_ids does not support token_type_ids.")
+    if obj.contains_mm_input() and mm_inputs is None:
+        raise ValueError(
+            "Multimodal scoring_suffix_ids requires tokenizer-side multimodal "
+            "processing before the suffix can be appended."
+        )
+
+    prefix_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+    if not prefix_ids:
+        raise ValueError("scoring_suffix_ids requires a non-empty processed prefix.")
+
+    if mm_inputs is not None:
+        multimodal_token_fields = (
+            "im_token_id",
+            "im_start_id",
+            "im_end_id",
+            "slice_start_id",
+            "slice_end_id",
+            "video_token_id",
+            "audio_token_id",
+            "audio_start_id",
+            "audio_end_id",
+        )
+        multimodal_token_ids = {
+            int(token_id)
+            for field in multimodal_token_fields
+            if (token_id := getattr(mm_inputs, field, None)) is not None
+        }
+        invalid_suffix_ids = sorted(set(suffix_ids) & multimodal_token_ids)
+        if invalid_suffix_ids:
+            raise ValueError(
+                "scoring_suffix_ids must contain pure-text actions; found "
+                f"multimodal special token IDs {invalid_suffix_ids}. Images or other "
+                "media introduced inside the suffix require a separate processor pass."
+            )
+
+    combined_ids = prefix_ids + list(suffix_ids)
+
+    if mm_inputs is not None:
+        mm_inputs.input_ids = combined_ids
+
+        padded_input_ids = mm_inputs.padded_input_ids
+        if padded_input_ids is not None:
+            if len(padded_input_ids) != len(prefix_ids):
+                raise ValueError(
+                    "Multimodal padded_input_ids length does not match the processed "
+                    f"prefix: {len(padded_input_ids)} != {len(prefix_ids)}."
+                )
+            mm_inputs.padded_input_ids = list(padded_input_ids) + list(suffix_ids)
+
+        mrope_positions = mm_inputs.mrope_positions
+        if mrope_positions is not None:
+            if mrope_positions.shape[-1] != len(prefix_ids):
+                raise ValueError(
+                    "Multimodal mrope_positions length does not match the processed "
+                    f"prefix: {mrope_positions.shape[-1]} != {len(prefix_ids)}."
+                )
+            terminal_positions = mrope_positions[:, -1]
+            if terminal_positions.numel() == 0 or not torch.equal(
+                terminal_positions,
+                terminal_positions[0].expand_as(terminal_positions),
+            ):
+                raise ValueError(
+                    "scoring_suffix_ids requires the processed multimodal prefix to "
+                    "end in a text position with equal terminal mRoPE coordinates; "
+                    f"got {terminal_positions.tolist()}."
+                )
+            # Pure-text suffix positions extend linearly. Their length raises
+            # both max(position)+1 and sequence length equally, so the existing
+            # mrope_position_delta remains valid.
+            mm_inputs.mrope_positions = extend_mrope_positions_for_retracted_request(
+                mrope_positions, len(suffix_ids)
+            )
+
+        visible_frame_counts = getattr(mm_inputs, "visible_frame_counts", None)
+        if visible_frame_counts is not None:
+            if visible_frame_counts.ndim != 1 or len(visible_frame_counts) != len(
+                prefix_ids
+            ):
+                raise ValueError(
+                    "Multimodal visible_frame_counts length does not match the "
+                    f"processed prefix: {visible_frame_counts.shape} vs "
+                    f"{len(prefix_ids)} tokens."
+                )
+            mm_inputs.visible_frame_counts = torch.cat(
+                [
+                    visible_frame_counts,
+                    visible_frame_counts[-1:].expand(len(suffix_ids)),
+                ]
+            )
+
+    return combined_ids
+
+
+from sglang.srt.oft.tokenizer_mixin import OFTTokenizerMixin
+
+
+class TokenizerManager(
+    TokenizerControlMixin, TokenizerManagerScoreMixin, OFTTokenizerMixin
+):
     """TokenizerManager is a process that tokenizes the text."""
 
     @property
@@ -435,7 +572,6 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
         self.enable_metrics = server_args.enable_metrics
         self.incremental_streaming_output = server_args.incremental_streaming_output
         self.enable_lora = get_lora().enable_lora
-        self.enable_oft = get_lora().enable_oft
         self.enable_trace = server_args.enable_trace
         self.allow_auto_truncate = server_args.allow_auto_truncate
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -464,7 +600,7 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
         # Init LoRA status
         self.init_lora()
 
-        # Init single-active OFT registry
+        # Init canonical OFT registry state independently from native LoRA.
         self.init_oft()
 
         # Init PD disaggregation and encoder disaggregation
@@ -669,6 +805,10 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
         self.lora_registry = LoRARegistry(get_lora().lora_paths)
         self.pending_lora_stage: Optional[LoRARef] = None
         self.failed_lora_activations: Dict[str, str] = {}
+        # Failed unloads leave worker state potentially split across ranks.
+        # Keep the original identity so inference stays blocked while a later
+        # explicit unload can retry cleanup with the same ID.
+        self.failed_lora_unloads: Dict[str, LoRARef] = {}
         # Lock to serialize LoRA update operations.
         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
         # LoRA updates and inference to overlap.
@@ -682,9 +822,7 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
     def init_oft(self):
-        # Single-active OFT registry bootstrap. Body lives in OFTTokenizerMixin
-        # (oft/tokenizer_mixin.py) to keep this file thin.
-        self.init_tokenizer_oft()
+        oft_tokenizer_hooks.init_tokenizer_oft(self)
 
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
@@ -824,6 +962,8 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                 )
 
         self._init_req_state(obj, request)
+        # Parallel sampling creates additional scheduler-owned request IDs.
+        child_rids = []
         try:
             if self.server_args.language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -835,40 +975,52 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
             async with self.model_update_lock.reader_lock:
-                # Single-active OFT (enable_lora XOR enable_oft) resolves the
-                # named adapter through the OFT path; its request never goes
-                # through upstream _validate_and_resolve_lora (which requires
-                # enable_lora). Upstream multi-tenant LoRA keeps the old path.
-                if self.enable_oft:
-                    # Mirrors _resolve_lora_path's Union[GenerateReqInput,
-                    # EmbeddingReqInput] coverage -- obj is always one of these
-                    # two types at this call site.
-                    if isinstance(obj, (GenerateReqInput, EmbeddingReqInput)):
-                        await self.maybe_resolve_oft_path(obj)
-                else:
-                    await self._validate_and_resolve_lora(obj)
+                try:
+                    if self.server_args.peft_method == "oft" and isinstance(
+                        obj, (GenerateReqInput, EmbeddingReqInput)
+                    ):
+                        await oft_tokenizer_hooks.maybe_resolve_oft_path(self, obj)
+                    else:
+                        await self._validate_and_resolve_lora(obj)
 
-                # Tokenize the request and send it to the scheduler
-                if obj.is_single:
-                    tokenized_obj = await self._tokenize_one_request(obj)
-                    state = self.rid_to_state[obj.rid]
-                    if obj.return_prompt_token_ids:
-                        state.prompt_token_ids = list(tokenized_obj.input_ids)
-                    self._send_one_request(tokenized_obj)
-                    async for response in self._wait_one_response(obj, request):
-                        yield response
-                else:
-                    async for response in self._handle_batch_request(obj, request):
-                        yield response
+                    # Tokenize the request and send it to the scheduler
+                    if obj.is_single:
+                        tokenized_obj = await self._tokenize_one_request(obj)
+                        state = self.rid_to_state[obj.rid]
+                        if obj.return_prompt_token_ids:
+                            state.prompt_token_ids = list(tokenized_obj.input_ids)
+                        self._send_one_request(tokenized_obj)
+                        async for response in self._wait_one_response(obj, request):
+                            yield response
+                    else:
+                        async for response in self._handle_batch_request(
+                            obj, request, child_rids
+                        ):
+                            yield response
+                except BaseException:
+                    from sglang.srt.adapter_sync.tokenizer_backend import (
+                        finish_irreversible_update,
+                    )
+
+                    # Completed sync Engine calls can close their generator
+                    # outside a running loop. Only live scheduler work needs
+                    # asynchronous draining before releasing the reader lock.
+                    rids = ([obj.rid] if obj.is_single else obj.rid) + child_rids
+                    if any(
+                        state.dispatched and not state.finished
+                        for rid in rids
+                        if (state := self.rid_to_state.get(rid)) is not None
+                    ):
+                        await finish_irreversible_update(
+                            lambda: self._abort_and_drain_pending_req_states(
+                                obj, child_rids
+                            )
+                        )
+                    raise
         except BaseException:
-            # _init_req_state created a rid_to_state entry per (sub-)request up
-            # front. The normal remover is the scheduler-response path
-            # (_handle_batch_output), so a failure *before* a request reaches the
-            # scheduler -- e.g. input-length validation rejecting an over-context
-            # request -- would otherwise leak those entries forever. Drop any that
-            # are still pending; entries already removed on the normal completion
-            # path are left untouched (pop is a no-op).
-            self._discard_pending_req_states(obj)
+            # Failures before acquiring the reader lock have no scheduler
+            # owner; dispatched requests are retired by their terminal response.
+            self._discard_pending_req_states(obj, child_rids)
             raise
 
     def _detect_input_format(
@@ -1198,6 +1350,7 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
         else:
             mm_inputs = None
 
+        input_ids = _append_scoring_suffix(obj, input_ids, mm_inputs, token_type_ids)
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
@@ -1245,7 +1398,10 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
 
         # Validate input length
         if input_token_num >= self.context_len:
-            if self.allow_auto_truncate:
+            has_exact_scoring_suffix = (
+                isinstance(obj, GenerateReqInput) and obj.scoring_suffix_ids is not None
+            )
+            if self.allow_auto_truncate and not has_exact_scoring_suffix:
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens). "
@@ -1254,9 +1410,15 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                 del input_ids[_max_req_len:]
                 input_token_num = len(input_ids)
             else:
+                exact_suffix_note = (
+                    " Exact scoring suffix requests cannot be auto-truncated."
+                    if has_exact_scoring_suffix
+                    else ""
+                )
                 raise ValueError(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens)."
+                    f"{exact_suffix_note}"
                 )
 
         # Validate total tokens (input + max_new_tokens)
@@ -1463,6 +1625,11 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                 return_sampling_mask=obj.return_sampling_mask,
                 return_flat_raw_top_logprobs=obj.return_flat_raw_top_logprobs,
                 stream=obj.stream,
+                scoring_suffix_len=(
+                    len(obj.scoring_suffix_ids)
+                    if obj.scoring_suffix_ids is not None
+                    else None
+                ),
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
                 bootstrap_host=obj.bootstrap_host,
@@ -1470,8 +1637,8 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                 bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
                 lora_version=obj.lora_version,
-                oft_id=obj.oft_id,
-                oft_version=obj.oft_version,
+                adapter_id=obj.adapter_id,
+                adapter_version=getattr(obj, "adapter_version", None),
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
@@ -1519,8 +1686,8 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                 dimensions=obj.dimensions,
                 lora_id=obj.lora_id,
                 lora_version=obj.lora_version,
-                oft_id=obj.oft_id,
-                oft_version=obj.oft_version,
+                adapter_id=obj.adapter_id,
+                adapter_version=obj.adapter_version,
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
@@ -1583,13 +1750,16 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
-            self._validate_one_request(obj[i], input_ids_list[i])
             token_type_ids = (
                 token_type_ids_list[i] if token_type_ids_list is not None else None
             )
+            input_ids = _append_scoring_suffix(
+                req, input_ids_list[i], None, token_type_ids
+            )
+            self._validate_one_request(req, input_ids)
             tokenized_objs.append(
                 self._create_tokenized_object(
-                    req, req.text, input_ids_list[i], None, None, token_type_ids
+                    req, req.text, input_ids, None, None, token_type_ids
                 )
             )
         logger.debug(f"Completed batch processing for {batch_size} requests")
@@ -1725,6 +1895,9 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
             self._dispatch_to_scheduler(batch_req)
             dispatched = True
             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
+                state = self.rid_to_state.get(tokenized_obj.rid)
+                if state is not None:
+                    state.dispatched = True
                 tokenized_obj.time_stats = time_stat
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
         finally:
@@ -1787,6 +1960,11 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
         state.lora_lease_released = True
         asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
+    def _finalize_oft_lease(self, state: Optional[ReqState]) -> None:
+        from sglang.srt.oft import tokenizer_hooks
+
+        tokenizer_hooks.finalize_oft_lease(self, state)
+
     async def _handle_abort_finish_reason(
         self,
         out: dict,
@@ -1823,7 +2001,7 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
             # already released the lease and deleted the state — the finalizer's
             # idempotency is what prevents the counter from going negative here.
             self._finalize_lora_lease(state)
-            self.finalize_oft_lease(state)
+            self._finalize_oft_lease(state)
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -1945,7 +2123,10 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        child_rids: Optional[List[str]] = None,
     ):
+        if child_rids is None:
+            child_rids = []
         batch_size = obj.batch_size
 
         generators = []
@@ -2007,6 +2188,7 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                         copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                     ]
                 tokenized_obj.rid = tmp_obj.regenerate_rid()
+                child_rids.append(tmp_obj.rid)
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
@@ -2026,6 +2208,7 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    child_rids.append(tmp_obj.rid)
                     self._init_req_state(tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats
@@ -2610,7 +2793,7 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
 
                 # Mark ongoing LoRA request as finished.
                 self._finalize_lora_lease(state)
-                self.finalize_oft_lease(state)
+                self._finalize_oft_lease(state)
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -3352,7 +3535,7 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
         # tokenizer-held, and disagg-retracted requests — none of them reach
         # _handle_batch_output, so this is their only lease-release point.
         self._finalize_lora_lease(self.rid_to_state.get(recv_obj.rid))
-        self.finalize_oft_lease(self.rid_to_state.get(recv_obj.rid))
+        self._finalize_oft_lease(self.rid_to_state.get(recv_obj.rid))
         del self.rid_to_state[recv_obj.rid]
 
         state.out_list.append(out)
@@ -3509,16 +3692,14 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                     f"Failed to implicitly load LoRA adapter {lora_path}: {load_result.error_message}"
                 )
 
-        # Snapshot the active ID/version and start tracking ongoing requests in
-        # one registry admission step.
-        obj.lora_id, obj.lora_version = (
-            await self.lora_registry.acquire_with_version(obj.lora_path)
+        # Snapshot ID/version and acquire the request lease atomically.
+        obj.lora_id, obj.lora_version = await self.lora_registry.acquire_with_version(
+            obj.lora_path
         )
         # Propagate the snapshot to sub-objects already cached by __getitem__.
         for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
-            is_batch = isinstance(obj.lora_id, list)
             sub_obj.lora_id = (
-                obj.lora_id[i] if is_batch else obj.lora_id
+                obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
             )
             sub_obj.lora_version = (
                 obj.lora_version[i]
@@ -3571,23 +3752,31 @@ class TokenizerManager(OFTTokenizerMixin, TokenizerControlMixin, TokenizerManage
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
-    def _discard_pending_req_states(self, obj):
-        """Drop rid_to_state entries created by _init_req_state for *obj*.
+    async def _abort_and_drain_pending_req_states(self, obj, child_rids=()):
+        """Retain dispatched request ownership until the scheduler finishes it."""
+        rids = ([obj.rid] if obj.is_single else obj.rid) + list(child_rids)
+        dispatched = [
+            (rid, state)
+            for rid in rids
+            if (state := self.rid_to_state.get(rid)) is not None and state.dispatched
+        ]
+        self._discard_pending_req_states(obj, child_rids)
+        for rid, _ in dispatched:
+            self.abort_request(rid)
+        for _, state in dispatched:
+            while not state.finished:
+                state.event.clear()
+                await state.event.wait()
 
-        Safe to call after a partial/failed dispatch: only entries still present
-        are removed, and the scheduler-response path looks up state with
-        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
-        """
-        if not hasattr(obj, "is_single") or obj.is_single:
-            rids = [obj.rid]
-        else:
-            rids = obj.rid
+    def _discard_pending_req_states(self, obj, child_rids=()):
+        """Release only requests that never reached the scheduler."""
+        rids = ([obj.rid] if obj.is_single else obj.rid) + list(child_rids)
         for rid in rids:
-            # A failed/partial dispatch may never produce a scheduler terminal for
-            # this rid, and once the state is dropped a late terminal has no release
-            # point either — so release the LoRA lease here.
-            self._finalize_lora_lease(self.rid_to_state.get(rid))
-            self.finalize_oft_lease(self.rid_to_state.get(rid))
+            state = self.rid_to_state.get(rid)
+            if state is None or state.dispatched:
+                continue
+            self._finalize_lora_lease(state)
+            self._finalize_oft_lease(state)
             self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(

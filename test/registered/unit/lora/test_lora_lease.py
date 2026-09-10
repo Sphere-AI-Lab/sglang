@@ -28,8 +28,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
-from sglang.srt.managers.io_struct import UnloadLoRAAdapterReqInput
+from sglang.srt.managers.io_struct import LoRAUpdateOutput, UnloadLoRAAdapterReqInput
 from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -191,12 +192,19 @@ class TestLruIgnoresReloadable(CustomTestCase):
 
 
 class TestUnloadRefCacheCleanup(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        parallel_config = get_context().override_server_args(
+            dp_size=1, enable_dp_attention=False
+        )
+        parallel_config.install()
+        self.addCleanup(parallel_config.restore)
+
     def _make_unload_tm(self, success: bool) -> TokenizerManager:
         tm = TokenizerManager.__new__(TokenizerManager)
         tm.auto_create_handle_loop = Mock()
         tm.server_args = MagicMock()
         tm.server_args.enable_lora = True
-        tm.server_args.dp_size = 1
         tm.lora_update_lock = asyncio.Lock()
         tm._unload_lora_adapter_locked = AsyncMock(
             return_value=SimpleNamespace(success=success)
@@ -220,6 +228,7 @@ class TestUnloadRefCacheCleanup(CustomTestCase):
         # reload-catalog entry or it can never be implicitly reloaded.
         tm = TokenizerManager.__new__(TokenizerManager)
         tm.lora_update_lock = asyncio.Lock()
+        tm.pending_lora_stage = None
         tm.lora_registry = MagicMock()
         tm.lora_registry.unregister = AsyncMock(return_value="id-a")
         tm.lora_registry.wait_for_unload = AsyncMock()
@@ -237,6 +246,65 @@ class TestUnloadRefCacheCleanup(CustomTestCase):
         result = asyncio.run(run())
         self.assertTrue(result.success)
         self.assertIn("a", tm.lora_ref_cache)
+
+    def test_failed_unload_is_quarantined_and_retryable_with_same_id(self):
+        async def scenario():
+            tm = TokenizerManager.__new__(TokenizerManager)
+            tm.auto_create_handle_loop = Mock()
+            tm.server_args = MagicMock(enable_lora=True)
+            tm.lora_update_lock = asyncio.Lock()
+            tm.pending_lora_stage = None
+            tm.failed_lora_activations = {}
+            tm.failed_lora_unloads = {}
+            tm.lora_registry = LoRARegistry()
+            ref = LoRARef(
+                lora_id="id-a",
+                lora_name="a",
+                lora_path="__distributed__",
+                reloadable=False,
+            )
+            await tm.lora_registry.register(ref)
+            tm.lora_ref_cache = {"a": ref}
+            responses = iter(
+                [
+                    [
+                        LoRAUpdateOutput(success=True),
+                        LoRAUpdateOutput(success=False, error_message="rank 1 failed"),
+                    ],
+                    [LoRAUpdateOutput(success=True), LoRAUpdateOutput(success=True)],
+                ]
+            )
+            dispatched_ids = []
+
+            async def communicate(obj):
+                dispatched_ids.append(obj.lora_id)
+                return next(responses)
+
+            tm.update_lora_adapter_communicator = communicate
+
+            first = await tm.unload_lora_adapter(
+                UnloadLoRAAdapterReqInput(lora_name="a")
+            )
+
+            self.assertFalse(first.success)
+            self.assertNotIn("a", tm.lora_registry.get_all_adapters())
+            self.assertIs(tm.failed_lora_unloads["a"], ref)
+            self.assertIn("a", tm.lora_ref_cache)
+            with self.assertRaisesRegex(ValueError, "failed unload"):
+                tm._assert_native_lora_available("a")
+            with self.assertRaisesRegex(ValueError, "failed unload"):
+                tm._ensure_no_pending_lora_load("a")
+
+            retry = await tm.unload_lora_adapter(
+                UnloadLoRAAdapterReqInput(lora_name="a")
+            )
+
+            self.assertTrue(retry.success, retry.error_message)
+            self.assertEqual(dispatched_ids, ["id-a", "id-a"])
+            self.assertNotIn("a", tm.failed_lora_unloads)
+            self.assertNotIn("a", tm.lora_ref_cache)
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ def _manager(tp_worker, draft_worker):
         memory_saver_adapter=Mock(),
         flush_cache=Mock(return_value=True),
         is_fully_idle=Mock(return_value=True),
+        scheduler=Mock(),
     )
     # update_weights_from_* assert an open begin_weight_update session.
     manager._weight_update_in_progress = True
@@ -223,3 +224,7 @@ def test_begin_weight_update_rejects_reentry():
     with patch("torch.distributed.barrier"):
         with pytest.raises(AssertionError, match="already open"):
             manager.begin_weight_update(BeginWeightUpdateReqInput())
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -46,6 +46,7 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_serving,
     get_spec,
+    is_ep_scale_joiner,
 )
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
@@ -130,9 +131,11 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    CudaMemoryPeakRankResult,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DiscardAdapterStageReqInput,
     DumperControlReqInput,
     DumperControlReqOutput,
     EndWeightUpdateReqInput,
@@ -157,19 +160,17 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
-    LoadOFTAdapterFromDistributedReqInput,
-    LoadOFTAdapterFromDistributedReqOutput,
-    LoadOFTAdapterFromTensorsReqInput,
-    LoadOFTAdapterFromTensorsReqOutput,
-    LoadOFTAdapterReqInput,
-    LoadOFTAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
     PullWeightsReqInput,
+    ReadCudaMemoryPeakReqInput,
+    ReadCudaMemoryPeakReqOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
+    ResetCudaMemoryPeakReqInput,
+    ResetCudaMemoryPeakReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -186,8 +187,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
-    UnloadOFTAdapterReqInput,
-    UnloadOFTAdapterReqOutput,
     UpdateAdapterFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -276,6 +275,10 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_components.tp_update_consensus import (
+    run_tp_adapter_unload,
+    run_tp_oft_load,
+)
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -304,6 +307,8 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.oft import integration as oft
+from sglang.srt.oft.io_types import OFTUpdateOutput
 from sglang.srt.oft.oft_drainer import OFTDrainer
 from sglang.srt.oft.oft_overlap_loader import OFTOverlapLoader
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -404,6 +409,60 @@ def _accumulate_decode_moment(
 _is_npu = is_npu()
 _is_hip = is_hip()
 
+_EXACT_SCORING_SUFFIX_STREAMING_SESSION_ERROR = (
+    "Exact scoring suffix is not supported for streaming sessions because "
+    "they do not preserve custom prompt-logprob boundaries."
+)
+
+
+def _resolve_exact_scoring_suffix_boundary(
+    req: Req, recv_req: TokenizedGenerateReqInput
+) -> Tuple[Optional[int], Optional[str]]:
+    """Validate an exact suffix against the final scheduler token sequence."""
+    suffix_len = recv_req.scoring_suffix_len
+    if suffix_len is None:
+        return None, None
+    if suffix_len <= 0:
+        return None, "scoring_suffix_len must be positive."
+    if recv_req.input_ids is None or suffix_len > len(recv_req.input_ids):
+        return None, (
+            "scoring_suffix_len exceeds the tokenizer-side input length: "
+            f"{suffix_len=} vs {len(recv_req.input_ids) if recv_req.input_ids else 0}."
+        )
+    if suffix_len >= len(req.origin_input_ids):
+        return None, (
+            "Exact scoring suffix requires a non-empty processed prefix: "
+            f"{suffix_len=} vs final input length {len(req.origin_input_ids)}."
+        )
+    if req.session is not None and req.session.streaming:
+        return None, _EXACT_SCORING_SUFFIX_STREAMING_SESSION_ERROR
+
+    expected_suffix = list(recv_req.input_ids[-suffix_len:])
+    actual_suffix = list(req.origin_input_ids[-suffix_len:])
+    if actual_suffix != expected_suffix:
+        mismatch_index = next(
+            index
+            for index, (expected, actual) in enumerate(
+                zip(expected_suffix, actual_suffix)
+            )
+            if expected != actual
+        )
+        return None, (
+            "Model-specific preprocessing did not preserve scoring_suffix_ids at "
+            f"the end of the final input: mismatch at suffix offset "
+            f"{mismatch_index}, expected token {expected_suffix[mismatch_index]}, "
+            f"got {actual_suffix[mismatch_index]} (suffix length {suffix_len})."
+        )
+
+    return len(req.origin_input_ids) - suffix_len - 1, None
+
+
+def _should_allow_auto_truncate(
+    allow_auto_truncate: bool, scoring_suffix_len: Optional[int]
+) -> bool:
+    """Never truncate a request that promises an exact suffix."""
+    return allow_auto_truncate and scoring_suffix_len is None
+
 
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
@@ -455,11 +514,9 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
-        # OFT adapters are admitted on the same schedule-time contract as LoRA
-        # above; the check itself lives in _can_schedule_oft_req below.
-        self.enable_oft = server_args.enable_oft
-        self.enable_oft_overlap_loading = server_args.enable_oft_overlap_loading
+        self.enable_oft = server_args.peft_method == "oft"
         self.max_ofts_per_batch = server_args.max_ofts_per_batch
+        self.enable_oft_overlap_loading = server_args.enable_oft_overlap_loading
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
         self.enable_pdmux = server_args.enable_pdmux
@@ -1567,6 +1624,21 @@ class Scheduler(
         )
 
     def init_request_dispatcher(self):
+        # Resolved here rather than at module scope: oft.io_types imports
+        # managers.io_struct, which is the cycle io_struct.__getattr__ avoids.
+        from sglang.srt.oft.io_types import (
+            LoadOFTAdapterFromDistributedReqInput as _LoadOFTAdapterFromDistributedReqInput,
+        )
+        from sglang.srt.oft.io_types import (
+            LoadOFTAdapterFromTensorsReqInput as _LoadOFTAdapterFromTensorsReqInput,
+        )
+        from sglang.srt.oft.io_types import (
+            LoadOFTAdapterReqInput as _LoadOFTAdapterReqInput,
+        )
+        from sglang.srt.oft.io_types import (
+            UnloadOFTAdapterReqInput as _UnloadOFTAdapterReqInput,
+        )
+
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
@@ -1621,6 +1693,10 @@ class Scheduler(
                     self.weight_updater.activate_adapter_version,
                 ),
                 (
+                    DiscardAdapterStageReqInput,
+                    self.weight_updater.discard_adapter_stage,
+                ),
+                (
                     UpdateWeightsFromTensorReqInput,
                     self.weight_updater.update_weights_from_tensor,
                 ),
@@ -1662,6 +1738,8 @@ class Scheduler(
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
+                (ResetCudaMemoryPeakReqInput, self.reset_cuda_memory_peak),
+                (ReadCudaMemoryPeakReqInput, self.read_cuda_memory_peak),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (
@@ -1673,16 +1751,16 @@ class Scheduler(
                     self.load_lora_adapter_from_distributed,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
-                (LoadOFTAdapterReqInput, self.load_oft_adapter),
+                (_LoadOFTAdapterReqInput, self.load_oft_adapter),
                 (
-                    LoadOFTAdapterFromTensorsReqInput,
+                    _LoadOFTAdapterFromTensorsReqInput,
                     self.load_oft_adapter_from_tensors,
                 ),
                 (
-                    LoadOFTAdapterFromDistributedReqInput,
+                    _LoadOFTAdapterFromDistributedReqInput,
                     self.load_oft_adapter_from_distributed,
                 ),
-                (UnloadOFTAdapterReqInput, self.unload_oft_adapter),
+                (_UnloadOFTAdapterReqInput, self.unload_oft_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
@@ -1968,24 +2046,20 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                self._send_control_output(recv_req, output)
-
-        staged = self.weight_updater.poll_adapter_stage()
-        if staged is not None:
-            self._send_control_output(*staged)
+                if self.rust_server is not None:
+                    # Embedded Rust server: every control-request response goes
+                    # back through the egress ring (the zmq tokenizer socket is
+                    # not consumed); the Rust api_server shapes it per-endpoint.
+                    self.rust_server.push_control_output(recv_req, output)
+                elif isinstance(output, RpcReqOutput):
+                    if self.ipc_channels.recv_from_rpc is not None:
+                        sock_send(self.ipc_channels.recv_from_rpc, output)
+                else:
+                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
-
-    def _send_control_output(self, recv_req, output):
-        if self.rust_server is not None:
-            self.rust_server.push_control_output(recv_req, output)
-        elif isinstance(output, RpcReqOutput):
-            if self.ipc_channels.recv_from_rpc is not None:
-                sock_send(self.ipc_channels.recv_from_rpc, output)
-        else:
-            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
     def _materialize_cuda_vmm_inputs(self, recv_req):
         """Release VMM slices before request handling can reject the request."""
@@ -2037,12 +2111,6 @@ class Scheduler(
         else:
             self.lora_drainer = None
 
-    def init_lora_overlap_loader(self) -> None:
-        if self.enable_lora_overlap_loading:
-            self.lora_overlap_loader = LoRAOverlapLoader(
-                self.tp_worker.model_runner.lora_manager
-            )
-
     def init_oft_drainer(self) -> None:
         if get_lora().oft_drain_wait_threshold > 0.0:
             self.oft_drainer = OFTDrainer(
@@ -2056,6 +2124,12 @@ class Scheduler(
         if self.enable_oft_overlap_loading:
             self.oft_overlap_loader = OFTOverlapLoader(
                 self.tp_worker.model_runner.oft_manager
+            )
+
+    def init_lora_overlap_loader(self) -> None:
+        if self.enable_lora_overlap_loading:
+            self.lora_overlap_loader = LoRAOverlapLoader(
+                self.tp_worker.model_runner.lora_manager
             )
 
     def init_grammar_manager(self) -> None:
@@ -2499,8 +2573,8 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 lora_version=recv_req.lora_version,
-                oft_id=recv_req.oft_id,
-                oft_version=recv_req.oft_version,
+                adapter_id=recv_req.adapter_id,
+                adapter_version=recv_req.adapter_version,
                 session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
@@ -2565,6 +2639,22 @@ class Scheduler(
         ):
             # Session exists and is not closing: create request from session
             session = self.session_controller.get(session_id)
+            if recv_req.scoring_suffix_len is not None and session.streaming:
+                # Reject before Session.create_req() can mark the session inflight
+                # or share its multimodal state with the rejected request.
+                req = Req(
+                    recv_req.rid,
+                    recv_req.input_text,
+                    recv_req.input_ids,
+                    recv_req.sampling_params,
+                    vocab_size=self.model_config.vocab_size,
+                    http_worker_ipc=recv_req.http_worker_ipc,
+                )
+                req.tokenizer = self.tokenizer
+                req.set_finish_with_abort(_EXACT_SCORING_SUFFIX_STREAMING_SESSION_ERROR)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
             req = session.create_req(
                 recv_req,
                 self.tokenizer,
@@ -2696,6 +2786,15 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        exact_logprob_start_len, error_msg = _resolve_exact_scoring_suffix_boundary(
+            req, recv_req
+        )
+        if error_msg:
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
@@ -2703,9 +2802,19 @@ class Scheduler(
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
-            get_serving().allow_auto_truncate,
+            _should_allow_auto_truncate(
+                get_serving().allow_auto_truncate,
+                recv_req.scoring_suffix_len,
+            ),
         )
         if error_msg:
+            if recv_req.scoring_suffix_len is not None:
+                error_msg = (
+                    f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
+                    f"the maximum allowed length ({self.max_req_input_len} tokens). "
+                    "Exact scoring suffix requests cannot be auto-truncated; use a "
+                    "shorter input."
+                )
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
@@ -2714,7 +2823,9 @@ class Scheduler(
             # When return_logprob is False, logprob_start_len should be ignored
             recv_req.logprob_start_len = -1
 
-        if recv_req.logprob_start_len == -1:
+        if exact_logprob_start_len is not None:
+            req.logprob_start_len = exact_logprob_start_len
+        elif recv_req.logprob_start_len == -1:
             if recv_req.return_logprob and recv_req.token_ids_logprob is None:
                 # If logprob is required but neither token_ids_logprob nor logprob_start_len is
                 # set, return the logprobs for output tokens by default
@@ -2959,6 +3070,8 @@ class Scheduler(
             dimensions=recv_req.dimensions,
             lora_id=recv_req.lora_id,
             lora_version=recv_req.lora_version,
+            adapter_id=recv_req.adapter_id,
+            adapter_version=recv_req.adapter_version,
             http_worker_ipc=recv_req.http_worker_ipc,
             time_stats=recv_req.time_stats,
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,
@@ -3378,19 +3491,6 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
-        if self.enable_oft:
-            running_ofts = {
-                req.oft_id for req in running_batch.reqs if not req.finished()
-            }
-            # Account for adapters already loaded in the adder, such as chunked requests
-            running_ofts.update(req.oft_id for req in adder.can_run_list)
-
-            if self.oft_drainer:
-                self.oft_drainer.update_draining_state(
-                    self.waiting_queue,
-                    running_batch.reqs,
-                )
-
         if self.enable_lora:
             if self.max_loras_per_batch == 1:
                 # At most one distinct LoRA identity can ever be admitted, so
@@ -3412,6 +3512,18 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
+        if self.enable_oft:
+            running_ofts = {
+                req.adapter_id for req in running_batch.reqs if not req.finished()
+            }
+            running_ofts.update(req.adapter_id for req in adder.can_run_list)
+
+            if self.oft_drainer:
+                self.oft_drainer.update_draining_state(
+                    self.waiting_queue,
+                    running_batch.reqs,
+                )
+
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
@@ -3427,7 +3539,7 @@ class Scheduler(
                 if not can_schedule_lora:
                     continue
 
-            if self.enable_oft and not self._can_schedule_oft_req(req, running_ofts):
+            if self.enable_oft and not oft.maybe_admit_request(self, req, running_ofts):
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3470,7 +3582,7 @@ class Scheduler(
                     running_loras.add(req.lora_id)
 
             if self.enable_oft:
-                running_ofts.add(req.oft_id)
+                running_ofts.add(req.adapter_id)
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -3614,33 +3726,6 @@ class Scheduler(
             new_lora_set = {req.lora_id} | running_loras
             return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
                 new_lora_set
-            )
-
-    def _can_schedule_oft_req(
-        self, req: Req, running_ofts: set[Optional[str]]
-    ) -> bool:
-        """Check if an OFT request can be scheduled.
-
-        This method checks two conditions:
-        1. The drainer allows scheduling (based on draining state)
-        2. The OFT adapter can be loaded (either already running or can be added)
-        """
-        if self.oft_drainer and not self.oft_drainer.can_schedule(req):
-            return False
-
-        if req.oft_id in running_ofts:
-            return True
-
-        if self.enable_oft_overlap_loading:
-            # For overlapping loading of OFT weights with computation, we will load each
-            # adapter one at a time, as opposed to loading them in one batch
-            return self.oft_overlap_loader.try_overlap_load_oft(
-                req.oft_id, running_ofts
-            )
-        else:
-            new_oft_set = {req.oft_id} | running_ofts
-            return self.tp_worker.model_runner.oft_manager.validate_oft_batch(
-                new_oft_set
             )
 
     def _resolve_active_lora_fast(
@@ -4630,6 +4715,122 @@ class Scheduler(
     def save_sharded_model(self, **kwargs):
         self.weight_updater.save_sharded_model(kwargs)
 
+    def reset_cuda_memory_peak(
+        self, recv_req: ResetCudaMemoryPeakReqInput
+    ) -> ResetCudaMemoryPeakReqOutput:
+        return self._cuda_memory_peak_control(recv_req, "reset")
+
+    def read_cuda_memory_peak(
+        self, recv_req: ReadCudaMemoryPeakReqInput
+    ) -> ReadCudaMemoryPeakReqOutput:
+        return self._cuda_memory_peak_control(recv_req, "read")
+
+    def _cuda_memory_peak_control(self, recv_req, operation):
+        """Sample the model process allocator and require complete TP consensus.
+
+        Local CUDA failures must reach the same CPU collective as successful
+        ranks. A read consumes the armed identity, including on failure.
+        """
+        armed = getattr(self, "_cuda_memory_peak_sample_id", None)
+        self._cuda_memory_peak_sample_id = None
+        local = CudaMemoryPeakRankResult(
+            rank=self.ps.tp_rank,
+            sample_id=recv_req.sample_id,
+            operation=operation,
+            success=False,
+            message="",
+        )
+        try:
+            if (
+                not isinstance(recv_req.sample_id, str)
+                or not recv_req.sample_id.strip()
+            ):
+                raise ValueError("sample_id must be a nonempty string")
+            if get_parallel().dp_size != 1 or get_parallel().pp_size != 1:
+                raise ValueError("CUDA peak control supports only DP1/PP1")
+            if (
+                torch.distributed.get_world_size(group=self.tp_cpu_group)
+                != self.ps.tp_size
+            ):
+                raise ValueError("CUDA peak TP group size mismatch")
+            if operation == "read" and armed != recv_req.sample_id:
+                raise ValueError("CUDA peak sample is not armed with this sample_id")
+            device = torch.cuda.current_device()
+            torch.cuda.synchronize(device)
+            if operation == "reset":
+                torch.cuda.reset_peak_memory_stats(device)
+            else:
+                allocated = torch.cuda.max_memory_allocated(device)
+                reserved = torch.cuda.max_memory_reserved(device)
+                if (
+                    type(allocated) is not int
+                    or type(reserved) is not int
+                    or not 0 <= allocated <= reserved
+                ):
+                    raise ValueError("invalid CUDA allocator peak statistics")
+                local.allocated_bytes = allocated
+                local.reserved_bytes = reserved
+            local.success = True
+        except Exception as exc:
+            local.message = str(exc)
+
+        gathered = [None] * self.ps.tp_size
+        ranks = []
+        success = False
+        message = ""
+        try:
+            torch.distributed.all_gather_object(
+                gathered, local, group=self.tp_cpu_group
+            )
+            if len(gathered) != self.ps.tp_size or not all(
+                isinstance(row, CudaMemoryPeakRankResult) and type(row.rank) is int
+                for row in gathered
+            ):
+                raise ValueError("incomplete or malformed CUDA peak TP evidence")
+            ranks = sorted(gathered, key=lambda row: row.rank)
+            if [row.rank for row in ranks] != list(range(self.ps.tp_size)):
+                raise ValueError("CUDA peak TP rank identities are not exact")
+            errors = []
+            for row in ranks:
+                if row.sample_id != recv_req.sample_id or row.operation != operation:
+                    errors.append(
+                        f"TP rank {row.rank}: CUDA peak sample/operation mismatch"
+                    )
+                elif row.success is not True:
+                    errors.append(
+                        f"TP rank {row.rank}: {row.message or 'CUDA peak operation failed'}"
+                    )
+                elif operation == "read" and (
+                    type(row.allocated_bytes) is not int
+                    or type(row.reserved_bytes) is not int
+                    or not 0 <= row.allocated_bytes <= row.reserved_bytes
+                ):
+                    errors.append(f"TP rank {row.rank}: invalid CUDA peak metrics")
+                elif operation == "reset" and (
+                    row.allocated_bytes is not None or row.reserved_bytes is not None
+                ):
+                    errors.append(f"TP rank {row.rank}: unexpected CUDA reset metrics")
+            if errors:
+                raise ValueError(" | ".join(errors))
+            success = True
+            if operation == "reset":
+                self._cuda_memory_peak_sample_id = recv_req.sample_id
+        except Exception as exc:
+            message = str(exc)
+
+        output_type = (
+            ResetCudaMemoryPeakReqOutput
+            if operation == "reset"
+            else ReadCudaMemoryPeakReqOutput
+        )
+        return output_type(
+            sample_id=recv_req.sample_id,
+            operation=operation,
+            success=success,
+            message=message,
+            ranks=ranks,
+        )
+
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
         logger.info(
@@ -5053,45 +5254,76 @@ class Scheduler(
         result = self.tp_worker.load_lora_adapter_from_distributed(recv_req)
         return result
 
+    def _adapter_unload_cpu_groups(self) -> Tuple[Any, ...]:
+        # Match SchedulerRequestReceiver's control broadcast domain. Local DP
+        # controls can arrive on different scheduler polls, so joining full TP
+        # here could collide with another DP domain's MLP synchronization.
+        if get_parallel().enable_dp_attention and (
+            get_parallel().enable_dp_attention_local_control_broadcast
+            or is_ep_scale_joiner()
+        ):
+            return tuple(
+                group
+                for size, group in (
+                    (self.ps.attn_tp_size, self.attn_tp_cpu_group),
+                    (self.ps.attn_cp_size, self.attn_cp_cpu_group),
+                )
+                if size > 1
+            )
+        return (self.tp_cpu_group,)
+
     def unload_lora_adapter(
         self, recv_req: UnloadLoRAAdapterReqInput
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
-        result = self.tp_worker.unload_lora_adapter(recv_req)
-        return result
+        return run_tp_adapter_unload(
+            distributed=torch.distributed,
+            groups=self._adapter_unload_cpu_groups(),
+            unload=lambda: self.tp_worker.unload_lora_adapter(recv_req),
+            output_type=UnloadLoRAAdapterReqOutput,
+        )
 
-    def load_oft_adapter(
-        self, recv_req: LoadOFTAdapterReqInput
-    ) -> LoadOFTAdapterReqOutput:
-        """In-place loading a new OFT adapter from disk or huggingface."""
+    def _load_oft_adapter_with_consensus(self, recv_req, load):
+        return run_tp_oft_load(
+            distributed=torch.distributed,
+            groups=self._adapter_unload_cpu_groups(),
+            load=lambda: load(recv_req),
+            get_loaded_ref=lambda: self.tp_worker.model_runner.oft_manager.refs.get(
+                recv_req.adapter_id
+            ),
+            expected_ref=recv_req.to_ref(),
+            output_type=OFTUpdateOutput,
+        )
 
-        result = self.tp_worker.load_oft_adapter(recv_req)
-        return result
+    def load_oft_adapter(self, recv_req):
+        """Load a path adapter with TP-wide installed-state agreement."""
+        return self._load_oft_adapter_with_consensus(
+            recv_req, self.tp_worker.load_oft_adapter
+        )
 
-    def load_oft_adapter_from_tensors(
-        self, recv_req: LoadOFTAdapterFromTensorsReqInput
-    ) -> LoadOFTAdapterFromTensorsReqOutput:
-        """In-place loading a new OFT adapter from serialized tensors."""
+    def load_oft_adapter_from_tensors(self, recv_req):
+        """Load serialized tensors with TP-wide installed-state agreement."""
+        return self._load_oft_adapter_with_consensus(
+            recv_req, self.tp_worker.load_oft_adapter_from_tensors
+        )
 
-        result = self.tp_worker.load_oft_adapter_from_tensors(recv_req)
-        return result
+    def load_oft_adapter_from_distributed(self, recv_req):
+        """Load broadcast tensors with TP-wide installed-state agreement."""
+        return self._load_oft_adapter_with_consensus(
+            recv_req, self.tp_worker.load_oft_adapter_from_distributed
+        )
 
-    def load_oft_adapter_from_distributed(
-        self, recv_req: LoadOFTAdapterFromDistributedReqInput
-    ) -> LoadOFTAdapterFromDistributedReqOutput:
-        """In-place loading a new OFT adapter broadcast over a process group."""
+    def unload_oft_adapter(self, recv_req):
+        """Unload the OFT adapter. Mirrors unload_lora_adapter()."""
+        from sglang.srt.oft.io_types import UnloadOFTAdapterReqOutput
 
-        result = self.tp_worker.load_oft_adapter_from_distributed(recv_req)
-        return result
-
-    def unload_oft_adapter(
-        self, recv_req: UnloadOFTAdapterReqInput
-    ) -> UnloadOFTAdapterReqOutput:
-        """Unload the OFT adapter."""
-
-        result = self.tp_worker.unload_oft_adapter(recv_req)
-        return result
+        return run_tp_adapter_unload(
+            distributed=torch.distributed,
+            groups=self._adapter_unload_cpu_groups(),
+            unload=lambda: self.tp_worker.unload_oft_adapter(recv_req),
+            output_type=UnloadOFTAdapterReqOutput,
+        )
 
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput

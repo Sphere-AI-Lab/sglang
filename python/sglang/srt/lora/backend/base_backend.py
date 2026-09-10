@@ -32,7 +32,7 @@ def get_gathered_moe_num_tokens(forward_batch: ForwardBatch, num_tokens: int) ->
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
     from sglang.srt.runtime_context import get_parallel
 
-    # v0.5.16 retired dp_attention.get_attention_tp_size(); it lives on ParallelState now.
+    # v0.5.16 moved the attention TP size onto ParallelState.
     attn_tp_size = get_parallel().attn_tp_size
     cp_align_size = get_cp_padding_align_size()
     upper = max(

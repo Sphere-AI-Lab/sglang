@@ -41,6 +41,7 @@ def _make_tokenizer_manager(rids=(), tokenizer_worker_num=1) -> TokenizerManager
     # The IPC boundary: sock_send's wire format varies (pickle/msgpack), so
     # tests observe dispatched objects here instead of on the zmq socket.
     tm._dispatch_to_scheduler = MagicMock()
+    tm.cuda_vmm_feature_transport = MagicMock()
     return tm
 
 
@@ -154,7 +155,7 @@ class TestAbortTokenizerHeldRequests(CustomTestCase):
 
     def test_dispatch_resolves_flagged_request_locally(self):
         tm = _make_tokenizer_manager_with_states(["job-1-seq-0"])
-        tm.server_args.weight_version = "v0"
+        tm.config_value = {"weight_version": "v0"}.__getitem__
         state = tm.rid_to_state["job-1-seq-0"]
         tm.abort_request(rid="job-1", prefix=True)
         tm._dispatch_to_scheduler.reset_mock()
@@ -187,7 +188,7 @@ class TestAbortTokenizerHeldRequests(CustomTestCase):
 
     def test_batch_dispatch_filters_flagged_requests(self):
         tm = _make_tokenizer_manager_with_states(["job-1-seq-0", "job-1-seq-1"])
-        tm.server_args.weight_version = "v0"
+        tm.config_value = {"weight_version": "v0"}.__getitem__
         tm.abort_request(rid="job-1", prefix=True)
         tm._dispatch_to_scheduler.reset_mock()
 
@@ -203,7 +204,9 @@ class FakeReq:
     def __init__(self, rid: str):
         self.rid = rid
         self.mamba_pool_idx = None
+        self.output_ids = []
         self.to_finish = None
+        self.weight_version_events = []
 
     def finished(self) -> bool:
         return False
@@ -223,11 +226,36 @@ def _make_scheduler(waiting_rids=(), running_rids=(), chunked_rid=None):
     # the pp_size == 1 path since the v0.5.16 rebase.
     sched.ps = SimpleNamespace(pp_size=1)
     sched.last_batch = None
+    sched.collect_inflight_reqs = lambda: {
+        req
+        for batch in (sched.running_batch, sched.last_batch)
+        if batch is not None
+        for req in batch.reqs
+    }
     sched.ipc_channels = MagicMock()
     return sched
 
 
-class TestSchedulerAbortMatching(CustomTestCase):
+class _SchedulerAbortTestCase(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        patcher = patch(
+            "sglang.srt.managers.scheduler.get_serving",
+            return_value=SimpleNamespace(weight_version="v0"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch(
+            "sglang.srt.managers.scheduler.get_disagg",
+            return_value=SimpleNamespace(
+                disaggregation_decode_retraction_backup="cpu_tensor"
+            ),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class TestSchedulerAbortMatching(_SchedulerAbortTestCase):
     """Scheduler-side matching semantics for AbortReq (see io_struct.AbortReq:
     always ``rid.startswith``, so batch children ``f"{rid}_{i}"`` are covered)."""
 
@@ -299,7 +327,9 @@ def _make_decode_req(rid: str) -> SimpleNamespace:
 
 
 def _make_retracted_req(rid: str) -> SimpleNamespace:
-    return SimpleNamespace(rid=rid, kv_cache_cpu=object())
+    req = FakeReq(rid)
+    req.retraction_backup = object()
+    return req
 
 
 def _make_decode_scheduler(
@@ -325,7 +355,7 @@ def _echoed_rids(sched) -> set:
     }
 
 
-class TestSchedulerDisaggPrefillAbort(CustomTestCase):
+class TestSchedulerDisaggPrefillAbort(_SchedulerAbortTestCase):
     """PREFILL-side disaggregation abort matching: the bootstrap and in-flight
     queues hold requests the waiting queue no longer tracks, and the waiting
     queue itself must release the metadata buffer slot and abort a
@@ -381,7 +411,7 @@ class TestSchedulerDisaggPrefillAbort(CustomTestCase):
         ].disagg_kv_sender.abort.assert_called_once()
 
 
-class TestSchedulerDisaggDecodeAbort(CustomTestCase):
+class TestSchedulerDisaggDecodeAbort(_SchedulerAbortTestCase):
     """DECODE-side disaggregation abort matching: prealloc/transfer queues
     abort their KV receivers, the retracted queue frees CPU KV cache and
     echoes the abort back to the tokenizer, and waiting-queue requests
@@ -409,7 +439,7 @@ class TestSchedulerDisaggDecodeAbort(CustomTestCase):
             [d.rid for d in sched.disagg_decode_prealloc_queue.retracted_queue],
             ["B::1"],
         )
-        self.assertFalse(hasattr(aborted, "kv_cache_cpu"))
+        self.assertIsNone(aborted.retraction_backup)
         self.assertEqual(_echoed_rids(sched), {"A::1"})
 
     def test_waiting_queue_releases_kv_cache(self):

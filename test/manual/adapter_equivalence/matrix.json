@@ -1,0 +1,41 @@
+[
+  {
+    "architecture": "dense",
+    "ep": 1,
+    "gpu": "H200",
+    "id": "qwen3-4b-bf16",
+    "model": "Qwen/Qwen3-4B-Instruct-2507",
+    "precision": "bf16",
+    "tp": 1
+  },
+  {
+    "architecture": "dense",
+    "ep": 1,
+    "gpu": "H200",
+    "id": "qwen3-4b-fp8",
+    "model": "Qwen/Qwen3-4B-Instruct-2507-FP8",
+    "precision": "fp8",
+    "quantization": "fp8",
+    "tp": 1
+  },
+  {
+    "architecture": "moe",
+    "ep": 4,
+    "gpu": "H200",
+    "id": "qwen3-30b-a3b-bf16",
+    "model": "Qwen/Qwen3-30B-A3B",
+    "precision": "bf16",
+    "tp": 4
+  },
+  {
+    "architecture": "moe",
+    "ep": 4,
+    "gpu": "H200",
+    "id": "qwen3-30b-a3b-fp8",
+    "model": "Qwen/Qwen3-30B-A3B-FP8",
+    "moe_runner": "triton",
+    "precision": "fp8",
+    "quantization": "fp8",
+    "tp": 4
+  }
+]

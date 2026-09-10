@@ -1,9 +1,9 @@
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.oft.backend.base_backend import BaseOFTBackend
 from sglang.srt.oft.torch_ops.oft_ops import sgemm_oft_r_fwd
 from sglang.srt.oft.utils import OFTBatchInfo, generate_sequence_lengths
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class TorchNativeOFTBackend(BaseOFTBackend):
@@ -23,7 +23,9 @@ class TorchNativeOFTBackend(BaseOFTBackend):
         return sgemm_oft_r_fwd(
             inputs=x,
             weights=weights,
-            weight_indices=self.batch_info.weight_indices[: self.batch_info.num_segments],
+            weight_indices=self.batch_info.weight_indices[
+                : self.batch_info.num_segments
+            ],
             seg_len_tensor=self.batch_info.seg_lens[: self.batch_info.num_segments],
             oft_block_sizes=self.batch_info.oft_block_sizes,
             num_slices=1,
@@ -51,7 +53,9 @@ class TorchNativeOFTBackend(BaseOFTBackend):
         return sgemm_oft_r_fwd(
             inputs=x,
             weights=qkv_oft_r,
-            weight_indices=self.batch_info.weight_indices[: self.batch_info.num_segments],
+            weight_indices=self.batch_info.weight_indices[
+                : self.batch_info.num_segments
+            ],
             seg_len_tensor=self.batch_info.seg_lens[: self.batch_info.num_segments],
             oft_block_sizes=self.batch_info.oft_block_sizes,
             num_slices=3,
@@ -79,7 +83,9 @@ class TorchNativeOFTBackend(BaseOFTBackend):
         return sgemm_oft_r_fwd(
             inputs=x,
             weights=gate_up_oft_r,
-            weight_indices=self.batch_info.weight_indices[: self.batch_info.num_segments],
+            weight_indices=self.batch_info.weight_indices[
+                : self.batch_info.num_segments
+            ],
             seg_len_tensor=self.batch_info.seg_lens[: self.batch_info.num_segments],
             oft_block_sizes=self.batch_info.oft_block_sizes,
             num_slices=2,
@@ -90,26 +96,11 @@ class TorchNativeOFTBackend(BaseOFTBackend):
         max_bs_in_cuda_graph: int,
         num_tokens_per_bs: int,
     ):
-        self.cuda_graph_batch_info = OFTBatchInfo(
-            use_cuda_graph=True,
-            bs=max_bs_in_cuda_graph,
-            num_segments=self.max_ofts_per_batch,
-            seg_lens=torch.full(
-                (max_bs_in_cuda_graph,), num_tokens_per_bs, dtype=torch.int32
-            ),
-            seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
-            weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
-            oft_block_sizes=torch.zeros(self.max_ofts_per_batch, dtype=torch.int32),
-            permutation=None,
-            max_len=num_tokens_per_bs,
-        )
-
-        # Initialize seg_indptr for CUDA graph as they remain constant
-        # across batches.
-        torch.cumsum(
-            self.cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph],
-            dim=0,
-            out=self.cuda_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
+        # The reference kernel branches and slices using CPU metadata. Those
+        # choices would be frozen at capture and cannot follow replay routing.
+        raise ValueError(
+            "OFT backend torch_native does not support CUDA graphs; "
+            "use --disable-cuda-graph or --oft-backend triton."
         )
 
     def prepare_oft_batch(
@@ -118,38 +109,40 @@ class TorchNativeOFTBackend(BaseOFTBackend):
         weight_indices: list[int],
         oft_block_sizes: list[int],
         use_cuda_graph: bool,
-        use_prefill_cuda_graph: bool = False,
     ):
         original_seq_lens = generate_sequence_lengths(forward_batch, device="cpu")
         original_weight_indices_tensor = torch.tensor(
             weight_indices, dtype=torch.int32, device="cpu"
         )
 
-        unique_weight_indices_tensor, inverse_weight_indices_tensor = (
-            torch.unique_consecutive(
-                original_weight_indices_tensor, return_inverse=True
+        if self.is_moe_oft:
+            seg_lens = original_seq_lens.pin_memory()
+            weight_indices_tensor = original_weight_indices_tensor.pin_memory()
+        else:
+            unique_weight_indices_tensor, inverse_weight_indices_tensor = (
+                torch.unique_consecutive(
+                    original_weight_indices_tensor, return_inverse=True
+                )
             )
-        )
 
-        seg_lens = (
-            torch.zeros_like(
-                unique_weight_indices_tensor, dtype=torch.int32, device="cpu"
+            seg_lens = (
+                torch.zeros_like(
+                    unique_weight_indices_tensor, dtype=torch.int32, device="cpu"
+                )
+                .scatter_add_(
+                    0,
+                    inverse_weight_indices_tensor,
+                    original_seq_lens,
+                )
+                .pin_memory()
             )
-            .scatter_add_(
-                0,
-                inverse_weight_indices_tensor,
-                original_seq_lens,
-            )
-            .pin_memory()
-        )
+            weight_indices_tensor = unique_weight_indices_tensor.pin_memory()
 
         seg_indptr = torch.zeros(
             (len(seg_lens) + 1,), dtype=torch.int32, pin_memory=True
         )
         seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
 
-        # Use pinned memory to avoid synchronizations during host-to-device transfer
-        weight_indices_tensor = unique_weight_indices_tensor.pin_memory()
         oft_block_sizes_tensor = torch.tensor(
             oft_block_sizes, dtype=torch.int32, pin_memory=True, device="cpu"
         )
@@ -176,7 +169,8 @@ class TorchNativeOFTBackend(BaseOFTBackend):
                 seg_indptr=torch.empty((num_segments + 1,), dtype=torch.int32),
                 weight_indices=torch.empty((num_segments,), dtype=torch.int32),
                 oft_block_sizes=torch.empty(
-                    (self.max_ofts_per_batch,), dtype=torch.int32,
+                    (self.max_ofts_per_batch,),
+                    dtype=torch.int32,
                 ),
                 permutation=None,
             )
@@ -184,15 +178,9 @@ class TorchNativeOFTBackend(BaseOFTBackend):
         batch_info.oft_block_sizes[: self.max_ofts_per_batch].copy_(
             oft_block_sizes_tensor
         )
-        batch_info.weight_indices[:num_segments].copy_(
-            weight_indices_tensor
-        )
-        batch_info.seg_indptr[: len(seg_indptr)].copy_(
-            seg_indptr
-        )
-        batch_info.seg_lens[: len(seg_lens)].copy_(
-            seg_lens
-        )
+        batch_info.weight_indices[:num_segments].copy_(weight_indices_tensor)
+        batch_info.seg_indptr[: len(seg_indptr)].copy_(seg_indptr)
+        batch_info.seg_lens[: len(seg_lens)].copy_(seg_lens)
 
         self._last_prepare_cpu_tensors = (
             oft_block_sizes_tensor,
@@ -200,6 +188,9 @@ class TorchNativeOFTBackend(BaseOFTBackend):
             seg_indptr,
             seg_lens,
         )
-        self.batch_info = batch_info
+        batch_info.has_active_oft = any(
+            oft_block_sizes[index] > 0 for index in weight_indices
+        )
+        self.batch_info = self._add_moe_oft_info(forward_batch, batch_info)
         if use_cuda_graph:
             self.refresh_cuda_graph_grouped_batch_infos()

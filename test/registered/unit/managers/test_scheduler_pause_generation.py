@@ -261,29 +261,61 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.hisparse_coordinator.retract_req.assert_called_once_with(last_req)
         self.assertEqual([entry["req"] for entry in requeue_log], [last_req])
 
-    def test_retract_disagg_prefill_excludes_last_batch(self):
-        """retract under disagg prefill must not release or requeue last extend reqs."""
+    def test_retract_disagg_prefill_rejected_before_mutation(self):
+        """PD prefill retract must fail before touching batches or transfer state."""
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         run_req = self._make_req("run")
         last_req = self._make_req("last")
-        scheduler.running_batch = self._make_batch(
-            scheduler, reqs=[run_req], with_tensors=True
-        )
-        scheduler.last_batch = self._make_batch(
+        running_batch = self._make_batch(scheduler, reqs=[run_req], with_tensors=True)
+        last_batch = self._make_batch(
             scheduler,
             reqs=[last_req],
             forward_mode=ForwardMode.EXTEND,
             with_tensors=True,
         )
-        requeue_log = self._spy_requeue(scheduler)
+        chunked_req = MagicMock()
+        inflight_req = object()
+        bootstrap_req = object()
+        inflight_queue = [inflight_req]
+        bootstrap_queue = [bootstrap_req]
+        result_entry = (MagicMock(), MagicMock())
+        result_queue = deque([result_entry])
+        scheduler.running_batch = running_batch
+        scheduler.last_batch = last_batch
+        scheduler.chunked_req = chunked_req
+        scheduler.disagg_prefill_inflight_queue = inflight_queue
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            queue=bootstrap_queue
+        )
+        scheduler.enable_overlap = True
+        scheduler.result_queue = result_queue
+        scheduler.process_batch_result = MagicMock()
+        scheduler._add_request_to_queue = MagicMock()
 
-        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
+            with self.assertRaisesRegex(
+                AssertionError,
+                r"pause_generation\(mode='retract'\) is not supported in PD",
+            ):
+                scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-        self.assertEqual([entry["req"] for entry in requeue_log], [run_req])
-        self.assertEqual(run_req.retraction_count, 1)
-        self.assertEqual(last_req.retraction_count, 0)
-        self.assertFalse(last_req.is_retracted)
+        self.assertFalse(scheduler._engine_paused)
+        self.assertIs(scheduler.running_batch, running_batch)
+        self.assertIs(scheduler.running_batch.reqs[0], run_req)
+        self.assertIs(scheduler.last_batch, last_batch)
+        self.assertIs(scheduler.last_batch.reqs[0], last_req)
+        self.assertIs(scheduler.chunked_req, chunked_req)
+        self.assertIs(scheduler.disagg_prefill_inflight_queue, inflight_queue)
+        self.assertIs(scheduler.disagg_prefill_inflight_queue[0], inflight_req)
+        self.assertIs(scheduler.disagg_prefill_bootstrap_queue.queue, bootstrap_queue)
+        self.assertIs(scheduler.disagg_prefill_bootstrap_queue.queue[0], bootstrap_req)
+        self.assertIs(scheduler.result_queue, result_queue)
+        self.assertIs(scheduler.result_queue[0], result_entry)
+        chunked_req.finished.assert_not_called()
+        scheduler.process_batch_result.assert_not_called()
+        scheduler._add_request_to_queue.assert_not_called()
+        mock_retract_all.assert_not_called()
 
     def test_retract_decode_last_batch_only_retracts_running(self):
         """retract with a decode last batch only releases and requeues running reqs."""
@@ -402,24 +434,6 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertEqual(len(scheduler.waiting_queue), 0)
         self.assertEqual(scheduler.running_batch.reqs, [])
 
-    def test_retract_disagg_prefill_keeps_live_chunked_req(self):
-        """disagg-PREFILL retract must leave a live mid-chunk chunked_req untouched."""
-        scheduler = self._new_scheduler()
-        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
-        scheduler._add_request_to_queue = MagicMock()
-        scheduler.last_batch = None
-
-        chunked_req = MagicMock()
-        chunked_req.finished.return_value = False
-        scheduler.chunked_req = chunked_req
-
-        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
-            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
-
-        mock_retract_all.assert_not_called()
-        scheduler._add_request_to_queue.assert_not_called()
-        self.assertIs(scheduler.chunked_req, chunked_req)
-
     def test_retract_drains_overlap_queue(self):
         """retract with overlap enabled should drain the result_queue."""
         scheduler = self._new_scheduler()
@@ -435,13 +449,22 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.process_batch_result.assert_called_once()
         self.assertEqual(len(scheduler.result_queue), 0)
 
-    def test_pd_decode_retract_requeues_for_rebootstrap(self):
-        """PD decode retract should rebootstrap instead of resuming stale CPU KV."""
+    def test_pd_decode_retract_rejected_before_rebootstrap_mutation(self):
+        """PD decode retract must fail before touching requests or transfer queues."""
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.last_batch = None
         scheduler._add_request_to_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
+        prealloc_req = object()
+        retracted_req = object()
+        transfer_req = object()
+        prealloc_queue = [prealloc_req]
+        retracted_queue = [retracted_req]
+        transfer_queue = [transfer_req]
+        scheduler.disagg_decode_prealloc_queue.queue = prealloc_queue
+        scheduler.disagg_decode_prealloc_queue.retracted_queue = retracted_queue
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=transfer_queue)
 
         req = SimpleNamespace(
             finished=lambda: False,
@@ -449,21 +472,32 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
             time_stats=MagicMock(),
         )
         scheduler.running_batch.reqs = [req]
+        running_batch = scheduler.running_batch
 
         with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
-            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+            with self.assertRaisesRegex(
+                AssertionError,
+                r"pause_generation\(mode='retract'\) is not supported in PD",
+            ):
+                scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
+        self.assertFalse(scheduler._engine_paused)
+        self.assertIs(scheduler.running_batch, running_batch)
+        self.assertIs(scheduler.running_batch.reqs[0], req)
+        self.assertEqual(req.output_ids, [10, 11, 12])
         scheduler._add_request_to_queue.assert_not_called()
-        scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.assert_called_once_with(
-            req
+        scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.assert_not_called()
+        self.assertIs(scheduler.disagg_decode_prealloc_queue.queue, prealloc_queue)
+        self.assertEqual(scheduler.disagg_decode_prealloc_queue.queue, [prealloc_req])
+        self.assertIs(
+            scheduler.disagg_decode_prealloc_queue.retracted_queue, retracted_queue
         )
-        self.assertEqual(req.output_ids, [10, 11])
-        self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
-        self.assertTrue(req.pd_rebootstrap_in_progress)
-        # Rebootstrap recomputes the KV from the prefill, so the retract must skip
-        # the device->host KV offload rather than offload-then-delete it.
-        mock_retract_all.assert_called_once()
-        self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
+        self.assertEqual(
+            scheduler.disagg_decode_prealloc_queue.retracted_queue, [retracted_req]
+        )
+        self.assertIs(scheduler.disagg_decode_transfer_queue.queue, transfer_queue)
+        self.assertEqual(scheduler.disagg_decode_transfer_queue.queue, [transfer_req])
+        mock_retract_all.assert_not_called()
 
     def test_pd_decode_continue_releases_held_rebootstrap(self):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""

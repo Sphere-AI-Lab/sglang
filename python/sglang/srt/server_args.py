@@ -3264,6 +3264,7 @@ class ServerArgs(OFTArgs):
     custom_pull_weights_pre_read_hook: A[
         Optional[str],
         "Import path of a hook(source_dir, target_version) that /pull_weights calls before reading the published weights. POSIX shared filesystems need no hook; object-store-backed mounts often lack cross-host read-after-write consistency, so another host's writes only become visible after an explicit refresh.",
+        NS("model"),
     ] = None
     weight_loader_disable_mmap: A[
         bool, "Disable mmap while loading weight using safetensors.", NS("model")
@@ -3314,10 +3315,12 @@ class ServerArgs(OFTArgs):
     enable_engine_info_bootstrap: A[
         bool,
         "Start the EngineInfoBootstrapServer and register per-rank parallelism config, without the mooncake/verbs P2P transfer-engine seeding.",
+        NS("model"),
     ] = False
     enable_rdt_weight_sync: A[
         bool,
         "Expose SchedulerActor.pull_weights for RDT (Ray Direct Transport / NIXL) weight sync. Requires --use-ray; implies --enable-engine-info-bootstrap.",
+        NS("model"),
     ] = False
     engine_info_bootstrap_port: A[
         int,
@@ -3434,11 +3437,13 @@ class ServerArgs(OFTArgs):
     enable_prefill_only_deterministic_inference: A[
         bool,
         "Enable prefill-only deterministic inference mode with batch invariant ops.",
+        NS("exec.deterministic"),
     ] = False
     true_on_policy_contract: A[
         Optional[str],
         "Internal true-on-policy parity contract selected by the launcher. "
         "Normal users should prefer the Miles true_on_policy switch.",
+        NS("exec.deterministic"),
     ] = None
     rl_on_policy_target: A[
         Optional[str],
@@ -4667,18 +4672,13 @@ class ServerArgs(OFTArgs):
             ),
             # Dynamo blocks LoRA under tc_piecewise (per-batch LoRABatchInfo
             # rebinds break guards); breakable/full support LoRA.
-            (
-                "LoRA",
-                lambda: bool(self.lora_paths) or self.enable_lora,
-            ),
+            ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
                 "OFT",
-                # Same tc_piecewise incompatibility as LoRA: the OFT layer forward
-                # reads oft_backend.batch_info, which is only populated by the real
-                # prepare step, not the torch.compile dummy forward -- so the
-                # compile pass raises "AttributeError: 'TritonOFTBackend' object has
-                # no attribute 'batch_info'".
-                lambda: self.enable_oft,
+                # The OFT layer forward reads batch metadata populated by the
+                # real prepare step, which is unavailable to tc_piecewise's
+                # dummy compile forward.
+                lambda: self.peft_method == "oft",
             ),
             (
                 "multimodal model",
@@ -8748,8 +8748,8 @@ class ServerArgs(OFTArgs):
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
 
-        # OFT fields are bare-typed on OFTArgs, so the auto-generator above
-        # skips them; register them manually here.
+        # OFTArgs uses import-light namespace annotations, so its dedicated
+        # registrar owns the canonical OFT CLI surface.
         register_oft_args(parser)
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
@@ -9280,7 +9280,7 @@ class ServerArgs(OFTArgs):
         # Check LoRA
         self.check_lora_server_args()
 
-        # Check OFT args
+        # Check canonical OFT independently from native multi-tenant LoRA.
         validate_oft_args(self)
 
         # Check speculative decoding
@@ -9432,9 +9432,6 @@ class ServerArgs(OFTArgs):
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
-        if self.enable_lora_staging and not self.enable_lora:
-            raise ValueError("--enable-lora-staging requires --enable-lora")
-
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
             if self.enable_lora is None:
@@ -9446,6 +9443,9 @@ class ServerArgs(OFTArgs):
                 logger.warning(
                     "--enable-lora is set to False, any provided lora_paths will be ignored."
                 )
+
+        if self.enable_lora_staging and not self.enable_lora:
+            raise ValueError("--enable-lora-staging requires --enable-lora")
 
         if self.enable_lora:
             if self.enable_lora_overlap_loading is None:

@@ -101,7 +101,14 @@ class Qwen2MLP(nn.Module):
         x: torch.Tensor,
         forward_batch: ForwardBatch = None,
     ) -> torch.Tensor:
-        if (
+        # Only unquantized weights define the projection's activation dtype.
+        # Casting to FP8/integer storage here would discard activation scales.
+        if self.gate_up_proj.weight.dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        ) and (
             should_force_bfloat16_dense_tensor_math()
             or x.dtype != self.gate_up_proj.weight.dtype
         ):

@@ -46,8 +46,7 @@ def _free_port() -> int:
 def _versioned_tensors(adapter, version: int):
     source = adapter.state_dict() if hasattr(adapter, "state_dict") else adapter
     tensors = {
-        name: tensor.detach().clone().to("cuda:0")
-        for name, tensor in source.items()
+        name: tensor.detach().clone().to("cuda:0") for name, tensor in source.items()
     }
     if version == 2:
         for name in sorted(tensors):
@@ -59,9 +58,7 @@ def _versioned_tensors(adapter, version: int):
 def _stage_payload(name, version, tensors, adapter_config, *, double_buffer=True):
     return {
         "names": list(tensors),
-        "dtypes": [
-            str(t.dtype).removeprefix("torch.") for t in tensors.values()
-        ],
+        "dtypes": [str(t.dtype).removeprefix("torch.") for t in tensors.values()],
         "shapes": [list(t.shape) for t in tensors.values()],
         "group_name": GROUP_NAME,
         "weight_version": str(version),
@@ -137,9 +134,7 @@ class StagedLoRATestHarness:
             "backend": "nccl",
         }
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                self._post, "/init_weights_update_group", payload
-            )
+            future = executor.submit(self._post, "/init_weights_update_group", payload)
             self.group = init_custom_process_group(
                 backend="nccl",
                 init_method=f"tcp://127.0.0.1:{self.master_port}",
@@ -212,9 +207,7 @@ class TestStagedLoRAUpdate(CustomTestCase):
             repo_id=LORA_REPO,
             allow_patterns=["adapter_model.safetensors", "adapter_config.json"],
         )
-        cls.adapter = load_file(
-            os.path.join(adapter_dir, "adapter_model.safetensors")
-        )
+        cls.adapter = load_file(os.path.join(adapter_dir, "adapter_model.safetensors"))
         with open(
             os.path.join(adapter_dir, "adapter_config.json"), encoding="utf-8"
         ) as config_file:
@@ -223,9 +216,7 @@ class TestStagedLoRAUpdate(CustomTestCase):
     def _run_update(self, *, disable_cuda_graph=False, fresh_check=False):
         v1 = _versioned_tensors(self.adapter, 1)
         v2 = _versioned_tensors(self.adapter, 2)
-        harness = StagedLoRATestHarness(
-            self, disable_cuda_graph=disable_cuda_graph
-        )
+        harness = StagedLoRATestHarness(self, disable_cuda_graph=disable_cuda_graph)
         try:
             harness.stage("policy-b", 1, v1, self.adapter_config)
             harness.activate("policy-b", 1)

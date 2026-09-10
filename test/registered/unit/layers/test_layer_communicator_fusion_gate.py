@@ -36,6 +36,11 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
             input_ids=types.SimpleNamespace(shape=(8,))
         )
         with (
+            patch.object(
+                comm,
+                "should_disable_mlp_allreduce_fusion_for_on_policy",
+                return_value=False,
+            ),
             patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
             patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=True),
             patch.object(

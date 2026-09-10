@@ -2,21 +2,13 @@ import os
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.oft.backend.base_backend import BaseOFTBackend
 from sglang.srt.oft.triton_ops import gemm_oft_r_fwd, sgemm_oft_r_fwd
 from sglang.srt.oft.utils import OFTBatchInfo, generate_sequence_lengths
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-
-# Fixed segment slots (one per request) baked into the captured prefill OFT
-# kernel grids; batches with more requests fall back to eager prefill
-# (mirrors PREFILL_CUDA_GRAPH_LORA_SEGMENTS).
-PREFILL_CUDA_GRAPH_OFT_SEGMENTS = 32
 
 
 class TritonOFTBackend(BaseOFTBackend):
-    supports_prefill_cuda_graph = True
-
     name = "triton"
 
     def __init__(
@@ -32,29 +24,14 @@ class TritonOFTBackend(BaseOFTBackend):
         # exactly one slot. So we enable the fast path whenever
         # max_ofts_per_batch <= 2:
         #   * max==1: one slot, one adapter — trivially uniform.
-        #   * max==2: typical RL setup. Slot 0 is the auto-registered `None`
-        #     placeholder (identity = base / reference model, used for KL
-        #     against the base in PPO/GRPO). Slot 1 is the active OFT adapter
-        #     loaded via the streamed identity loader (or a real trained adapter
-        #     in production rollout). Each batch still uses one adapter; the
-        #     0-d device tensors are updated only when the active slot changes.
-        # The kernel itself handles slot 0 (block_size_val=0) by taking an
-        # identity-passthrough branch — just memory copy, no GEMM. So the
-        # ref-model forward is essentially free beyond the kernel launch.
-        # When more than 2 slots are ADDRESSABLE by requests we assume a
-        # multi-tenant setup where different requests in a single batch may
-        # target different adapters; the segmented `sgemm_oft_r_fwd` kernel is
-        # correct for that case. `prepare_oft_batch` enables the fast path only
-        # for uniform batches. The double-buffer staging slot
-        # (--oft-double-buffer reserves slot max_ofts_per_batch-1 in
-        # OFTMemoryPool) is never referenced by a request, so it does not
-        # count: orbit's async double-buffer run (max_ofts_per_batch=3 = base
-        # + active + staging) keeps the single-adapter fast path exactly like
-        # its sync run (max_ofts_per_batch=2).
-        server_args = kwargs.get("server_args")
-        double_buffer = server_args is not None and server_args.oft_double_buffer
-        addressable_slots = max_ofts_per_batch - (1 if double_buffer else 0)
-        self.single_adapter_mode = addressable_slots <= 2
+        #   * max==2: base/reference plus an adapter, or two adapters.
+        # Slot numbers are reusable; block-size metadata identifies base
+        # (zero) versus active OFT (positive), including in the fast path.
+        # When max_ofts_per_batch > 2 we assume a multi-tenant setup where
+        # different requests in a single batch may target different adapters;
+        # the segmented `sgemm_oft_r_fwd` kernel is correct for that case.
+        # `prepare_oft_batch` enables the fast path only for uniform batches.
+        self.single_adapter_mode = max_ofts_per_batch <= 2
         self._use_single_adapter_fast_path = False
         if self.single_adapter_mode:
             with torch.device(device):
@@ -86,6 +63,26 @@ class TritonOFTBackend(BaseOFTBackend):
                 BLOCK_S=self.single_adapter_block_s,
             )
         return sgemm_oft_r_fwd(x, weights, self.batch_info, num_slices=1)
+
+    def run_grouped_oft_r_sgemm(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        *args,
+        n_groups: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        if self._use_single_adapter_fast_path:
+            if n_groups <= 0:
+                raise ValueError(f"n_groups must be positive, got {n_groups}")
+            return self.run_oft_r_sgemm(x, weights, *args, **kwargs)
+        return super().run_grouped_oft_r_sgemm(
+            x,
+            weights,
+            *args,
+            n_groups=n_groups,
+            **kwargs,
+        )
 
     def run_qkv_oft(
         self,
@@ -189,6 +186,7 @@ class TritonOFTBackend(BaseOFTBackend):
         from sglang.srt.oft.triton_ops import (
             fused_rotate_project_qkv,
         )
+
         if not x.is_contiguous():
             x = x.contiguous()
         if not R.is_contiguous():
@@ -199,8 +197,13 @@ class TritonOFTBackend(BaseOFTBackend):
         bsv_t = self._single_block_size_val_t
         if len(output_sizes) == 3:
             return fused_rotate_project_qkv(
-                x, R, weight, output_sizes, bias,
-                slot_idx_t=slot_idx_t, bsv_t=bsv_t,
+                x,
+                R,
+                weight,
+                output_sizes,
+                bias,
+                slot_idx_t=slot_idx_t,
+                bsv_t=bsv_t,
             )
         raise NotImplementedError(
             f"run_fused_rotate_project: unsupported slice count {len(output_sizes)}"
@@ -219,15 +222,9 @@ class TritonOFTBackend(BaseOFTBackend):
                 seg_lens=torch.full(
                     (max_bs_in_cuda_graph,), num_tokens_per_bs, dtype=torch.int32
                 ),
-                seg_indptr=torch.zeros(
-                    max_bs_in_cuda_graph + 1, dtype=torch.int32
-                ),
-                weight_indices=torch.zeros(
-                    max_bs_in_cuda_graph, dtype=torch.int32
-                ),
-                oft_block_sizes=torch.zeros(
-                    self.max_ofts_per_batch, dtype=torch.int32
-                ),
+                seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
+                weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
+                oft_block_sizes=torch.zeros(self.max_ofts_per_batch, dtype=torch.int32),
                 permutation=None,
                 max_len=num_tokens_per_bs,
             )
@@ -235,38 +232,9 @@ class TritonOFTBackend(BaseOFTBackend):
             torch.cumsum(
                 self.cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph],
                 dim=0,
-                out=self.cuda_graph_batch_info.seg_indptr[
-                    1 : max_bs_in_cuda_graph + 1
-                ],
+                out=self.cuda_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
             )
-
-    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
-        """Allocate the static OFT batch metadata the prefill CUDA graph reads.
-
-        Mirrors TritonLoRABackend.init_prefill_cuda_graph_batch_info: ``bs``
-        and ``num_segments`` are pinned at the slot count so the captured
-        segmented-kernel grids cover any replay batch; slots past the live
-        batch keep ``seg_lens == 0`` and ``_sgemm_oft_r_kernel`` returns early
-        for them. ``max_len`` is refreshed per prepare (at capture it is the
-        bucket's token count, the largest any replay segment can reach).
-        """
-        num_slots = PREFILL_CUDA_GRAPH_OFT_SEGMENTS
-        with torch.device(self.device):
-            self.prefill_cuda_graph_batch_info = OFTBatchInfo(
-                use_cuda_graph=True,
-                bs=num_slots,
-                num_segments=num_slots,
-                seg_lens=torch.zeros(num_slots, dtype=torch.int32),
-                seg_indptr=torch.zeros(num_slots + 1, dtype=torch.int32),
-                weight_indices=torch.zeros(num_slots, dtype=torch.int32),
-                oft_block_sizes=torch.zeros(
-                    self.max_ofts_per_batch, dtype=torch.int32
-                ),
-                permutation=None,
-                max_len=max_num_tokens,
-            )
-        self.prefill_cuda_graph_max_bs = num_slots
-        self.prefill_cuda_graph_max_tokens = max_num_tokens
+            self._init_cuda_graph_moe_buffers(max_bs_in_cuda_graph * num_tokens_per_bs)
 
     def prepare_oft_batch(
         self,
@@ -274,10 +242,13 @@ class TritonOFTBackend(BaseOFTBackend):
         weight_indices: list[int],
         oft_block_sizes: list[int],
         use_cuda_graph: bool,
-        use_prefill_cuda_graph: bool = False,
     ):
-        import os as _os, sys as _sys
-        _trace_enabled = _os.environ.get("SGLANG_OFT_PREPARE_TRACE", "0").strip() not in ("0", "false", "False")
+        import os as _os
+        import sys as _sys
+
+        _trace_enabled = _os.environ.get(
+            "SGLANG_OFT_PREPARE_TRACE", "0"
+        ).strip() not in ("0", "false", "False")
         if _trace_enabled:
             _counter = getattr(self, "_prepare_trace_counter", 0) + 1
             self._prepare_trace_counter = _counter
@@ -302,7 +273,10 @@ class TritonOFTBackend(BaseOFTBackend):
                     f"prev_bsv={self._single_block_size_val if self.single_adapter_mode else 'n/a'}\n"
                 )
                 _sys.stderr.flush()
-        if self.single_adapter_mode:
+        # Capture and replay must use the same kernel. Uniform capture batches
+        # can replay with mixed adapter IDs, so graph batches always use the
+        # per-row segmented path and its persistent device metadata.
+        if self.single_adapter_mode and not use_cuda_graph:
             # Fast path is only valid when every row in the current batch uses
             # one adapter. Mixed base+adapter batches must keep the segmented
             # metadata path even when max_ofts_per_batch <= 2.
@@ -314,7 +288,9 @@ class TritonOFTBackend(BaseOFTBackend):
             else:
                 self._use_single_adapter_fast_path = True
 
-            if self._use_single_adapter_fast_path:
+            if self.is_moe_oft:
+                self._use_single_adapter_fast_path = False
+            elif self._use_single_adapter_fast_path:
                 adapter_idx = int(weight_indices[0]) if weight_indices else 0
                 if 0 <= adapter_idx < len(oft_block_sizes):
                     block_size_val = int(oft_block_sizes[adapter_idx])
@@ -333,14 +309,12 @@ class TritonOFTBackend(BaseOFTBackend):
         else:
             self._use_single_adapter_fast_path = False
 
-        original_seq_lens_cpu = generate_sequence_lengths(
-            forward_batch, device="cpu"
-        )
+        original_seq_lens_cpu = generate_sequence_lengths(forward_batch, device="cpu")
         original_weight_indices_tensor = torch.tensor(
             weight_indices, dtype=torch.int32, device="cpu"
         )
 
-        if use_cuda_graph or use_prefill_cuda_graph:
+        if use_cuda_graph or self.is_moe_oft:
             # CUDA graph captures the Triton launch grid. Keep one segment per
             # graph row so padded replay rows remain covered even when runtime
             # adapter ids differ from the all-empty capture batch.
@@ -390,18 +364,6 @@ class TritonOFTBackend(BaseOFTBackend):
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = num_segments
             batch_info.max_len = int(max(seg_lens_cpu))
-        elif use_prefill_cuda_graph:
-            assert (
-                self.prefill_cuda_graph_batch_info is not None
-            ), "Prefill CUDA Graph batch info is not initialized."
-            batch_info = self.prefill_cuda_graph_batch_info
-            assert num_segments <= batch_info.num_segments, (
-                f"prefill CUDA graph OFT batch has {num_segments} requests but "
-                f"only {batch_info.num_segments} static segment slots"
-            )
-            # bs / num_segments stay pinned at the slot count (the captured
-            # grids); max_len sizes the token-tile grid at capture time.
-            batch_info.max_len = int(max(seg_lens_cpu))
         else:
             max_len = int(max(seg_lens_cpu))
 
@@ -434,25 +396,10 @@ class TritonOFTBackend(BaseOFTBackend):
         batch_info.weight_indices[:num_segments].copy_(
             weight_indices_tensor, non_blocking=True
         )
-        if use_prefill_cuda_graph:
-            # Slots past the live batch must read as empty segments for the
-            # pinned captured grid: zero their lengths (and indices, for
-            # hygiene) and rebuild the CSR pointers on device -- no sync.
-            batch_info.weight_indices[num_segments:].zero_()
-            batch_info.seg_lens[:num_segments].copy_(
-                seg_lens_cpu, non_blocking=True
-            )
-            batch_info.seg_lens[num_segments:].zero_()
-            torch.cumsum(
-                batch_info.seg_lens, dim=0, out=batch_info.seg_indptr[1:]
-            )
-        else:
-            batch_info.seg_indptr[: num_segments + 1].copy_(
-                seg_indptr_cpu, non_blocking=True
-            )
-            batch_info.seg_lens[:num_segments].copy_(
-                seg_lens_cpu, non_blocking=True
-            )
+        batch_info.seg_indptr[: num_segments + 1].copy_(
+            seg_indptr_cpu, non_blocking=True
+        )
+        batch_info.seg_lens[:num_segments].copy_(seg_lens_cpu, non_blocking=True)
 
         self._last_prepare_cpu_tensors = (
             oft_block_sizes_tensor,
@@ -460,6 +407,9 @@ class TritonOFTBackend(BaseOFTBackend):
             seg_indptr_cpu,
             seg_lens_cpu,
         )
-        self.batch_info = batch_info
+        batch_info.has_active_oft = any(
+            oft_block_sizes[index] > 0 for index in weight_indices
+        )
+        self.batch_info = self._add_moe_oft_info(forward_batch, batch_info)
         if use_cuda_graph:
             self.refresh_cuda_graph_grouped_batch_infos()

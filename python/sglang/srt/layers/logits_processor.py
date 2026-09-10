@@ -353,11 +353,20 @@ class LogitsProcessor(nn.Module):
         if _autotune_run_lm_head is False:
             return LogitsProcessorOutput(next_token_logits=None)
 
+        # OFT batch metadata describes the full token batch, so rotate before
+        # common prefill pruning or the MIS delimiter slice. Keep the original
+        # tensor for hidden-state capture and return values.
+        logits_hidden_states = hidden_states
+        if hasattr(lm_head, "set_oft") and hasattr(lm_head, "apply_oft"):
+            if lm_head.oft_active:
+                logits_hidden_states = lm_head.apply_oft(hidden_states)
+            lm_head = lm_head.base_layer
+
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
         if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
             return self.compute_logprobs_for_multi_item_scoring(
                 input_ids,
-                hidden_states,
+                logits_hidden_states,
                 lm_head,
                 logits_metadata,
                 multi_item_delimiter_indices,
@@ -365,7 +374,7 @@ class LogitsProcessor(nn.Module):
 
         # Diffusion LLM only.
         if logits_metadata.forward_mode.is_dllm_extend():
-            return self._get_dllm_logits(hidden_states, lm_head, logits_metadata)
+            return self._get_dllm_logits(logits_hidden_states, lm_head, logits_metadata)
 
         # Get the last hidden states and last logits for the next token prediction
         (
@@ -392,11 +401,20 @@ class LogitsProcessor(nn.Module):
             sample_indices,
             logits_metadata,
         )
-        del hidden_states
+        if logits_hidden_states is hidden_states:
+            logits_pruned_states = pruned_states
+        else:
+            logits_pruned_states = self._get_pruned_states(
+                logits_hidden_states,
+                None,
+                None,
+                logits_metadata,
+            )[0]
+        del hidden_states, logits_hidden_states
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            logits = self._get_logits(logits_pruned_states, lm_head, logits_metadata)
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -409,7 +427,7 @@ class LogitsProcessor(nn.Module):
             )
 
         logprobs_result, sampled_logits = self.input_logprob_processor.forward(
-            pruned_states=pruned_states,
+            pruned_states=logits_pruned_states,
             sample_indices=sample_indices,
             input_logprob_indices=input_logprob_indices,
             token_to_seq_idx=token_to_seq_idx,

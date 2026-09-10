@@ -292,8 +292,7 @@ def prepare_mlp_sync_batch_raw(
                     is_target_verify=local_batch.forward_mode.is_target_verify(),
                     capture_hidden_mode=None,
                     return_logprob=local_batch.return_logprob,
-                    lora_ineligible=prefill_graph_runner.enable_lora
-                    or prefill_graph_runner.enable_oft,
+                    lora_ineligible=prefill_graph_runner.enable_lora,
                 )
             )
             and breakable_prefill

@@ -279,13 +279,20 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if (
+        if self.qkv_proj.weight.dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        ) and (
             should_force_bfloat16_dense_tensor_math()
             or hidden_states.dtype != self.qkv_proj.weight.dtype
         ):
             # True-on-policy RMSNorm can produce fp32 activations while dense
             # projections remain bf16, including during cuda-graph capture when
             # the global on-policy flag is temporarily cleared.
+            # Quantized weight storage is not an activation dtype: its quant
+            # method must receive floating activations and derive their scales.
             hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
 
         save_kv_cache = True

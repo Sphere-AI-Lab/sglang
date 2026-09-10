@@ -74,7 +74,12 @@ _PACKAGE_ROOT = Path(next(iter(sglang.__path__))) / "srt"
 
 # The config the resolution pipeline owns; reading the in-flight record is their
 # job, not a supplied-instance read.
-_OWNERS = ("server_args.py", "runtime_context.py", "arg_groups/")
+_OWNERS = (
+    "server_args.py",
+    "runtime_context.py",
+    "arg_groups/",
+    "oft/config.py",  # Validation/late resolution delegated by ServerArgs.
+)
 
 _MINI_CONFIG = {
     "architectures": ["LlamaForCausalLM"],
@@ -191,10 +196,6 @@ _EXPOSED = {
     ("entrypoints/engine.py", "enable_symm_mem"),
     ("entrypoints/engine.py", "moe_dp_size"),
     ("entrypoints/engine.py", "reasoning_parser"),
-    (
-        "entrypoints/engine.py",
-        "remote_instance_weight_loader_start_seed_via_transfer_engine",
-    ),
     ("entrypoints/engine.py", "tool_call_parser"),
     ("eplb/eplb_manager.py", "ep_dispatch_algorithm"),
     ("eplb/eplb_manager.py", "expert_distribution_recorder_buffer_size"),

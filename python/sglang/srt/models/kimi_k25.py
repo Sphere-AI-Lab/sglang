@@ -45,10 +45,19 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.oft.kimi_k25_policy import (
-    get_kimi_dense_first_unsupported_targets,
-    is_kimi_dense_first_oft_module,
-)
+
+_KIMI_OFT_POLICY = None
+
+
+def _kimi_oft_policy():
+    global _KIMI_OFT_POLICY
+    if _KIMI_OFT_POLICY is None:
+        from sglang.srt.oft import kimi_k25_policy
+
+        _KIMI_OFT_POLICY = kimi_k25_policy
+    return _KIMI_OFT_POLICY
+
+
 from sglang.srt.runtime_context import (
     configured_tp_size,
     get_exec,
@@ -913,15 +922,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
         return getattr(self.language_model, "expert_params_mapping", [])
 
     def should_apply_oft(self, module_name: str) -> bool:
-        """Apply Kimi K2.5's dense-first OFT policy from the outer model wrapper.
-
-        OFTManager consults this wrapper rather than the inner language model.
-        """
-        return is_kimi_dense_first_oft_module(module_name)
+        """Apply Kimi K2.5's dense-first canonical OFT policy."""
+        return _kimi_oft_policy().is_kimi_dense_first_oft_module(module_name)
 
     def validate_oft_target_modules(self, target_modules: Iterable[str]) -> None:
         """Reject OFT targets unsupported by Kimi K2.5's dense-first policy."""
-        unsupported = get_kimi_dense_first_unsupported_targets(target_modules)
+        unsupported = _kimi_oft_policy().get_kimi_dense_first_unsupported_targets(
+            target_modules
+        )
         if unsupported:
             raise ValueError(
                 "Kimi K2.5 dense-first OFT does not support target modules: "

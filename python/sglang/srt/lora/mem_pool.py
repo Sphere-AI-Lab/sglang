@@ -384,7 +384,7 @@ class LoRAMemoryPool:
         the LoRA buffer matches the actual shard regardless of which TP group
         owns it — covers DP-attention (``o_proj`` uses ``attn_tp_size``) and
         shared-expert dense-vs-MoE per-layer-TP differences. Falls back to
-        ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
+        the module-classified TP width. Cached per ``(module_name, layer_idx)``.
 
         MoE-internal names go through ``self.moe_tp_size`` upstream.
         """
@@ -420,7 +420,7 @@ class LoRAMemoryPool:
                 found = r
                 break
 
-        out = found if found is not None else self.tp_size
+        out = found if found is not None else self._effective_tp_size(module_name)
         cache[key] = out
         return out
 
@@ -440,7 +440,8 @@ class LoRAMemoryPool:
         ``shared_experts.gate_up_proj``). The output-axis ratio is
         quantization-independent: ``output_size_per_partition`` is set in
         ``ColumnParallelLinear.__init__`` before the quant method runs. Falls
-        back to ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
+        back to the module-classified TP width. Cached per ``(module_name,
+        layer_idx)``.
         """
         cache = getattr(self, "_col_parallel_tp_cache", None)
         if cache is None:
@@ -474,7 +475,7 @@ class LoRAMemoryPool:
                 found = r
                 break
 
-        out = found if found is not None else self.tp_size
+        out = found if found is not None else self._effective_tp_size(module_name)
         cache[key] = out
         return out
 
@@ -564,7 +565,18 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name, base_model)
-        effective_tp_size = self._effective_tp_size(module_name)
+        # Routed MoE shards along moe_tp_size; shared MoE shards over full TP
+        # at EP=1. Non-MoE row-parallel modules use a probed shard that may be
+        # attn_tp under DP-attention.
+        effective_tp_size = (
+            (
+                self.tp_size
+                if self.is_shared_moe_module(module_name)
+                else self.moe_tp_size
+            )
+            if self.is_moe_module(module_name)
+            else self._row_parallel_shard_tp(module_name, base_model, layer_idx)
+        )
         if (
             effective_tp_size > 1
             and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
@@ -661,8 +673,24 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        # Same sharding rule as get_lora_A_shape above.
-        effective_tp_size = self._effective_tp_size(module_name)
+        # Routed MoE shards along moe_tp_size; shared MoE shards over full TP
+        # at EP=1. Non-MoE column-parallel modules probe the OUTPUT axis
+        # (quantization-independent). An input-axis probe is meaningless for
+        # column-parallel layers and can mis-size quantized GLM shared-expert
+        # LoRA-B buffers.
+        effective_tp_size = (
+            (
+                self.tp_size
+                if self.is_shared_moe_module(module_name)
+                else self.moe_tp_size
+            )
+            if self.is_moe_module(module_name)
+            else self._column_parallel_shard_tp(
+                module_name,
+                base_model,
+                layer_idx,
+            )
+        )
         if (
             effective_tp_size > 1
             and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
@@ -992,11 +1020,7 @@ class LoRAMemoryPool:
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
 
-    def _clear_buffer_slot_for_base(self, buffer_id: int) -> None:
-        """Make an evicted slot safe for graph-captured base-model replay."""
-        for buffers in (*self.A_buffer.values(), *self.B_buffer.values()):
-            for tensor in buffers:
-                tensor[buffer_id].zero_()
+    def _clear_optional_buffer_slot(self, buffer_id: int) -> None:
         for buffers in (
             self.embedding_A_buffer,
             self.embedding_B_buffer,
@@ -1006,6 +1030,13 @@ class LoRAMemoryPool:
         ):
             for tensor in buffers.values():
                 tensor[buffer_id].zero_()
+
+    def _clear_buffer_slot_for_base(self, buffer_id: int) -> None:
+        """Make an evicted slot safe for graph-captured base-model replay."""
+        for buffers in (*self.A_buffer.values(), *self.B_buffer.values()):
+            for tensor in buffers:
+                tensor[buffer_id].zero_()
+        self._clear_optional_buffer_slot(buffer_id)
 
     def remove_lora(self, uid: str) -> Optional[int]:
         """Remove a resident adapter and return its cleared pool slot."""
@@ -1533,6 +1564,8 @@ class LoRAMemoryPool:
                         # contracts over the full padded max_rank, so the tail must be clean.
                         target_buffer[buffer_id, :, lora_rank:].zero_()
 
+        self._clear_optional_buffer_slot(buffer_id)
+
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size
             lora_added_tokens_size = lora_adapter.config.lora_added_tokens_size
@@ -1658,22 +1691,6 @@ class LoRAMemoryPool:
                         not get_pp_group().is_last_rank
                     ), f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
                     continue
-        else:
-            # Zero out embedding/lm_head buffers for adapters without embedding LoRA
-            # to avoid using garbage values from uninitialized memory
-            for k in self.embedding_A_buffer.keys():
-                self.embedding_A_buffer[k][buffer_id].zero_()
-            for k in self.embedding_B_buffer.keys():
-                self.embedding_B_buffer[k][buffer_id].zero_()
-            for k in self.lm_head_A_buffer.keys():
-                self.lm_head_A_buffer[k][buffer_id].zero_()
-            for k in self.lm_head_B_buffer.keys():
-                self.lm_head_B_buffer[k][buffer_id].zero_()
-            if (
-                self.lora_added_tokens_size > 0
-                and "input_embeddings" in self.new_embeddings_buffer
-            ):
-                self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType

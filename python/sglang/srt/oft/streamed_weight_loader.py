@@ -7,7 +7,11 @@ from typing import Dict, List, Literal, Sequence, Tuple
 
 import torch
 
-from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorMetadata
+from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.weight_sync.tensor_bucket import (
+    FlattenedTensorBucket,
+    FlattenedTensorMetadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,26 +22,101 @@ logger = logging.getLogger(__name__)
 # expert dimension) and are dispatched per-FusedMoE via
 # `oft_manager.apply_streamed_expert_oft`. Canonical grouped expert FC1 emits
 # independent gate/up rotations, so up_proj is preserved here; oft_manager
-# disambiguates split (gate != up) from legacy shared-R (only gate streamed)
-# state and routes to w1_oft_r/w3_oft_r vs w13_oft_r accordingly.
+# uses its configured canonical/shared layout to route each chunk to
+# w1_oft_r/w3_oft_r or w13_oft_r, even when gate and up arrive separately.
 _EXPERT_OFT_RE = re.compile(
     r"mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.oft_R"
 )
-_DSV4_EXPERT_OFT_RE = re.compile(
-    r"(?:mlp|ffn)\.experts\.(\d+)\.(w1|w2|w3)\.oft_R"
-)
+_DSV4_EXPERT_OFT_RE = re.compile(r"(?:mlp|ffn)\.experts\.(\d+)\.(w1|w2|w3)\.oft_R")
 _DSV4_TO_FUSED_EXPERT_OFT_PROJ = {
     "w1": "gate_proj",
     "w2": "down_proj",
     "w3": "up_proj",
 }
 
-type FlattenedOFTTensorPayload = tuple[
+FlattenedOFTTensorPayload = tuple[
     Literal["flattened_oft_payload"],
     bytes,
     List[FlattenedTensorMetadata],
     List[Tuple[str, int]],
 ]
+
+
+def get_tensor_alias_key(tensor: torch.Tensor) -> tuple:
+    storage = tensor.untyped_storage()
+    return (
+        tensor.device.type,
+        tensor.device.index,
+        str(tensor.dtype),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.storage_offset(),
+        storage.data_ptr(),
+    )
+
+
+def dedupe_named_tensors_by_storage(
+    named_tensors: Sequence[Tuple[str, torch.Tensor]],
+) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, int]]]:
+    unique_named_tensors: list[tuple[str, torch.Tensor]] = []
+    entries: list[tuple[str, int]] = []
+    key_to_index: dict[tuple, int] = {}
+
+    for name, tensor in named_tensors:
+        alias_key = get_tensor_alias_key(tensor)
+        unique_index = key_to_index.get(alias_key)
+        if unique_index is None:
+            unique_index = len(unique_named_tensors)
+            key_to_index[alias_key] = unique_index
+            unique_named_tensors.append((name, tensor))
+        entries.append((name, unique_index))
+
+    return unique_named_tensors, entries
+
+
+def serialize_flattened_oft_payload(
+    named_tensors: Sequence[Tuple[str, torch.Tensor]],
+) -> bytes:
+    unique_named_tensors, entries = dedupe_named_tensors_by_storage(named_tensors)
+    flattened_bucket = FlattenedTensorBucket(named_tensors=list(unique_named_tensors))
+    payload: FlattenedOFTTensorPayload = (
+        "flattened_oft_payload",
+        MultiprocessingSerializer.serialize(
+            flattened_bucket.get_flattened_tensor().detach()
+        ),
+        flattened_bucket.get_metadata(),
+        entries,
+    )
+    return MultiprocessingSerializer.serialize(payload)
+
+
+def normalize_oft_weight_payload(
+    payload: FlattenedOFTTensorPayload,
+    *,
+    device,
+) -> list[tuple[str, torch.Tensor]]:
+    """Deserialize a flattened OFT payload to a list of (name, tensor).
+
+    OFT sync (orbit, verl) always sends the flattened bucket form built by
+    `serialize_flattened_oft_payload`. The legacy non-flattened path was
+    never exercised in production and has been removed.
+    """
+    assert (
+        isinstance(payload, tuple)
+        and len(payload) == 4
+        and payload[0] == "flattened_oft_payload"
+    ), "OFT update_weights_from_tensor expects a FlattenedOFTTensorPayload"
+    _, serialized_flattened_tensor, metadata, entries = payload
+    flattened_tensor = MultiprocessingSerializer.deserialize(
+        serialized_flattened_tensor
+    ).to(device)
+    bucket = FlattenedTensorBucket(
+        flattened_tensor=flattened_tensor,
+        metadata=metadata,
+    )
+    unique_named_tensors = bucket.reconstruct_tensors()
+    unique_tensors = [tensor for _, tensor in unique_named_tensors]
+    return [(name, unique_tensors[unique_index]) for name, unique_index in entries]
 
 
 def _partition_expert_oft_tensors(
@@ -79,9 +158,7 @@ def _partition_expert_oft_tensors(
             continue
         expert_id = int(m.group(1))
         expert_layer_dict = (
-            fused_expert_layer_dict
-            if family == "fused"
-            else dsv4_expert_layer_dict
+            fused_expert_layer_dict if family == "fused" else dsv4_expert_layer_dict
         )
         layer = expert_layer_dict.setdefault(layer_id, {})
         ew = layer.setdefault(expert_id, {})
@@ -190,9 +267,11 @@ def _flush_oft_group_chunk(
 
     packed_weight = torch.cat(
         [
-            compact_weight
-            if compact_weight.device == target_device
-            else compact_weight.to(target_device)
+            (
+                compact_weight
+                if compact_weight.device == target_device
+                else compact_weight.to(target_device)
+            )
             for _, _, compact_weight, _, _ in normalized_items
         ],
         dim=0,
@@ -200,7 +279,13 @@ def _flush_oft_group_chunk(
     packed_r = precompute_oft_r(packed_weight, block_size)
 
     offset = 0
-    for layer_id, fused_target, compact_weight, slice_index, split_count in normalized_items:
+    for (
+        layer_id,
+        fused_target,
+        compact_weight,
+        slice_index,
+        split_count,
+    ) in normalized_items:
         next_offset = offset + compact_weight.shape[0]
         memory_pool._write_precomputed_oft_r(
             buffer_id,
@@ -218,6 +303,133 @@ def _flush_oft_group_chunk(
             tp_rank=memory_pool.tp_rank,
         )
         offset = next_offset
+
+
+def _validate_oft_compact(
+    tensor: torch.Tensor, block_size: int, *, compute_dtype=None
+) -> None:
+    """Check the metadata needed by compact expansion and Cayley, without compute."""
+    if not isinstance(tensor, torch.Tensor) or tensor.ndim != 2:
+        raise ValueError("OFT compact weights must be rank two")
+    width = block_size * (block_size - 1) // 2
+    # expand_to_skew_symmetric truncates padding and accepts singleton
+    # broadcasting. Preserve those existing formats, including empty blocks.
+    if tensor.shape[1] < width and tensor.shape[1] != 1:
+        raise ValueError(
+            f"OFT compact width {tensor.shape[1]} cannot fill {width} elements"
+        )
+    dtype = tensor.dtype if compute_dtype is None else compute_dtype
+    if not (dtype.is_floating_point or dtype.is_complex):
+        raise ValueError(
+            f"OFT Cayley requires floating or complex weights, got {dtype}"
+        )
+
+
+def _validate_oft_buffer_capacity(
+    tensor, buffer, block_size, slice_index=None, split_count=1
+) -> None:
+    """Mirror _write_oft_r_block using a buffer's per-slot shape only."""
+    _validate_oft_compact(tensor, block_size)
+    blocks = buffer.shape[-3]
+    if block_size > min(buffer.shape[-2:]):
+        raise ValueError(
+            f"OFT block size {block_size} exceeds buffer shape {tuple(buffer.shape)}"
+        )
+    if slice_index is not None:
+        if split_count <= 1 or not 0 <= slice_index < split_count:
+            raise ValueError(
+                f"Invalid OFT slice {slice_index} for split_count={split_count}"
+            )
+        if blocks % split_count:
+            raise ValueError(
+                f"Cannot split {blocks} OFT blocks into {split_count} slices"
+            )
+        blocks //= split_count
+    if tensor.shape[0] > blocks:
+        raise ValueError(
+            f"OFT tensor has {tensor.shape[0]} blocks, but buffer has {blocks}"
+        )
+
+
+def _validate_streamed_expert_oft(oft_manager, expert_chunk, block_size):
+    """Mirror expert writer layout and batched-scatter requirements read-only."""
+
+    from sglang.srt.oft.oft_manager import _get_fused_moe_weight_device
+
+    modules = oft_manager._find_fused_moe_modules()
+    pool = oft_manager.memory_pool
+    for layer_id, experts in expert_chunk.items():
+        moe = modules.get(layer_id)
+        if moe is None or not experts:
+            continue  # The writer skips layers/experts not owned by this rank.
+        samples = {
+            proj: next(
+                (weights[proj] for weights in experts.values() if proj in weights), None
+            )
+            for proj in ("gate_proj.oft_R", "up_proj.oft_R", "down_proj.oft_R")
+        }
+        split = oft_manager.oft_type == "canonical_oft"
+        if not split and samples["up_proj.oft_R"] is not None:
+            raise ValueError(
+                "Independent expert up_proj OFT rotations require canonical_oft layout"
+            )
+        gate = samples["gate_proj.oft_R"]
+        up = samples["up_proj.oft_R"]
+        w13 = gate if gate is not None else up
+        down = samples["down_proj.oft_R"]
+        first = w13 if w13 is not None else down
+        if first is None:
+            continue
+        _validate_oft_compact(first, block_size)
+        dtype = first.dtype
+        w13_blocks = w13.shape[0] if w13 is not None else 0
+        if down is not None and down.shape[0] % moe.moe_tp_size:
+            raise ValueError("Expert down_proj OFT blocks must be divisible by tp_size")
+        down_blocks = down.shape[0] // moe.moe_tp_size if down is not None else 0
+        for proj, sample in samples.items():
+            if sample is None:
+                continue
+            _validate_oft_compact(sample, block_size, compute_dtype=dtype)
+            is_down = proj == "down_proj.oft_R"
+            blocks = down_blocks if is_down else w13_blocks
+            if blocks == 0:
+                continue
+            group = {
+                "down_proj.oft_R": "w2_oft_r",
+                "up_proj.oft_R": "w3_oft_r",
+                "gate_proj.oft_R": "w1_oft_r" if split else "w13_oft_r",
+            }[proj]
+            buffer = pool._groups.get(group, {}).get(layer_id)
+            expected = (moe.num_local_experts, blocks, block_size, block_size)
+            if (
+                buffer is None
+                or tuple(buffer.shape[1:]) != expected
+                or buffer.dtype != oft_manager.oft_r_dtype
+                or buffer.device != _get_fused_moe_weight_device(moe)
+            ):
+                raise ValueError(
+                    f"Expert OFT {group} layer {layer_id} buffer does not match {expected}"
+                )
+            compacts = []
+            for expert_id, weights in experts.items():
+                local_id = moe._map_global_expert_id_to_local_expert_id(expert_id)
+                if not 0 <= local_id < moe.num_local_experts or proj not in weights:
+                    continue
+                tensor = weights[proj]
+                _validate_oft_compact(tensor, block_size, compute_dtype=dtype)
+                if is_down:
+                    start = moe.moe_tp_rank * blocks
+                    tensor = tensor[start : start + blocks]
+                compacts.append(tensor)
+            # torch.cat requires matching compact widths, and view requires
+            # the aggregate block count (individual counts need not match).
+            if compacts and (
+                len({t.shape[1] for t in compacts}) != 1
+                or sum(t.shape[0] for t in compacts) != len(compacts) * blocks
+            ):
+                raise ValueError(
+                    f"Expert OFT {proj} tensors cannot be batched into {blocks} blocks per expert"
+                )
 
 
 def _resolve_streamed_oft_tensor_groups(
@@ -241,7 +453,7 @@ def _resolve_streamed_oft_tensor_groups(
     from sglang.srt.layers.utils import get_layer_id
 
     memory_pool = oft_manager.memory_pool
-    oft_modules = oft_manager.oft_modules
+    oft_modules = oft_manager.adapter_modules
 
     # MoE expert OFT R cannot share the dense per-layer R_buffer slots
     # (those have no expert dimension and would silently overwrite each
@@ -290,6 +502,12 @@ def _resolve_streamed_oft_tensor_groups(
                 "(fork DeepSeekV4 model support was removed)"
             )
 
+    try:
+        if fused_expert_chunk:
+            _validate_streamed_expert_oft(oft_manager, fused_expert_chunk, block_size)
+    except (ValueError, IndexError, TypeError, RuntimeError) as exc:
+        return None, f"Invalid expert OFT payload: {exc}"
+
     # CanonicalOFT: pre-stack per-slice q_proj/k_proj/v_proj (and gate/up)
     # tensors into a single fused ``qkv_proj.oft_R`` (and ``gate_up_proj.oft_R``)
     # so the existing dense dispatch path writes one stacked tensor per fused
@@ -316,21 +534,33 @@ def _resolve_streamed_oft_tensor_groups(
         layer_id = get_layer_id(name)
         if layer_id is not None:
             try:
-                fused_target, slice_module, is_row_parallel, slice_index, split_count = (
-                    memory_pool._resolve_oft_tensor_plan(name, oft_modules, layer_id)
-                )
+                (
+                    fused_target,
+                    slice_module,
+                    is_row_parallel,
+                    slice_index,
+                    split_count,
+                ) = memory_pool._resolve_oft_tensor_plan(name, oft_modules, layer_id)
             except (KeyError, ValueError, IndexError) as exc:
                 unresolved_names.append(f"{name} ({exc})")
                 continue
 
-            target_device = memory_pool.R_buffer[fused_target][layer_id].device
+            target_buffer = memory_pool.R_buffer[fused_target][layer_id]
+            target_device = target_buffer.device
             compact_weight = tensor
+            try:
+                _validate_oft_compact(compact_weight, block_size)
+                if is_row_parallel:
+                    compact_weight = memory_pool._slice_oft_compact_weight(
+                        compact_weight, slice_module
+                    )
+                _validate_oft_buffer_capacity(
+                    compact_weight, target_buffer, block_size, slice_index, split_count
+                )
+            except (ValueError, IndexError, TypeError, RuntimeError) as exc:
+                return None, f"Invalid OFT tensor {name}: {exc}"
 
             if is_row_parallel:
-                compact_weight = memory_pool._slice_oft_compact_weight(
-                    compact_weight,
-                    slice_module,
-                )
                 group_key = (
                     target_device,
                     fused_target,
@@ -354,6 +584,16 @@ def _resolve_streamed_oft_tensor_groups(
             # Deferred, not written here: this function must not mutate any
             # buffer slot (see docstring) -- _commit_streamed_oft_tensor_groups
             # performs the actual write once a buffer_id exists.
+            buffer = None
+            if "embed_tokens" in name:
+                buffer = memory_pool.embedding_R_buffer.get("embed_tokens")
+            if buffer is None and "lm_head" in name:
+                buffer = memory_pool.lm_head_R_buffer.get("lm_head")
+            if buffer is not None:
+                try:
+                    _validate_oft_buffer_capacity(tensor, buffer, block_size)
+                except (ValueError, IndexError, TypeError, RuntimeError) as exc:
+                    return None, f"Invalid OFT tensor {name}: {exc}"
             direct_writes.append((name, tensor))
         elif ".oft_" in name or name.endswith(".oft_R"):
             unresolved_names.append(name)
@@ -376,8 +616,8 @@ def _commit_streamed_oft_tensor_groups(
     plan,
     buffer_id: int,
     block_size: int,
-    oft_name: str,
-    oft_id: str | None,
+    adapter_name: str,
+    adapter_id: str | None,
 ) -> tuple[bool, str]:
     """Write an already-resolved plan (see _resolve_streamed_oft_tensor_groups)
     into buffer_id's R_buffer slots. named_tensors is the ORIGINAL raw
@@ -386,9 +626,14 @@ def _commit_streamed_oft_tensor_groups(
     """
     fused_expert_chunk, non_row_groups, row_parallel_groups, direct_writes = plan
     memory_pool = oft_manager.memory_pool
-    oft_modules = oft_manager.oft_modules
+    oft_modules = oft_manager.adapter_modules
 
-    if os.getenv("ORBIT_LOG_WEIGHT_SYNC", "").strip().lower() not in {"", "0", "false", "no"}:
+    if os.getenv("ORBIT_LOG_WEIGHT_SYNC", "").strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+    }:
         samples = []
         max_abs = 0.0
         total_nonzero = 0
@@ -396,8 +641,12 @@ def _commit_streamed_oft_tensor_groups(
             if not torch.is_tensor(tensor):
                 continue
             detached = tensor.detach()
-            cur_max = float(detached.float().abs().max().item()) if detached.numel() else 0.0
-            cur_mean = float(detached.float().abs().mean().item()) if detached.numel() else 0.0
+            cur_max = (
+                float(detached.float().abs().max().item()) if detached.numel() else 0.0
+            )
+            cur_mean = (
+                float(detached.float().abs().mean().item()) if detached.numel() else 0.0
+            )
             cur_nonzero = int((detached != 0).sum().item())
             max_abs = max(max_abs, cur_max)
             total_nonzero += cur_nonzero
@@ -407,10 +656,10 @@ def _commit_streamed_oft_tensor_groups(
                     f"max={cur_max:.3e} mean={cur_mean:.3e} nonzero={cur_nonzero}"
                 )
         logger.info(
-            "OFT streamed payload adapter=%s oft_id=%s buffer_id=%s "
+            "OFT streamed payload adapter=%s adapter_id=%s buffer_id=%s "
             "tensor_count=%s max_abs=%.6e total_nonzero=%s samples=%s",
-            oft_name,
-            oft_id,
+            adapter_name,
+            adapter_id,
             buffer_id,
             len(named_tensors),
             max_abs,

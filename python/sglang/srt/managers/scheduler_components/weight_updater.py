@@ -27,6 +27,8 @@ from sglang.srt.managers.io_struct import (
     CheckWeightsReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    DiscardAdapterStageReqInput,
+    DiscardAdapterStageReqOutput,
     EndWeightUpdateReqInput,
     EndWeightUpdateReqOutput,
     GetWeightsByNameReqInput,
@@ -50,8 +52,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.managers.scheduler_components.async_adapter_stage import (
-    AsyncAdapterStage,
+from sglang.srt.managers.scheduler_components.tp_update_consensus import (
+    run_tp_adapter_activation,
+    run_tp_adapter_stage_discard,
+    run_tp_adapter_update,
 )
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
@@ -106,13 +110,12 @@ class SchedulerWeightUpdaterManager:
     # Runner selector for the open session, recorded at begin_weight_update and
     # reused by end_weight_update so the same set is restored and finalized.
     _weight_update_selector: str = "all"
-    _async_adapter_stage: Optional[AsyncAdapterStage] = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
         # Edge-trigger weight_load_duration_seconds at the end of each
-        # update_weights_from_* call. Full-weight updates pause the engine;
-        # double-buffer OFT staging runs on its dedicated worker instead.
+        # update_weights_from_* call. Engine is paused during the update so
+        # the periodic log_stats path can't carry this.
         # `source` distinguishes disk vs distributed vs tensor vs ipc.
         t0 = time.perf_counter()
         try:
@@ -129,38 +132,6 @@ class SchedulerWeightUpdaterManager:
                 empty_cache=recv_req.torch_empty_cache
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
-
-    def _flush_radix_after_adapter_activate(self, recv_req) -> None:
-        """Invalidate the radix cache after a double-buffer adapter activate.
-
-        The DB stage/activate path is flush-free by design (lock-free stage +
-        drained atomic flip), so a prompt prefix cached before the swap would be
-        served with KV computed under the old adapter weights unless something
-        invalidates it.
-
-        OFT no longer needs this: the radix key carries the adapter WEIGHT
-        VERSION (Req.__init__ -> maybe_extend_extra_key), so KV produced under
-        version k lives under a different key than requests arriving at k+1 and
-        can never be matched. Entries for retired versions become unreachable
-        and age out through the cache's normal LRU eviction. Dropping the flush
-        keeps every prefix the swap did NOT invalidate -- above all the
-        base-model prefixes (shared system prompts, the KL/reference path),
-        which a full flush discarded on every training step.
-
-        LoRA still needs the flush: our single-active LoRA path names no adapter
-        per request, so its keys have nothing to version by. It gets per-request
-        identity once per-adapter versioned staging exists for LoRA; until then,
-        flush.
-
-        Ordering note: this does NOT replace the tokenizer-side drain
-        (model_update_lock.writer_lock around activate). That drain prevents a
-        request from spanning the weight swap; keying prevents cache reuse
-        across versions. Both are required, for different reasons.
-        """
-        if recv_req.load_format != "lora_adapter":
-            return
-        flushed = self.flush_cache(empty_cache=False)
-        assert flushed, "radix flush failed after peft double-buffer activate"
 
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
@@ -295,100 +266,56 @@ class SchedulerWeightUpdaterManager:
             )
 
     def update_adapter_from_distributed(
-        self,
-        recv_req: UpdateAdapterFromDistributedReqInput,
-    ) -> Optional[UpdateAdapterFromDistributedReqOutput]:
-        if (
-            recv_req.double_buffer
-            and recv_req.load_format == "oft_adapter"
-            and self.scheduler is not None
-            and self.scheduler.device == "cuda"
-            and self.scheduler.server_args.oft_impl == "sibling"
-        ):
-            if self._async_adapter_stage is None:
-                self._async_adapter_stage = AsyncAdapterStage(
-                    torch.cuda.current_device(), self.tp_cpu_group
-                )
-            self._async_adapter_stage.submit(
-                recv_req, self._stage_adapter_from_distributed, self.scheduler.forward_ct
-            )
-            return None
-        return self._stage_adapter_from_distributed(recv_req)
-
-    def poll_adapter_stage(self):
-        if self._async_adapter_stage is None:
-            return None
-        result = self._async_adapter_stage.poll()
-        if result is not None:
-            req, output = result
-            logger.info(
-                "event=oft_stage_complete version=%s success=%s forwards_during_stage=%d",
-                req.adapter_version,
-                output.success,
-                self.scheduler.forward_ct - self._async_adapter_stage.start_forward_ct,
-            )
-        return result
-
-    def _stage_adapter_from_distributed(
-        self,
-        recv_req: UpdateAdapterFromDistributedReqInput,
+        self, recv_req: UpdateAdapterFromDistributedReqInput
     ) -> UpdateAdapterFromDistributedReqOutput:
-        """Double-buffer STAGE (mirrors update_weights_from_distributed). STAGE
-        is lock-free (fills the reserved staging slot while generation runs). For
-        the synchronous distributed-but-NOT-double-buffer path (double_buffer=
-        False) the caller holds the writer_lock (engine idle), so we also
-        ACTIVATE-in-place in the same call and return active_adapter_version."""
+        """Stage native LoRA weights while the active version keeps serving."""
         with self._observe_weight_load("distributed_adapter"):
-            stage_success, message = self.tp_worker.update_adapter_from_distributed(
-                recv_req
+            success, message, staged_version, active_version = run_tp_adapter_update(
+                distributed=torch.distributed,
+                group=self.tp_cpu_group,
+                version=recv_req.adapter_version,
+                activate_immediately=not recv_req.double_buffer,
+                stage=lambda: self.tp_worker.update_adapter_from_distributed(recv_req),
+                activate=lambda: self.tp_worker.activate_adapter_version(recv_req),
             )
-            success = stage_success
-            active_version = None
-            if stage_success and not recv_req.double_buffer:
-                act_success, act_message = self.tp_worker.activate_adapter_version(
-                    recv_req
-                )
-                success = act_success
-                if act_success:
-                    active_version = recv_req.adapter_version
-                    self._flush_radix_after_adapter_activate(recv_req)
-                else:
-                    message = act_message
             if not success:
                 logger.error(message)
             return UpdateAdapterFromDistributedReqOutput(
                 success=success,
                 message=message,
-                staged_adapter_version=(
-                    recv_req.adapter_version if stage_success else None
-                ),
+                staged_adapter_version=staged_version,
                 adapter_version=recv_req.adapter_version,
                 weight_version=recv_req.weight_version,
                 active_adapter_version=active_version,
             )
 
-    def activate_adapter_version(
-        self,
-        recv_req: ActivateAdapterVersionReqInput,
-    ) -> ActivateAdapterVersionReqOutput:
-        """Activate while admission is writer-locked or generation is paused.
+    def discard_adapter_stage(
+        self, recv_req: DiscardAdapterStageReqInput
+    ) -> DiscardAdapterStageReqOutput:
+        success, message, _ = run_tp_adapter_stage_discard(
+            distributed=torch.distributed,
+            group=self.tp_cpu_group,
+            discard=lambda: self.tp_worker.discard_adapter_stage(recv_req),
+        )
+        return DiscardAdapterStageReqOutput(success=success, message=message)
 
-        In-place pause retains running requests; the scheduler stream's existing
-        forward-read fence orders active-slot writes safely before resume.
-        Sibling OFT copies staging into stable CUDA-graph addresses.
-        """
+    def activate_adapter_version(
+        self, recv_req: ActivateAdapterVersionReqInput
+    ) -> ActivateAdapterVersionReqOutput:
+        """Promote the exact native LoRA stage after tokenizer-side drain."""
         with self._observe_weight_load("activate_adapter"):
-            success, message = self.tp_worker.activate_adapter_version(recv_req)
-            if success:
-                self._flush_radix_after_adapter_activate(recv_req)
-            else:
+            success, message, active_version = run_tp_adapter_activation(
+                distributed=torch.distributed,
+                group=self.tp_cpu_group,
+                version=recv_req.adapter_version,
+                activate=lambda: self.tp_worker.activate_adapter_version(recv_req),
+            )
+            if not success:
                 logger.error(message)
             return ActivateAdapterVersionReqOutput(
                 success=success,
                 message=message,
-                active_adapter_version=(
-                    recv_req.adapter_version if success else None
-                ),
+                active_adapter_version=active_version,
             )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

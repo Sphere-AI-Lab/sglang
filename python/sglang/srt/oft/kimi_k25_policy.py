@@ -1,6 +1,5 @@
 from collections.abc import Iterable
 
-
 # NOTE: "qkv_proj" is allowed but a no-op for Kimi K2.5 -- the text model uses
 # MLA, so no module name ends in ".qkv_proj" and
 # is_kimi_dense_first_oft_module never matches. We accept it so verl-style

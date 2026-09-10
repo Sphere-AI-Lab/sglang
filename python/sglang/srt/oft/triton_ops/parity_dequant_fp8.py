@@ -10,7 +10,7 @@ Semantics of the math this replaces
 
 Why this exists
 ---------------
-The PyTorch reference implementation (``peft/fp8_utils.py::dequant_fp8`` in
+The PyTorch reference implementation (``dequant_fp8`` in
 Megatron-Bridge, and ``_bridge_dequant_fp8`` in sglang) does:
 
     w = w_fp8.float().reshape(E, sr, BH, sc, BW)   # full fp32 copy
@@ -28,8 +28,6 @@ reshape-multiply otherwise.
 """
 
 from __future__ import annotations
-
-from typing import Optional
 
 import torch
 
@@ -140,9 +138,9 @@ def dequant_fp8_block_triton(
         w_fp8 = w_fp8.unsqueeze(0)
         scale = scale.unsqueeze(0)
         squeeze_out = True
-    assert w_fp8.dim() == 3 and scale.dim() == 3, (
-        f"expected [E,M,N] and [E,sr,sc], got {w_fp8.shape} and {scale.shape}"
-    )
+    assert (
+        w_fp8.dim() == 3 and scale.dim() == 3
+    ), f"expected [E,M,N] and [E,sr,sc], got {w_fp8.shape} and {scale.shape}"
     E, M, N = w_fp8.shape
     E_s, SR, SC = scale.shape
     assert E_s == E, (E, E_s)
@@ -160,12 +158,26 @@ def dequant_fp8_block_triton(
 
     grid = (E, triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _dequant_fp8_block_kernel[grid](
-        w_fp8, scale, out,
-        E, M, N, SR, SC,
-        w_fp8.stride(0), w_fp8.stride(1), w_fp8.stride(2),
-        scale.stride(0), scale.stride(1), scale.stride(2),
-        out.stride(0), out.stride(1), out.stride(2),
-        BH=BH, BW=BW,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        w_fp8,
+        scale,
+        out,
+        E,
+        M,
+        N,
+        SR,
+        SC,
+        w_fp8.stride(0),
+        w_fp8.stride(1),
+        w_fp8.stride(2),
+        scale.stride(0),
+        scale.stride(1),
+        scale.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        BH=BH,
+        BW=BW,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
     )
     return out.squeeze(0) if squeeze_out else out

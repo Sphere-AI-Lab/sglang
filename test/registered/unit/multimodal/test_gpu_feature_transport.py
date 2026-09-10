@@ -265,6 +265,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
         manager = object.__new__(TokenizerManager)
+        manager.rid_to_state = {}
         transport = MagicMock()
         transport.prepare_for_dispatch.return_value = []
         manager.cuda_vmm_feature_transport = transport
@@ -292,6 +293,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
+        manager.rid_to_state = {}
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock(
             side_effect=RuntimeError("send failed")
@@ -326,6 +328,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
+        manager.rid_to_state = {}
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock()
         time_stats = MagicMock()
@@ -441,7 +444,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.pool = pool
         manager.cuda_vmm_feature_transport = transport
         server_args = SimpleNamespace(
-            remote_instance_weight_loader_start_seed_via_transfer_engine=False,
+            needs_engine_info_bootstrap=lambda: False,
             reasoning_parser=None,
             tool_call_parser=None,
             weight_cache_mode=None,

@@ -35,6 +35,7 @@ class StagedLoRAMemoryPool(LoRAMemoryPool):
         self.staging_idx = None
         self._staged_uid = None
         self._staged_version = None
+        self._staged_name = None
         super().__init__(*args, **kwargs)
 
     def init_buffers(self, base_model) -> None:
@@ -104,6 +105,8 @@ class StagedLoRAMemoryPool(LoRAMemoryPool):
         lora_modules,
         embed_module,
         lm_head_module,
+        *,
+        name=None,
     ) -> None:
         current = self.staged_identity()
         if current == (uid, version):
@@ -127,6 +130,7 @@ class StagedLoRAMemoryPool(LoRAMemoryPool):
         )
         self._staged_uid = uid
         self._staged_version = version
+        self._staged_name = name
 
     def activate(self, uid: str, version: int, destination: int) -> None:
         self._require_staged_identity(uid, version)
@@ -144,6 +148,7 @@ class StagedLoRAMemoryPool(LoRAMemoryPool):
         self._require_staged_identity(uid, version)
         self._staged_uid = None
         self._staged_version = None
+        self._staged_name = None
 
 
 class StagedLoRAManager(LoRAManager):
@@ -172,6 +177,67 @@ class StagedLoRAManager(LoRAManager):
         )
         self.fetch_new_loras({None})
 
+    def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
+        pending = getattr(self, "_pending_lora_stage", None)
+        if pending is not None and pending.ref.lora_id == lora_ref.lora_id:
+            try:
+                self.memory_pool.discard_stage(pending.ref.lora_id, pending.ref.version)
+            except Exception as error:
+                return self.create_lora_update_result(
+                    success=False, error_message=str(error)
+                )
+            self._pending_lora_stage = None
+            if pending.old_ref is None:
+                return self.create_lora_update_result(success=True)
+        if (
+            lora_ref.lora_id not in self.configs
+            and lora_ref.lora_id not in self.lora_refs
+            and lora_ref.lora_id not in self.loras
+        ):
+            # The tokenizer validates user unloads against its active/pending
+            # registry. A rank may nevertheless have no local state when its
+            # stage failed, including before stage_adapter was reached.
+            return self.create_lora_update_result(success=True)
+        return super().unload_lora_adapter(lora_ref)
+
+    def discard_adapter_stage(self, name, version, adapter_id=None) -> LoRAUpdateOutput:
+        """Discard only the exact hidden transaction, preserving serving state."""
+        try:
+            if (
+                not isinstance(name, str)
+                or not name
+                or not isinstance(adapter_id, str)
+                or not adapter_id
+            ):
+                raise ValueError("Stage discard requires adapter name and ID")
+            if type(version) not in (int, str):
+                raise ValueError("Stage discard requires an integer version")
+            version = int(version)
+            pending = self._pending_lora_stage
+            pool_identity = self.memory_pool.staged_identity()
+            if pending is not None and (
+                pending.ref.lora_name,
+                pending.ref.lora_id,
+                pending.ref.version,
+            ) != (name, adapter_id, version):
+                raise ValueError("Stage discard does not match pending LoRA identity")
+            if pool_identity is None:
+                if pending is not None:
+                    raise ValueError("Pending LoRA stage has no matching pool stage")
+            else:
+                if (
+                    pool_identity != (adapter_id, version)
+                    or self.memory_pool._staged_name != name
+                ):
+                    raise ValueError("Stage discard does not match pool LoRA identity")
+                self.memory_pool.discard_stage(adapter_id, version)
+            self._pending_lora_stage = None
+        except Exception as error:
+            return self.create_lora_update_result(
+                success=False, error_message=str(error)
+            )
+        return self.create_lora_update_result(success=True)
+
     def stage_adapter(
         self, named_tensors, config, name, version, adapter_id=None
     ) -> LoRAUpdateOutput:
@@ -193,6 +259,11 @@ class StagedLoRAManager(LoRAManager):
                 base_vocab_size=self.base_hf_config.vocab_size,
             )
             old_ref = self.lora_refs.get(uid)
+            if old_ref is not None and version <= old_ref.version:
+                raise ValueError(
+                    f"LoRA adapter version {version} must be newer than active "
+                    f"version {old_ref.version}."
+                )
             old_config = self.configs.get(uid)
             old_adapter = self.loras.get(uid)
             new_ref = LoRARef(
@@ -219,6 +290,7 @@ class StagedLoRAManager(LoRAManager):
                 self.lora_modules,
                 self.embed_tokens_module,
                 self.lm_head_module,
+                name=name,
             )
             self._pending_lora_stage = PendingLoRAStage(
                 ref=new_ref,
@@ -235,9 +307,7 @@ class StagedLoRAManager(LoRAManager):
 
         return self.create_lora_update_result(success=True)
 
-    def activate_adapter(
-        self, name, version, adapter_id=None
-    ) -> LoRAUpdateOutput:
+    def activate_adapter(self, name, version, adapter_id=None) -> LoRAUpdateOutput:
         uid = adapter_id if adapter_id is not None else name
         try:
             version = int(version)
@@ -312,7 +382,10 @@ class StagedLoRAManager(LoRAManager):
         return self.create_lora_update_result(success=True)
 
 
-class LoRAStagingBackend:
+from sglang.srt.adapter_sync.tokenizer_backend import AdapterStagingBackend
+
+
+class LoRAStagingBackend(AdapterStagingBackend):
     """Tokenizer-layer staging for native LoRA. Wraps TokenizerManager's
     lora_registry/lora_ref_cache/failed_lora_activations/pending_lora_stage
     state — same objects tokenizer_control_mixin.py used directly before
@@ -320,6 +393,10 @@ class LoRAStagingBackend:
 
     def __init__(self, tm):
         self._tm = tm
+
+    @property
+    def lifecycle_lock(self):
+        return self._tm.lora_update_lock
 
     def _assert_available(self, lora_path) -> None:
         # Shared with the always-on check in _resolve_lora_path
@@ -329,6 +406,16 @@ class LoRAStagingBackend:
 
     def _quarantine(self, name: str, message: str) -> None:
         self._tm.failed_lora_activations[name] = message
+
+    def clear_stage_reservation(self, obj) -> None:
+        if not isinstance(obj.adapter_id, str) or not obj.adapter_id:
+            raise ValueError("Stage discard requires an exact adapter ID")
+        if type(obj.adapter_version) not in (int, str):
+            raise ValueError("Stage discard requires an integer version")
+        self.prepare_activation(obj)
+        if obj.load_format != "lora_adapter":
+            raise ValueError("Stage discard requires load_format=lora_adapter")
+        self._tm.pending_lora_stage = None
 
     async def reserve_stage(self, obj) -> None:
         # Reservation must be atomic across concurrent stage requests. The
@@ -350,20 +437,27 @@ class LoRAStagingBackend:
             ) from exc
         if self._tm.server_args.tokenizer_worker_num > 1:
             raise ValueError("native LoRA staging requires tokenizer_worker_num == 1")
-        if obj.adapter_name in self._tm.failed_lora_activations:
-            raise ValueError(
-                f"LoRA adapter '{obj.adapter_name}' is quarantined; restart required"
-            )
+        self._assert_available(obj.adapter_name)
 
         pending = self._tm.pending_lora_stage
         if pending is not None:
             if pending.lora_name == obj.adapter_name and pending.version == version:
+                self._validate_adapter_id(obj, pending.lora_id)
                 obj.adapter_id = pending.lora_id
                 return
             raise ValueError(
                 "staging slot already reserved for "
                 f"name={pending.lora_name} id={pending.lora_id} "
                 f"version={pending.version}"
+            )
+
+        active = self._tm.lora_registry.get_all_adapters().get(obj.adapter_name)
+        if active is not None:
+            self._validate_adapter_id(obj, active.lora_id)
+        if active is not None and version <= active.version:
+            raise ValueError(
+                f"LoRA adapter version {version} must be newer than active "
+                f"version {active.version}."
             )
 
         candidate, _ = await self._tm.lora_registry.register_or_reuse(
@@ -404,6 +498,7 @@ class LoRAStagingBackend:
                 f"Cannot activate name={obj.adapter_name} version={version}; {detail}"
             )
         self._assert_available(obj.adapter_name)
+        self._validate_adapter_id(obj, pending.lora_id)
         obj.adapter_id = pending.lora_id
 
     async def _publish(self) -> None:

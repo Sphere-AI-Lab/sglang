@@ -431,7 +431,7 @@ class RMSNorm(BaseFusedOp):
         eps: float = 1e-6,
         var_hidden_size: Optional[int] = None,
         cast_x_before_out_mul: bool = False,
-        fp32_residual: bool = True,
+        fp32_residual: Optional[bool] = None,
         has_weight: bool = True,
         weight_dtype: Optional[torch.dtype] = None,
         override_orig_dtype: Optional[torch.dtype] = None,
@@ -450,7 +450,8 @@ class RMSNorm(BaseFusedOp):
             cast_x_before_out_mul = true_on_policy_kwargs.get(
                 "cast_x_before_out_mul", cast_x_before_out_mul
             )
-        fp32_residual = true_on_policy_kwargs.get("fp32_residual", fp32_residual)
+        if fp32_residual is None:
+            fp32_residual = true_on_policy_kwargs.get("fp32_residual", True)
         if weight_dtype is None:
             weight_dtype = true_on_policy_kwargs.get("weight_dtype", weight_dtype)
         if override_orig_dtype is None:

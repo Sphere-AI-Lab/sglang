@@ -2885,21 +2885,47 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
     return x_
 
 
+def _rebuild_cpu_storage_from_bytes(data: bytes):
+    if not data:
+        return torch.UntypedStorage(0, device="cpu")
+    # The storage retains the writable backing buffer after this tensor dies.
+    return torch.frombuffer(bytearray(data), dtype=torch.uint8).untyped_storage()
+
+
 class MultiprocessingSerializer:
     @staticmethod
-    def serialize(obj, output_str: bool = False):
+    def serialize(obj, output_str: bool = False, *, cpu_tensors_as_bytes: bool = False):
         """
         Serialize a Python object using ForkingPickler.
 
         Args:
             obj: The object to serialize.
             output_str (bool): If True, return a base64-encoded string instead of raw bytes.
+            cpu_tensors_as_bytes (bool): Copy CPU storage into the payload instead
+                of exporting shared-memory handles. CUDA tensors still use IPC.
 
         Returns:
             bytes or str: The serialized object.
         """
         buf = io.BytesIO()
-        ForkingPickler(buf).dump(obj)
+        pickler = ForkingPickler(buf)
+        if cpu_tensors_as_bytes:
+            reduce_storage = pickler.dispatch_table[torch.UntypedStorage]
+
+            def reduce_storage_as_bytes(storage):
+                if storage.device.type == "cpu":
+                    # UntypedStorage's legacy archive reducer cannot round-trip
+                    # on all supported Torch versions. Carry only the raw bytes;
+                    # existing tensor reducers retain dtype and view metadata.
+                    raw = torch.empty(0, dtype=torch.uint8, device="cpu").set_(storage)
+                    return (_rebuild_cpu_storage_from_bytes, (raw.numpy().tobytes(),))
+                return reduce_storage(storage)
+
+            # ForkingPickler owns this dispatch table. Preserve tensor/view
+            # reducers and global sharing policy while avoiding an FD per
+            # CPU storage and recipient for large MoE adapter payloads.
+            pickler.dispatch_table[torch.UntypedStorage] = reduce_storage_as_bytes
+        pickler.dump(obj)
         buf.seek(0)
         output = buf.read()
 
@@ -4347,50 +4373,9 @@ SUPPORTED_LORA_TARGET_MODULES = [
     # Inkling attention projections (merged q/k/v/r and its row-parallel output).
     "qkvr",
     "wo_ud",
-    # GDN (GatedDeltaNet) projections
-    "in_proj_qkvz",
-    "in_proj_ba",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
-
-# OFT-related constants and utilities
-# OFT (Orthogonal Finetuning) targets the same linear modules as LoRA,
-# but applies orthogonal transformations instead of low-rank decomposition.
-SUPPORTED_OFT_TARGET_MODULES = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-    "qkv_proj",
-    "q_a_proj",
-    "q_b_proj",
-    "kv_a_proj_with_mqa",
-    "kv_b_proj",
-    "gate_up_proj",
-    "embed_tokens",
-    "lm_head",
-    # DeepSeek V4 attention sublayer names. V4 uses native-quant
-    # DeepSeekV4Linear primitives that are NOT fused into qkv_proj/gate_up_proj,
-    # so each attention sublayer ships as its own OFT target. The
-    # corresponding wrap classes live in sglang/srt/oft/layers.py.
-    "wq_a",
-    "wq_b",
-    "wkv",
-    "wo_a",
-    "wo_b",
-    # DeepSeek V4 routed MoE expert names. These are handled outside the
-    # dense per-layer OFT memory pool by DeepSeek V4 MoE-owned expert buffers.
-    "w1",
-    "w2",
-    "w3",
-    # GDN (GatedDeltaNet) packed input projections, e.g. Qwen3.5.
-    "in_proj_qkvz",
-    "in_proj_ba",
-]
 
 
 class ConcurrentCounter:
